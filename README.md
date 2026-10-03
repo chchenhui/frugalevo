@@ -5,9 +5,9 @@
 
 **FrugalEvo** is a cost-aware evolutionary framework for computational optimization. It uses a stronger, higher-cost LLM to explore solution strategies, and a cheaper LLM to implement them and iteratively refines the resulting code.
 
-
+<br>
 <div align="center">
-  <img src="assets/frugalevo_overview.png" width="100%" ></img>
+  <img src="assets/frugalevo_overview.png" width="90%" ></img>
   <br>
   <em>
       Figure 1: The FrugalEvo framework.
