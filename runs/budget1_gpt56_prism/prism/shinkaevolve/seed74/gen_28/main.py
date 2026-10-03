@@ -1,0 +1,339 @@
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """
+    Place models while minimizing the maximum GPU KV cache pressure ratio.
+
+    A threshold p is feasible when every GPU can satisfy:
+        used_memory + total_load / p <= GPU_MEM_SIZE
+
+    Therefore, packing transformed item sizes:
+        model_size + model_load / p
+    into 80 GB bins guarantees actual KVPR <= p.
+    """
+
+    EPS = 1e-12
+    models = list(models)
+
+    if gpu_num <= 0:
+        if models:
+            raise ValueError("Unable to place models because gpu_num must be positive.")
+        return {}
+
+    def load_of(model):
+        return model.req_rate / model.slo
+
+    model_info = [(model, model.model_size, load_of(model)) for model in models]
+
+    if any(size > GPU_MEM_SIZE for _, size, _ in model_info):
+        raise ValueError(
+            "Unable to place all models within GPU memory. "
+            f"Each GPU has {GPU_MEM_SIZE} GB."
+        )
+
+    def pressure(load, remaining):
+        if remaining <= EPS:
+            return float("inf") if load > EPS else 0.0
+        return load / remaining
+
+    def score(loads, remaining):
+        values = sorted(
+            (pressure(loads[gpu], remaining[gpu]) for gpu in range(gpu_num)),
+            reverse=True,
+        )
+        return tuple(values) + (-max(remaining),)
+
+    def make_result(bins):
+        placement = {gpu: [] for gpu in range(gpu_num)}
+        remaining = [GPU_MEM_SIZE] * gpu_num
+        loads = [0.0] * gpu_num
+
+        for gpu, items in enumerate(bins):
+            for model, size, load in items:
+                placement[gpu].append(model)
+                remaining[gpu] -= size
+                loads[gpu] += load
+
+        return placement, remaining, loads
+
+    def greedy_pack(order, transformed=None, best_fit=False):
+        """
+        Pack items using either real memory or transformed threshold sizes.
+        transformed is a mapping from model identity to transformed size.
+        """
+        bins = [[] for _ in range(gpu_num)]
+        used = [0.0] * gpu_num
+        loads = [0.0] * gpu_num
+        memory = [0.0] * gpu_num
+
+        for model, size, load in order:
+            item_size = transformed[id(model)] if transformed is not None else size
+            choices = []
+
+            for gpu in range(gpu_num):
+                if used[gpu] + item_size > GPU_MEM_SIZE + EPS:
+                    continue
+
+                next_used = used[gpu] + item_size
+                next_memory = memory[gpu] + size
+                next_load = loads[gpu] + load
+                remaining = GPU_MEM_SIZE - next_memory
+
+                if transformed is None:
+                    projected = pressure(next_load, remaining)
+                    key = (
+                        projected,
+                        -remaining,
+                        gpu,
+                    )
+                elif best_fit:
+                    key = (GPU_MEM_SIZE - next_used, gpu)
+                else:
+                    key = (
+                        pressure(next_load, remaining),
+                        GPU_MEM_SIZE - next_used,
+                        gpu,
+                    )
+
+                choices.append((key, gpu))
+
+            if not choices:
+                return None
+
+            _, gpu = min(choices)
+            bins[gpu].append((model, size, load))
+            used[gpu] += item_size
+            memory[gpu] += size
+            loads[gpu] += load
+
+        return make_result(bins)
+
+    def improve(placement, remaining, loads):
+        """Apply lexicographically improving moves and swaps."""
+        for _ in range(60):
+            current = score(loads, remaining)
+            best = current
+            action = None
+
+            for source in range(gpu_num):
+                for model in placement[source]:
+                    size = model.model_size
+                    load = load_of(model)
+
+                    for target in range(gpu_num):
+                        if source == target or size > remaining[target] + EPS:
+                            continue
+
+                        new_remaining = remaining[:]
+                        new_loads = loads[:]
+                        new_remaining[source] += size
+                        new_remaining[target] -= size
+                        new_loads[source] -= load
+                        new_loads[target] += load
+                        candidate = score(new_loads, new_remaining)
+
+                        if candidate < best:
+                            best = candidate
+                            action = ("move", source, target, model)
+
+            for left in range(gpu_num):
+                for right in range(left + 1, gpu_num):
+                    for left_model in placement[left]:
+                        left_size = left_model.model_size
+                        left_load = load_of(left_model)
+
+                        for right_model in placement[right]:
+                            right_size = right_model.model_size
+                            right_load = load_of(right_model)
+
+                            left_free = remaining[left] + left_size - right_size
+                            right_free = remaining[right] + right_size - left_size
+                            if left_free < -EPS or right_free < -EPS:
+                                continue
+
+                            new_remaining = remaining[:]
+                            new_loads = loads[:]
+                            new_remaining[left] = left_free
+                            new_remaining[right] = right_free
+                            new_loads[left] += right_load - left_load
+                            new_loads[right] += left_load - right_load
+                            candidate = score(new_loads, new_remaining)
+
+                            if candidate < best:
+                                best = candidate
+                                action = (
+                                    "swap",
+                                    left,
+                                    right,
+                                    left_model,
+                                    right_model,
+                                )
+
+            if action is None:
+                break
+
+            if action[0] == "move":
+                _, source, target, model = action
+                size = model.model_size
+                load = load_of(model)
+                placement[source].remove(model)
+                placement[target].append(model)
+                remaining[source] += size
+                remaining[target] -= size
+                loads[source] -= load
+                loads[target] += load
+            else:
+                _, left, right, left_model, right_model = action
+                left_size = left_model.model_size
+                right_size = right_model.model_size
+                left_load = load_of(left_model)
+                right_load = load_of(right_model)
+
+                placement[left].remove(left_model)
+                placement[right].remove(right_model)
+                placement[left].append(right_model)
+                placement[right].append(left_model)
+
+                remaining[left] += left_size - right_size
+                remaining[right] += right_size - left_size
+                loads[left] += right_load - left_load
+                loads[right] += left_load - right_load
+
+        return placement, remaining, loads
+
+    orderings = [
+        sorted(model_info, key=lambda x: (x[2], x[1]), reverse=True),
+        sorted(model_info, key=lambda x: (x[1], x[2]), reverse=True),
+        sorted(
+            model_info,
+            key=lambda x: (x[2] / max(GPU_MEM_SIZE - x[1], EPS), x[1]),
+            reverse=True,
+        ),
+        sorted(model_info, key=lambda x: (x[2] / max(x[1], EPS), x[1]), reverse=True),
+        sorted(model_info, key=lambda x: (x[2] * x[1], x[2]), reverse=True),
+    ]
+
+    candidates = []
+
+    # Real-memory greedy seeds provide robust fallback behavior.
+    for order in orderings:
+        candidate = greedy_pack(order)
+        if candidate is not None:
+            candidates.append(candidate)
+
+    if not candidates:
+        raise ValueError(
+            "Unable to place all models within GPU memory. "
+            f"Each GPU has {GPU_MEM_SIZE} GB."
+        )
+
+    # The best normal seed gives a safe upper bound for threshold search.
+    seed = min(candidates, key=lambda result: score(result[2], result[1]))
+    upper = score(seed[2], seed[1])[0]
+    lower = 0.0
+    for _, size, load in model_info:
+        if load > 0:
+            lower = max(lower, load / max(GPU_MEM_SIZE - size, EPS))
+
+    def try_threshold(target):
+        if target <= EPS:
+            return []
+
+        transformed = {
+            id(model): size + load / target
+            for model, size, load in model_info
+        }
+
+        if any(value > GPU_MEM_SIZE + EPS for value in transformed.values()):
+            return []
+
+        transformed_orders = [
+            sorted(
+                model_info,
+                key=lambda x: (transformed[id(x[0])], x[1], x[2]),
+                reverse=True,
+            ),
+            sorted(
+                model_info,
+                key=lambda x: (x[2] / max(x[1], EPS), transformed[id(x[0])]),
+                reverse=True,
+            ),
+            sorted(
+                model_info,
+                key=lambda x: (
+                    x[2] / max(GPU_MEM_SIZE - x[1], EPS),
+                    transformed[id(x[0])],
+                ),
+                reverse=True,
+            ),
+            sorted(
+                model_info,
+                key=lambda x: (x[1], x[2], transformed[id(x[0])]),
+                reverse=True,
+            ),
+        ]
+
+        results = []
+        for index, order in enumerate(transformed_orders):
+            result = greedy_pack(order, transformed, best_fit=(index == 0))
+            if result is not None:
+                results.append(result)
+        return results
+
+    # Search threshold feasibility, retaining every successful transformed
+    # packing because different orders can have different true KVPR profiles.
+    if upper > lower + EPS:
+        lo, hi = lower, upper
+        threshold_candidates = try_threshold(hi)
+        candidates.extend(threshold_candidates)
+
+        if threshold_candidates:
+            for _ in range(22):
+                middle = (lo + hi) / 2.0
+                results = try_threshold(middle)
+                if results:
+                    hi = middle
+                    candidates.extend(results)
+                else:
+                    lo = middle
+
+    best_result = None
+    best_score = None
+
+    # Improve all successful candidates before choosing the final placement.
+    for placement, remaining, loads in candidates:
+        placement, remaining, loads = improve(placement, remaining, loads)
+        candidate_score = score(loads, remaining)
+        if best_score is None or candidate_score < best_score:
+            best_score = candidate_score
+            best_result = (placement, remaining, loads)
+
+    return best_result[0]
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

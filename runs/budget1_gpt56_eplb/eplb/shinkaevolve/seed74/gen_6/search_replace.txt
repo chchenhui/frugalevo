@@ -1,0 +1,67 @@
+<NAME>
+vectorized_balanced_packing
+</NAME>
+
+<DESCRIPTION>
+Replace the Python-level per-layer/per-expert packing loop with a batched tensor implementation of the same capacity-constrained LPT greedy policy.
+
+The previous implementation repeatedly converts tensor values into Python operations while selecting a pack for every group. This creates substantial interpreter overhead, particularly when there are many MoE layers, groups, or repeated balancing calls. The replacement processes all layers simultaneously for each sorted group position: it chooses the least-loaded non-full pack per layer, writes the selected pack/rank with scatter operations, and updates pack loads/counts with scatter_add.
+
+This preserves the important balancing behavior: groups are processed in descending load order and each is assigned to the currently lightest eligible pack, while every pack receives exactly the required number of groups. It also avoids forced CPU index transfers, allowing the helper to remain efficient if called with tensors already on an accelerator.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    # Process the same descending-load greedy assignment for every layer in
+    # parallel.  Keeping loads and occupancy as tensors avoids a Python loop
+    # over layers and scalar tensor accesses for every group.
+    indices = weight.float().sort(-1, descending=True).indices
+    device = weight.device
+    pack_index = torch.full_like(weight, -1, dtype=torch.int64)
+    rank_in_pack = torch.full_like(pack_index, -1)
+
+    pack_weights = torch.zeros(
+        (num_layers, num_packs), dtype=torch.float32, device=device)
+    pack_items = torch.zeros(
+        (num_layers, num_packs), dtype=torch.int64, device=device)
+
+    for position in range(num_groups):
+        group = indices[:, position]
+        eligible_weights = pack_weights.masked_fill(
+            pack_items >= groups_per_pack, float("inf"))
+        pack = eligible_weights.argmin(dim=-1)
+        item_rank = pack_items.gather(1, pack.unsqueeze(1)).squeeze(1)
+
+        pack_index.scatter_(1, group.unsqueeze(1), pack.unsqueeze(1))
+        rank_in_pack.scatter_(1, group.unsqueeze(1), item_rank.unsqueeze(1))
+
+        group_weight = weight.gather(1, group.unsqueeze(1)).float()
+        pack_weights.scatter_add_(1, pack.unsqueeze(1), group_weight)
+        pack_items.scatter_add_(
+            1, pack.unsqueeze(1), torch.ones_like(pack.unsqueeze(1)))
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

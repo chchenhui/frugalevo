@@ -1,0 +1,321 @@
+{
+  "version": 24,
+  "curve": {
+    "unit": "usd",
+    "budget": 2.0,
+    "spent": 0.4834102,
+    "final_incumbent": 0.6625598147594406,
+    "ba_auc": 1.2850367662795135,
+    "ba_auc_normalized": 0.6425183831397567,
+    "num_points": 6,
+    "points": [
+      {
+        "cost": 0.0,
+        "score": 0.49825364225419244,
+        "incumbent": 0.49825364225419244,
+        "iteration": 0,
+        "candidates": 0
+      },
+      {
+        "cost": 0.0583092,
+        "score": 0.531613242228994,
+        "incumbent": 0.531613242228994,
+        "iteration": 1,
+        "candidates": 3
+      },
+      {
+        "cost": 0.0905892,
+        "score": 0.5176604836574654,
+        "incumbent": 0.531613242228994,
+        "iteration": 2,
+        "candidates": 1
+      },
+      {
+        "cost": 0.2912462,
+        "score": 0.6625598147594406,
+        "incumbent": 0.6625598147594406,
+        "iteration": 3,
+        "candidates": 4
+      },
+      {
+        "cost": 0.3903322,
+        "score": 0.6625598147594406,
+        "incumbent": 0.6625598147594406,
+        "iteration": 4,
+        "candidates": 3
+      },
+      {
+        "cost": 0.4834102,
+        "score": 0.565380520408181,
+        "incumbent": 0.6625598147594406,
+        "iteration": 5,
+        "candidates": 3
+      }
+    ]
+  },
+  "strategy_objective_guidance": "- **Hard validity constraints:** submit `run_signal_processing(noisy_signal, window_size)` returning a `dict` with `filtered_signal` of **exactly** `len(noisy_signal) - window_size + 1` samples, for every call (including Stage 1 with `window_size=10`). Exceptions, timeouts (10 s per full-evaluation signal; 5 s Stage 1), missing key/function, or any wrong length yield failure/zero. Return finite numeric values; NaNs can poison filtering, correlation, and variance calculations.\n- **The program receives the complete input array at once**, not a stream. It may therefore use offline/batch, non-causal, bidirectional, zero-phase, and global fitting methods. The evaluator aligns output sample `j` to input/clean sample `j + window_size - 1`; output must cover the aligned suffix `noisy_signal[window_size-1:]`. There is no evaluation of actual per-window causality.\n- **Primary selection metric is `combined_score = overall_score`:**\n  - **0.40 \u00d7 mean composite score**, where per-signal `composite = 1 / (1 + penalty)`.\n    - Composite penalty has **0.30 \u00d7 `min(S/50, 2)`**: raw count of every output slope-sign reversal. Flat differences have asymmetric behavior: a preceding zero suppresses a reversal, but transitions involving zero can still matter on the next comparison.\n    - **0.20 \u00d7 `min(L_recent, 2)`**: MAE from noisy input over the final 20 aligned output samples.\n    - **0.20 \u00d7 `min(L_avg, 2)`**: MAE from the aligned noisy input over all outputs.\n    - **0.30 \u00d7 `min(R/25, 2)`**: count of output reversals that do not coincide at the same index with a clean-signal reversal.\n  - **0.20 \u00d7 smoothness score**, `1/(1 + mean(S)/20)`: independently rewards fewer total output reversals, including reversals that match the clean signal.\n  - **0.20 \u00d7 correlation** with the hidden clean signal, clipped only below by `max(0, correlation)`: rewards shape/linear association with clean data, not absolute calibration.\n  - **0.10 \u00d7 noise reduction**, `max(0, (Var(noisy-clean)-Var(filtered-clean))/Var(noisy-clean))`: rewards lower residual variance relative to hidden clean data; negative improvement gets no extra penalty.\n  - **0.10 \u00d7 success rate** across five signals.\n- **Accuracy gate:** if mean clean correlation is below **0.1**, the entire `overall_score` is set to zero. Robustly clearing this gate is mandatory.\n- **Largest remaining lever is usually reversal suppression (`S` and especially false reversals `R`) while retaining enough clean correlation.** `S` is rewarded twice: inside the 0.40-weighted composite and directly by the 0.20 smoothness term. `R` has the same 0.30 composite-penalty weight as `S`, but is not separately rewarded outside composite. Error terms have only 0.20 each within composite and are capped at 2, so once either MAE is at its cap it has no further downside within composite.\n- **Near/far-from-maximum status cannot be known without baseline metrics.** Numerically, `success_rate` is at maximum only when all five signals run; correlation is near maximum only near 1; noise reduction is near maximum only when output residual variance is far below input-noise variance; `S`, `R`, and both MAEs are best at zero. Inspect returned metrics before tuning: if `S_norm`, `R_norm`, or either MAE normalization is already capped at 2, reduce that capped term first because it is currently inflicting its full weighted penalty.\n- **Core conflicts:** copying the aligned noisy suffix minimizes both lag-MAE terms but creates many slope changes, poor noise reduction, and likely high `R`; strong smoothing lowers `S`/`R` and can improve noise reduction but increases MAE to noisy observations and can erase high-frequency clean components, reducing correlation. A zero-phase batch smoother reduces apparent lag relative to causal filtering, but overly broad smoothing still damages the multitone and changing-frequency cases. Exact step preservation conflicts with global smoothness but is important for correlation/noise reduction on the step test.\n- **The highest-scoring result is not necessarily the best real-time adaptive filter.** Actual latency, online operation, computational efficiency, true phase delay, and adherence to a rolling-window implementation are **not scored**. `efficiency_score` and `responsiveness_score` are reported but not included in `overall_score`. The evaluator\u2019s \u201clag\u201d compares against the noisy observation, not clean ground truth, and complete-input access permits zero-phase/offline methods; optimizing a genuinely causal real-time filter can therefore stall against batch smoothers.\n- Correlation, noise reduction, and false-reversal matching use the hidden clean signal; no method can directly optimize them from the API, but denoising models that preserve broad waveform structure and isolate discontinuities are evaluator-visible proxies.",
+  "strategy_diverge_guidance": "EXAMPLES OF DIFFERENT approaches:\n- **Offline zero-phase frequency-selective filtering:** use `scipy.signal.butter` with `output=\"sos\"` and `scipy.signal.sosfiltfilt` (or `scipy.signal.butter` plus `scipy.signal.filtfilt`) on the full signal, then retain the aligned suffix. This directly avoids causal phase delay while suppressing high-frequency noise, targeting correlation, noise reduction, `S`, and `R`.\n- **Robust local polynomial smoothing:** use `scipy.signal.savgol_filter` with an odd window and low polynomial order, optionally preceded by `scipy.signal.medfilt` to remove impulsive samples. Local polynomial preservation can retain sinusoidal slopes and step-adjacent trends better than a low-pass filter, reducing false reversals without excessive noisy-input MAE.\n- **Wavelet multiscale denoising:** use `pywt.wavedec`, `pywt.threshold`, and `pywt.waverec`, with level-dependent detail thresholds. This separates high-frequency noise from oscillatory and non-stationary structure; compare soft versus hard thresholding by their effects on clean correlation versus slope/reversal counts.\n- **Global smooth-trend fitting:** use `scipy.interpolate.UnivariateSpline` with a smoothing factor, evaluated on all sample locations. A global fit can sharply reduce `S` and `R`, but must be tested against the step and multicomponent signals because excessive smoothing loses correlation and raises noisy-input MAE.\n- **State-space/adaptive family:** implement a compact constant-velocity or constant-acceleration Kalman-style smoother using full-sequence forward/backward estimates; no dedicated Kalman package is available. A forward-only version is the causal comparator, while forward-backward smoothing exploits the evaluator\u2019s batch access and should improve apparent lag/correlation.\n- **Change-aware piecewise family:** detect candidate discontinuities with `scipy.signal.find_peaks` on absolute first differences, partition around substantial changes, and apply a smoother independently per segment. This preserves the two synthetic steps while denoising within plateaus, avoiding the global-filter tendency to smear steps and introduce transition reversals.",
+  "strategy_refine_guidance": "EXAMPLES OF REFINEMENT approaches:\n- **Enforce alignment and reliability first:** always produce one finite estimate per complete window and return precisely the suffix-aligned length for arbitrary `window_size`, not a hard-coded 20; retain full-input batch processing internally but slice only at the final output contract.\n- **Tune reversal-versus-correlation frontier:** grid-search smoothing strength using mean `S`, `R`, correlation, and composite score across all five known signal families; reject settings that approach the correlation gate even if they minimize reversals.\n- **Zero-phase filter polish:** sweep `scipy.signal.butter` order and normalized cutoff, using SOS form; choose the least aggressive cutoff that materially lowers `S`/`R`, since additional attenuation may reduce correlation on the 2 Hz/5 Hz and chirp-like signals.\n- **Savitzky\u2013Golay polish:** sweep odd `window_length` values around the evaluator window scale and `polyorder` 2\u20134; favor shorter windows/high-enough order when correlation on multicomponent signals falls, and longer windows only when random-walk noise dominates reversal penalties.\n- **Wavelet polish:** tune wavelet basis, decomposition `level`, threshold multiplier, and `mode=\"soft\"` versus `\"hard\"` in `pywt.threshold`; soft thresholding commonly reduces artificial slope-sign flips, whereas hard thresholding may better preserve step magnitude but can create artifacts.\n- **Robust outlier stage:** tune `scipy.signal.medfilt` kernel size conservatively before the main smoother; increase it only if isolated noisy excursions dominate `R`, because median filtering can flatten real small oscillations and hurt correlation.\n- **Step protection:** set the `find_peaks` prominence threshold from a robust noise estimate such as median absolute first difference; smooth separately between only high-confidence jumps, preventing two true step transitions from being rounded into long high-MAE ramps.\n- **Global-fit regularization:** tune `scipy.interpolate.UnivariateSpline` smoothing factor separately against sinusoidal/chirp and step behavior; use a lower smoothing factor when correlation or noisy-input MAE is the limiting metric, and a higher one only when `S`/`R` dominate.\n- **Avoid unscored optimization:** do not spend budget optimizing reported `efficiency_score`, claimed real-time latency, or a causal-only implementation unless runtime risks timeout; their only evaluator-visible benefit is preserving successful execution.",
+  "strategy_guidance_attempted": true,
+  "strategy_guidance_cost": 0.031485,
+  "strategies": [
+    {
+      "index": 1,
+      "title": "[zero-phase-local-polynomial] Local zero-phase Savitzky\u2013Golay replacement",
+      "plan": "Mechanism family: zero-phase-local-polynomial\n\nReplacement scope: Replace only the body of `enhanced_filter_with_trend_preservation`; leave `adaptive_filter`, `process_signal`, and result alignment unchanged.\n\nCompute budget: none; one `savgol_filter` call over the complete input, with an odd window `min(11, largest valid odd length)` for `window_size >= 16`, otherwise `min(7, largest valid odd length)`, polynomial order 3, plus one linear-time derivative deadband pass. Expected evaluation-time effect: substantially below 10 ms for typical evaluator signals.\n\nGain mechanism: The incumbent is a causal alpha-beta tracker, so its level estimate necessarily follows noisy turning points and its trend state can repeatedly reverse. A centered Savitzky\u2013Golay polynomial fit is evaluator-legal because the complete array is available; it preserves local curvature and sinusoidal dynamics while eliminating causal phase delay. After smoothing, suppress only increments smaller than `0.08 * sigma`, where `sigma = median(abs(diff(x) - median(diff(x)))) / 0.6745 / sqrt(2)`, by holding the previous output level. This adds a direct slope-sign hysteresis mechanism that the incumbent lacks without imposing a broad moving-average lag. Convert non-finite inputs with `nan_to_num`, ensure the Savitzky\u2013Golay window is odd and no larger than the input, and return exactly `smoothed[window_size - 1:]`.\n\nExpected-gain check: this construction has a falsifiable acceptance target of mean slope changes below the incumbent\u2019s 246.4 while retaining mean clean correlation at or above 0.9293, because centered polynomial smoothing removes sub-noise derivative sign flips that the incumbent\u2019s causal trend recursion cannot inspect symmetrically.",
+      "cost": 0.021968000000000005,
+      "best_score": 0.565562157963958,
+      "baseline_score": 0.531613242228994,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 1,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.034422666666666664,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 3,
+      "failure_feedback": []
+    },
+    {
+      "index": 2,
+      "title": "[change-point-segmented-smoothing] Step-protected mesoscopic segment replacement",
+      "plan": "Mechanism family: change-point-segmented-smoothing\n\nReplacement scope: Replace the full-stream filtering phase inside `enhanced_filter_with_trend_preservation` with a high-confidence change-point partition followed by independent segment smoothing.\n\nCompute budget: none; one robust difference-scale estimate, one linear scan for change points, and at most one zero-phase SOS Butterworth filter per segment. Use Butterworth order 3, normalized cutoff `clip(2.6 / window_size, 0.10, 0.30)`, and a pad length capped at `segment_length - 1`. Expected evaluation-time effect: linear in input length; no optimizer starts or iterations.\n\nGain mechanism: A single global smoother necessarily spreads an actual step into neighboring samples, creating transition lag, ringing, and extra reversals. Estimate `sigma_d = median(abs(diff(x) - median(diff(x)))) / 0.6745`; declare a boundary only when `abs(diff(x)[i]) > max(6 * sigma_d, 0.12 * (max(x)-min(x)))`. Filter each resulting segment independently with zero-phase SOS filtering; segments shorter than 8 samples are copied unchanged. Preserve the sample immediately before and immediately after every accepted boundary exactly from the input, then concatenate and return the aligned suffix. This changes the topology from one globally coupled trajectory to independently denoised regimes, protecting genuine step-like signal events while retaining low reversal counts within regimes. All segments must remain finite, and the final output is always sliced as `[window_size - 1:]`, guaranteeing the required length.\n\nExpected-gain check: this construction is falsifiably better if it reduces false reversals below the incumbent\u2019s 195.4 without increasing average aligned noisy-input MAE above 0.2621, since step isolation removes a global-filter artifact unavailable to the incumbent\u2019s single continuous alpha-beta state.",
+      "cost": 0.021968000000000005,
+      "best_score": 0.6625598147594406,
+      "baseline_score": 0.531613242228994,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 1,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.13094657253044661,
+      "cumulative_relative_gain": 0.19763735984801634,
+      "productive_rounds": 1,
+      "barren_rounds": 0,
+      "implementation_spend": 0.034422666666666664,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 3,
+      "failure_feedback": []
+    },
+    {
+      "index": 3,
+      "title": "[second-order-trend-filtering] Structural convex piecewise-linear trend reconstr",
+      "plan": "Mechanism family: second-order-trend-filtering\n\nReplacement scope: Replace `enhanced_filter_with_trend_preservation` entirely with a batch second-order total-variation trend filter, retaining its signature and suffix alignment contract.\n\nCompute budget: one deterministic ADMM solve, no multistarts, exactly 80 iterations maximum. Use `rho = 4`, initialize all primal and dual variables to zero, and stop earlier only if both scaled primal and dual residual norms are below `1e-4 * sqrt(n)`. Expected evaluation-time effect: sparse banded linear solve or pre-factored pentadiagonal solve per iteration; practical for evaluator-length arrays and bounded by the 10-second limit.\n\nGain mechanism: Solve the convex reconstruction problem\n`min_y 0.5 * sum((y_i-x_i)^2) + lambda * sum(abs(y_(i+2)-2*y_(i+1)+y_i))`,\nwith `lambda = 2.2 * sigma_d * sqrt(max(window_size, 2))` and `sigma_d = median(abs(diff(x) - median(diff(x)))) / 0.6745`. Use ADMM splitting on the second-difference vector, soft-threshold its auxiliary variable by `lambda/rho`, and solve the fixed pentadiagonal `I + rho*D2.T@D2` system at each iteration. This representation penalizes changes in slope rather than amplitude or first difference: it can retain ramps and broad waveform motion while directly removing the oscillatory curvature responsible for spurious reversals. For detected high-confidence jumps using the same `max(6*sigma_d, 0.12*range)` rule, solve separate blocks and preserve boundary samples to avoid forcing a step into a ramp. Return finite `y[window_size-1:]` exactly; for extremely short input blocks where second differences do not exist, use the centered local mean fallback.\n\nExpected-gain check: this structural representation is falsifiably superior if it achieves fewer than 123.2 slope changes\u2014half the incumbent count\u2014while maintaining correlation above the mandatory 0.1 gate, because the incumbent has no second-difference sparsity degree of freedom and therefore cannot produce sparse slope-change trajectories directly.",
+      "cost": 0.021968000000000005,
+      "best_score": null,
+      "baseline_score": 0.531613242228994,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 0,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.034422666666666664,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 3,
+      "failure_feedback": [
+        "Pilot returned no finite combined_score"
+      ]
+    },
+    {
+      "index": 4,
+      "title": "ordered attempt [change-point-segmented-smoothing] Step-protected mesoscopic segment replacement",
+      "plan": "Mechanism family: change-point-segmented-smoothing\n\nReplacement scope: Replace the full-stream filtering phase inside `enhanced_filter_with_trend_preservation` with a high-confidence change-point partition followed by independent segment smoothing.\n\nCompute budget: none; one robust difference-scale estimate, one linear scan for change points, and at most one zero-phase SOS Butterworth filter per segment. Use Butterworth order 3, normalized cutoff `clip(2.6 / window_size, 0.10, 0.30)`, and a pad length capped at `segment_length - 1`. Expected evaluation-time effect: linear in input length; no optimizer starts or iterations.\n\nGain mechanism: A single global smoother necessarily spreads an actual step into neighboring samples, creating transition lag, ringing, and extra reversals. Estimate `sigma_d = median(abs(diff(x) - median(diff(x)))) / 0.6745`; declare a boundary only when `abs(diff(x)[i]) > max(6 * sigma_d, 0.12 * (max(x)-min(x)))`. Filter each resulting segment independently with zero-phase SOS filtering; segments shorter than 8 samples are copied unchanged. Preserve the sample immediately before and immediately after every accepted boundary exactly from the input, then concatenate and return the aligned suffix. This changes the topology from one globally coupled trajectory to independently denoised regimes, protecting genuine step-like signal events while retaining low reversal counts within regimes. All segments must remain finite, and the final output is always sliced as `[window_size - 1:]`, guaranteeing the required length.\n\nExpected-gain check: this construction is falsifiably better if it reduces false reversals below the incumbent\u2019s 195.4 without increasing average aligned noisy-input MAE above 0.2621, since step isolation removes a global-filter artifact unavailable to the incumbent\u2019s single continuous alpha-beta state.",
+      "cost": 0.0,
+      "best_score": 0.6625598147594406,
+      "baseline_score": 0.6625598147594406,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 3,
+      "implementations": 3,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": 2,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 1,
+      "implementation_spend": 0.09908600000000001,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 4,
+      "failure_feedback": []
+    },
+    {
+      "index": 5,
+      "title": "ordered attempt [zero-phase-local-polynomial] Local zero-phase Savitzky\u2013Golay replacement",
+      "plan": "Mechanism family: zero-phase-local-polynomial\n\nReplacement scope: Replace only the body of `enhanced_filter_with_trend_preservation`; leave `adaptive_filter`, `process_signal`, and result alignment unchanged.\n\nCompute budget: none; one `savgol_filter` call over the complete input, with an odd window `min(11, largest valid odd length)` for `window_size >= 16`, otherwise `min(7, largest valid odd length)`, polynomial order 3, plus one linear-time derivative deadband pass. Expected evaluation-time effect: substantially below 10 ms for typical evaluator signals.\n\nGain mechanism: The incumbent is a causal alpha-beta tracker, so its level estimate necessarily follows noisy turning points and its trend state can repeatedly reverse. A centered Savitzky\u2013Golay polynomial fit is evaluator-legal because the complete array is available; it preserves local curvature and sinusoidal dynamics while eliminating causal phase delay. After smoothing, suppress only increments smaller than `0.08 * sigma`, where `sigma = median(abs(diff(x) - median(diff(x)))) / 0.6745 / sqrt(2)`, by holding the previous output level. This adds a direct slope-sign hysteresis mechanism that the incumbent lacks without imposing a broad moving-average lag. Convert non-finite inputs with `nan_to_num`, ensure the Savitzky\u2013Golay window is odd and no larger than the input, and return exactly `smoothed[window_size - 1:]`.\n\nExpected-gain check: this construction has a falsifiable acceptance target of mean slope changes below the incumbent\u2019s 246.4 while retaining mean clean correlation at or above 0.9293, because centered polynomial smoothing removes sub-noise derivative sign flips that the incumbent\u2019s causal trend recursion cannot inspect symmetrically.",
+      "cost": 0.0,
+      "best_score": 0.565380520408181,
+      "baseline_score": 0.6625598147594406,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 3,
+      "implementations": 3,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": 1,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 1,
+      "implementation_spend": 0.093078,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 5,
+      "failure_feedback": []
+    }
+  ],
+  "active_strategy": 5,
+  "strategy_queue": [],
+  "ordered_portfolio_roots": [
+    1,
+    2,
+    3
+  ],
+  "ordered_exploitation_queue": [
+    3
+  ],
+  "ordered_active_root": null,
+  "ordered_pilot_scores": {
+    "1": 0.565562157963958,
+    "2": 0.6625598147594406,
+    "3": null
+  },
+  "ordered_phase": "exploit",
+  "ordered_reference_feedback": [
+    "portfolio reference scored 0.596434953929 and promoted to shared pilot parent"
+  ],
+  "strategy_reference_failure_streak": 0,
+  "strategy_reference_disabled": false,
+  "strategy_costs": [
+    0.06590400000000002
+  ],
+  "implementation_costs": [
+    0.0194364,
+    0.032279999999999996,
+    0.034422666666666664,
+    0.03302866666666667,
+    0.031025999999999998
+  ],
+  "guide_implementation_costs": [],
+  "guide_implementation_due": false,
+  "guide_implementation_due_reason": null,
+  "guide_implementation_unguided": false,
+  "strategy_call_count": 1,
+  "anchor_next_cheap_to_incumbent": false,
+  "opening_cheap_probe_done": true,
+  "opening_failure_retries_used": 0,
+  "opening_guide_hedge_done": false,
+  "success_achieved": false,
+  "barren_rounds": 1,
+  "stagnation": 2,
+  "next_strategy_escalation": 32,
+  "strategy_escalation_gap": 32,
+  "seen_solutions": [
+    "057b4059c05bf28480a29b242d05882de5dfae01",
+    "1e4b8b2c3a646743f2abb5f8e106b5aa97f1d526",
+    "25a3d2be49a657ff2f4d7523f379d75c7882a622",
+    "37e5c1f55aa30d56c75facacd546f6ef0c402862",
+    "5d6422c2de75fec3a416c97da5a8c8654d85a8e8",
+    "6277494c0fd4407cba98157a0523d2946f891991",
+    "8b21f3ed356900c2c6731e242cff73e043872ef1",
+    "abc4dbd50cba9f1b8f84d1b5cdc9ab4e04193d46",
+    "b3e110db5086a060a4e5dc40fe0e3c62a928e68f",
+    "b9f6567a58491e4ba7f2bd5ae261b330241dcd1a",
+    "d30e98b7dc165e733a4c49eded4e98332f424690",
+    "d42236e8853dee65093190b6b4f39d23e116681c",
+    "dcfd3679163daa0661e4d175d2d54886f980a6ce"
+  ],
+  "score_ledger": [
+    [
+      0.531613242,
+      1
+    ],
+    [
+      0.518493856,
+      1
+    ],
+    [
+      0.531146332,
+      1
+    ],
+    [
+      0.517660484,
+      1
+    ],
+    [
+      0.596434954,
+      1
+    ],
+    [
+      0.565562158,
+      1
+    ],
+    [
+      0.662559815,
+      4
+    ],
+    [
+      0.56538052,
+      1
+    ],
+    [
+      0.562621762,
+      1
+    ],
+    [
+      0.48940887,
+      1
+    ]
+  ],
+  "cost_samples": [
+    [
+      3,
+      0.0583092
+    ],
+    [
+      1,
+      0.032279999999999996
+    ],
+    [
+      3,
+      0.20065700000000003
+    ],
+    [
+      3,
+      0.09908600000000001
+    ],
+    [
+      3,
+      0.093078
+    ]
+  ],
+  "exploring": true
+}

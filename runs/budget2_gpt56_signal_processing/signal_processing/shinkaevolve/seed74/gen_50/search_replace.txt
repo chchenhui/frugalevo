@@ -1,0 +1,151 @@
+<NAME>
+evidence_locked_reversals
+</NAME>
+
+<DESCRIPTION>
+Replace the single-sample reversal threshold with cumulative, normalized multi-scale evidence and apply the directional lock to the reported output rather than freezing the internal alpha-beta state.
+
+The current tracker updates `previous_direction` as soon as velocity crosses its small deadband, which explains the very high slope-change and false-reversal counts despite excellent lag and point accuracy. The new gate requires counter-trend velocity, recent-slope confirmation, and a significant innovation in the same direction. Evidence accumulates for sustained turns, decays quickly for incoherent pullbacks, and confirms after sufficient normalized evidence or three coherent samples. Meanwhile, the internal position and velocity continue adapting, so the output can be released directly to the already-updated internal state once a genuine reversal is confirmed. This targets the dominant false-reversal penalty while retaining a bounded turn latency.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    position = 0.0
+    velocity = 0.0
+    previous_direction = 0.0
+=======
+    position = 0.0
+    velocity = 0.0
+
+    # The tracker state remains responsive, while the presentation state uses
+    # evidence-confirmed direction changes to prevent output chatter.
+    previous_direction = 0.0
+    reported_position = 0.0
+    pending_direction = 0.0
+    pending_evidence = 0.0
+    pending_count = 0
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            position = measurement
+            velocity = local_slope
+            y[i] = position
+            previous_direction = np.sign(velocity)
+            continue
+=======
+            position = measurement
+            velocity = local_slope
+            reported_position = position
+            y[i] = reported_position
+            previous_direction = np.sign(velocity)
+            continue
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        candidate_velocity = velocity + beta * bounded_innovation
+        candidate_direction = np.sign(candidate_velocity)
+        reversal_threshold = 2.0 * noise_scale
+
+        # Do not flip direction on a small innovation.  Decaying the velocity
+        # still permits a sustained opposite trend to reverse promptly.
+        if (
+            previous_direction != 0.0
+            and candidate_direction != 0.0
+            and candidate_direction != previous_direction
+            and abs(innovation) < reversal_threshold
+        ):
+            candidate_velocity = 0.5 * velocity
+
+        position = prediction + alpha * bounded_innovation
+        velocity = candidate_velocity
+        if abs(velocity) > noise_scale / max(window_size, 1):
+            previous_direction = np.sign(velocity)
+        y[i] = position
+=======
+        candidate_velocity = velocity + beta * bounded_innovation
+        velocity_floor = 0.07 * noise_scale
+        candidate_direction = (
+            np.sign(candidate_velocity)
+            if abs(candidate_velocity) > velocity_floor
+            else 0.0
+        )
+        recent_direction = (
+            np.sign(recent_slope)
+            if abs(recent_slope) > 0.07 * noise_scale
+            else 0.0
+        )
+        counter_trend = (
+            previous_direction != 0.0
+            and candidate_direction != 0.0
+            and candidate_direction != previous_direction
+        )
+        coherent_turn = (
+            counter_trend
+            and recent_direction == candidate_direction
+            and np.sign(bounded_innovation) == candidate_direction
+            and abs(bounded_innovation) > 0.55 * noise_scale
+        )
+
+        if coherent_turn:
+            if pending_direction != candidate_direction:
+                pending_direction = candidate_direction
+                pending_evidence = 0.0
+                pending_count = 0
+
+            innovation_strength = min(
+                abs(bounded_innovation) / max(noise_scale, 1e-8), 2.0
+            )
+            slope_strength = min(
+                abs(candidate_velocity) / max(noise_scale, 1e-8), 1.5
+            )
+            pending_evidence += innovation_strength * (0.55 + 0.25 * slope_strength)
+            pending_count += 1
+        elif counter_trend:
+            # Preserve some evidence for a sustained rounded turn, but make
+            # alternating one-sample noise unable to pass the gate.
+            pending_evidence *= 0.40
+            pending_count = max(0, pending_count - 1)
+            if pending_evidence < 0.25:
+                pending_direction = 0.0
+                pending_count = 0
+        else:
+            pending_direction = 0.0
+            pending_evidence = 0.0
+            pending_count = 0
+
+        reversal_confirmed = coherent_turn and (
+            pending_evidence >= 2.8 or pending_count >= 3
+        )
+
+        # Do not let an unconfirmed counter-trend velocity create momentum
+        # overshoot. Position still assimilates its observation immediately.
+        if counter_trend and not reversal_confirmed:
+            velocity = 0.60 * velocity + 0.40 * candidate_velocity
+        else:
+            velocity = candidate_velocity
+
+        position = prediction + alpha * bounded_innovation
+        if reversal_confirmed:
+            previous_direction = candidate_direction
+            pending_direction = 0.0
+            pending_evidence = 0.0
+            pending_count = 0
+            # Release the lock to the internally tracked state at confirmation.
+            reported_position = position
+        elif previous_direction == 0.0 and candidate_direction != 0.0:
+            previous_direction = candidate_direction
+            reported_position = position
+        elif previous_direction > 0.0:
+            reported_position = max(reported_position, position)
+        elif previous_direction < 0.0:
+            reported_position = min(reported_position, position)
+        else:
+            reported_position = position
+
+        y[i] = reported_position
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,359 @@
+<NAME>
+dense_edge_multistart_sa
+</NAME>
+<DESCRIPTION>
+Builds on the Gen-24 lineage's proven components (sparse CSR LP radii, slack-directed moves, Metropolis reheating) but restructures per the recommendations: (1) a much broader deduplicated candidate screen with boundary-dense row patterns ([6,5,5,5,6], [6,5,4,5,6], [6,5,6,5,4], etc.) plus vertical-axis mirrored variants and 3 scale factors each, screened cheaply with fast iterative-shrink radii before committing to expensive LP search; (2) multi-start hill-climb with per-start Metropolis acceptance and best-ever tracking on the top-screened basins only; (3) final exact-LP polish. Key insight: boundary clustering (6-count edge rows) leaves large corner gaps that LP radii can exploit with bigger corner circles, matching AlphaEvolve-level structure.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles.
+
+Architecture:
+  1. Wide deduplicated seed screen: boundary-dense row patterns,
+     mirrored variants, 3 scale factors, cheap fast_radii prescreen.
+  2. Sparse CSR LP for exact radii (fast, no O(n^2) Python loops).
+  3. Multi-start slack-directed hill climb with Metropolis acceptance
+     and best-ever tracking on the top-screened basins.
+  4. Final exact LP polish on the best center set.
+"""
+import numpy as np
+
+try:
+    from scipy.optimize import linprog
+    from scipy.sparse import csr_matrix
+    _HAS_SCIPY = True
+except Exception:
+    _HAS_SCIPY = False
+
+N = 26
+
+
+# ------------------------------------------------------------- layouts ----
+def hex_layout(rows, scale=1.0, wide_ends=False):
+    R = len(rows)
+    k = np.sqrt(3.0) / 2.0
+    s_h = 1.0 / ((R - 1) * k + 1.0)
+    s_w = 1.0 / max(rows)
+    s = min(s_h, s_w) * scale
+    r0 = s / 2.0
+    g = s * k
+    pts = []
+    for ri, count in enumerate(rows):
+        y = r0 + ri * g
+        if count < 3 and wide_ends:
+            sp = min(1.6 * s, (1.0 - s) / max(count - 1, 1))
+        else:
+            sp = s
+        for c in range(count):
+            x = 0.5 + (c - (count - 1) / 2.0) * sp
+            x = min(max(x, 0.005), 0.995)
+            pts.append([x, y])
+    return np.array(pts)
+
+
+def mirror_x(centers):
+    c = centers.copy()
+    c[:, 1] = 1.0 - c[:, 1]
+    return c
+
+
+def initial_layouts():
+    """Deduplicated candidate pool: boundary-dense patterns, mirrored
+    variants, staggered hex patterns; 3 scale factors each."""
+    patterns = [
+        ([6, 5, 4, 5, 6], False),
+        ([6, 5, 5, 5, 5], False),
+        ([5, 5, 5, 5, 6], False),
+        ([6, 5, 6, 5, 4], False),
+        ([5, 6, 4, 6, 5], False),
+        ([6, 4, 6, 4, 6], False),
+        ([5, 6, 5, 6, 4], False),
+        ([4, 6, 6, 6, 4], False),
+        ([6, 6, 4, 6, 4], False),
+        ([4, 5, 4, 5, 4, 4], False),
+        ([5, 4, 5, 4, 5, 3], False),
+        ([3, 4, 5, 4, 5, 5], False),
+        ([2, 4, 5, 6, 5, 4], False),
+        ([3, 5, 4, 5, 4, 5], False),
+        ([5, 4, 5, 4, 5, 3], True),
+        ([4, 5, 4, 5, 4, 4], True),
+    ]
+    layouts = []
+    seen = set()
+    for rows, wide in patterns:
+        for scale in (0.96, 1.0, 1.02):
+            c = hex_layout(rows, scale=scale, wide_ends=wide)
+            for cc in (c, mirror_x(c)):
+                key = np.round(cc, 5).tobytes()
+                if key not in seen:
+                    seen.add(key)
+                    layouts.append(cc)
+    return layouts
+
+
+# ------------------------------------------------- radius evaluation ----
+def fast_radii(centers, iters=80):
+    """Iterative shrinking: monotone, always valid, cheap for screening."""
+    n = len(centers)
+    x = centers[:, 0]
+    y = centers[:, 1]
+    walls = np.minimum(np.minimum(x, y), np.minimum(1 - x, 1 - y))
+    d = np.sqrt(((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1))
+    np.fill_diagonal(d, np.inf)
+    r = walls.copy()
+    for _ in range(iters):
+        cand = np.min(d - r[None, :], axis=1)
+        new_r = np.minimum(walls, np.maximum(cand, 0.0))
+        new_r = np.minimum(new_r, r)
+        if np.max(r - new_r) < 1e-12:
+            r = new_r
+            break
+        r = new_r
+    return r
+
+
+def lp_radii(centers):
+    """Exact LP: maximize sum r s.t. r_i+r_j<=d_ij, r_i<=walls (sparse)."""
+    n = len(centers)
+    fallback = fast_radii(centers, iters=200)
+    if not _HAS_SCIPY:
+        return fallback
+    try:
+        ii, jj = np.triu_indices(n, 1)
+        d = np.linalg.norm(centers[ii] - centers[jj], axis=1)
+        keep = d > 1e-9
+        ii, jj, d = ii[keep], jj[keep], d[keep]
+        m = len(d)
+        bd = np.minimum.reduce([centers[:, 0], centers[:, 1],
+                                1.0 - centers[:, 0], 1.0 - centers[:, 1]])
+        data = np.ones(2 * m + n)
+        rows_ = np.concatenate([np.arange(m), np.arange(m), m + np.arange(n)])
+        cols_ = np.concatenate([ii, jj, np.arange(n)])
+        A_ub = csr_matrix((data, (rows_, cols_)), shape=(m + n, n))
+        b_ub = np.concatenate([d, bd])
+        res = linprog(c=-np.ones(n), A_ub=A_ub, b_ub=b_ub,
+                      bounds=[(0, None)] * n, method="highs")
+        if res.success and np.sum(res.x) > np.sum(fallback):
+            return np.maximum(res.x, 0.0)
+    except Exception:
+        pass
+    return fallback
+
+
+def ensure_valid(centers, radii):
+    """Hard-clip radii so all constraints hold exactly."""
+    x = centers[:, 0]
+    y = centers[:, 1]
+    r = np.minimum(radii, np.minimum(np.minimum(x, y), np.minimum(1 - x, 1 - y)))
+    n = len(r)
+    d = np.sqrt(((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1))
+    for _ in range(5):
+        viol = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                s = r[i] + r[j]
+                if s > d[i, j] and s > 0:
+                    f = d[i, j] / s
+                    r[i] *= f
+                    r[j] *= f
+                    viol = True
+        if not viol:
+            break
+    return r
+
+
+# ------------------------------------------------- local search ----
+def slack_dirs_and_scores(pts, rads):
+    n = len(pts)
+    dirs = np.zeros((n, 2))
+    scores = np.zeros(n)
+    for i in range(n):
+        x, y = pts[i]
+        wall_d = np.array([x, y, 1 - x, 1 - y])
+        wall_dirs = np.array([[-1, 0], [1, 0], [0, -1], [0, 1]])
+        nd = pts - pts[i]
+        dists = np.linalg.norm(nd, axis=1)
+        dists[i] = np.inf
+        j = int(np.argmin(dists))
+        gap_n = dists[j] - rads[i] - rads[j]
+        wi = int(np.argmin(wall_d))
+        gap_w = wall_d[wi] - rads[i]
+        if gap_w < gap_n:
+            dirs[i] = wall_dirs[wi]
+            scores[i] = gap_w
+        else:
+            dirs[i] = nd[j] / (dists[j] + 1e-12)
+            scores[i] = gap_n
+    return dirs, scores
+
+
+def hill_climb(centers, deadline, seed):
+    """Slack-directed Metropolis climb with best-ever tracking."""
+    rng = np.random.default_rng(seed)
+    n = len(centers)
+    c = centers.copy()
+    r = lp_radii(c)
+    tot = float(np.sum(r))
+    bc, br, bt = c.copy(), r.copy(), tot
+    step = 0.02
+    T = 0.004
+    since_gain = 0
+    while time.time() < deadline:
+        u = rng.random()
+        trial = c.copy()
+        if u < 0.10:
+            # Row-shift: translate a horizontal band by a common delta
+            anchor = int(rng.integers(n))
+            band = 0.055
+            mask = np.abs(c[:, 1] - c[anchor, 1]) < band
+            delta = rng.uniform(-1.0, 1.0) * max(0.005, step * 0.5)
+            trial[mask, 0] += delta
+        elif u < 0.18:
+            # Block-shift: spatially coherent cluster move
+            anchor = int(rng.integers(n))
+            dd = np.linalg.norm(c - c[anchor], axis=1)
+            mask = dd < 0.25
+            delta = rng.normal(size=2) * max(0.005, step * 0.5)
+            trial[mask] += delta
+        else:
+            dirs, scores = slack_dirs_and_scores(c, r)
+            w = np.maximum(-scores, 0.01)
+            w = w / w.sum()
+            idx = int(rng.choice(n, p=w))
+            if rng.random() < 0.75:
+                trial[idx] += (0.7 * dirs[idx] + 0.3 * rng.normal(size=2)) * step
+            else:
+                trial[idx] += rng.normal(0.0, 1.4 * step, size=2)
+        trial = np.clip(trial, 0.005, 0.995)
+        if np.allclose(trial, c):
+            continue
+        r_t = lp_radii(trial)
+        tot_t = float(np.sum(r_t))
+        if tot_t > tot + 1e-9:
+            c, r, tot = trial, r_t, tot_t
+            if tot_t > bt + 1e-9:
+                bc, br, bt = trial.copy(), r_t.copy(), tot_t
+            step = min(step * 1.15, 0.05)
+            since_gain = 0
+        elif rng.random() < np.exp((tot_t - tot) / max(T, 1e-9)):
+            c, r = trial, r_t
+            since_gain += 1
+        else:
+            since_gain += 1
+            if rng.random() < 0.7:
+                step = max(step * 0.92, 0.002)
+            else:
+                step = min(step * 1.4, 0.05)
+        # Reheat when stuck to cross barriers
+        if since_gain >= 60:
+            T = 0.004
+            step = 0.03
+            c, r, tot = bc.copy(), br.copy(), bt
+            since_gain = 0
+    return bc, br, bt
+
+
+# ------------------------------------------------------------- interface ----
+def construct_packing():
+    """
+    Construct an arrangement of 26 circles in a unit square maximizing
+    the sum of radii. Returns (centers, radii, sum_of_radii).
+    """
+    import time
+    t_start = time.time()
+    layouts = initial_layouts()
+
+    # Cheap screen: fast_radii on every candidate, keep top basins
+    scored = []
+    for i, c in enumerate(layouts):
+        if len(c) != N:
+            continue
+        scored.append((float(fast_radii(c).sum()), i, c))
+    scored.sort(key=lambda t: -t[0])
+
+    total_budget = 2.6
+    n_starts = 5
+    best = None
+    for rank, (pre, idx, c0) in enumerate(scored[:n_starts]):
+        remaining = total_budget - (time.time() - t_start)
+        if remaining <= 0.15:
+            break
+        budget = remaining / (n_starts - rank)
+        sub_deadline = time.time() + budget
+        bc, br, bt = hill_climb(c0, sub_deadline, seed=1000 + idx)
+        if best is None or bt > best[2]:
+            best = (bc, br, bt)
+
+    if best is None:
+        # Fallback: best screened layout with exact LP
+        c0 = scored[0][2]
+        r0 = lp_radii(c0)
+        best = (c0, r0, float(np.sum(r0)))
+
+    centers, radii, sum_radii = best
+
+    # Final polish: exact LP + hard validity clip
+    r_final = ensure_valid(centers, lp_radii(centers))
+    if np.sum(r_final) > sum_radii + 1e-12:
+        radii = r_final
+        sum_radii = float(np.sum(radii))
+    else:
+        radii = ensure_valid(centers, radii)
+        sum_radii = float(np.sum(radii))
+
+    return centers, radii, sum_radii
+
+
+def compute_max_radii(centers):
+    """Backward-compatible helper: radii for given centers."""
+    return ensure_valid(centers, lp_radii(centers))
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)
+```
+</CODE>

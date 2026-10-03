@@ -1,0 +1,198 @@
+<NAME>
+early_exit_staged_pipeline</NAME>
+<DESCRIPTION>
+Restructure into a staged pipeline (seed → repulsion → SLSQP polish → optional bottleneck polish) that checks a target-ratio early-exit condition after each seed completes. Icosahedron+poles seeds are placed first since they reliably reach the known optimum, so the program terminates as soon as the target squared ratio (~0.2395) is achieved, cutting runtime dramatically while preserving the 1.00 score. The seed list is generated lazily via a generator so unbuilt seeds cost nothing once the target is hit.</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.optimize import minimize
+
+N, D = 14, 3
+PAIRS_I, PAIRS_J = np.triu_indices(N, k=1)
+
+# Early-exit threshold: reference squared ratio is 1/4.165849767 ~ 0.2400,
+# i.e. a ratio of ~0.4899. Use a slightly conservative threshold on the
+# ratio itself so we exit only when essentially at the optimum.
+TARGET_RATIO = 0.4895
+
+
+def _pair_dists(P):
+    return np.linalg.norm(P[PAIRS_I] - P[PAIRS_J], axis=1)
+
+
+def _ratio(pts):
+    ds = _pair_dists(pts)
+    dmax = ds.max()
+    if dmax <= 0:
+        return -1.0
+    return ds.min() / dmax
+
+
+def _repulsion_stage(pts, iters=500, step=0.03):
+    """Diameter-normalized repulsion to spread close pairs apart."""
+    pts = pts.copy()
+    for _ in range(iters):
+        diff = pts[PAIRS_I] - pts[PAIRS_J]
+        dist = np.linalg.norm(diff, axis=1)
+        dmax = dist.max()
+        if dmax <= 0:
+            break
+        pts /= dmax
+        diff = pts[PAIRS_I] - pts[PAIRS_J]
+        dist = np.sqrt(np.maximum((diff * diff).sum(-1), 1e-18))
+        w = 1.0 / dist ** 12
+        forces = (w[:, None] * diff) / dist[:, None]
+        grad = np.zeros_like(pts)
+        np.add.at(grad, PAIRS_I, forces)
+        np.add.at(grad, PAIRS_J, -forces)
+        norm = np.linalg.norm(grad, axis=1, keepdims=True)
+        norm[norm == 0] = 1.0
+        pts += step * grad / norm
+        step *= 0.997
+    return pts
+
+
+def _slsqp_stage(pts, maxiter=500):
+    """Polish: maximize dmin subject to dmax <= 1."""
+    def objective(flat):
+        return -_pair_dists(flat.reshape(N, D)).min()
+
+    def constraint(flat):
+        return 1.0 - _pair_dists(flat.reshape(N, D)).max()
+
+    ds = _pair_dists(pts)
+    if ds.max() > 0:
+        pts = pts / ds.max()
+    res = minimize(
+        objective,
+        pts.ravel(),
+        method='SLSQP',
+        constraints={'type': 'ineq', 'fun': constraint},
+        options={'maxiter': maxiter, 'ftol': 1e-12},
+    )
+    out = res.x.reshape(N, D)
+    if not np.all(np.isfinite(out)) or _ratio(out) <= _ratio(pts):
+        return pts
+    return out
+
+
+def _bottleneck_polish(pts, tries=6, step=0.05):
+    """Micro-search: push apart the closest pair, then short SLSQP pass."""
+    best, best_r = pts, _ratio(pts)
+    for _ in range(tries):
+        if best_r >= TARGET_RATIO:
+            break
+        ds = _pair_dists(best)
+        k = int(np.argmin(ds))
+        i, j = PAIRS_I[k], PAIRS_J[k]
+        direction = best[i] - best[j]
+        nrm = np.linalg.norm(direction)
+        if nrm <= 0:
+            break
+        direction = direction / nrm
+        improved = False
+        for s in (step, step / 2, step * 2):
+            cand = best.copy()
+            cand[i] = cand[i] + s * direction
+            cand[j] = cand[j] - s * direction
+            cand = _slsqp_stage(cand)
+            r = _ratio(cand)
+            if r > best_r + 1e-12:
+                best, best_r = cand, r
+                improved = True
+                break
+        if not improved:
+            break
+    return best
+
+
+def _unit(v):
+    return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+
+
+def _icosahedron():
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    ico = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    ], dtype=float)
+    return _unit(ico)
+
+
+def _fibonacci_sphere(offset=0.0):
+    k = np.arange(N) + 0.5
+    ph = np.arccos(1.0 - 2.0 * k / N)
+    th = np.pi * (1.0 + 5.0 ** 0.5) * k + offset
+    return np.stack([np.cos(th) * np.sin(ph),
+                     np.sin(th) * np.sin(ph),
+                     np.cos(ph)], axis=1)
+
+
+def _seed_generator(rng):
+    """Lazily yield seeds: strongest (ico + poles) first, then others.
+    Lazy generation means unneeded seeds are never built."""
+    ico = _icosahedron()
+    # Icosahedron + 2 perturbed poles — these reliably reach the optimum
+    for _ in range(3):
+        extra = np.array([[0, 0, 1], [0, 0, -1]]) + 0.05 * rng.standard_normal((2, 3))
+        yield np.vstack([ico, _unit(extra)])
+    # Fibonacci variants
+    for off in (0.0, 0.7, 1.9):
+        yield _fibonacci_sphere(off)
+    # Random on sphere and in ball
+    for _ in range(5):
+        yield _unit(rng.standard_normal((N, D)))
+        yield rng.uniform(-1.0, 1.0, (N, D))
+
+
+def _process_seed(init):
+    """Run the full pipeline for a single seed; return (best_pts, ratio)."""
+    best_pts, best_r = None, -1.0
+    pre = _repulsion_stage(init)
+    for cand in (pre, init):
+        polished = _slsqp_stage(cand)
+        r = _ratio(polished)
+        if r > best_r:
+            best_r, best_pts = r, polished
+    # Bottleneck micro-polish on the best of the two candidates
+    polished2 = _bottleneck_polish(best_pts)
+    r2 = _ratio(polished2)
+    if r2 > best_r:
+        best_r, best_pts = r2, polished2
+    return best_pts, best_r
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3 dimensions in order to maximize the ratio of
+    minimum to maximum pairwise distance.
+
+    Pipeline per seed: repulsion -> SLSQP polish -> bottleneck polish,
+    with an early exit once the target ratio is reached.
+
+    Returns
+        points: np.ndarray of shape (14, 3)
+    """
+    rng = np.random.default_rng(42)
+    best_pts, best_ratio = None, -1.0
+
+    for init in _seed_generator(rng):
+        pts, r = _process_seed(init)
+        if r > best_ratio:
+            best_ratio, best_pts = r, pts
+        # Early exit: target reached, stop exploring further seeds
+        if best_ratio >= TARGET_RATIO:
+            break
+
+    if best_pts is None:
+        np.random.seed(42)
+        best_pts = np.random.randn(N, D)
+
+    return np.asarray(best_pts, dtype=float)
+
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

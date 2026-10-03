@@ -1,0 +1,140 @@
+<NAME>
+multi_seed_and_tangential_pair_hillclimb</NAME>
+<DESCRIPTION>
+The current 0.99 score is close to the reference squared ratio (1/4.1658 ≈ 0.24004). Two targeted improvements: (1) add structured seed configurations — the D6h family (two staggered hexagonal rings plus two axial poles), which is the suspected optimal symmetry class for n=14 in 3D — to the multi-start annealed soft-min polish, so the optimizer starts in the best basin rather than only the icosahedron+2 basin. (2) After the axis-aligned greedy polish, add a targeted pair-separation hill-climb that moves the closest pair apart along the connecting direction plus tangential variants (letting the pair slide around third-neighbor obstacles, as pure axial moves get blocked), and simultaneously pulls the farthest pair inward, with step halving. This attacks the exact min/max pair bottleneck directly and can push the squared ratio to/past the reference 0.24004. Both changes are bounded in iterations to stay within the timeout.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    base = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    ], dtype=float)
+    base /= np.linalg.norm(base, axis=1, keepdims=True)
+    # two extra points near opposite poles, slightly perturbed to break symmetry
+    extra = np.array([[0.0, 0.0, 1.05], [0.1, -0.1, -1.05]])
+    points = np.vstack([base, extra])
+=======
+    base = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    ], dtype=float)
+    base /= np.linalg.norm(base, axis=1, keepdims=True)
+    # two extra points near opposite poles, slightly perturbed to break symmetry
+    extra = np.array([[0.0, 0.0, 1.05], [0.1, -0.1, -1.05]])
+    points = np.vstack([base, extra])
+
+    # Structured seeds: D6h family (two staggered hexagonal rings + 2 axial poles),
+    # the suspected optimal symmetry class for 14 points in 3D.
+    seeds = [points.copy()]
+    th = np.arange(6) * (np.pi / 3.0)
+    for R, h, z0 in [(1.0, 0.55, 1.15), (1.0, 0.75, 1.35),
+                     (1.0, 0.95, 1.55), (1.0, 0.35, 1.05)]:
+        r1 = np.stack([R * np.cos(th), R * np.sin(th), np.full(6, h)], axis=1)
+        r2 = np.stack([R * np.cos(th + np.pi / 6), R * np.sin(th + np.pi / 6),
+                       np.full(6, -h)], axis=1)
+        poles = np.array([[0.0, 0.0, z0], [0.0, 0.0, -z0]])
+        seeds.append(np.vstack([r1, r2, poles]))
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        for trial in range(10):
+            if trial == 0:
+                P0 = best_pts.copy()
+            elif trial == 1:
+                P0 = normalize(alt)
+            else:
+                P0 = normalize(best_pts + 0.08 * rng.randn(n, d))
+=======
+        n_struct = len(seeds)
+        for trial in range(12):
+            if trial < n_struct:
+                P0 = normalize(seeds[trial].copy())
+            elif trial == n_struct:
+                P0 = normalize(alt)
+            else:
+                P0 = normalize(best_pts + 0.08 * rng.randn(n, d))
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+                    improved = True
+        if not improved:
+            step *= 0.5
+    points = best_pts
+=======
+                    improved = True
+        if not improved:
+            step *= 0.5
+    points = best_pts
+
+    # Targeted pair-separation hill-climb with tangential variants:
+    # separate the closest pair along its connecting axis AND with a tangential
+    # component so it can slide around blocking third neighbors; also pull the
+    # farthest pair inward. Directly attacks the min/max pair bottleneck.
+    def pair_hillclimb(P, iters=250, step0=0.01):
+        P = normalize(P)
+        r_best = true_ratio(P)
+        iu = np.triu_indices(n, 1)
+        step = step0
+        for _ in range(iters):
+            dv = pairwise(P)[iu]
+            imin, imax = dv.argmin(), dv.argmax()
+            ia, ib = iu[0][imin], iu[1][imin]
+            ja, jb = iu[0][imax], iu[1][imax]
+            improved = False
+            u = P[ia] - P[ib]
+            nu = np.linalg.norm(u)
+            if nu < 1e-12:
+                break
+            u = u / nu
+            # tangential direction within the pair's local tangent plane
+            t0 = np.array([1.0, 0.0, 0.0]) if abs(u[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+            t = np.cross(u, t0)
+            nt = np.linalg.norm(t)
+            if nt > 1e-12:
+                t = t / nt
+            else:
+                t = np.zeros(3)
+            for mag in (step, step / 2, step / 4):
+                for dirv in (u, u + 0.3 * t, u - 0.3 * t):
+                    nv = np.linalg.norm(dirv)
+                    if nv < 1e-12:
+                        continue
+                    dvec = dirv / nv
+                    Q = P.copy()
+                    Q[ia] += mag * dvec
+                    Q[ib] -= mag * dvec
+                    Q = normalize(Q)
+                    r = true_ratio(Q)
+                    if r > r_best + 1e-12:
+                        P, r_best, improved = Q, r, True
+                        break
+                if improved:
+                    break
+                # pull the farthest pair inward
+                w = P[ja] - P[jb]
+                nw = np.linalg.norm(w)
+                if nw > 1e-12:
+                    w = w / nw
+                    Q = P.copy()
+                    Q[ja] -= mag * w
+                    Q[jb] += mag * w
+                    Q = normalize(Q)
+                    r = true_ratio(Q)
+                    if r > r_best + 1e-12:
+                        P, r_best, improved = Q, r, True
+                        break
+            if not improved:
+                step *= 0.6
+                if step < 1e-7:
+                    break
+        return P, r_best
+
+    for k in range(4):
+        Q, r = pair_hillclimb(points, step0=0.01 * (0.7 ** k))
+        if r > best_val + 1e-14:
+            best_val, points = r, Q
+        else:
+            break
+    best_pts = points
+>>>>>>> REPLACE
+</DIFF>

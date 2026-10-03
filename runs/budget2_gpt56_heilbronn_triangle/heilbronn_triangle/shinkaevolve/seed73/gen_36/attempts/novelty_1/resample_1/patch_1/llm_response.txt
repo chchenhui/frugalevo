@@ -1,0 +1,209 @@
+<NAME>
+continuation_forcefield
+</NAME>
+
+<DESCRIPTION>
+This replaces evolutionary crossover with a deterministic continuation-based force-field optimizer. It optimizes a smooth soft-minimum of all 165 normalized triangle areas, whose gradient concentrates automatically on the currently smallest triangles. A population of perturbed structured and random simplex layouts is evolved simultaneously by projected Adam-style ascent, with annealed smoothing, controlled kicks, and periodic elite reseeding. This directly attacks active near-degenerate triples rather than relying on random mutation acceptance.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import itertools
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Deterministic projected continuation optimizer for the 11-point
+    Heilbronn problem in the reference simplex u>=0, v>=0, u+v<=1.
+
+    Determinants in this reference triangle equal normalized areas after
+    the affine map to the requested equilateral triangle.
+    """
+    try:
+        rng = np.random.default_rng(73492111)
+        n = 11
+        triples = np.asarray(list(itertools.combinations(range(n), 3)),
+                             dtype=np.intp)
+        i0, i1, i2 = triples[:, 0], triples[:, 1], triples[:, 2]
+        m = len(triples)
+
+        def project_simplex(x):
+            """Euclidean-style radial projection into u,v >= 0, u+v <= 1."""
+            np.maximum(x, 0.0, out=x)
+            s = x.sum(axis=-1, keepdims=True)
+            x /= np.maximum(s, 1.0)
+            return x
+
+        def determinants(pop):
+            q = pop[:, triples, :]
+            a = q[:, :, 1] - q[:, :, 0]
+            b = q[:, :, 2] - q[:, :, 0]
+            return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+
+        def areas(pop):
+            return np.abs(determinants(pop))
+
+        # A symmetric near-lattice seed is useful because it fills the
+        # triangle well.  Deliberate asymmetric perturbation removes its
+        # many initial collinearities.
+        base = np.array([
+            [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+            [1.0 / 3.0, 0.0], [2.0 / 3.0, 0.0],
+            [0.0, 1.0 / 3.0], [0.0, 2.0 / 3.0],
+            [1.0 / 3.0, 2.0 / 3.0], [2.0 / 3.0, 1.0 / 3.0],
+            [0.31, 0.31], [0.57, 0.18],
+        ], dtype=float)
+
+        population_size = 72
+        pop = np.empty((population_size, n, 2), dtype=float)
+
+        # Half of the population explores perturbations of dense layouts;
+        # the other half supplies geometrically unrelated basin starts.
+        pop[:population_size // 2] = base
+        pop[:population_size // 2, 3:] += rng.normal(
+            0.0, 0.105, (population_size // 2, n - 3, 2)
+        )
+        raw = rng.random((population_size - population_size // 2, n - 3, 2))
+        over = raw.sum(axis=-1) > 1.0
+        raw[over] = 1.0 - raw[over]
+        pop[population_size // 2:, 0] = (0.0, 0.0)
+        pop[population_size // 2:, 1] = (1.0, 0.0)
+        pop[population_size // 2:, 2] = (0.0, 1.0)
+        pop[population_size // 2:, 3:] = raw
+        project_simplex(pop[:, 3:])
+
+        # The enclosing corners are retained, which makes the search use the
+        # full available domain and removes affine drift degrees of freedom.
+        pop[:, 0] = (0.0, 0.0)
+        pop[:, 1] = (1.0, 0.0)
+        pop[:, 2] = (0.0, 1.0)
+
+        velocity = np.zeros_like(pop)
+        second = np.zeros_like(pop)
+        best = pop[0].copy()
+        best_value = -1.0
+        iterations = 3200
+
+        for step in range(iterations):
+            progress = step / float(iterations - 1)
+            det = determinants(pop)
+            aa = np.abs(det)
+            minima = aa.min(axis=1)
+
+            imax = int(np.argmax(minima))
+            if minima[imax] > best_value:
+                best_value = float(minima[imax])
+                best = pop[imax].copy()
+
+            # Annealed soft minimum.  At high temperature it improves the
+            # whole lower tail; at low temperature it closely follows the
+            # actual worst triangle.
+            temperature = 0.018 * (1.0 - progress) ** 1.8 + 0.00065
+            shifted = aa - aa.min(axis=1, keepdims=True)
+            w = np.exp(-shifted / temperature)
+            w /= w.sum(axis=1, keepdims=True)
+
+            # Gradient of weighted absolute determinants.  For determinant
+            # D(i,j,k), derivatives are:
+            # dD/di=(yj-yk, xk-xj), dD/dj=(yk-yi, xi-xk),
+            # dD/dk=(yi-yj, xj-xi).
+            q = pop[:, triples, :]
+            sgn = np.where(det >= 0.0, 1.0, -1.0) * w
+            grad = np.zeros_like(pop)
+
+            for point in range(3, n):
+                mask0 = (i0 == point)
+                mask1 = (i1 == point)
+                mask2 = (i2 == point)
+                g = np.zeros((population_size, 2), dtype=float)
+
+                if np.any(mask0):
+                    z = q[:, mask0]
+                    ww = sgn[:, mask0]
+                    g[:, 0] += np.sum(ww * (z[:, :, 1, 1] - z[:, :, 2, 1]),
+                                      axis=1)
+                    g[:, 1] += np.sum(ww * (z[:, :, 2, 0] - z[:, :, 1, 0]),
+                                      axis=1)
+                if np.any(mask1):
+                    z = q[:, mask1]
+                    ww = sgn[:, mask1]
+                    g[:, 0] += np.sum(ww * (z[:, :, 2, 1] - z[:, :, 0, 1]),
+                                      axis=1)
+                    g[:, 1] += np.sum(ww * (z[:, :, 0, 0] - z[:, :, 2, 0]),
+                                      axis=1)
+                if np.any(mask2):
+                    z = q[:, mask2]
+                    ww = sgn[:, mask2]
+                    g[:, 0] += np.sum(ww * (z[:, :, 0, 1] - z[:, :, 1, 1]),
+                                      axis=1)
+                    g[:, 1] += np.sum(ww * (z[:, :, 1, 0] - z[:, :, 0, 0]),
+                                      axis=1)
+                grad[:, point] = g
+
+            # Normalize population members independently: this prevents one
+            # configuration with many nearly tied constraints dominating its
+            # own update scale.
+            norm = np.sqrt(np.mean(grad[:, 3:] ** 2, axis=(1, 2),
+                                   keepdims=True))
+            grad[:, 3:] /= np.maximum(norm, 1.0e-11)
+
+            velocity = 0.86 * velocity + 0.14 * grad
+            second = 0.985 * second + 0.015 * grad * grad
+            rate = 0.020 * (1.0 - progress) ** 1.35 + 0.0010
+            pop[:, 3:] += rate * velocity[:, 3:] / (
+                np.sqrt(second[:, 3:]) + 0.08
+            )
+
+            # Small annealed stochastic symmetry-breaking kicks are applied
+            # only while the soft-min landscape is still broad.
+            if step < 2100:
+                kick = 0.0065 * (1.0 - progress) ** 1.4
+                pop[:, 3:] += rng.normal(0.0, kick, pop[:, 3:].shape)
+
+            project_simplex(pop[:, 3:])
+            pop[:, 0] = (0.0, 0.0)
+            pop[:, 1] = (1.0, 0.0)
+            pop[:, 2] = (0.0, 1.0)
+
+            # Periodically replace the weakest trajectories by noisy copies
+            # of several elite basins, rather than allowing all trajectories
+            # to collapse into one local optimum.
+            if step % 160 == 159 and step < 2700:
+                now = areas(pop).min(axis=1)
+                order = np.argsort(now)[::-1]
+                weak = order[-14:]
+                sources = order[:10]
+                chosen = sources[np.arange(len(weak)) % len(sources)]
+                pop[weak] = pop[chosen]
+                noise = 0.035 * (1.0 - progress) + 0.004
+                pop[weak, 3:] += rng.normal(
+                    0.0, noise, (len(weak), n - 3, 2)
+                )
+                project_simplex(pop[weak, 3:])
+                velocity[weak] = 0.0
+                second[weak] = 0.0
+
+        final_area = areas(pop).min(axis=1)
+        if final_area.max() > best_value:
+            best = pop[int(np.argmax(final_area))].copy()
+
+        h = np.sqrt(3.0) * 0.5
+        return np.column_stack((best[:, 0] + 0.5 * best[:, 1],
+                                h * best[:, 1]))
+
+    except Exception:
+        h = np.sqrt(3.0) * 0.5
+        return np.array([
+            [0.0, 0.0], [1.0, 0.0], [0.5, h],
+            [0.25, 0.0], [0.75, 0.0],
+            [0.125, 0.216506350946], [0.875, 0.216506350946],
+            [0.25, 0.433012701892], [0.75, 0.433012701892],
+            [0.50, 0.216506350946], [0.50, 0.577350269190],
+        ], dtype=float)
+
+
+# EVOLVE-BLOCK-END
+``` 
+</CODE>

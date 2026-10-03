@@ -1,0 +1,154 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
+
+    Returns
+        points: np.ndarray of shape (14,3) containing the (x,y) coordinates of the 14 points.
+
+    """
+
+    from scipy.optimize import minimize
+    from scipy.special import logsumexp
+
+    n = 14
+    d = 3
+    iu = np.triu_indices(n, 1)
+
+    def unit(x):
+        p = x.reshape(n, d)
+        return p / np.linalg.norm(p, axis=1, keepdims=True)
+
+    def dists(p):
+        diff = p[:, None, :] - p[None, :, :]
+        D2 = (diff * diff).sum(-1)
+        return np.sqrt(np.maximum(D2[iu], 1e-12))
+
+    def ratio(p):
+        D = dists(p)
+        return D.min() / D.max()
+
+    rng = np.random.default_rng(0)
+    best_pts = None
+    best_r = -1.0
+
+    # D6-symmetric seed: two staggered hexagonal rings + 2 poles
+    def d6_seed(p, h, r):
+        t = 2 * np.pi * np.arange(6) / 6.0
+        ring1 = np.stack([r * np.cos(t), r * np.sin(t), np.full(6, h)], axis=1)
+        ring2 = np.stack([r * np.cos(t + np.pi / 6), r * np.sin(t + np.pi / 6),
+                          np.full(6, -h)], axis=1)
+        poles = np.array([[0.0, 0.0, p], [0.0, 0.0, -p]])
+        return np.vstack([ring1, ring2, poles])
+
+    seeds = [d6_seed(1.0, 0.35, 1.0), d6_seed(1.1, 0.4, 1.05),
+             d6_seed(0.9, 0.3, 0.9), d6_seed(1.2, 0.45, 1.0)]
+    # icosahedron + 2 poles
+    phi = (1 + np.sqrt(5)) / 2
+    ico = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    ], dtype=float)
+    ico /= np.linalg.norm(ico, axis=1, keepdims=True)
+    for pz in (1.0, 1.1):
+        seeds.append(np.vstack([ico, [[0.0, 0.0, pz], [0.0, 0.0, -pz]]]))
+    # random sphere starts
+    for _ in range(6):
+        p = rng.normal(size=(n, d))
+        seeds.append(p / np.linalg.norm(p, axis=1, keepdims=True))
+
+    # Annealed soft-min/soft-max objective on the free configuration:
+    # directly maximizes the smoothed dmin/dmax ratio (scale-invariant).
+    for P0 in seeds:
+        pts = np.asarray(P0, dtype=float).copy()
+        pts -= pts.mean(axis=0)
+        pts /= max(np.linalg.norm(pts, axis=1).max(), 1e-12)
+        for T in (0.06, 0.03, 0.012, 0.005, 0.002):
+            def loss(x, T=T):
+                p = x.reshape(n, d)
+                p = p - p.mean(axis=0)
+                D = dists(p)
+                D = D / max(D.max(), 1e-9)
+                smin = -T * logsumexp(-D / T)
+                smax = T * logsumexp(D / T)
+                return -(smin / smax)
+
+            res = minimize(loss, pts.ravel(), method="L-BFGS-B",
+                           options={"maxiter": 500, "maxfun": 2000})
+            q = res.x.reshape(n, d)
+            if np.isfinite(q).all():
+                pts = q / max(np.linalg.norm(q - q.mean(axis=0), axis=1).max(), 1e-12)
+
+        r = ratio(pts)
+        if r > best_r:
+            best_r = r
+            best_pts = pts.copy()
+
+    # Perturb-and-reanneal restarts around the best configuration
+    for trial in range(8):
+        P0 = best_pts + (0.02 + 0.015 * trial) * rng.normal(size=(n, d)) / np.sqrt(3)
+        pts = P0 / max(np.linalg.norm(P0, axis=1).max(), 1e-12)
+        for T in (0.03, 0.012, 0.005, 0.002):
+            def loss(x, T=T):
+                p = x.reshape(n, d)
+                p = p - p.mean(axis=0)
+                D = dists(p)
+                D = D / max(D.max(), 1e-9)
+                smin = -T * logsumexp(-D / T)
+                smax = T * logsumexp(D / T)
+                return -(smin / smax)
+
+            res = minimize(loss, pts.ravel(), method="L-BFGS-B",
+                           options={"maxiter": 400, "maxfun": 1500})
+            q = res.x.reshape(n, d)
+            if np.isfinite(q).all():
+                pts = q / max(np.linalg.norm(q - q.mean(axis=0), axis=1).max(), 1e-12)
+        r = ratio(pts)
+        if r > best_r:
+            best_r = r
+            best_pts = pts.copy()
+
+    # Final low-temperature polish: push the smoothed surrogate all the
+    # way to the exact dmin/dmax ratio, with tiny perturbation restarts
+    # to escape numerical plateaus around the best basin.
+    for trial in range(6):
+        P0 = best_pts + (0.004 + 0.003 * trial) * rng.normal(size=(n, d)) / np.sqrt(3)
+        pts = P0 / max(np.linalg.norm(P0, axis=1).max(), 1e-12)
+        for T in (0.002, 0.001, 0.0005, 0.0002):
+            def loss(x, T=T):
+                p = x.reshape(n, d)
+                p = p - p.mean(axis=0)
+                D = dists(p)
+                D = D / max(D.max(), 1e-9)
+                smin = -T * logsumexp(-D / T)
+                smax = T * logsumexp(D / T)
+                return -(smin / smax)
+
+            res = minimize(loss, pts.ravel(), method="L-BFGS-B",
+                           options={"maxiter": 600, "maxfun": 2500,
+                                    "ftol": 1e-14, "gtol": 1e-12})
+            q = res.x.reshape(n, d)
+            if np.isfinite(q).all():
+                pts = q / max(np.linalg.norm(q - q.mean(axis=0), axis=1).max(), 1e-12)
+        r = ratio(pts)
+        if r > best_r:
+            best_r = r
+            best_pts = pts.copy()
+
+    # Normalize and guard
+    points = np.asarray(best_pts, dtype=float)
+    points = points - points.mean(axis=0)
+    Dm = dists(points).max()
+    if (not np.isfinite(points).all()) or points.shape != (n, d) or Dm <= 0:
+        points = rng.normal(size=(n, d))
+    else:
+        points = points / Dm
+
+    return points
+
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,133 @@
+<NAME>
+vectorize_wls_with_slope_consistency_snap
+</NAME>
+<DESCRIPTION>
+The current per-sample Python loop computes weighted linear regression twice per output sample, which is slow (execution_time jumped from 0.01 to 0.05) and leaves slope churn high (slope_changes 256.6, false_reversals 200.2, smoothness 0.07). We vectorize the first-pass regression using np.convolve (Sx and Stx become running weighted sums, computed once for the whole signal), keep a cheap second pass only where residuals are large, and then add a light slope-consistency post-process: estimate noise sigma from the first-pass output's first differences, and wherever consecutive output differences are below ~0.5*sigma (i.e., statistically indistinguishable from noise), replace the output locally with a 3-tap running median. This "snaps" micro-fluctuations to a locally consistent value, directly reducing spurious slope reversals and false reversals without hurting tracking of genuine trends (median snapping only activates on sub-noise changes). The vectorization buys back the efficiency headroom so the overall runtime stays low while the smoothing pass reduces slope churn.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Time axis anchored so the last sample in the window is t = 0:
+    # evaluating the fitted line at t = 0 gives zero trend-lag output.
+    t = np.arange(window_size) - (window_size - 1)
+
+    # Precompute weighted-normal-equation components that don't change
+    Sw = np.sum(weights)
+    St = np.sum(weights * t)
+    Stt = np.sum(weights * t * t)
+    denom = Sw * Stt - St * St
+
+    for i in range(output_length):
+        window = x[i : i + window_size].astype(float)
+
+        # --- Pass 1: weighted local linear regression, evaluated at window end ---
+        Sx = np.sum(weights * window)
+        Stx = np.sum(weights * t * window)
+        if denom > 1e-12:
+            slope = (Sw * Stx - St * Sx) / denom
+            intercept = (Stt * Sx - St * Stx) / denom
+            fit = slope * t + intercept
+        else:
+            fit = np.full(window_size, Sx / Sw)
+            slope = 0.0
+            intercept = fit[0]
+        y0 = intercept  # fitted value at t = 0 (most recent sample)
+
+        # --- Pass 2: Huber-style robust reweighting to suppress outliers ---
+        resid = window - fit
+        scale = np.std(resid)
+        if scale > 1e-12:
+            rw = weights.copy()
+            big = np.abs(resid) > 2.0 * scale
+            rw[big] *= scale / (np.abs(resid[big]) + 1e-12)
+            Sw2 = np.sum(rw)
+            St2 = np.sum(rw * t)
+            Stt2 = np.sum(rw * t * t)
+            den2 = Sw2 * Stt2 - St2 * St2
+            if den2 > 1e-12:
+                Sx2 = np.sum(rw * window)
+                Stx2 = np.sum(rw * t * window)
+                slope2 = (Sw2 * Stx2 - St2 * Sx2) / den2
+                y[i] = (Stt2 * Sx2 - St2 * Stx2) / den2  # value at t = 0
+            else:
+                y[i] = Sx2 / Sw2
+        else:
+            y[i] = y0
+
+    return y
+=======
+    # Time axis anchored so the last sample in the window is t = 0:
+    # evaluating the fitted line at t=0 gives zero trend-lag output.
+    t = np.arange(window_size) - (window_size - 1)
+
+    # Precompute weighted-normal-equation components that don't change
+    Sw = np.sum(weights)
+    St = np.sum(weights * t)
+    Stt = np.sum(weights * t * t)
+    denom = Sw * Stt - St * St
+
+    xf = np.asarray(x, dtype=float)
+
+    # --- Vectorized pass 1: running weighted sums via convolution ---
+    # Sx[i] = sum(weights * x[i:i+W]), reversed weights make it a correlation
+    Sx = np.convolve(xf, weights[::-1], mode="valid")[:output_length]
+    wt = weights * t
+    Stx = np.convolve(xf, wt[::-1], mode="valid")[:output_length]
+
+    if denom > 1e-12:
+        y = (Stt * Sx - St * Stx) / denom  # fitted value at t = 0 per window
+    else:
+        y = Sx / Sw
+
+    # --- Pass 2 (targeted): robust reweighting only where pass-1 fails badly ---
+    # Estimate per-window residual scale cheaply: residual variance of a
+    # weighted linear fit is proportional to (x - y) variance in the window.
+    win_sq = np.convolve(xf * xf, weights[::-1], mode="valid")[:output_length]
+    resid_var = np.maximum(win_sq - 2.0 * y * Sx + y * y * Sw, 0.0)
+    resid_scale = np.sqrt(resid_var / Sw)
+
+    # Windows whose weighted RMS residual is large relative to the typical
+    # scale are candidates for outlier contamination; re-fit those robustly.
+    global_scale = np.median(resid_scale)
+    bad = np.where(resid_scale > 2.0 * global_scale + 1e-12)[0]
+
+    for i in bad:
+        window = xf[i : i + window_size]
+        base = y[i]
+        slope_i = ((Sw * Stx[i]) - (St * Sx[i])) / denom if denom > 1e-12 else 0.0
+        fit = slope_i * t + base
+        resid = window - fit
+        scale = np.std(resid)
+        if scale > 1e-12:
+            rw = weights.copy()
+            big = np.abs(resid) > 2.0 * scale
+            rw[big] *= scale / (np.abs(resid[big]) + 1e-12)
+            Sw2 = np.sum(rw)
+            St2 = np.sum(rw * t)
+            Stt2 = np.sum(rw * t * t)
+            den2 = Sw2 * Stt2 - St2 * St2
+            if den2 > 1e-12:
+                Sx2 = np.sum(rw * window)
+                Stx2 = np.sum(rw * t * window)
+                y[i] = (Stt2 * Sx2 - St2 * Stx2) / den2  # value at t = 0
+            else:
+                y[i] = Sx2 / Sw2
+
+    # --- Slope-consistency snap: kill sub-noise directional churn ---
+    # Estimate noise sigma from first differences of the pass-1 output
+    # (diff of a smooth trend is small; noise dominates high-frequency diff).
+    if output_length > 2:
+        d = np.diff(y)
+        sigma = 1.4826 * np.median(np.abs(d - np.median(d))) + 1e-12
+        thresh = 0.5 * sigma
+        # 3-tap running median of the output
+        pad = np.concatenate(([y[0]], y, [y[-1]]))
+        med3 = np.median(np.stack([pad[:-2], pad[1:-1], pad[2:]]), axis=0)
+        # Where the output step is below the noise threshold, the direction
+        # is indistinguishable from noise -> snap toward local median value.
+        small = np.abs(d) < thresh
+        idx = np.where(small)[0] + 1  # diffs d[k] affect y[k+1]
+        y[idx] = 0.5 * y[idx] + 0.5 * med3[idx]
+
+    return y
+>>>>>>> REPLACE
+</DIFF>

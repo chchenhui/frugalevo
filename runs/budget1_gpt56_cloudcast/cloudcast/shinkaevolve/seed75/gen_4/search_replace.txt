@@ -1,0 +1,100 @@
+<NAME>
+shared_multicast_tree
+</NAME>
+
+<DESCRIPTION>
+Replace independent per-destination shortest paths with a greedy shared multicast-tree construction. The previous implementation finds a complete source-to-destination route separately for every destination, which can repeatedly pay for the same expensive inter-cloud links.
+
+The new search grows a directed broadcast tree from the source. At each step it chooses the unserved destination whose route has the smallest incremental cost when already-selected tree edges are treated as free. This preserves previously transferred data on shared links, naturally favors overlapping routes, and only adds new network segments when necessary. Each destination still receives a complete source-to-destination path for every partition, so the existing BroadCastTopology interface remains unchanged. Edges without a valid numeric cost are excluded rather than causing Dijkstra failures.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    """Build a low-cost shared directed multicast tree rooted at ``src``."""
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    # Dijkstra cannot safely compare None costs.  Such links are incomplete
+    # profile entries and must not be selected as supposedly free routes.
+    invalid_edges = []
+    for u, v, data in h.edges(data=True):
+        try:
+            if data.get("cost") is None or float(data["cost"]) < 0:
+                invalid_edges.append((u, v))
+        except (TypeError, ValueError):
+            invalid_edges.append((u, v))
+    h.remove_edges_from(invalid_edges)
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    pending = {dst for dst in dsts if dst != src}
+    tree_nodes = {src}
+    tree_edges = set()
+    source_paths = {src: [src]}
+
+    # Repeatedly attach the destination requiring the least *additional*
+    # transfer cost. Existing tree links represent data already broadcast and
+    # therefore have zero incremental cost for subsequent destinations.
+    while pending:
+        best = None
+        for dst in pending:
+            for attachment in tree_nodes:
+                try:
+                    suffix = nx.dijkstra_path(
+                        h,
+                        attachment,
+                        dst,
+                        weight=lambda u, v, data: (
+                            0.0 if (u, v) in tree_edges else float(data["cost"])
+                        ),
+                    )
+                except nx.NetworkXNoPath:
+                    continue
+
+                added_cost = sum(
+                    0.0 if (u, v) in tree_edges else float(h[u][v]["cost"])
+                    for u, v in zip(suffix, suffix[1:])
+                )
+                candidate = (added_cost, dst, attachment, suffix)
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+
+        if best is None:
+            # Match the prior behavior for unreachable destinations by leaving
+            # their partition paths unset while preserving reachable routes.
+            break
+
+        _, dst, attachment, suffix = best
+        full_path = source_paths[attachment] + suffix[1:]
+        for u, v in zip(full_path, full_path[1:]):
+            tree_edges.add((u, v))
+
+        # Record source paths for every newly reached relay so later
+        # destinations can branch from any inexpensive shared prefix.
+        for index, node in enumerate(full_path):
+            if node not in source_paths:
+                source_paths[node] = full_path[:index + 1]
+                tree_nodes.add(node)
+
+        for u, v in zip(full_path, full_path[1:]):
+            for partition in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, partition, [u, v, G[u][v]])
+        pending.remove(dst)
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

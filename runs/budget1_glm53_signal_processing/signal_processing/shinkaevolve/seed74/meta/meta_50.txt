@@ -1,0 +1,373 @@
+# INDIVIDUAL PROGRAM SUMMARIES
+
+The following are summaries of individual programs evaluated since the last meta update:
+
+**Program Name: Exponentially-Weighted Moving Average Signal Filter**
+- **Implementation**: Applies a sliding window (default W=20) with exponentially decaying weights (normalized `exp(linspace(-2,0,W))`) that emphasize recent samples; a simple unweighted moving average is available as a "basic" fallback. Metrics are computed by aligning the filtered output against the clean signal with a delay of `window_size - 1` to account for group delay.
+- **Performance**: Achieved a combined score of 0.50 (composite 0.45), with correlation 0.84, noise reduction 0.33, lag error 0.38, smoothness 0.08, responsiveness 0.73, and perfect efficiency/success (execution time 0.01s).
+- **Feedback**: The weighted moving average is fast and maintains decent correlation/accuracy, but the fixed-size causal window introduces significant lag (0.38) and poor smoothness (0.08), leaving many slope changes (223.40) and false reversals (175.40) — indicating the naive linear filter preserves too little trend structure and suppresses noise too weakly; an adaptive window or higher-order (e.g., polynomial/Savitzky-Golay-style) approach would likely improve trend tracking and smoothness.
+**Program Identifier:** Generation 0 - Patch Name initial_program - Correct Program: True
+
+**Program Name: Kalman + Savitzky-Golay Adaptive Trend-Preserving Filter**
+- **Implementation**: Three-stage pipeline: a constant-velocity Kalman filter (with adaptive innovation-based measurement noise) for level/slope estimation, a quadratic Savitzky-Golay smoother, and predictive delay compensation via gradient-based slope extrapolation, re-indexed to sliding-window output convention.
+- **Performance**: Complete failure — combined score 0.00, all test signals failed (lag_error 1.00, avg_error 1.00, slope_changes 100, false_reversals 50, correlation 0.00).
+- **Feedback**: The delay-compensation re-indexing (`start = window_size - 1 - delay`) likely misaligns output relative to the evaluation's expected alignment, and the Kalman parameters (q=0.05, EWMA innovation variance) are likely mismatched to the test signals. The "All test signals failed" error suggests either an exception (e.g., negative start index or slicing producing empty output for short signals) or outputs that fail validation entirely, rather than merely poor filtering quality.
+**Program Identifier:** Generation 1 - Patch Name kalman_adaptive_filter - Correct Program: False
+
+**Program Name: Zero-Lag Adaptive Quadratic Endpoint Filter**
+- **Implementation**: Performs a local quadratic least-squares fit over each sliding window (evaluated at the newest sample, t=1, for near-zero lag), with adaptive window shrinking when the second half of the window shows high dispersion, plus a residual-driven one-pole smoother (α ∈ [0.75, 1]) for ripple damping; the "basic" mode is routed to the same enhanced estimator.
+- **Performance**: Combined score 0.51 with correlation 0.92, lag_error 0.36, noise_reduction 0.43, smoothness 0.08, responsiveness 0.73, and efficiency 1.00 (0.03s runtime).
+- **Feedback**: The endpoint-evaluation strategy successfully minimizes lag and maintains high accuracy, but the residual-driven post-smoothing is too weak to suppress high-frequency ripple, leaving a very low smoothness score (0.08) and 182.8 false reversals; stronger regularization or robust (e.g., median-based) fitting within the window would improve smoothness without sacrificing the achieved low lag.
+**Program Identifier:** Generation 3 - Patch Name zero_lag_quadratic_endpoint_filter - Correct Program: True
+
+**Program Name: Adaptive Kalman Trend Filter with Slope Hysteresis**
+- **Implementation**: Causal two-state Kalman filter (level + slope) with process noise scaled online by an innovation-EMA adaptivity factor (capped at 9×), robust MAD-based measurement-noise initialization refined via EMA updates, plus a slope-hysteresis stage (persistence=3, noise-scaled deadzone) that applies a forward-looking gain of 0.6 on confirmed slope; output is aligned to sliding-window semantics by blending the anchor sample (weight 0.65) with the window midpoint (0.35).
+- **Performance**: Combined score 0.50 with strong correlation (0.90), responsiveness (0.77), accuracy (0.90), and perfect efficiency (1.00, 0.02s), but weak smoothness (0.06), modest noise reduction (0.33), and many false reversals (267.8) and slope changes (328.4).
+- **Feedback**: The aggressive innovation-driven process noise amplification and the forward slope correction maximize responsiveness and lag reduction at a steep cost to smoothness and reversal suppression—the hysteresis deadzone (std of slopes × 0.3) is too narrow to gate noise-induced sign flips. Future iterations should lower the adaptivity cap, reduce the forward gain, or widen the deadzone to rebalance toward smoothness without sacrificing the excellent lag (0.30) and accuracy.
+**Program Identifier:** Generation 4 - Patch Name adaptive_kalman_trend_filter - Correct Program: True
+
+**Program Name: Adaptive Forward-Backward Kalman Filter with Velocity-Weighted Fusion**
+
+- **Implementation**: Runs a constant-velocity Kalman filter (state = [level, velocity]) in both forward and reverse directions, adapting measurement noise online as r = 0.5·r₀ + 0.5·innovation² (r₀ estimated from diff-variance), then fuses the two passes using velocity-confidence weights (1/(1+|velocity|)) to cancel phase lag; output is sliced as `smooth[window_size-1:]` to match the sliding-window length convention, with a plain moving-average baseline retained as a fallback option.
+
+- **Performance**: Achieves a combined score of 0.55 (composite 0.44) with excellent accuracy (correlation 0.96, noise reduction 0.70), low lag error (0.22), high responsiveness (0.82), and perfect efficiency (1.00, 0.02s), but critically weak smoothness (0.06) with 302.80 slope changes and 237.80 false reversals.
+
+- **Feedback**: The zero-phase dual-pass design and innovation-driven noise adaptation deliver strong trend tracking and lag cancellation, but feeding raw squared innovations directly into r causes the filter to chase measurement jitter, producing a jagged output riddled with spurious slope reversals; the backward pass is an independent reversed filter blend rather than a true RTS smoother, which further limits smoothing benefit. Temporally smoothing the adaptive noise estimate (e.g., EWMA of innovation variance) or retuning the q/qv process noise would sacrifice little responsiveness for a large smoothness gain.
+**Program Identifier:** Generation 5 - Patch Name kalman_zero_phase_hybrid_filter - Correct Program: True
+
+**Program Name: Adaptive Kalman + Savitzky-Golay Zero-Phase Signal Filter**
+
+- **Implementation**: Two-stage pipeline: a 1st-order adaptive Kalman filter (level+velocity state model with online local-noise estimation via sliding-window std, robust global noise scale via median absolute difference) followed by a centered Savitzky-Golay pass (polyorder=2) with a moving-average fallback; an "enhanced" variant uses reflection padding to preserve output length and edge dynamics.
+
+- **Performance**: Combined score of 0.00 with 0% success rate — the program fails validation on Signal 0 with "Invalid filtered signal length: expected 481, got 500."
+
+- **Feedback**: The critical failure is a length mismatch: the filter returns the full 500-sample output (zero-lag, same-length design), but the evaluation harness expects a truncated result of 481 samples (n − window_size + 1), indicating the required contract is a windowed output with edge samples dropped, not a full-length zero-phase output. Despite the sophisticated noise-adaptive design, no algorithmic quality is scored because the output format contract is violated; the fix is to trim the filtered signal to `len(x) - window_size + 1` samples (e.g., discarding the first `window_size - 1` samples) to match the expected validation length.
+**Program Identifier:** Generation 6 - Patch Name zero_phase_kalman_savgol_filter - Correct Program: False
+
+**Program Name: Zero-Lag Quadratic Endpoint Filter with Adaptive Regime Switching**
+- **Implementation**: Performs a local quadratic least-squares fit over each sliding window (with well-conditioned time coordinates on [-1, 1]) and evaluates at the leading edge (t=1) for near-zero lag, switching to a half-window fit when the second half of the window is significantly more volatile; post-processes with a residual-adaptive one-pole smoother and sub-noise reversal damping.
+- **Performance**: Combined score 0.51 with strong lag error (0.38), responsiveness (0.72), correlation (0.91), and perfect efficiency (1.00, 0.03s), but weak smoothness (0.09) with high slope changes (198.20) and false reversals (156).
+- **Feedback**: The zero-lag endpoint estimator and adaptive window shrinking excel at tracking non-stationary dynamics but leave substantial high-frequency ripple, indicating the light noise regularization (alpha ≥ 0.75) and reversal damping (30% retention) are too conservative; stronger smoothing would boost smoothness and reduce false reversals without much lag penalty.
+**Program Identifier:** Generation 7 - Patch Name reversal_suppression_postpass - Correct Program: True
+
+**Program Name: Three-Stage Adaptive Kalman Signal Processing Pipeline**
+- **Implementation**: Stage 1 uses a precomputed quadratic Savitzky-Golay endpoint filter (vectorized via np.correlate) for zero-lag smoothing; Stage 2 is a constant-velocity Kalman filter with innovation-gated adaptive measurement noise; Stage 3 is a slope-sign stabilizer that damps output updates conflicting with a slow EMA of dominant slope.
+- **Performance**: Combined score of 0.38 (composite 0.42) with efficiency 1.00 and responsiveness 0.59, but poor noise_reduction (0.04), correlation (0.41), smoothness (0.14), and 103 false reversals with lag error 0.68.
+- **Feedback**: The Kalman fusion and slope stabilizer stages appear to hurt rather than help—the high false reversal count and low noise reduction suggest the adaptive gating and damping logic introduce artifacts while over-smoothing genuine signal content. The zero-lag Stage 1 alone (the "basic" path) may outperform the full pipeline; future iterations should retune Kalman q/r parameters and the stabilizer's conflict threshold, or simplify to fewer stages.
+**Program Identifier:** Generation 8 - Patch Name zerolag_kalman_pipeline - Correct Program: True
+
+**Program Name: Adaptive Zero-Lag Polynomial Filter with Kalman Smoothing**
+- **Implementation**: Fits a local quadratic (via precomputed Vandermonde/normal equations) evaluated at the newest window sample for near-zero lag, with regime detection that shrinks the window when second-half variance exceeds 1.5× window variance, then smooths endpoint estimates with an adaptive constant-velocity Kalman filter whose R comes from MAD-based diff statistics and Q scales with input dynamics; both "basic" and "enhanced" modes route to this estimator.
+- **Performance**: Combined score 0.51 with strong correlation (0.91), responsiveness (0.71), and perfect efficiency/execution (1.00, 0.04s), but weak smoothness (0.09), moderate lag error (0.41), and high slope changes (190.60) and false reversals (149.80).
+- **Feedback**: The zero-lag endpoint-fit strategy excels at accuracy and responsiveness but the Kalman filter's tuning prioritizes tracking over smoothing, causing excessive oscillation and false reversals; increasing smoothing weight (smaller Q or higher-order state model) would trade a bit of responsiveness for much better smoothness and fewer slope changes.
+**Program Identifier:** Generation 9 - Patch Name adaptive_kalman_postfilter - Correct Program: True
+
+**Program Name: Adaptive Kalman + Savitzky-Golay Signal Filter**
+
+- **Implementation**: A two-stage pipeline that first applies an adaptive constant-velocity Kalman filter (innovation-squared-driven measurement noise `r = r_base + 0.5*innov²`) followed by a Savitzky-Golay order-2 smoother with edge padding, then trims output to sliding-window length semantics.
+
+- **Performance**: Achieves combined score 0.52 with strong correlation (0.93), noise reduction (0.51), responsiveness (0.81), efficiency (1.00), and accuracy (0.93), but poor smoothness (0.06), high false reversals (245.40), slope changes (307), and lag error (0.23).
+
+- **Feedback**: The adaptive Kalman stage preserves signal dynamics well (high responsiveness/correlation), but the SG smoothing window (window_size//6, ~half=3) is too narrow to suppress noise-induced slope changes, leaving many false reversals. Widening the SG window or increasing process noise adaptation would improve smoothness at modest lag cost.
+**Program Identifier:** Generation 11 - Patch Name kalman_savitzky_golay_hybrid - Correct Program: True
+
+**Program Name: Adaptive Kalman-Wavelet Hybrid Filter with Slope Latch**
+
+- **Implementation**: A causal single-pass filter combining a constant-velocity Kalman filter (with volatility-ratio-modulated process noise Q and MAD-estimated measurement noise R), a Daubechies-2 wavelet soft-thresholding gate on Kalman innovations (fixed 16-sample residual buffer), and a slope-direction latch with persistence/hysteresis for trend confirmation; first 12 samples use a quartic polynomial warm-up fit. The public entry `adaptive_filter` instantiates the class per call, while `run_signal_processing` delegates to an external `process_signal` helper.
+
+- **Performance**: The program scored a combined score of 0.0 and did not pass all validation tests.
+
+- **Feedback**: The core failure appears to be integration/compatibility: the harness path calls `process_signal(noisy_signal, window_size, "enhanced")`, which is not defined within this program, so evaluation cannot reach the adaptive filter logic; the `adaptive_filter` entry point is disconnected from the tested interface. Additionally, the warm-up quartic fit over noisy samples, the additive trend-lean term (`trend_sign * sigma_hat * 0.05`) that introduces systematic bias, and the blended wavelet correction (`gated*0.5 + coarse_mag*0.25`) inject offsets that would harm RMSE/correlation even if the pipeline ran.
+**Program Identifier:** Generation 2 - Patch Name adaptive_kalman_wavelet_hybrid_filter - Correct Program: False
+
+**Program Name: Zero-Phase Savitzky-Golay Trend Filter with Robust Refinement**
+- **Implementation**: Applies Hampel-style outlier clipping, then a scipy Savitzky-Golay polynomial smoother (order 3, window-aligned output indexed to window end), followed by slope-hysteresis reversal suppression with a MAD-based noise-scaled deadzone.
+- **Performance**: Combined score 0.58 with high correlation (0.97), noise reduction (0.80), and efficiency (1.00), but weak smoothness (0.10) and 127 false reversals with lag error 0.28 and avg error 0.32.
+- **Feedback**: The zero-phase design achieves excellent accuracy and responsiveness, but slope_hysteresis only averages a single neighbor for tentative reversals, providing too little smoothing to suppress reversals or improve smoothness. Reducing spurious slope changes (174.6) via stronger hysteresis correction or heavier smoothing would raise the composite score.
+**Program Identifier:** Generation 10 - Patch Name savgol_zerophase_trend_filter - Correct Program: True
+
+**Program Name: Zero-Lag Polynomial + Kalman Velocity + Hysteresis Trend Gate**
+- **Implementation**: Three-stage pipeline: a vectorized quadratic endpoint fit (via `np.correlate` with precomputed least-squares taps, plus a short-window variant for fast regimes), a constant-velocity 2D Kalman filter with dynamics-scaled process noise and MAD-based measurement noise, and a hysteresis trend gate that only commits slope reversals when they exceed a robust noise floor or persist for 3 steps. Output length is `len(x) - window_size + 1`, with alignment handled downstream by trimming the clean signal.
+- **Performance**: Complete failure — combined score 0.00, all test signals failed ("All test signals failed"), with lag_error 1.00, avg_error 1.00, 50 false reversals, 100 slope changes, and 0 correlation/noise reduction.
+- **Feedback**: Despite the sophisticated multi-stage design, the algorithm produced no valid output on the evaluation harness, suggesting either an exception/shape mismatch in the pipeline or the hysteresis gate's trend-holding/projection logic corrupting the output. The heavy reliance on difference-based noise estimates and the delayed output alignment may also have collapsed accuracy to failure levels.
+**Program Identifier:** Generation 12 - Patch Name hybrid_hysteresis_trend_filter - Correct Program: False
+
+**Program Name: Adaptive Kalman Filter with Zero-Phase Two-Pass Smoothing**
+- **Implementation**: Implements a constant-velocity adaptive Kalman filter with EMA-smoothed innovation-based measurement noise (outlier resistance), followed by a backward pass blended 50/50 with the forward pass for zero-phase (RTS-style) smoothing, and a final Savitzky-Golay (order-2 polynomial least-squares) smoothing stage; output is trimmed to `len(x) - window_size + 1` for window-alignment semantics.
+- **Performance**: Achieved a combined score of 0.53 with correlation 0.94, noise reduction 0.58, responsiveness 0.83, efficiency 1.00 (0.03s execution), and 100% success rate, but lag_error 0.21, 261.8 slope changes, 206.8 false reversals, and a very low smoothness score of 0.07.
+- **Feedback**: The two-pass zero-phase Kalman design effectively preserves dynamics (high responsiveness and accuracy), but the aggressive smoothing parameters and remaining false reversals indicate the filter still tracks noise too closely, leaving residual jitter that severely penalizes the smoothness component of the composite score. The main improvement path is increasing smoothness (reducing slope changes and false reversals) — e.g., stronger process-noise tuning or wider SG smoothing — without sacrificing the strong correlation and responsiveness already achieved.
+**Program Identifier:** Generation 13 - Patch Name rts_smoother_zero_phase - Correct Program: True
+
+**Program Name: Zero-Lag Quadratic Endpoint Filter with Adaptive Smoothing**
+- **Implementation**: Uses a local quadratic least-squares fit (Vandermonde with normalized time coordinates) evaluated at the window's leading edge for near-zero-lag estimation, plus adaptive window shrinking during high-volatility regimes, a bidirectional one-pole zero-lag smoother, and noise-floor-based reversal suppression.
+- **Performance**: Achieved a combined score of 0.57 with correlation 0.93, lag error 0.36, noise reduction 0.54, responsiveness 0.74, but weak smoothness (0.17) and high false reversals (77.40) and slope changes (100.40).
+- **Feedback**: The endpoint-fitting strategy effectively minimizes lag while maintaining accuracy and perfect efficiency (execution_time 0.03, efficiency_score 1.00), but residual high-frequency ripple from the polynomial fit still drives spurious slope changes and false reversals, indicating the post-smoothing and reversal-damping stages need stronger tuning to improve smoothness without reintroducing lag.
+**Program Identifier:** Generation 14 - Patch Name zero_lag_bidirectional_smoother - Correct Program: True
+
+**Program Name: Forward-Backward Adaptive Kalman Fusion with Velocity Deadband**
+
+- **Implementation**: Runs a two-state (level + velocity) adaptive Kalman filter both forward and backward over the signal, fuses results with inverse-residual variance weights (RTS-style zero-phase), then applies an inline velocity deadband with a level-correction term and a 3-point median polish; noise scale (r_base) is estimated robustly via MAD of first differences, and process noise is scaled adaptively from an innovation EMA.
+- **Performance**: Combined score of 0.0 — the program is incorrect and fails validation tests, meaning core functional/interface requirements are not met despite the sophisticated algorithm.
+- **Feedback**: The output length is truncated to `n - window_size + 1` by slicing off the first `window_size - 1` samples (SMA-style alignment), which likely breaks expected output-length or alignment contracts in validation; additionally, the pure-Python Kalman loop with per-step matrix operations is computationally slow, and the deadband's held-velocity level correction introduces subtle behavior that may not match expected filter responses.
+**Program Identifier:** Generation 15 - Patch Name fb_smoother_deadband_fusion - Correct Program: False
+
+**Program Name: Adaptive Two-State Kalman Trend Filter with Zero-Lag Fusion**
+- **Implementation**: Implements a forward/backward two-state Kalman filter (level + slope) with trend-gated process noise (stiff slope on consistent trends, loose on mixed signs), innovation-outlier slope loosening, and fusion of the two passes via locally-weighted averaging plus a forward/backward one-pole smoother to cancel lag.
+- **Performance**: Combined score of 0.0; the program is incorrect and fails all validation tests.
+- **Feedback**: The core failure is that the harness calls `process_signal(...)`, which is never defined anywhere in the file, causing a `NameError` before any filtering runs; additionally, the expected delay-alignment logic (window_size-1 shift) doesn't match a full-length, zero-lag filter output. The sophisticated filtering core must be wired into a `process_signal` wrapper returning a full-length signal to pass validation.
+**Program Identifier:** Generation 16 - Patch Name kalman_trend_adaptive_filter - Correct Program: False
+
+**Program Name: Bidirectional Kalman Fusion Filter with Zero-Lag Post-Smoothing**
+- **Implementation**: Runs a constant-velocity Kalman filter forward and backward, fusing the two passes with velocity-confidence weights for a zero-phase trend estimate, then applies two rounds of bidirectional one-pole smoothing (alpha 0.5 and 0.65) to cancel phase lag; `window_size` only controls output length via simple slicing.
+- **Performance**: Combined score 0.64 with correlation 0.96, noise reduction 0.78, lag error 0.28, avg error 0.30, but smoothness only 0.23 and false reversals 48.
+- **Feedback**: The zero-lag design delivers excellent accuracy and responsiveness (0.78) with minimal lag and perfect efficiency (1.00, 0.03s runtime), but the bidirectional approach preserves too much high-frequency content, yielding many slope changes (66.80) and false reversals—stronger smoothing or adaptive per-segment strength would improve the smoothness/reversal trade-off without sacrificing the lag advantage.
+**Program Identifier:** Generation 20 - Patch Name akf_bidirectional_smoother - Correct Program: True
+
+**Program Name: Kalman-RTS Fixed-Interval Smoother for Non-Stationary Signals**
+- **Implementation**: A constant-velocity Kalman forward pass with true Rauch-Tung-Striebel backward smoothing, using MAD-based first-difference noise estimation (R) and adaptive acceleration-derived process noise (Q); output is sliced at offset `window_size - 1` for zero-lag alignment. Both "basic" and "enhanced" modes route to the smoother, while legacy moving-average and quadratic-endpoint-fit functions remain as unused fallbacks.
+- **Performance**: Combined score of 0.67 with correlation 0.95, noise reduction 0.65, efficiency 1.00 (0.03s), but weaker smoothness (0.36), lag error 0.32, and 26.6 false reversals/36 slope changes.
+- **Feedback**: The RTS smoother excels at accuracy and noise rejection but trades off smoothness and produces false reversals, suggesting the adaptive process noise still over-trusts noisy dynamics; further tuning of the acceleration noise floor or additional smoothing could improve the smoothness/responsiveness balance without sacrificing its excellent lag characteristics.
+**Program Identifier:** Generation 21 - Patch Name kalman_rts_smoother_variant - Correct Program: True
+
+**Program Name: Adaptive Quadratic Endpoint Filter with Zero-Lag Bidirectional Smoothing**
+- **Implementation**: Fits a local quadratic to each window and evaluates at the leading edge (with adaptive half-window switching when late-window volatility spikes), then applies a forward one-pole smoother plus a time-reversed pass to cancel phase delay, finishing with a noise-adaptive deadband on fused velocity to suppress micro-reversals.
+- **Performance**: Combined score of 0.51 with strong correlation (0.88) and efficiency (1.00, 0.03s runtime), but weak smoothness (0.16), high slope changes (107), false reversals (83), and moderate lag error (0.72).
+- **Feedback**: The endpoint-fit strategy preserves responsiveness well (0.58) but leaves substantial residual noise (noise reduction only 0.24), and the deadband rebuild-from-previous-level introduces stair-step artifacts driving the high slope-change count and low smoothness. The bidirectional smoothing partially cancels lag but the aggressive output reconstruction trades too much smoothness for modest responsiveness gains.
+**Program Identifier:** Generation 22 - Patch Name fused_velocity_deadband_filter - Correct Program: True
+
+**Program Name: Zero-Phase Savitzky-Golay + Bidirectional Smoothing Filter**
+- **Implementation**: Combines a symmetric Savitzky-Golay filter (adaptive window based on MAD noise estimate vs. signal dynamics ratio) with forward+reverse one-pole exponential smoothing to cancel group delay; output sliced to len(x) - window_size + 1 contract.
+- **Performance**: Despite passing all tests (success_rate 1.0, efficiency 1.0), composite score is only 0.40 with correlation -0.46, avg_error 0.94, lag_error 0.56, and poor smoothness (0.08) with 192 false reversals and 242 slope changes.
+- **Feedback**: The algorithm severely fails quality metrics — the zero-phase claim doesn't hold in practice (lag_error 0.56) and the output tracks noise rather than the clean signal (negative correlation), suggesting the adaptive parameters over-smooth poorly or the window/alpha heuristics misfire on test data. Combined score of 0.00 indicates the design needs fundamental rework of its noise-dynamics ratio heuristics and delay handling rather than incremental tuning.
+**Program Identifier:** Generation 17 - Patch Name zerophase_sg_bidirectional - Correct Program: True
+
+**Program Name: Kalman + Zero-Lag One-Pole Adaptive Signal Filter**
+- **Implementation**: Cascades a constant-velocity Kalman filter with an exact Rauch-Tung-Striebel backward smoothing pass (adaptively estimating measurement noise from first differences), followed by two zero-lag bidirectional one-pole smoothers (alpha 0.5, 0.65); output is truncated to length `len(x) - window_size + 1` to mimic sliding-window conventions.
+- **Performance**: Combined score of 0.0 — the program fails validation tests entirely.
+- **Feedback**: Despite sophisticated zero-phase smoothing machinery, the solution is incorrect and does not pass validation, suggesting an interface/API mismatch (e.g., missing expected entry-point function or signature) or a numerical failure rather than a filtering-quality issue; the window_size parameter is only used for output length trimming, so any hidden test expecting true windowed behavior would fail.
+**Program Identifier:** Generation 18 - Patch Name true_rts_smoother_variant - Correct Program: False
+
+**Program Name: Adaptive Kalman Filter with EWMA Innovation Variance**
+- **Implementation**: Implements a two-state (level/velocity) Kalman filter with EWMA-smoothed innovation variance adapting measurement noise, run in forward and backward passes fused with position-dependent weights (0.35→0.65), followed by slope-reversal veto smoothing and derivative re-integration with drift correction.
+- **Performance**: Combined score 0.0 — the program is incorrect and fails all validation tests.
+- **Feedback**: The critical flaw is that `run_signal_processing` calls `process_signal()`, which is never defined (the evolved filter is named `filter_signal`), causing a `NameError` and preventing any metrics from being computed. Additionally, the harness applies a `window_size - 1` delay alignment (delay=19) that is incompatible with this filter's same-length zero-phase output, further corrupting the correlation/noise-reduction evaluation even if the function were wired correctly.
+**Program Identifier:** Generation 19 - Patch Name ewma_innovation_kalman_dualpass - Correct Program: False
+
+**Program Name: Kalman/RTS Smoother with Zero-Phase Ripple Damper**
+- **Implementation**: Constant-velocity Kalman forward filter followed by a true Rauch-Tung-Striebel backward smoother, with measurement noise estimated via MAD of first differences and adaptive process noise from local acceleration; a final bidirectional one-pole pass (alpha 0.55–0.95, chosen adaptively from residual noise) removes ripple without lag.
+- **Performance**: Combined score 0.67 with correlation 0.95, noise reduction 0.65, efficiency 1.00, but weak smoothness (0.36), high false reversals (26.60) and slope changes (36), and moderate lag error (0.32).
+- **Feedback**: The adaptive RTS design excels at accuracy, responsiveness, and speed, but leaves too many slope changes/reversals — the alpha range may be too conservative (never below 0.55), limiting smoothing strength; stronger damping or a smoothness-oriented pass would improve the smoothness score without sacrificing much correlation.
+**Program Identifier:** Generation 24 - Patch Name rts_bidirectional_hybrid_smoother - Correct Program: True
+
+**Program Name: Kalman/RTS Smoother with Zero-Phase Ripple Damper**
+- **Implementation**: Constant-velocity Kalman forward filter plus true Rauch-Tung-Striebel backward smoother, with MAD-based measurement noise estimation and adaptive process noise from local acceleration. Post-processing includes a bidirectional one-pole zero-phase pass, a zero-phase Savitzky-Golay polish, and slicing output to the `len(y) = len(x) - window_size + 1` contract.
+- **Performance**: Composite score 0.53 with combined score 0.00; correlation with clean signal is strongly negative (-0.85), avg_error 1.01, lag_error 0.58, 36.6 slope changes and 30.8 false reversals, despite efficiency_score 1.00 and success_rate 1.00.
+- **Feedback**: The negative correlation and zero noise_reduction strongly suggest a signal alignment/indexing mismatch (likely the window-offset slicing combined with aggressive smoothing inverts or misaligns output), even though runtime validation passes. The heavy multi-stage smoothing cascade may be over-smoothing relative to the evaluation's expectations, and the true bottleneck is accuracy, not efficiency.
+**Program Identifier:** Generation 25 - Patch Name add_bidirectional_postsmoother_and_sg_polish - Correct Program: True
+
+**Program Name: Kalman/RTS Smoother with Zero-Phase Ripple Damper**
+- **Implementation**: A constant-velocity Kalman forward filter with adaptive process noise (estimated from local acceleration MAD) and measurement noise (MAD of first differences), followed by a true RTS backward smoother, an iterated second RTS pass with 4x-reduced Q, and a bidirectional one-pole pass for zero-lag ripple suppression; all entry points (`adaptive_filter`, `enhanced_filter_with_trend_preservation`, `process_signal`) route to the same hybrid smoother and output is sliced to the lag contract `len(y) = len(x) - window_size + 1`.
+- **Performance**: Achieves a combined score of 0.72 with correlation 0.89, noise reduction 0.55, lag error 0.34, avg error 0.39, and perfect efficiency (1.00, 0.05s execution) at 100% success rate.
+- **Feedback**: Strong accuracy (0.89) and responsiveness (0.75) confirm the zero-phase design effectively removes lag, but smoothness (0.50), false reversals (14.20), and slope changes (20.40) indicate residual noise still triggers spurious direction changes; tuning the bidirectional one-pole alpha or increasing smoothing aggressiveness could trade a small amount of lag for better smoothness.
+**Program Identifier:** Generation 27 - Patch Name iterated_rts_two_pass - Correct Program: True
+
+**Program Name: Zero-Lag Kalman Fusion Filter with Adaptive Post-Smoothing**
+- **Implementation**: Runs a forward/backward constant-velocity Kalman filter fused with velocity-confidence weights, followed by three passes of bidirectional one-pole smoothing (SNR-adaptive alpha, 0.35–0.70) and a noise-scaled slope deadzone that suppresses small jitter steps while passing genuine trend moves.
+- **Performance**: Achieved a combined score of 0.51 with correlation 0.79, lag_error 0.77, avg_error 0.74, and efficiency 1.00 (0.03s execution), but noise_reduction was only 0.06 with 47.60 false reversals and a low smoothness score of 0.23.
+- **Feedback**: The zero-phase bidirectional design successfully minimizes lag, but the deadzone's carry/leak mechanism appears to leak accumulated step energy into the output, degrading noise reduction and smoothness; tuning the deadzone threshold and carry coefficients would likely improve the weak noise-reduction and false-reversal metrics without sacrificing the strong lag performance.
+**Program Identifier:** Generation 29 - Patch Name noise_adaptive_multismooth_hysteresis - Correct Program: True
+
+**Program Name: Kalman/RTS Smoother with Zero-Phase Bidirectional One-Pole Damper**
+
+- **Implementation**: A constant-velocity Kalman forward filter plus a true Rauch-Tung-Striebel backward smoother, iterated a second time with Q reduced 4x for variational refinement; noise parameters (R from MAD of first differences, Q from local second-difference acceleration statistics) are estimated adaptively from the signal, and a final forward+reversed one-pole pass (alpha in [0.55, 0.95], adapted to residual noise) removes ripple without phase lag. Output is sliced to the i + window_size - 1 alignment contract, and all algorithm_type routes funnel through the same hybrid smoother.
+- **Performance**: Combined score 0.68 with correlation 0.93, noise reduction 0.63, efficiency 1.00 (0.05s), but lag_error 0.33 and 24.2 false reversals indicate moderate over-smoothing/overshoot at trend changes.
+- **Feedback**: The two-pass RTS refinement plus bidirectional damping achieves excellent accuracy and near-ideal efficiency, but the aggressive smoothing (iterated smoother + low alpha one-pole) sacrifices responsiveness (0.39 smoothness/responsiveness tradeoff) and induces lag and spurious reversals; reducing the second-pass strength or raising alpha toward 1.0 on low-noise segments could improve lag_error without hurting correlation.
+**Program Identifier:** Generation 30 - Patch Name tighter_adaptive_q_calibration - Correct Program: True
+
+**Program Name: Kalman/RTS Hybrid Smoother with Zero-Phase Ripple Damper**
+- **Implementation**: A constant-velocity Kalman forward filter paired with a true Rauch-Tung-Striebel backward smoother, iterated twice (second pass with process noise Q reduced 4× for variational refinement); noise parameters are auto-tuned via MAD of first differences for measurement noise, EWMA-smoothed innovations for adaptive R, and local acceleration magnitude for Q, followed by a zero-phase bidirectional one-pole pass with noise-adaptive alpha (0.55–0.95) that removes residual ripple without adding lag.
+- **Performance**: Achieved a combined score of 0.69 with strong accuracy (correlation 0.92, accuracy_score 0.92), low lag_error 0.33, moderate noise_reduction 0.59, responsiveness 0.75, and perfect efficiency (1.00, 0.06s execution), though smoothness_score was only 0.42 with 22.20 false reversals and 28 slope changes.
+- **Feedback**: The adaptive Kalman/RTS architecture successfully preserves phase alignment and accuracy while remaining computationally efficient, but the conservatively-bounded final one-pole damper leaves residual high-frequency ripple in the output, inflating false reversals and dragging down smoothness. Loosening the alpha cap or strengthening the final smoothing stage would be the highest-leverage path to improving the combined score.
+**Program Identifier:** Generation 31 - Patch Name adaptive_ewma_measurement_noise - Correct Program: True
+
+**Program Name: Bidirectional Adaptive Kalman Filter with Slope Deadzone**
+- **Implementation**: A constant-velocity Kalman filter run forward and backward with velocity-confidence-weighted fusion, adaptive per-sample process noise estimated from local second-difference energy (noise removed in quadrature), followed by three zero-lag bidirectional one-pole smoothing passes and a noise-scaled slope deadzone that suppresses sub-noise steps.
+- **Performance**: Achieved a combined score of 0.47 with correlation 0.73, lag_error 1.42 (excellent low lag), but weak noise reduction (0.10), smoothness score 0.21, and 56.8 false reversals with 75.4 slope changes.
+- **Feedback**: The bidirectional zero-phase design is highly effective at minimizing lag (lag_error 1.42) and achieving perfect efficiency and success rates, but the aggressive trend-tracking plus the slope deadzone's step-accumulation "carry" logic leaves too much residual jitter and reversals — the filter needs stronger smoothing depth or better fusion weighting to improve smoothness and noise reduction without sacrificing its responsiveness advantage.
+**Program Identifier:** Generation 32 - Patch Name adaptive_rts_qfloor_tuned - Correct Program: True
+
+**Program Name: Kalman/RTS Smoother with Zero-Phase Polish Pipeline**
+- **Implementation**: Constant-velocity Kalman forward filter plus true RTS backward smoother using MAD-based measurement noise, widen-only EWMA-adaptive R, and acceleration-based process noise, followed by a second RTS refinement pass with Q reduced 4x, a zero-phase bidirectional one-pole ripple damper (alpha 0.55–0.95 gated on residual noise), and a quadratic Savitzky-Golay polish; output is sliced to `y[window_size-1:]` to satisfy the stated delay/length contract.
+- **Performance**: Combined score 0.0 — the program is incorrect and fails validation tests despite the elaborate multi-stage design.
+- **Feedback**: The cascaded zero-lag smoothing stack (double RTS pass, bilateral one-pole, Savitzky-Golay) did not produce acceptable output, suggesting the slice-based alignment contract (removing the first `window_size-1` samples of an inherently zero-lag smoother) or edge-case handling (short signals, alpha gating, SG window constraints) violates the validator's expectations. Robust noise estimation and adaptive gating add complexity but evidently didn't translate into passing behavior, indicating a fundamental contract or correctness mismatch rather than a tuning issue.
+**Program Identifier:** Generation 23 - Patch Name savgol_post_smoother - Correct Program: False
+
+**Program Name: Adaptive Kalman Hybrid Filter with Polynomial Smoothing**
+- **Implementation**: A streaming hybrid filter that pre-smooths each sample with a causal Savitzky-Golay fit (window=11, poly order=2, evaluated at the endpoint for zero lag), then runs a 2-state constant-velocity Kalman filter with volatility-scaled process noise (q = base_q·(1 + 10·var(residuals)/r)), Joseph-form covariance updates, hysteresis trend detection (dead zone plus 2× threshold flip requirement), sign-flip slope damping (prev·0.6), and a `level + 0.5·slope` lag-compensated output.
+- **Performance**: Combined score of 0.0 — the program is incorrect and does not pass all validation tests.
+- **Feedback**: The fatal flaw is that the harness entry point `process_signal(noisy_signal, window_size, "enhanced")` (called by `run_signal_processing`) is never defined — only `filter_signal`/`AdaptiveKalmanHybridFilter` are exposed, so validation hits a NameError and scores zero. Secondary issues include an off-by-one misalignment in the innovation residuals (buf vs. filt_history zip with dead `if True` code), a window mismatch (harness aligns metrics assuming window_size=20 while the filter defaults to 11), and slope damping that biases genuine reversals — all worth fixing once the required interface is implemented.
+**Program Identifier:** Generation 26 - Patch Name adaptive_kalman_hybrid_filter - Correct Program: False
+
+**Program Name: Kalman/RTS Hybrid Smoother with Zero-Phase Ripple Damper**
+- **Implementation**: Constant-velocity Kalman forward filter with MAD-based noise estimation, innovation-based adaptive (widen-only) measurement noise, true RTS backward smoothing, an iterated second RTS pass with 4x reduced process noise, and a final bidirectional one-pole pass with adaptive alpha (0.55–0.95) for lag-free ripple suppression.
+- **Performance**: Combined score 0.68 with correlation 0.92, noise reduction 0.61, responsiveness 0.75, efficiency 1.00, and low lag error 0.33 (execution time 0.06s, 100% success rate).
+- **Feedback**: The zero-phase design achieves strong accuracy and near-perfect efficiency, but modest smoothness (0.41), elevated slope changes (29.20), and false reversals (23.00) indicate residual ripple remains the main weakness; the heuristic adaptive-alpha one-pole damper is not aggressive enough to fully suppress high-frequency noise while preserving trend turns.
+**Program Identifier:** Generation 33 - Patch Name widen_only_adaptive_r - Correct Program: True
+
+**Program Name: Adaptive Bidirectional Kalman Filter with Noise-Deadzone Smoothing**
+
+- **Implementation**: Runs forward and backward constant-velocity Kalman passes with EWMA innovation-based adaptive measurement noise R, fuses them by inverse-velocity-confidence weights for zero phase, then applies three noise-adaptive bidirectional one-pole smoothing passes and a noise-scaled slope deadzone to suppress residual jitter. Output is trimmed to length n − window_size + 1.
+- **Performance**: Combined score 0.50 with high accuracy (correlation 0.85, efficiency 1.00, responsiveness 0.60), but weak noise reduction (0.17), smoothness (0.17), and 99.2 slope changes with 75.4 false reversals.
+- **Feedback**: The deadzone mechanism fails to actually flatten noise-level steps—it applies 20% of small steps plus a carry term rather than rejecting them, contributing to high false reversal count and low smoothness. The multi-pass smoothing reduces noise poorly (17%) while lag error (0.66) remains moderate, suggesting the alpha tuning trades smoothness away without gaining accuracy; a stricter deadzone that fully clips sub-threshold reversals and stronger smoothing would improve the dominant weak metrics.
+**Program Identifier:** Generation 34 - Patch Name ewma_adaptive_r_kalman - Correct Program: True
+
+**Program Name: Kalman/RTS Hybrid Smoother with Zero-Phase Ripple Damper**
+- **Implementation**: Uses a constant-velocity Kalman forward filter plus true Rauch-Tung-Striebel backward smoother, with MAD-based measurement noise estimation and adaptive process noise from local acceleration; includes up to three iterated RTS refinement passes with geometrically decaying Q (gated by a convergence check) and a final bidirectional one-pole pass for zero-phase ripple removal.
+- **Performance**: Achieved a combined score of 0.71 (correlation 0.86, noise_reduction 0.39, smoothness 0.54, responsiveness 0.73, efficiency 1.00, lag_error 0.37) in 0.08s with 100% success rate.
+- **Feedback**: The multi-pass RTS refinement and zero-phase post-filtering deliver excellent efficiency and low lag, but noise reduction (0.39) and smoothness (0.54) remain modest, and the relatively high slope_changes (16.80) and false_reversals (12.20) suggest residual ripple and tracking noise that limit the composite score.
+**Program Identifier:** Generation 35 - Patch Name third_rts_pass_gated - Correct Program: True
+
+**Program Name: Kalman/RTS Smoother with Bidirectional One-Pole Ripple Damper**
+- **Implementation**: Constant-velocity Kalman forward filter plus true RTS backward smoother, with MAD-based measurement noise estimation and acceleration-adaptive process noise, followed by a second RTS refinement pass (Q reduced 4x, blended by dynamics ratio) and a zero-phase bidirectional one-pole pass to damp residual ripple.
+- **Performance**: Combined score 0.72 with correlation 0.89, noise reduction 0.55, lag error 0.34, smoothness 0.50, responsiveness 0.75, and perfect efficiency/success (0.05s execution).
+- **Feedback**: The zero-phase design achieves low lag (0.34) and strong responsiveness, but moderate noise reduction and smoothness scores plus 14.2 false reversals indicate residual ripple persists despite the refinement pass; further smoothing strength could be traded against the already-good responsiveness.
+**Program Identifier:** Generation 37 - Patch Name dynamics_aware_blend_second_pass - Correct Program: True
+
+**Program Name: Kalman/RTS Hybrid Smoother with Zero-Phase Ripple Damper**
+- **Implementation**: A constant-velocity Kalman forward filter with MAD-based robust measurement-noise estimation, innovation-based adaptive R (EWMA blend with static anchor), and adaptive process noise from local acceleration statistics, followed by a true RTS backward smoother, a second iterated RTS refinement pass with 4x-reduced Q, and a final bidirectional one-pole zero-phase pass with noise-adaptive alpha.
+- **Performance**: Combined score 0.68 with excellent correlation (0.93), perfect efficiency (1.00, 0.05s) and success rate (1.00), but middling smoothness (0.39), noise reduction (0.62), lag error (0.33), and high slope changes (31.60) and false reversals (24.40).
+- **Feedback**: The multi-pass smoothing pipeline excels at accuracy and speed but still produces residual ripple and slope reversals, suggesting the one-pole damper's alpha range (0.55–0.95) is too conservative or the adaptive R blend over-trusts noisy segments. Further gains likely lie in stronger ripple suppression and tuning the process-noise floor to reduce false reversals without sacrificing the already-low lag error.
+**Program Identifier:** Generation 39 - Patch Name kalman_rts_adaptive_r_hybrid - Correct Program: True
+
+**Program Name: Robust Adaptive Whittaker-Henderson Penalized Least-Squares Smoother**
+- **Implementation**: Solves a global weighted penalized least-squares system (W + λ·D2ᵀD2)y = Wx with Huber-style iteratively reweighted residuals, MAD-based noise/acceleration estimates for adaptive λ selection, and a local penalty modulation that relaxes smoothing where genuine curvature is detected; finished with a scale-aware bilateral (zero-phase) one-pole ripple damper.
+- **Performance**: Combined score 0.71 (composite 0.72) with correlation 0.85, noise_reduction 0.36, lag_error 0.41, slope_changes 15.20, false_reversals 11.80, and efficiency 1.00 at 0.08s execution time.
+- **Feedback**: The zero-phase global solve and curvature-adaptive λ achieve strong correlation and responsiveness (0.71) with minimal lag, but the modest noise_reduction (0.36) and elevated slope_changes/false_reversals suggest over-adaptivity to noise—residual noise leaks through where the local penalty is relaxed. The dense solve avoids banded structure but remains fast at these signal lengths.
+**Program Identifier:** Generation 40 - Patch Name robust_whittaker_penalized_smoother - Correct Program: True
+
+**Program Name: Kalman/RTS Velocity-Clamped Smoother with Zero-Phase Damper**
+- **Implementation**: Two-pass Kalman constant-velocity filter with RTS backward smoothing, using MAD-based noise estimation and adaptive process noise from local acceleration; followed by velocity-limited reconstruction (clamping per-step displacement to 2|v| + 0.5σ) and a bidirectional one-pole zero-phase ripple damper.
+- **Performance**: Achieved combined score 0.71 (correlation 0.85, noise reduction 0.36, smoothness 0.56, responsiveness 0.72, efficiency 1.00), with lag error 0.38, avg error 0.44, 12 false reversals, and 15.80 slope changes.
+- **Feedback**: The approach is efficient and highly accurate but the modest noise reduction (0.36) and remaining false reversals suggest the velocity clamping and refinement blending trade denoising for trend preservation. Tightening the damper or stronger Q adaptation on noisy segments could improve smoothness and noise reduction without sacrificing the strong correlation.
+**Program Identifier:** Generation 41 - Patch Name rts_velocity_clamped_smoother - Correct Program: True
+
+**Program Name: Kalman/RTS Hybrid Smoother with Zero-Phase Ripple Damper**
+
+- **Implementation**: A constant-velocity Kalman forward filter with robust MAD-based measurement-noise estimation and innovation-adaptive R (EWMA blend), followed by a true RTS backward smoother, an iterated second pass with Q reduced 4x, and a bidirectional one-pole zero-phase pass with adaptive alpha, correlation guard, and cascade fallback for heavy smoothing.
+- **Performance**: Combined score 0.68 (composite 0.63), correlation 0.93, noise reduction 0.62, near-perfect efficiency (1.00, 0.05s execution) and 100% success rate, but moderate weaknesses in false reversals (24.40), slope changes (31.60), smoothness (0.39), and lag error (0.33).
+- **Feedback**: The adaptive-noise Kalman/RTS core with variational refinement delivers excellent tracking accuracy and responsiveness without phase lag, but residual slope changes and false reversals indicate the smoother still passes through local noise-induced dynamics the ripple damper doesn't fully suppress. Increasing the process-noise floor or strengthening the bilateral damping (with the correlation guard protecting trend) would likely reduce reversals and improve smoothness without sacrificing the strong accuracy score.
+**Program Identifier:** Generation 42 - Patch Name lower_damper_alpha_floor_with_corr_guard - Correct Program: True
+
+**Program Name: Adaptive Hybrid Kalman Zero-Lag Filter**
+- **Implementation**: Two-state (level, slope) Kalman filter with SNR-adaptive measurement noise, Joseph-form covariance update, polynomial lookahead gating, and hysteresis trend detection with reversal penalties.
+- **Performance**: Score 0.00 — all test signals failed; correlation 0.00, noise reduction 0.00, avg_error 1.00, lag_error 1.00, false_reversals 50.00.
+- **Feedback**: The program is broken at the interface level: `run_signal_processing` calls an undefined `process_signal` function instead of the `AdaptiveHybridKalmanZLAFilter.filter` method, causing immediate failure on every test. Additionally, the Kalman loop references `self._p_prev_01` before it is defined at i=0, and the `filter()` returns a dict (with smoothed/trend/reversals) rather than the plain array the harness expects, so the algorithm was never actually evaluated.
+**Program Identifier:** Generation 28 - Patch Name adaptive_hybrid_kalman_zla_filter - Correct Program: False
+
+**Program Name: Kalman/RTS + Bidirectional Damper Signal Smoother**
+- **Implementation**: Detrends with a low-order polynomial, estimates noise via MAD of first differences, runs a constant-velocity Kalman filter with an RTS backward smoothing pass, then applies cascaded bidirectional one-pole filters (alpha=0.65 with correlation-based backoff) and re-adds the trend.
+- **Performance**: Combined score of 0.0 — the program fails all validation tests.
+- **Feedback**: The core failure is integration: `run_signal_processing` calls an undefined `process_signal(noisy_signal, window_size, "enhanced")` and misaligns outputs with an assumed `window_size - 1` delay, while the actual `filter_signal(t, x, y)` (zero-phase, full-length output) is never invoked; the algorithm itself is reasonable but is never wired into the pipeline correctly.
+**Program Identifier:** Generation 36 - Patch Name adaptive_bidirectional_damper_rts - Correct Program: False
+
+**Program Name: Locally-Adaptive-Q Kalman/RTS Pipeline Filter**
+
+- **Implementation**: A 6-stage pipeline: Hampel robust denoising, per-sample process noise Q[k] estimated from block-MAD of second differences (50% overlapping blocks, interpolated to sample space), forward and backward constant-velocity Kalman passes (backward Q scaled 0.25x) blended for zero phase, a short-window Savitzky-Golay polish, and window-semantics alignment anchoring output i at the end of window x[i:i+W].
+
+- **Performance**: Combined score 0.60 (composite 0.51) with correlation 0.96, noise reduction 0.74, lag error 0.27, responsiveness 0.79, and near-perfect efficiency (1.00, 0.05s execution), but poor smoothness (0.17) and high slope-change/false-reversal counts (96.8 and 70.4).
+
+- **Feedback**: The locally adaptive Q and forward-backward blending achieve excellent tracking accuracy and lag suppression, but the output still exhibits excessive jitter and spurious slope reversals, indicating the light SG polish (window ~half the input window size) is too weak to smooth residual Kalman noise. A stronger final smoothing stage (longer SG window or higher-order state model) would directly improve the smoothness and false-reversal metrics that currently cap the combined score.
+**Program Identifier:** Generation 43 - Patch Name localq_rts_pipeline_filter - Correct Program: True
+
+**Program Name: Kalman/RTS Smoother with Zero-Phase Bidirectional Damper**
+- **Implementation**: Two-pass constant-velocity Kalman filter with true Rauch-Tung-Striebel backward smoother (second pass with 4x-reduced Q reusing adaptive Rseq), plus a MAD-based noise estimation, innovation-based adaptive measurement noise (widen-only EWMA), and a final zero-phase bilateral one-pole pass with correlation guard and cascaded moderate passes for heavy smoothing.
+- **Performance**: Combined score 0.68 with correlation 0.92, noise_reduction 0.61, accuracy 0.92, efficiency 1.00 (0.06s), but weaker smoothness (0.41), responsiveness (0.75), lag_error 0.33, false_reversals 23, and slope_changes 29.2.
+- **Feedback**: Strong accuracy and noise suppression confirm the RTS refinement strategy works, but residual ripple (low smoothness, high false reversals) indicates the final damper is too conservative — the alpha floor (0.40) and correlation guard (0.97) likely back off smoothing too aggressively, leaving slope instability; a more aggressive or better-tuned zero-phase pass could improve smoothness without sacrificing the already-strong correlation.
+**Program Identifier:** Generation 44 - Patch Name kalman_rts_cascade_widenonly - Correct Program: True
+
+**Program Name: Multiscale Savitzky-Golay Adaptive Smoother with Velocity Clamping**
+- **Implementation**: Uses three cascaded zero-phase Savitzky-Golay FIR passes (coarse, adaptive refinement, cubic trend) with MAD-based noise scale estimation, forward/backward trend-guided velocity clamping, and a bilateral one-pole ripple damper with correlation guards (corr ≥ 0.97) to accept/reject smoothing stages.
+- **Performance**: Achieved a combined score of 0.65 with strong efficiency (1.00, 0.01s) and responsiveness (0.70), but moderate accuracy (correlation 0.82, noise reduction 0.36, avg error 0.44) and weak smoothness (0.45) with many slope changes (24.60) and false reversals (20.80).
+- **Feedback**: The heavy adaptive machinery and correlation guards make the pipeline conservative, accepting smoothing stages too rarely to adequately suppress noise and ripple (low noise reduction, high false reversals). Lag error of 0.43 is well controlled by the zero-phase design, but smoother parameters (larger windows, more aggressive damping) would trade minimal lag for substantially better smoothness and accuracy.
+**Program Identifier:** Generation 45 - Patch Name sgolay_multiscale_adaptive - Correct Program: True
+
+**Program Name: Kalman/RTS Smoother with Velocity Clamp and Ripple Damper**
+- **Implementation**: Constant-velocity Kalman forward filter plus true RTS backward smoother run twice (second pass with Q reduced 4× as variational refinement), blended by a dynamics ratio; output is fused with a zero-phase bidirectional velocity-aware displacement clamp (guarded by a 0.97 correlation retry/fallback) and an adaptive zero-phase one-pole ripple damper, then sliced to the windowed output contract.
+- **Performance**: Combined score 0.72 with correlation 0.89, noise reduction 0.55, smoothness 0.50, responsiveness 0.75, efficiency 1.00 (0.05s), and 100% success rate; weaker areas are slope changes (20.40), false reversals (14.20), and lag error (0.34).
+- **Feedback**: The robust MAD-based noise estimation and correlation-guarded clamping make the method reliable across signal types, but residual false reversals and modest smoothness suggest the clamp/ripple damper still lets small ripples through; refinement effort on reversal suppression and lag reduction offers the most score upside.
+**Program Identifier:** Generation 47 - Patch Name rts_velocity_clamp_fusion - Correct Program: True
+
+**Program Name: Kalman/RTS Hybrid Smoother with Adaptive Noise Estimation**
+- **Implementation**: Constant-velocity Kalman forward filter with true RTS backward smoothing, using MAD-based robust measurement noise, EWMA-adaptive widen-only R, block-MAD locally interpolated process noise in an iterated second pass, and a final zero-phase bidirectional one-pole ripple damper with correlation guard.
+- **Performance**: Combined score 0.71 with correlation 0.90, noise reduction 0.55, lag error 0.34, 16.4 false reversals, 21.2 slope changes, and perfect efficiency (0.06s runtime, 100% success).
+- **Feedback**: The two-pass adaptive-Q design tracks busy segments while smoothing quiet ones, yielding strong accuracy (0.90) and responsiveness (0.74) with minimal lag, though moderate noise reduction (0.55) and smoothness (0.49) indicate the ripple damper may be too conservative; false reversals and slope changes suggest residual high-frequency content remains the main improvement opportunity.
+**Program Identifier:** Generation 48 - Patch Name local_block_mad_q - Correct Program: True
+
+**Program Name: Kalman/RTS Hybrid Smoother with Adaptive Process Noise**
+
+- **Implementation**: A two-pass constant-velocity Kalman forward filter plus true RTS backward smoother, using MAD-based measurement-noise estimation, block-median adaptive process noise (Q), EWMA widen-only adaptive R, a second refinement pass at 0.15x Q, and a final zero-phase bilateral one-pole ripple damper with correlation guard; output is sliced to `len(x) - window_size + 1` with an implied delay of `window_size - 1`.
+
+- **Performance**: Combined score 0.00 — all test signals failed (error: "All test signals failed"), with lag_error 1.00, avg_error 1.00, correlation 0.00, 100 slope changes, and 50 false reversals.
+
+- **Feedback**: The algorithm raises an error on the evaluation harness's test signals (likely the `n < window_size` ValueError or an edge-case failure in the adaptive pipeline), so no metric was ever computed; the sophisticated multi-stage pipeline adds complexity that is both fragile and likely overfit to the 1000-sample default signal. Simplifying the entry path and guaranteeing graceful handling of short/edge-case inputs is the top priority.
+**Program Identifier:** Generation 49 - Patch Name local_q_first_pass_plus_tighter_refinement - Correct Program: False
+
+**Program Name: Kalman/RTS Smoother with Velocity Clamp and Ripple Damper**
+- **Implementation**: A three-pass constant-velocity Kalman forward filter with RTS backward smoother (Q/1, Q/4, Q/8 refinement passes blended via dynamics-aware weights), fused with a zero-phase velocity-aware displacement clamp, bidirectional one-pole ripple damper, and guarded sub-noise reversal damping; measurement noise is estimated robustly via MAD of first differences and process noise from local acceleration.
+- **Performance**: Combined score 0.72 (correlation 0.89, noise reduction 0.54, efficiency 1.00, execution time 0.07s, success rate 1.00), with lag error 0.34, avg error 0.39, and 14.20 false reversals.
+- **Feedback**: The multi-pass smoothing with correlation guards (≥0.97) achieves strong accuracy and perfect efficiency, but moderate noise reduction (0.54) and smoothness (0.50) plus lingering false reversals (14.20) and slope changes (20.40) suggest the aggressive clamping/damping stages trade residual ripple suppression against distortion limits; further noise removal could be attempted without risking the lag/error metrics since efficiency headroom exists.
+**Program Identifier:** Generation 51 - Patch Name kalman_rts_velocity_clamp_v2 - Correct Program: True
+
+**Program Name: Locally-Adaptive-Q Kalman/RTS Six-Stage Pipeline Filter**
+- **Implementation**: Hampel outlier clipping feeds a two-pass constant-velocity Kalman scheme: a conservative uniform-Q first pass drives per-sample process-noise Q[k] from block-MAD of second differences (noise floor σ_r·√6/√block subtracted, floored/capped, power-2 ratio clipped to [0.1, 8.0], 50% overlap, interpolated), then a forward pass with innovation-EMA-adaptive R is blended 50/50 with a reversed 0.25×-Q backward pass (a cascade on the forward output, not a true RTS smoother), followed by a short order-2 Savitzky-Golay polish (w ≈ window/2) and window-end anchoring (output i ~ x[i:i+W], length n−W+1).
+- **Performance**: Combined score 0.60 (composite 0.51) with correlation 0.96, accuracy 0.96, noise reduction 0.73, responsiveness 0.78, and lag error 0.28, but very low smoothness (0.18) with 68.6 false reversals and 93.6 slope changes; execution is fast (0.06s, efficiency 1.00) and all validation tests pass.
+- **Feedback**: The adaptive-Q and bidirectional blend successfully preserve trend and responsiveness with near-zero phase error, but residual jitter clearly escapes the light SG polish and the cascaded backward pass, producing the high false-reversal/slope-change counts and dragging smoothness down. Main improvement levers: a longer/stronger polish window, a true RTS smoother over the raw data, or tighter Q-ratio clipping in high-dynamics regions to trade a little responsiveness for much better smoothness.
+**Program Identifier:** Generation 52 - Patch Name noise_floor_subtracted_two_pass_q - Correct Program: True
+
+# GLOBAL INSIGHTS SCRATCHPAD
+
+The following are global insights about optimization approaches and their effectiveness:
+
+## Successful Algorithmic Patterns
+
+- **The two-pass Kalman + true RTS refinement with 4×-reduced Q remains the winning skeleton**: the current best (Gen 47 `rts_velocity_clamp_fusion`, 0.72, and Gen 51 `kalman_rts_velocity_clamp_v2`, 0.72) both use forward constant-velocity Kalman → true RTS backward pass → second forward+RTS pass at Q/4 (Gen 51 extends to Q/1, Q/4, Q/8 three-pass blend), fused with velocity-aware displacement clamping. Metrics: correlation 0.89, noise_reduction 0.55, smoothness 0.50, lag 0.34, false_reversals 14.2, efficiency 1.00 at 0.05–0.07s.
+- **The current best program's code confirms the plateau architecture**: full forward pass storing `xp/xf/Pp/Pf`, exact RTS recursion with `G = Pf[k]FᵀPp[k+1]⁻¹` + pinv fallback, MAD-of-first-differences for R, quadrature-subtracted acceleration variance for Q (floor 0.05σ_r, cap 0.6σ_r), covariance symmetrization, and a final bidirectional one-pole damper with alpha 0.55–0.95 via tanh on residual-noise ratio.
+- **Adaptive-Q extensions deliver the best tracking metrics but not the best composite**: Gen 43/Gens 52 `localq_rts_pipeline_filter` (0.60) hit correlation 0.96 and noise_reduction 0.73–0.74, but smoothness collapsed to 0.17–0.18 with 68–71 false reversals — high responsiveness achieved at the cost of the smoothness/reversal metrics that dominate the composite.
+- **The whole 0.68–0.72 cluster is one family**: Gen 44 (RTS cascade with widen-only R, 0.68), Gen 48 (`local_block_mad_q`, 0.71), Gen 47/51 (velocity-clamp fusion, 0.72) — all correctly-wired zero-phase Kalman/RTS + damper variants.
+
+## Ineffective Approaches
+
+- **Interface wiring failures remain the only source of zeros**: Gen 28 (`adaptive_hybrid_kalman_zla_filter`, 0.0) called an undefined `process_signal` instead of its `filter` method, referenced `self._p_prev_01` before initialization, and returned a dict rather than an array. Gen 36 (`adaptive_bidirectional_damper_rts`, 0.0) likewise called undefined `process_signal` and never invoked `filter_signal`. Gen 49 (0.0) crashed on harness edge-case signals (likely `n < window_size` ValueError). Three of nine programs were killed by integration, not algorithms.
+- **Too-weak final polish lets residual jitter through**: Gen 43/52's short Savitzky-Golay polish (window ≈ window/2) failed to smooth residual Kalman noise — 68–96 slope changes vs the best program's 20.4. Feedback is consistent: the polish stage must be stronger/longer or replaced by more smoothing inside the RTS stage.
+- **Over-conservative correlation guards (≥0.97) and high alpha floors (0.40–0.55) block smoothing**: Gen 44's damper backed off too aggressively (smoothness 0.41, 23 false reversals); Gen 45 (`sgolay_multiscale_adaptive`, 0.65) accepted smoothing stages too rarely, yielding noise_reduction 0.36 and 20.8 false reversals.
+- **Stacking extra adaptive machinery on the damper doesn't beat doing more work in the RTS stage**: Gen 45's three cascaded SG passes with trend-guided clamping scored 0.65, well below the 0.72 simple two-pass RTS core.
+
+## Implementation Insights
+
+- **The best program (Gen 47/51 code shown) keeps all entry points (`adaptive_filter`, `enhanced_filter_with_trend_preservation`, `process_signal`) routed through one core `kalman_rts_filter`**, with the explicit output contract `y = y[window_size-1:]`, `len(y) = n − window_size + 1` — this exact pattern is what Gens 28/36/49 lacked and died on. Note Gen 49's identical architecture scored 0.0 purely from fragile edge-case handling; the current best guards `n < window_size` and `n == 1` gracefully.
+- **Velocity-aware displacement clamping guarded by correlation retry/fallback is validated as the top scorer's differentiator** (Gen 47/51, 0.72) — combining Gen 37's dynamics-blend refinement with Gen 41's clamp, exactly as the previous insights predicted.
+- **Robust statistics are universal across all top scorers**: MAD-of-first-differences R, block/local MAD second-difference Q with noise-floor subtraction (Gen 48's block-MAD adaptive Q, 0.71), EWMA widen-only R (Gen 44). These add robustness without runtime cost (0.05–0.07s, efficiency 1.00 everywhere).
+- **Iterated refinement passes are cheap and safe**: Gen 51's three Q-reduced passes (Q/1, Q/4, Q/8) blended via dynamics-aware weights matched Gen 47's 0.72 with identical metrics — no gain from the third pass, but no penalty either, indicating saturation of the refinement lever.
+
+## Performance Analysis
+
+- **Score ceiling unchanged at 0.72**: the correctly-wired RTS family spans 0.60–0.72 with the same accuracy/efficiency saturation (correlation 0.89–0.96, efficiency 1.00). The gap between Gen 47/51 (0.72, smoothness 0.50, 14.2 reversals) and Gen 43/52 (0.60, smoothness 0.17, ~70 reversals) confirms smoothness/false-reversals are the dominant composite levers, not correlation.
+- **Responsiveness vs smoothness trade quantified**: Gen 43/52 achieved lag_error 0.27–0.28 and correlation 0.96 (best in family) but lost ~0.12 combined score to jitter; the best program accepted lag 0.34 for 4–5× fewer false reversals. Future gains likely require preserving adaptive-Q tracking while adding a stronger zero-phase ripple suppression stage.
+- **Noise reduction is decoupled from score**: Gen 44 (nr 0.61, score 0.68) vs Gen 47 (nr 0.55, score 0.72) — the composite rewards the balanced profile; chasing nr at the expense of reversals is counterproductive.
+- **Zeros are entirely preventable**: 3 of 9 programs (33%) failed on NameError/crash/interface issues while their underlying algorithms were reasonable (Gen 36's RTS + damper was "never wired in"). Contract compliance — single funnel entry, array return, graceful short-input handling — is worth more than any single algorithmic tweak.
+
+# META RECOMMENDATIONS
+
+The following are actionable recommendations for the next program generations:
+
+# Actionable Recommendations for Future Program Mutations
+
+1. **Add velocity-aware displacement clamping between the second RTS pass and the bilateral damper.** After computing `y = xs[:, 0]` from the Q/4 refinement pass, clamp per-step displacement in a forward sweep plus a mirrored backward sweep (zero-phase): limit |y[k]−y[k−1]| ≤ 2·|velocity estimate at k| + 0.5·σ_r, where the velocity estimate comes from the second pass's `xs[:, 1]` state. Guard with a correlation retry (if corr(clamped, unclamped) < 0.97, double the slack to 1.0·σ_r and re-apply); the current best already stores velocity states, so this costs nothing structurally and directly targets smoothness (0.50) and false reversals (14.2), the dominant composite levers per the score-ceiling analysis.
+
+2. **Replace the final bilateral one-pole damper with a fixed-λ Whittaker–Henderson polish (second-order difference penalty).** Use λ = clip(25·(r_std/σ_r)², 1, 200) from the existing residual MAD, solved with a banded (bandwidth-5) O(n) Cholesky solver to preserve the 0.05s runtime. The evidence shows Gen 40's Whittaker hit 0.71 with only the curvature-relaxed λ leaking noise — a *constant* λ keeps the penalty uniform, and the second-order penalty's flatter passband should cut residual ripple (slope changes 20.4 → fewer) without the lag a stronger one-pole adds. Apply it to the full-length signal and slice last to protect the `len(y) = n − window_size + 1` contract (Gen 23's zero came from a length-changing post-smoother).
+
+3. **Make Q locally adaptive via block-MAD second differences computed from the first-pass smoothed output, interpolated per-sample.** Compute σ_acc in overlapping blocks of length ≈ window_size (50% overlap) using y1's second differences (y1 is already denoised, so its d2 reflects genuine dynamics like the 5 Hz component a global Q under-serves), subtract the (σ_r/√w)·√6 noise floor per block, floor at 0.05σ_r, cap at ~1.5σ_r, and linearly interpolate to Q[k] used at each prediction step — the second pass uses 0.25·Q[k]. This fuses Gen 48's validated block-MAD Q (0.71) with the two-pass core to attack lag_error (0.34) and avg_error (0.39) by granting busy segments larger process noise while smoothing slow segments harder — but keep the strong final polish so the Gen 43/52 jitter collapse (smoothness 0.17, ~70 reversals) is not repeated.
+
+4. **Reorder the pipeline: run the moderate-alpha bilateral damper between the two RTS passes instead of last.** Place a one-pole pass at alpha ≈ 0.65 after the first RTS output, then let the Q/4 refinement pass finish the signal — RTS's minimum-variance smoothing re-sharpens corners the damper rounds while the ripple it removed stays gone. Keep R = σ_r² and all noise statistics unchanged, and monitor lag_error; if it exceeds 0.40, back the inter-pass alpha toward 0.75 or add a light alpha=0.9 final bilateral only when the post-pass-2 residual MAD exceeds 0.3·σ_r. This exploits the consistent finding that smoothing inside the RTS stage beats damper-stage heuristics (Gens 42/45 damper stacking capped at 0.65–0.68).
+
+5. **Harden the interface and edge-case envelope before any algorithmic change — copy the current best's contract verbatim into every mutation.** Three of nine prior programs scored 0.0 from integration failures (undefined `process_signal`, dict returns, `n < window_size` crashes), which outweighs any algorithmic gain. Concretely: route `adaptive_filter`, `enhanced_filter_with_trend_preservation`, and `process_signal` through one core function that returns a 1-D float array sliced as `y[window_size-1:]` with a final length assertion, guard `n < window_size` by returning a graceful fallback (e.g., the input clipped to length max(1, n − window_size + 1)) rather than raising, and handle n == 1 and NaN/inf inputs explicitly. Test with n = 1, 2, window_size−1, and window_size before submission.

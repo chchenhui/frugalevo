@@ -1,0 +1,224 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List, Dict, Optional
+from collections import Counter, defaultdict
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-cache oriented row/column reordering.
+
+    Builds a small number of cheap candidate per-row column orderings, scores
+    each with the true serial character-Trie reuse objective (sum of adjacent
+    LCPs over the sorted serialized rows), and returns the best one. All cell
+    values and the DataFrame shape are preserved exactly; only the per-row
+    column permutation (and hence per-row orderings) change.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------
+    # Serialization helpers (match evaluator: fillna("") then astype(str))
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _ser(v) -> str:
+        try:
+            if v is None or pd.isna(v):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(v)
+
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        if a == b:
+            return len(a)
+        lo, hi = 0, min(len(a), len(b))
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_reuse(self, serials: List[str]) -> int:
+        """Exact ideal trie reuse: sum of LCPs of lexicographically adjacent rows."""
+        if len(serials) < 2:
+            return 0
+        s = sorted(serials)
+        total = 0
+        prev = s[0]
+        for x in s[1:]:
+            total += self._lcp(prev, x)
+            prev = x
+        return total
+
+    # ------------------------------------------------------------------
+    # Main API
+    # ------------------------------------------------------------------
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+
+        df = df.copy()
+        nrows, ncols = df.shape
+        colnames = list(df.columns)
+        colpos = {c: j for j, c in enumerate(colnames)}
+
+        # Edge cases ---------------------------------------------------
+        if nrows == 0 or ncols == 0:
+            column_orderings = [[] for _ in range(nrows)] if ncols == 0 else [list(colnames) for _ in range(nrows)]
+            if ncols == 0:
+                column_orderings = [[] for _ in range(nrows)]
+            return df, [list(colnames) for _ in range(nrows)] if ncols > 0 else [[] for _ in range(nrows)]
+
+        # ---------------------------------------------------------------
+        # Units: honor col_merge by keeping each merge group as one atomic,
+        # always-adjacent block. Single columns are their own unit.
+        # ---------------------------------------------------------------
+        merged = set()
+        units: List[List[str]] = []
+        for grp in col_merge or []:
+            g = [c for c in grp if c in colpos]
+            if g:
+                units.append(g)
+                merged.update(g)
+        for c in colnames:
+            if c not in merged:
+                units.append([c])
+
+        # ---------------------------------------------------------------
+        # Serialize every cell once; reuse across all constructions.
+        # ---------------------------------------------------------------
+        raw_rows = [list(r) for r in df.itertuples(index=False, name=None)]
+        cellstr = [[Evolved._ser(v) for v in row] for row in raw_rows]
+        first_col_of_unit = [colpos[u[0]] for u in units]
+
+        # ---------------------------------------------------------------
+        # Global unit scores: sum over serialized values v of len(v)*c*(c-1)
+        # ---------------------------------------------------------------
+        unit_scores = []
+        for u in units:
+            s = 0
+            for c in u:
+                j = colpos[c]
+                cnt = Counter(row[j] for row in cellstr)
+                s += sum(len(v) * k * (k - 1) for v, k in cnt.items())
+            unit_scores.append(s)
+        n_units = len(units)
+        global_unit_order = sorted(range(n_units), key=lambda ui: (-unit_scores[ui], ui))
+
+        # Suffix lookup: remaining units in global order
+        def full_order(prefix_units, remaining_set):
+            tail = [u for u in global_unit_order if u in remaining_set]
+            return list(prefix_units) + tail
+
+        # ---------------------------------------------------------------
+        # Candidate A: baseline (original column order)
+        # ---------------------------------------------------------------
+        baseline_units = sorted(range(n_units), key=lambda ui: min(colpos[c] for c in units[ui]))
+        cand_orders = {"baseline": [baseline_units] * nrows}
+
+        # ---------------------------------------------------------------
+        # Candidate B: global frequency-ranked order (same for all rows)
+        # ---------------------------------------------------------------
+        cand_orders["global"] = [global_unit_order] * nrows
+
+        # ---------------------------------------------------------------
+        # Candidate C: recursive conditional partition tree.
+        # Within each row group, pick the remaining unit with the largest
+        # length-weighted pair repetition, partition rows by its serialized
+        # value, recurse with bounded depth / candidates.
+        # ---------------------------------------------------------------
+        max_depth = col_stop if (col_stop is not None and col_stop > 0) else min(8, n_units)
+        max_depth = min(max_depth, 12)
+        max_candidates = 16
+        cond_orders = [None] * nrows
+
+        def rec(row_idx, remaining, prefix, depth):
+            remaining_set = set(remaining)
+            if len(row_idx) < 2 or not remaining or depth >= max_depth:
+                fo = full_order(prefix, remaining_set)
+                for i in row_idx:
+                    cond_orders[i] = fo
+                return
+            # candidate units: top by global score among remaining
+            cand = [u for u in global_unit_order if u in remaining_set][:max_candidates]
+            best_ui, best_s = None, early_stop
+            for ui in cand:
+                j = first_col_of_unit[ui]
+                cnt = Counter(cellstr[i][j] for i in row_idx)
+                s = sum(len(v) * k * (k - 1) for v, k in cnt.items())
+                if s > best_s:
+                    best_s, best_ui = s, ui
+            if best_ui is None:
+                fo = full_order(prefix, remaining_set)
+                for i in row_idx:
+                    cond_orders[i] = fo
+                return
+            groups = defaultdict(list)
+            j = first_col_of_unit[best_ui]
+            for i in row_idx:
+                groups[cellstr[i][j]].append(i)
+            if len(groups) < 2:
+                fo = full_order(prefix, remaining_set)
+                for i in row_idx:
+                    cond_orders[i] = fo
+                return
+            new_remaining = [u for u in remaining if u != best_ui]
+            for g in groups.values():
+                rec(g, new_remaining, prefix + [best_ui], depth + 1)
+
+        rec(list(range(nrows)), list(range(n_units)), [], 0)
+        for i in range(nrows):
+            if cond_orders[i] is None:
+                cond_orders[i] = list(global_unit_order)
+        cand_orders["conditional"] = cond_orders
+
+        # ---------------------------------------------------------------
+        # Score each candidate with the real serial-Trie objective
+        # ---------------------------------------------------------------
+        def unit_join(row_i, unit_seq):
+            parts = []
+            for ui in unit_seq:
+                for c in units[ui]:
+                    parts.append(cellstr[row_i][colpos[c]])
+            return "".join(parts)
+
+        best_name, best_score, best_orders = None, -1, None
+        for name, orders in cand_orders.items():
+            serials = [unit_join(i, orders[i]) for i in range(nrows)]
+            sc = self._trie_reuse(serials)
+            if sc > best_score:
+                best_name, best_score, best_orders = name, sc, orders
+
+        # ---------------------------------------------------------------
+        # Build output: per-row value permutation, object dtype, same shape
+        # ---------------------------------------------------------------
+        out_arr = np.empty((nrows, ncols), dtype=object)
+        column_orderings: List[List[str]] = []
+        for i in range(nrows):
+            order_names = []
+            for ui in best_orders[i]:
+                order_names.extend(units[ui])
+            column_orderings.append(order_names)
+            for pos, cname in enumerate(order_names):
+                out_arr[i, pos] = raw_rows[i][colpos[cname]]
+
+        result = pd.DataFrame(out_arr, columns=colnames, index=df.index)
+        assert result.shape == (nrows, ncols)
+        return result, column_orderings
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,72 @@
+<NAME>
+vectorize_balanced_packing
+
+<DESCRIPTION>
+The main runtime bottleneck is `balanced_packing`: it runs a pure-Python double loop over `num_layers x num_groups` items (called once for groups→nodes and once for physical experts→GPUs), each iteration doing Python-level list operations and `min()`. This dominates the algorithm time (speed_score is currently 0.00).
+
+We can vectorize across layers: keep `pack_weights` and `pack_items` as tensors of shape [num_layers, num_packs], and only loop over the `num_groups` placement steps. In each step we place the next-heaviest remaining item of every layer simultaneously: mask out full packs with +inf, take an `argmin` over packs (which preserves the original min-index tie-breaking), and update state with advanced indexing. This reduces the Python loop count from `num_layers * num_groups` to `num_groups`, with each iteration doing a handful of vectorized tensor ops, and keeps identical greedy semantics (sort descending, place each item in the lightest non-full pack).
+
+The greedy packing logic and outputs are unchanged, so GPU/ node balancedness is preserved, while algorithm runtime drops substantially, improving the speed score and thus the combined score.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    indices = weight.float().sort(-1, descending=True).indices
+    pack_index = torch.full((num_layers, num_groups),
+                            fill_value=-1,
+                            dtype=torch.int64,
+                            device=weight.device)
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    # Vectorized across layers: only loop over the placement steps.
+    pack_weights = weight.new_zeros((num_layers, num_packs))
+    pack_items = torch.zeros((num_layers, num_packs),
+                             dtype=torch.int64,
+                             device=weight.device)
+    arangen = torch.arange(num_layers, device=weight.device).unsqueeze(-1)
+    for g in range(num_groups):
+        group = indices[:, g]
+        # Choose the lightest pack that is not yet full (per layer).
+        cand_weights = pack_weights.clone()
+        cand_weights[pack_items >= groups_per_pack] = float("inf")
+        pack = cand_weights.argmin(-1)
+        pack_index[arangen, group] = pack
+        rank_in_pack[arangen, group] = pack_items[arangen, pack].squeeze(-1)
+        pack_weights[arangen, pack] += weight[arangen, group]
+        pack_items[arangen, pack] += 1
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+=======
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+    weight = weight.float()
+>>>>>>> REPLACE
+</DIFF>

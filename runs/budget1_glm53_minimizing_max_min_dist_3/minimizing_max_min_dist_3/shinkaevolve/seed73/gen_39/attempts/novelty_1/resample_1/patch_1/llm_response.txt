@@ -1,0 +1,84 @@
+<NAME>
+slsqp_input_guard_and_smooth_escalation</NAME>
+<DESCRIPTION>
+Two targeted improvements:
+
+1. **Input guard in `_slsqp_packing`** (the recommended edit): a malformed or non-finite candidate coming out of `_opt` (repulsion/L-BFGS stage) would currently crash `minimize` and waste all prior work. Adding a cheap validity check at the top (finite, correct shape, positive diameter) and returning `None` on failure lets the caller fall back to the fallback path gracefully — zero cost, closes the remaining failure window.
+
+2. **Escalating smooth-softmin objective inside SLSQP**: the highest-scoring prior program (combined_score 1.00) used a smooth soft-min objective `-1/beta*log(sum(exp(-beta*d)))` with escalating beta (20 → 60 → 200 → 1000) and diameter re-normalization between rounds, instead of the hard `min()`. The hard min is nonsmooth: its gradient only moves one pair at a time, so SLSQP stalls near ties. The soft-min gives gradients to *all* close pairs simultaneously, letting ties equalize properly (which is exactly what the optimum of this packing problem looks like — many equal minimal distances), then sharpens to converge to the true min. Re-normalizing the diameter after each round keeps each restart feasible. This was the key ingredient of the 1.00-scoring variant and is cheap to reintroduce here.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _slsqp_packing(P0, maxiter=500):
+    """Maximize min pairwise distance subject to max pairwise distance <= 1."""
+    if not HAVE_SCIPY:
+        return None
+    P = np.asarray(P0, dtype=float).copy()
+    P = P - P.mean(axis=0)
+    dm = np.linalg.norm(P[PI_] - P[PJ], axis=1).max()
+    if dm > 0:
+        P = P / dm
+
+    def pdists(flat):
+        Pm = flat.reshape(N, D)
+        return np.linalg.norm(Pm[PI_] - Pm[PJ], axis=1)
+
+    res = minimize(lambda f: -pdists(f).min(), P.ravel(), method='SLSQP',
+                  constraints={'type': 'ineq', 'fun': lambda f: 1.0 - pdists(f).max()},
+                  options={'maxiter': maxiter, 'ftol': 1e-14})
+    P = res.x.reshape(N, D)
+    if not np.all(np.isfinite(P)):
+        return None
+    score = _true_score(P)
+    if score <= 0:
+        return None
+    return P, score
+=======
+def _slsqp_packing(P0, maxiter=500):
+    """Maximize min pairwise distance subject to max pairwise distance <= 1."""
+    if not HAVE_SCIPY:
+        return None
+    P = np.asarray(P0, dtype=float).copy()
+    # guard: reject malformed/non-finite input before handing to SLSQP
+    if P.shape != (N, D) or not np.all(np.isfinite(P)):
+        return None
+    P = P - P.mean(axis=0)
+    dm = np.linalg.norm(P[PI_] - P[PJ], axis=1).max()
+    if not np.isfinite(dm) or dm <= 0:
+        return None
+    P = P / dm
+
+    def pdists(flat):
+        Pm = flat.reshape(N, D)
+        return np.linalg.norm(Pm[PI_] - Pm[PJ], axis=1)
+
+    def obj_soft(flat, beta):
+        # smooth soft-min: 1/beta * log(sum(exp(-beta*d))
+        ds = pdists(flat)
+        a = -beta * ds
+        amax = a.max()
+        return (amax + np.log(np.sum(np.exp(a - amax)))) / beta
+
+    # escalating sharpness: soft-min gives gradients to all close pairs
+    # so ties equalize, then sharpens toward the exact min.
+    res = None
+    for beta in (20.0, 60.0, 200.0, 1000.0):
+        res = minimize(obj_soft, P.ravel(), args=(beta,), method='SLSQP',
+                       constraints={'type': 'ineq',
+                                   'fun': lambda f: 1.0 - pdists(f).max()},
+                       options={'maxiter': maxiter // 2, 'ftol': 1e-14})
+        if res.x.size != N * D or not np.all(np.isfinite(res.x)):
+            break
+        P = res.x.reshape(N, D)
+        # re-normalize diameter so each restart is feasible
+        dcur = pdists(P.ravel()).max()
+        if dcur > 1e-12:
+            P = P / dcur
+    if P.shape != (N, D) or not np.all(np.isfinite(P)):
+        return None
+    score = _true_score(P)
+    if score <= 0:
+        return None
+    return P, score
+>>>>>>> REPLACE
+</DIFF>

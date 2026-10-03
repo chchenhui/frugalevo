@@ -1,0 +1,306 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+from solver import Algorithm
+from typing import Tuple, List, Dict
+from collections import Counter, defaultdict
+
+
+class Evolved(Algorithm):
+    """
+    Deterministic, non-destructive row serialization optimizer.
+
+    The dataframe values are never normalized or changed.  Normalized strings
+    are used only to estimate the character Trie objective.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+        self.dep_graph = None
+        self.num_rows = 0
+        self.num_cols = 0
+        self.column_stats = None
+        self.val_len = None
+        self.row_stop = None
+        self.col_stop = None
+        self.base = 2000
+
+    @staticmethod
+    def _cell_text(value) -> str:
+        """Match evaluator serialization without changing the stored value."""
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, bool) and missing:
+                return ""
+        except Exception:
+            pass
+        return str(value)
+
+    @staticmethod
+    def _lcp(left: str, right: str) -> int:
+        """Bounded Python-level LCP using C-level slice comparisons."""
+        if left == right:
+            return len(left)
+        high = min(len(left), len(right))
+        low = 0
+        while low < high:
+            mid = (low + high + 1) // 2
+            if left[:mid] == right[:mid]:
+                low = mid
+            else:
+                high = mid - 1
+        return low
+
+    def _trie_score(self, serialized_rows: List[str]) -> int:
+        if len(serialized_rows) < 2:
+            return 0
+        ordered = sorted(serialized_rows)
+        return sum(
+            self._lcp(ordered[i - 1], ordered[i])
+            for i in range(1, len(ordered))
+        )
+
+    @staticmethod
+    def _resolve_column(name, columns):
+        """Resolve API column names conservatively and deterministically."""
+        exact = [i for i, col in enumerate(columns) if col == name]
+        if exact:
+            return exact[0]
+        partial = [i for i, col in enumerate(columns) if str(name) in str(col)]
+        return partial[0] if len(partial) == 1 else None
+
+    def _make_units(self, columns, col_merge):
+        """
+        Convert required merge groups to atomic position units.  Every source
+        column remains present exactly once.
+        """
+        used = set()
+        units = []
+
+        for group in col_merge or []:
+            positions = []
+            for name in group:
+                pos = self._resolve_column(name, columns)
+                if pos is not None and pos not in used:
+                    positions.append(pos)
+                    used.add(pos)
+            if positions:
+                units.append(positions)
+
+        for pos in range(len(columns)):
+            if pos not in used:
+                units.append([pos])
+
+        return units
+
+    def _apply_dependencies(self, unit_order, units, columns, one_way_dep):
+        """Move dependency source units before destination units when possible."""
+        if not one_way_dep:
+            return unit_order
+
+        position_to_unit = {}
+        for unit_id, unit in enumerate(units):
+            for pos in unit:
+                position_to_unit[pos] = unit_id
+
+        edges = []
+        for before, after in one_way_dep:
+            before_pos = self._resolve_column(before, columns)
+            after_pos = self._resolve_column(after, columns)
+            if before_pos is None or after_pos is None:
+                continue
+            source = position_to_unit[before_pos]
+            target = position_to_unit[after_pos]
+            if source != target:
+                edges.append((source, target))
+
+        # Stable, inexpensive topological ordering over the proposed ranking.
+        rank = {unit: i for i, unit in enumerate(unit_order)}
+        outgoing = defaultdict(list)
+        indegree = {unit: 0 for unit in unit_order}
+        for source, target in edges:
+            if target not in outgoing[source]:
+                outgoing[source].append(target)
+                indegree[target] += 1
+
+        available = [unit for unit in unit_order if indegree[unit] == 0]
+        result = []
+        while available:
+            available.sort(key=lambda unit: rank[unit])
+            unit = available.pop(0)
+            result.append(unit)
+            for child in outgoing[unit]:
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    available.append(child)
+
+        # Cyclic dependency specifications retain the proposed stable order.
+        if len(result) != len(unit_order):
+            return unit_order
+        return result
+
+    @staticmethod
+    def _flatten_units(unit_order, units):
+        return [pos for unit in unit_order for pos in units[unit]]
+
+    def _global_unit_order(self, texts, units, square_lengths=False):
+        """Frequency-ranked global ordering using character-weighted repetition."""
+        row_count = len(texts)
+        scores = []
+        for unit_id, unit in enumerate(units):
+            score = 0
+            for col in unit:
+                counts = Counter(texts[row][col] for row in range(row_count))
+                for value, count in counts.items():
+                    length = len(value)
+                    if square_lengths:
+                        length *= length
+                    score += length * count * (count - 1)
+            scores.append((score, unit_id))
+
+        # Original position is the deterministic tie break.
+        return [
+            unit_id
+            for _, unit_id in sorted(
+                scores,
+                key=lambda item: (-item[0], min(units[item[1]])),
+            )
+        ]
+
+    def _conditional_orders(self, texts, units, global_order):
+        """
+        A bounded conditional partition candidate.  It chooses the best leading
+        unit globally, partitions by that unit's serialized values, and ranks
+        only the suffix units within each partition.
+        """
+        nrows = len(texts)
+        if nrows == 0 or len(units) < 2:
+            return [self._flatten_units(global_order, units) for _ in range(nrows)]
+
+        lead = global_order[0]
+        tail = [unit for unit in global_order if unit != lead]
+        groups = defaultdict(list)
+        for row in range(nrows):
+            key = tuple(texts[row][col] for col in units[lead])
+            groups[key].append(row)
+
+        orders = [None] * nrows
+        for rows in groups.values():
+            if len(rows) < 2:
+                local_units = [lead] + tail
+            else:
+                local_scores = []
+                for unit in tail:
+                    score = 0
+                    for col in units[unit]:
+                        counts = Counter(texts[row][col] for row in rows)
+                        score += sum(
+                            len(value) * count * (count - 1)
+                            for value, count in counts.items()
+                        )
+                    local_scores.append((score, unit))
+
+                local_tail = [
+                    unit
+                    for _, unit in sorted(
+                        local_scores,
+                        key=lambda item: (-item[0], min(units[item[1]])),
+                    )
+                ]
+                local_units = [lead] + local_tail
+
+            flattened = self._flatten_units(local_units, units)
+            for row in rows:
+                orders[row] = flattened
+
+        return orders
+
+    def _serialize_orders(self, texts, orders):
+        return [
+            "".join(texts[row][col] for col in orders[row])
+            for row in range(len(texts))
+        ]
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        # Do not mutate the caller's dataframe, including its index or values.
+        self.df = df
+        self.num_rows, self.num_cols = df.shape
+
+        if df.empty or df.shape[1] == 0:
+            return df.copy(), [[] for _ in range(len(df))]
+
+        columns = list(df.columns)
+        values = df.to_numpy(dtype=object, copy=True)
+        nrows, ncols = values.shape
+        texts = [
+            [self._cell_text(values[row, col]) for col in range(ncols)]
+            for row in range(nrows)
+        ]
+
+        units = self._make_units(columns, col_merge)
+        original_units = list(range(len(units)))
+
+        global_units = self._global_unit_order(texts, units, square_lengths=False)
+        global_units = self._apply_dependencies(
+            global_units, units, columns, one_way_dep
+        )
+
+        alternatives = []
+
+        original_order = self._flatten_units(original_units, units)
+        alternatives.append([original_order[:] for _ in range(nrows)])
+
+        global_order = self._flatten_units(global_units, units)
+        alternatives.append([global_order[:] for _ in range(nrows)])
+
+        # Keep candidate selection bounded on wide or very large input.
+        if len(units) <= 80 and nrows <= 20000:
+            conditional = self._conditional_orders(texts, units, global_units)
+            alternatives.append(conditional)
+
+        best_orders = alternatives[0]
+        best_score = -1
+        for candidate in alternatives:
+            serialized = self._serialize_orders(texts, candidate)
+            score = self._trie_score(serialized)
+            if score > best_score:
+                best_score = score
+                best_orders = candidate
+
+        # Sorting output rows is safe: row identity is retained in the index.
+        # It also remains compatible with sequential evaluators.
+        best_serialized = self._serialize_orders(texts, best_orders)
+        row_indices = sorted(range(nrows), key=lambda row: (best_serialized[row], row))
+
+        reordered_values = []
+        column_orderings = []
+        output_index = []
+        for row in row_indices:
+            order = best_orders[row]
+            reordered_values.append([values[row, col] for col in order])
+            column_orderings.append([columns[col] for col in order])
+            output_index.append(df.index[row])
+
+        # Columns are positional slots.  Per-row column_orderings records which
+        # source column occupies each slot and therefore supports row-specific
+        # valid permutations without altering any source value.
+        output = pd.DataFrame(
+            reordered_values,
+            index=output_index,
+            columns=columns,
+            dtype=object,
+        )
+
+        return output, column_orderings
+
+
+# EVOLVE-BLOCK-END

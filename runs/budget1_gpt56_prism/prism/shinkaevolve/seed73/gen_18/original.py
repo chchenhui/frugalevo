@@ -1,0 +1,204 @@
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """Place models to minimize the maximum memory-aware KVPR."""
+
+    def pressure(model):
+        return model.req_rate / model.slo
+
+    def kvpr(load, remaining):
+        return load / remaining if remaining > 0 else float("inf")
+
+    def objective(loads, remaining):
+        return max(kvpr(loads[gpu], remaining[gpu]) for gpu in range(gpu_num))
+
+    def build_greedy(ordered_models):
+        placement = {gpu: [] for gpu in range(gpu_num)}
+        remaining = [GPU_MEM_SIZE] * gpu_num
+        loads = [0.0] * gpu_num
+
+        for model in ordered_models:
+            model_pressure = pressure(model)
+            best_gpu = None
+            best_score = None
+
+            for gpu in range(gpu_num):
+                if model.model_size > remaining[gpu]:
+                    continue
+
+                candidate_load = loads[gpu] + model_pressure
+                candidate_remaining = remaining[gpu] - model.model_size
+                candidate_max = 0.0
+
+                for other in range(gpu_num):
+                    if other == gpu:
+                        value = kvpr(candidate_load, candidate_remaining)
+                    else:
+                        value = kvpr(loads[other], remaining[other])
+                    if value > candidate_max:
+                        candidate_max = value
+
+                score = (candidate_max, kvpr(candidate_load, candidate_remaining),
+                         -candidate_remaining)
+
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_gpu = gpu
+
+            if best_gpu is None:
+                return None
+
+            placement[best_gpu].append(model)
+            loads[best_gpu] += model_pressure
+            remaining[best_gpu] -= model.model_size
+
+        return placement, loads, remaining
+
+    if gpu_num <= 0:
+        if models:
+            raise ValueError("Unable to place models without GPUs.")
+        return {}
+
+    def criticality(model):
+        # KVPR the model would create if it were alone on a GPU.
+        remaining_after = GPU_MEM_SIZE - model.model_size
+        return pressure(model) / remaining_after if remaining_after > 0 else float("inf")
+
+    orders = [
+        sorted(models, key=lambda m: (pressure(m), m.model_size), reverse=True),
+        sorted(models, key=lambda m: (m.model_size, pressure(m)), reverse=True),
+        sorted(models, key=lambda m: (criticality(m), pressure(m), m.model_size),
+               reverse=True),
+        sorted(models, key=lambda m: (criticality(m), m.model_size, pressure(m)),
+               reverse=True),
+    ]
+
+    best_result = None
+    best_value = float("inf")
+
+    for ordered_models in orders:
+        result = build_greedy(ordered_models)
+        if result is None:
+            continue
+
+        placement, loads, remaining = result
+        value = objective(loads, remaining)
+        if value < best_value:
+            best_value = value
+            best_result = (placement, loads, remaining)
+
+    if best_result is None:
+        largest = max(models, key=lambda m: m.model_size)
+        raise ValueError(
+            f"Unable to place model of size {largest.model_size} GB on any GPU."
+        )
+
+    placement, loads, remaining = best_result
+
+    while True:
+        current_value = objective(loads, remaining)
+        best_change = None
+        best_value = current_value
+
+        # Find the best single-model relocation.
+        for source in range(gpu_num):
+            for model_index, model in enumerate(placement[source]):
+                model_pressure = pressure(model)
+
+                for target in range(gpu_num):
+                    if source == target or model.model_size > remaining[target]:
+                        continue
+
+                    candidate_loads = loads[:]
+                    candidate_remaining = remaining[:]
+                    candidate_loads[source] -= model_pressure
+                    candidate_remaining[source] += model.model_size
+                    candidate_loads[target] += model_pressure
+                    candidate_remaining[target] -= model.model_size
+                    value = objective(candidate_loads, candidate_remaining)
+
+                    if value < best_value - 1e-12:
+                        best_value = value
+                        best_change = (
+                            "move", source, model_index, target,
+                            candidate_loads, candidate_remaining
+                        )
+
+        if best_change is not None:
+            _, source, model_index, target, loads, remaining = best_change
+            model = placement[source].pop(model_index)
+            placement[target].append(model)
+            continue
+
+        # If no move helps, find the best memory-safe swap.
+        for left in range(gpu_num):
+            for right in range(left + 1, gpu_num):
+                for left_index, left_model in enumerate(placement[left]):
+                    for right_index, right_model in enumerate(placement[right]):
+                        new_left_remaining = (
+                            remaining[left] + left_model.model_size - right_model.model_size
+                        )
+                        new_right_remaining = (
+                            remaining[right] + right_model.model_size - left_model.model_size
+                        )
+
+                        if new_left_remaining < 0 or new_right_remaining < 0:
+                            continue
+
+                        candidate_loads = loads[:]
+                        candidate_remaining = remaining[:]
+                        candidate_loads[left] += (
+                            pressure(right_model) - pressure(left_model)
+                        )
+                        candidate_loads[right] += (
+                            pressure(left_model) - pressure(right_model)
+                        )
+                        candidate_remaining[left] = new_left_remaining
+                        candidate_remaining[right] = new_right_remaining
+                        value = objective(candidate_loads, candidate_remaining)
+
+                        if value < best_value - 1e-12:
+                            best_value = value
+                            best_change = (
+                                "swap", left, left_index, right, right_index,
+                                candidate_loads, candidate_remaining
+                            )
+
+        if best_change is None:
+            break
+
+        _, left, left_index, right, right_index, loads, remaining = best_change
+        left_model = placement[left][left_index]
+        right_model = placement[right][right_index]
+        placement[left][left_index] = right_model
+        placement[right][right_index] = left_model
+
+    return placement
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

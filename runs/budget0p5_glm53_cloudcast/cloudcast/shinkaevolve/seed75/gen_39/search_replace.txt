@@ -1,0 +1,117 @@
+<NAME>
+steiner_multicast_tree_with_sweep</NAME>
+<DESCRIPTION>
+The current program sends each destination independently along its shortest path, paying for shared edges multiple times (once per dst that uses them). The best prior program (total_cost 759.09 vs 1035.14) built a greedy Steiner multicast tree where edges shared between destinations are paid only once. We adopt that improved approach: grow a tree from src using multi-source Dijkstra from the current tree, attach the cheapest remaining destination, and record each tree edge once per partition per destination. Additionally, following the recommendation, we sweep a discount factor: attachment cost for already-shared edges is discounted (edge cost * (1 - discount)) so higher discounts push more traffic onto shared trunks; we build a tree for each discount in {0.0, 0.05, 0.1, 0.3, 0.5} and keep the tree with the lowest true incremental cost. This internal search is cheap (small graphs) and avoids any scoring-contract risk.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def _build_tree_with_discount(src, dsts, h, discount):
+    """
+    Greedy Steiner multicast tree rooted at src reaching all reachable dsts.
+    Edges already in the tree are discounted by `discount` when evaluating
+    candidate attachments, encouraging sharing. Returns (parent, reachable_dsts,
+    true_cost) where true_cost is the sum of unduplicated edge costs.
+    """
+    reachable_dsts = [d for d in dsts if d in h and nx.has_path(h, src, d)]
+    tree_nodes = {src}
+    parent = {}
+    tree_edges = set()
+    true_cost = 0.0
+    remaining = set(reachable_dsts)
+
+    while remaining:
+        # Build a shadow graph where tree edges are discounted.
+        h2 = h.copy()
+        for (u, v) in tree_edges:
+            if h2.has_edge(u, v):
+                h2[u][v]["cost"] = h[u][v]["cost"] * (1.0 - discount)
+        dist, paths_from = nx.multi_source_dijkstra(h2, tree_nodes, weight="cost")
+
+        best_dst = None
+        best_cost = float("inf")
+        best_path = None
+        for d in remaining:
+            c = dist.get(d, float("inf"))
+            if c < best_cost:
+                best_cost = c
+                best_dst = d
+                best_path = paths_from.get(d)
+
+        if best_dst is None or best_path is None:
+            break
+
+        for i in range(len(best_path) - 1):
+            s, t = best_path[i], best_path[i + 1]
+            if t not in tree_nodes:
+                tree_nodes.add(t)
+                parent[t] = s
+            if (s, t) not in tree_edges:
+                tree_edges.add((s, t))
+                true_cost += h[s][t]["cost"]
+        remaining.discard(best_dst)
+
+    return parent, reachable_dsts, true_cost
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    # Backfill unknown costs with a large finite penalty so shortest-path
+    # computations never crash on None and unknown links are deprioritized.
+    for u, v, d in h.edges(data=True):
+        if d.get("cost") is None:
+            h[u][v]["cost"] = 1e6
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Sweep discount values; keep the tree with lowest true incremental cost.
+    best = (None, None, float("inf"))
+    for discount in (0.0, 0.05, 0.1, 0.3, 0.5):
+        parent, reach, tcost = _build_tree_with_discount(src, dsts, h, discount)
+        if tcost < best[2]:
+            best = (parent, reach, tcost)
+    parent, reachable_dsts, _ = best
+
+    if parent is None:
+        parent, reachable_dsts, _ = _build_tree_with_discount(src, dsts, h, 0.0)
+
+    for dst in reachable_dsts:
+        # Reconstruct src -> dst chain from tree parents.
+        chain = []
+        node = dst
+        ok = True
+        while node != src:
+            p = parent.get(node)
+            if p is None:
+                ok = False
+                break
+            chain.append((p, node))
+            node = p
+        if not ok:
+            try:
+                path = nx.dijkstra_path(h, src, dst, weight="cost")
+                chain = [(path[i], path[i + 1]) for i in range(len(path) - 1)]
+                chain.reverse()
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+        for s, t in reversed(chain):
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

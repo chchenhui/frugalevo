@@ -1,0 +1,433 @@
+# EVOLVE-BLOCK-START
+#pragma GCC optimize("O3,unroll-loops")
+
+#include <bits/stdc++.h>
+using namespace std;
+
+static constexpr int MAXN = 40;
+static constexpr int MAXV = MAXN * MAXN;
+static constexpr int MAXL = 100000;
+
+static constexpr int DR[4] = {0, 1, 0, -1};
+static constexpr int DC[4] = {1, 0, -1, 0};
+static constexpr char OUTDIR[4] = {'R', 'D', 'L', 'U'};
+
+int N, V;
+int dirt[MAXV];
+int nxtCell[MAXV][4];
+int distAll[MAXV][MAXV];
+signed char firstDir[MAXV][MAXV];
+
+mt19937 rng((unsigned)chrono::high_resolution_clock::now().time_since_epoch().count());
+
+struct State {
+    vector<unsigned char> mv;
+    vector<short> pos;
+    long long cellTerm[MAXV];
+    long long numerator = (1LL << 62);
+    double score = 1e100;
+};
+
+inline int tri(long long x) {
+    return (int)(x * (x - 1) / 2);
+}
+
+inline long long tri64(long long x) {
+    return x * (x - 1) / 2;
+}
+
+inline int rndInt(int l, int r) {
+    return uniform_int_distribution<int>(l, r)(rng);
+}
+
+inline double rnd01() {
+    return uniform_real_distribution<double>(0.0, 1.0)(rng);
+}
+
+void buildGraph(const vector<string>& h, const vector<string>& vwall) {
+    V = N * N;
+    for (int id = 0; id < V; ++id) {
+        int r = id / N, c = id % N;
+        for (int d = 0; d < 4; ++d) nxtCell[id][d] = -1;
+
+        if (c + 1 < N && vwall[r][c] == '0') nxtCell[id][0] = id + 1;
+        if (r + 1 < N && h[r][c] == '0') nxtCell[id][1] = id + N;
+        if (c - 1 >= 0 && vwall[r][c - 1] == '0') nxtCell[id][2] = id - 1;
+        if (r - 1 >= 0 && h[r - 1][c] == '0') nxtCell[id][3] = id - N;
+    }
+}
+
+void buildAPSP() {
+    static int q[MAXV];
+
+    for (int s = 0; s < V; ++s) {
+        for (int t = 0; t < V; ++t) {
+            distAll[s][t] = -1;
+            firstDir[s][t] = -1;
+        }
+
+        int head = 0, tail = 0;
+        q[tail++] = s;
+        distAll[s][s] = 0;
+
+        while (head < tail) {
+            int x = q[head++];
+            for (int d = 0; d < 4; ++d) {
+                int y = nxtCell[x][d];
+                if (y < 0 || distAll[s][y] != -1) continue;
+                distAll[s][y] = distAll[s][x] + 1;
+                firstDir[s][y] = (x == s ? d : firstDir[s][x]);
+                q[tail++] = y;
+            }
+        }
+    }
+}
+
+inline void appendShortest(vector<unsigned char>& out, int from, int to) {
+    while (from != to) {
+        int d = firstDir[from][to];
+        out.push_back((unsigned char)d);
+        from = nxtCell[from][d];
+    }
+}
+
+bool evaluate(State& st) {
+    const int L = (int)st.mv.size();
+    if (L <= 0 || L > MAXL) {
+        st.score = 1e100;
+        return false;
+    }
+
+    st.pos.resize(L + 1);
+    st.pos[0] = 0;
+
+    static int firstSeen[MAXV];
+    static int lastSeen[MAXV];
+    static int seenCount[MAXV];
+
+    for (int i = 0; i < V; ++i) {
+        firstSeen[i] = -1;
+        lastSeen[i] = -1;
+        seenCount[i] = 0;
+        st.cellTerm[i] = 0;
+    }
+
+    seenCount[0] = 1;
+
+    int cur = 0;
+    for (int t = 1; t <= L; ++t) {
+        int d = st.mv[t - 1];
+        if (d < 0 || d >= 4) {
+            st.score = 1e100;
+            return false;
+        }
+        cur = nxtCell[cur][d];
+        if (cur < 0) {
+            st.score = 1e100;
+            return false;
+        }
+
+        st.pos[t] = (short)cur;
+        ++seenCount[cur];
+
+        if (firstSeen[cur] < 0) {
+            firstSeen[cur] = lastSeen[cur] = t;
+        } else {
+            long long gap = t - lastSeen[cur];
+            st.cellTerm[cur] += tri64(gap);
+            lastSeen[cur] = t;
+        }
+    }
+
+    if (cur != 0) {
+        st.score = 1e100;
+        return false;
+    }
+
+    long long total = 0;
+    for (int id = 0; id < V; ++id) {
+        if (seenCount[id] == 0 || firstSeen[id] < 0) {
+            st.score = 1e100;
+            return false;
+        }
+        long long cyclicGap = firstSeen[id] + L - lastSeen[id];
+        st.cellTerm[id] += tri64(cyclicGap);
+        total += (long long)dirt[id] * st.cellTerm[id];
+    }
+
+    st.numerator = total;
+    st.score = (double)total / L;
+    return true;
+}
+
+void buildInitialDFS(State& st) {
+    static bool used[MAXV];
+    fill(used, used + V, false);
+
+    function<void(int)> dfs = [&](int x) {
+        used[x] = true;
+
+        array<pair<int, int>, 4> cand;
+        int cnt = 0;
+        for (int d = 0; d < 4; ++d) {
+            int y = nxtCell[x][d];
+            if (y >= 0 && !used[y]) cand[cnt++] = {dirt[y], d};
+        }
+
+        // Visiting higher-dirt branches earlier tends to make their local
+        // traversal occur nearer the root's repeated returns.
+        sort(cand.begin(), cand.begin() + cnt,
+             [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        for (int k = 0; k < cnt; ++k) {
+            int d = cand[k].second;
+            int y = nxtCell[x][d];
+            if (used[y]) continue;
+            st.mv.push_back((unsigned char)d);
+            dfs(y);
+            st.mv.push_back((unsigned char)((d + 2) & 3));
+        }
+    };
+
+    dfs(0);
+}
+
+int chooseHotCell(const State& st, int topCount) {
+    static pair<long long, int> vals[MAXV];
+    for (int i = 0; i < V; ++i) {
+        vals[i] = {(long long)dirt[i] * st.cellTerm[i], i};
+    }
+
+    topCount = max(1, min(topCount, V));
+    nth_element(vals, vals + topCount, vals + V,
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+    return vals[rndInt(0, topCount - 1)].second;
+}
+
+bool insertWiggle(State& cand, const State& cur) {
+    int L = (int)cur.mv.size();
+    if (L + 2 > MAXL) return false;
+
+    int k = rndInt(0, L);
+    int p = cur.pos[k];
+
+    int dirs[4], cnt = 0;
+    for (int d = 0; d < 4; ++d) if (nxtCell[p][d] >= 0) dirs[cnt++] = d;
+    if (!cnt) return false;
+
+    int d = dirs[rndInt(0, cnt - 1)];
+    cand.mv.insert(cand.mv.begin() + k, {(unsigned char)d, (unsigned char)((d + 2) & 3)});
+    return true;
+}
+
+bool removeBacktrack(State& cand, const State& cur) {
+    int L = (int)cur.mv.size();
+    if (L < 2) return false;
+
+    for (int rep = 0; rep < 24; ++rep) {
+        int k = rndInt(0, L - 2);
+        if (cur.pos[k] == cur.pos[k + 2]) {
+            cand.mv.erase(cand.mv.begin() + k, cand.mv.begin() + k + 2);
+            return true;
+        }
+    }
+
+    for (int k = 0; k + 2 <= L; ++k) {
+        if (cur.pos[k] == cur.pos[k + 2]) {
+            cand.mv.erase(cand.mv.begin() + k, cand.mv.begin() + k + 2);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool shortcutSegment(State& cand, const State& cur) {
+    int L = (int)cur.mv.size();
+    if (L < 2) return false;
+
+    int a = rndInt(0, L - 1);
+    int maxLen = min(L - a, 20 + rndInt(0, 100));
+    int b = rndInt(a + 1, a + maxLen);
+
+    int x = cur.pos[a], y = cur.pos[b];
+    int nd = distAll[x][y];
+    if (nd >= b - a) return false;
+
+    vector<unsigned char> add;
+    add.reserve(nd);
+    appendShortest(add, x, y);
+
+    cand.mv.erase(cand.mv.begin() + a, cand.mv.begin() + b);
+    cand.mv.insert(cand.mv.begin() + a, add.begin(), add.end());
+    return true;
+}
+
+bool reverseClosedLoop(State& cand, const State& cur) {
+    int L = (int)cur.mv.size();
+    if (L < 2) return false;
+
+    int pivot = rndInt(0, L);
+    int cell = cur.pos[pivot];
+
+    int a = -1, b = -1;
+    for (int rep = 0; rep < 30; ++rep) {
+        int x = rndInt(0, L);
+        if (cur.pos[x] != cell) continue;
+        int y = rndInt(0, L);
+        if (cur.pos[y] != cell || x == y) continue;
+        a = min(x, y);
+        b = max(x, y);
+        break;
+    }
+    if (a < 0) return false;
+
+    reverse(cand.mv.begin() + a, cand.mv.begin() + b);
+    for (int i = a; i < b; ++i) cand.mv[i] = (cand.mv[i] + 2) & 3;
+    return true;
+}
+
+bool addTargetDetour(State& cand, const State& cur) {
+    int L = (int)cur.mv.size();
+    int target = chooseHotCell(cur, max(10, V / 10));
+
+    int bestK = -1;
+    int bestCost = INT_MAX;
+    int samples = min(40, L + 1);
+
+    for (int z = 0; z < samples; ++z) {
+        int k = rndInt(0, L);
+        int p = cur.pos[k];
+        int cost = (p == target ? 2 : 2 * distAll[p][target]);
+        if (cost < bestCost) {
+            bestCost = cost;
+            bestK = k;
+        }
+    }
+
+    if (bestK < 0 || L + bestCost > MAXL) return false;
+
+    int p = cur.pos[bestK];
+    if (p == target) {
+        int dirs[4], cnt = 0;
+        for (int d = 0; d < 4; ++d) if (nxtCell[p][d] >= 0) dirs[cnt++] = d;
+        if (!cnt) return false;
+        int d = dirs[rndInt(0, cnt - 1)];
+        cand.mv.insert(cand.mv.begin() + bestK,
+                       {(unsigned char)d, (unsigned char)((d + 2) & 3)});
+    } else {
+        vector<unsigned char> add;
+        add.reserve(bestCost);
+        appendShortest(add, p, target);
+        appendShortest(add, target, p);
+        cand.mv.insert(cand.mv.begin() + bestK, add.begin(), add.end());
+    }
+    return true;
+}
+
+bool routeViaTarget(State& cand, const State& cur) {
+    int L = (int)cur.mv.size();
+    if (L == 0) return false;
+
+    int target = chooseHotCell(cur, max(1, N));
+    int a = rndInt(0, L - 1);
+    int b = rndInt(a + 1, min(L, a + 25));
+
+    int x = cur.pos[a], y = cur.pos[b];
+    int newLen = distAll[x][target] + distAll[target][y];
+    if (L - (b - a) + newLen > MAXL) return false;
+
+    vector<unsigned char> add;
+    add.reserve(newLen);
+    appendShortest(add, x, target);
+    appendShortest(add, target, y);
+
+    cand.mv.erase(cand.mv.begin() + a, cand.mv.begin() + b);
+    cand.mv.insert(cand.mv.begin() + a, add.begin(), add.end());
+    return true;
+}
+
+int main(int argc, char** argv) {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    double timeLimit = 1.94;
+    if (argc >= 2) timeLimit = stod(argv[1]);
+
+    auto start = chrono::steady_clock::now();
+
+    cin >> N;
+    vector<string> h(N - 1), vwall(N);
+    for (int i = 0; i < N - 1; ++i) cin >> h[i];
+    for (int i = 0; i < N; ++i) cin >> vwall[i];
+
+    for (int r = 0; r < N; ++r) {
+        for (int c = 0; c < N; ++c) cin >> dirt[r * N + c];
+    }
+
+    buildGraph(h, vwall);
+    buildAPSP();
+
+    State current;
+    current.mv.reserve(MAXL);
+    buildInitialDFS(current);
+    evaluate(current);
+
+    State best = current;
+    State candidate;
+    candidate.mv.reserve(MAXL);
+
+    long long iterations = 0;
+
+    while (true) {
+        if ((++iterations & 127) == 0) {
+            double elapsed = chrono::duration<double>(chrono::steady_clock::now() - start).count();
+            if (elapsed >= timeLimit) break;
+        }
+
+        const int L = (int)current.mv.size();
+        candidate.mv = current.mv;
+
+        int roll = rndInt(0, 99);
+        bool changed = false;
+
+        if (roll < 17) {
+            if (L < 98000) changed = insertWiggle(candidate, current);
+        } else if (roll < 34) {
+            changed = removeBacktrack(candidate, current);
+        } else if (roll < 59) {
+            changed = shortcutSegment(candidate, current);
+        } else if (roll < 69) {
+            changed = reverseClosedLoop(candidate, current);
+        } else if (roll < 86) {
+            if (L < 97000) changed = addTargetDetour(candidate, current);
+        } else {
+            changed = routeViaTarget(candidate, current);
+        }
+
+        if (!changed) continue;
+        if (!evaluate(candidate)) continue;
+
+        double elapsed = chrono::duration<double>(chrono::steady_clock::now() - start).count();
+        double progress = min(1.0, elapsed / timeLimit);
+
+        // A broader early temperature permits target-detour and route-via-target
+        // moves to escape greedy local minima; it cools rapidly near the end.
+        double temp = 150000.0 * sqrt((double)N) * pow(0.00001, progress) + 0.05;
+        double delta = candidate.score - current.score;
+
+        bool accept = delta <= 0.0;
+        if (!accept) {
+            double prob = exp(-min(60.0, delta / temp));
+            accept = rnd01() < prob;
+        }
+
+        if (accept) current = std::move(candidate);
+
+        if (current.score < best.score) best = current;
+    }
+
+    for (unsigned char d : best.mv) cout << OUTDIR[d];
+    cout << '\n';
+    return 0;
+}
+# EVOLVE-BLOCK-END

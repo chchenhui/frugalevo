@@ -1,0 +1,110 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+try:
+    from scipy.optimize import minimize as _scipy_minimize
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of n points on or inside an equilateral triangle with
+    vertices (0,0), (1,0), (0.5, sqrt(3)/2) in order to maximize the area of the
+    smallest triangle formed by these points. Here n = 11.
+
+    Uses a deterministic multi-start smooth-softmin local optimization. Points are
+    parametrized as convex combinations of the triangle vertices (softmax weights),
+    guaranteeing feasibility. A hardcoded fallback configuration is returned if the
+    optimizer is unavailable or fails.
+
+    Returns:
+        points: np.ndarray of shape (11,2) with the x,y coordinates of the points.
+    """
+    n = 11
+    sqrt3 = np.sqrt(3.0)
+    V = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, sqrt3 / 2.0]])
+    area_T = sqrt3 / 4.0
+
+    from itertools import combinations
+    triples = list(combinations(range(n), 3))
+
+    def min_area(pts):
+        p = pts[triples]                     # (C,3,2)
+        cross = ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+                 - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
+        return 0.5 * np.min(np.abs(cross))
+
+    def unpack(theta):
+        W = theta.reshape(n, 3)
+        W = W - W.max(axis=1, keepdims=True)
+        E = np.exp(W)
+        W = E / E.sum(axis=1, keepdims=True)
+        return W @ V
+
+    def softmin_obj(theta, temp, k=20):
+        pts = unpack(theta)
+        p = pts[triples]
+        cross = ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+                 - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
+        a = 0.5 * np.abs(cross)
+        # top-k softmin: focus the smooth surrogate on the k binding
+        # (smallest-area) triples instead of diluting across all 165.
+        ak = np.partition(a, k)[:k]
+        amin = ak.min()
+        # smooth lower bound on min(a): -temp*log(sum(exp(-a/temp)))
+        return temp * np.log(np.sum(np.exp(-(ak - amin) / temp))) - amin
+
+    # Deterministic starting configurations
+    rng = np.random.default_rng(12345)
+    starts = []
+    # symmetric-ish start: vertices + edge points + interior points
+    base = np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.5, sqrt3 / 2.0],
+        [0.5, 0.0], [0.25, sqrt3 / 4.0], [0.75, sqrt3 / 4.0],
+        [0.25, sqrt3 / 12.0], [0.75, sqrt3 / 12.0],
+        [0.5, sqrt3 / 6.0], [0.125, sqrt3 / 8.0], [0.875, sqrt3 / 8.0],
+    ])
+    # convert to logits (approximate inverse-softmax), exact vertices via large logits
+    bary = np.array([
+        [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
+        [0.5, 0.5, 0.0], [0.5, 0.0, 0.5], [0.0, 0.5, 0.5],
+        [0.75, 0.25, 0.0], [0.25, 0.75, 0.0], [0.25, 0.25, 0.5],
+        [0.625, 0.125, 0.25], [0.125, 0.625, 0.25],
+    ])
+    starts.append(np.log(np.clip(bary, 1e-6, 1.0)).ravel())
+    for _ in range(3):
+        starts.append(rng.normal(scale=1.5, size=(n, 3)).ravel())
+
+    best_pts = base
+    best_val = min_area(base)
+
+    if _HAVE_SCIPY:
+        for s in starts:
+            theta = np.array(s, dtype=float)
+            try:
+                for temp in (1e-2 * area_T, 1e-3 * area_T, 1e-4 * area_T):
+                    res = _scipy_minimize(
+                        softmin_obj, theta, args=(temp,),
+                        method="Powell",
+                        options={"maxiter": 400, "xtol": 1e-6, "ftol": 1e-8},
+                    )
+                    if np.all(np.isfinite(res.x)):
+                        theta = res.x
+                pts = unpack(theta)
+                val = min_area(pts)
+                if val > best_val:
+                    best_val = val
+                    best_pts = pts
+            except Exception:
+                continue
+
+    # Final validity check (numerical safety)
+    best_pts = np.asarray(best_pts, dtype=float)
+    if best_pts.shape != (n, 2) or not np.all(np.isfinite(best_pts)):
+        best_pts = base
+    return best_pts
+
+
+# EVOLVE-BLOCK-END

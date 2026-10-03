@@ -1,0 +1,250 @@
+# EVOLVE-BLOCK-START
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <numeric>
+#include <random>
+#include <cmath>
+#include <chrono>
+#include <cstdint>
+
+using namespace std;
+
+static int M, N, L;
+static double eps;
+static mt19937 rng(
+    (unsigned)chrono::high_resolution_clock::now().time_since_epoch().count()
+);
+
+static vector<uint16_t> ged_codes;
+static vector<int> edge_counts;
+static bool use_ged = false;
+
+static inline int popcnt(uint16_t x) {
+    return __builtin_popcount((unsigned)x);
+}
+
+static inline int bit_index(int n, int a, int b) {
+    if (a > b) swap(a, b);
+    int idx = 0;
+    for (int i = 0; i < a; ++i) idx += n - i - 1;
+    return idx + (b - a - 1);
+}
+
+static uint16_t permuted_mask(uint16_t mask, const vector<int>& p, int n) {
+    uint16_t out = 0;
+    int k = 0;
+    for (int i = 0; i < n; ++i) {
+        for (int j = i + 1; j < n; ++j, ++k) {
+            int b = bit_index(n, p[i], p[j]);
+            if ((mask >> b) & 1U) out |= uint16_t(1U << k);
+        }
+    }
+    return out;
+}
+
+static bool isomorphic(uint16_t a, uint16_t b, int n) {
+    if (popcnt(a) != popcnt(b)) return false;
+    vector<int> p(n);
+    iota(p.begin(), p.end(), 0);
+    do {
+        if (permuted_mask(a, p, n) == b) return true;
+    } while (next_permutation(p.begin(), p.end()));
+    return false;
+}
+
+static int min_edit_distance(uint16_t query, uint16_t code, int n) {
+    vector<int> p(n);
+    iota(p.begin(), p.end(), 0);
+    int best = n * (n - 1) / 2;
+    do {
+        int d = popcnt(uint16_t(permuted_mask(query, p, n) ^ code));
+        if (d < best) best = d;
+        if (best == 0) break;
+    } while (next_permutation(p.begin(), p.end()));
+    return best;
+}
+
+static uint16_t string_to_mask(const string& s) {
+    uint16_t mask = 0;
+    for (int i = 0; i < (int)s.size(); ++i) {
+        if (s[i] == '1') mask |= uint16_t(1U << i);
+    }
+    return mask;
+}
+
+static string mask_to_string(uint16_t mask) {
+    string s(L, '0');
+    for (int i = 0; i < L; ++i) {
+        if ((mask >> i) & 1U) s[i] = '1';
+    }
+    return s;
+}
+
+static void build_ged_codes() {
+    ged_codes.clear();
+
+    if (N <= 5) {
+        const int total = 1 << L;
+        for (int mask = 0; mask < total && (int)ged_codes.size() < M; ++mask) {
+            bool duplicate = false;
+            for (uint16_t old : ged_codes) {
+                if (isomorphic((uint16_t)mask, old, N)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) ged_codes.push_back((uint16_t)mask);
+        }
+    } else {
+        uniform_int_distribution<int> dist(0, (1 << L) - 1);
+
+        ged_codes.push_back(0);
+        if ((int)ged_codes.size() < M) ged_codes.push_back((1 << L) - 1);
+
+        int attempts = 0;
+        while ((int)ged_codes.size() < M && attempts < 200000) {
+            ++attempts;
+            uint16_t cand = (uint16_t)dist(rng);
+            bool duplicate = false;
+            for (uint16_t old : ged_codes) {
+                if (isomorphic(cand, old, N)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) ged_codes.push_back(cand);
+        }
+
+        // Guaranteed fallback: scan masks if random sampling did not fill enough.
+        for (int mask = 0;
+             (int)ged_codes.size() < M && mask < (1 << L);
+             ++mask) {
+            bool duplicate = false;
+            for (uint16_t old : ged_codes) {
+                if (isomorphic((uint16_t)mask, old, N)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) ged_codes.push_back((uint16_t)mask);
+        }
+    }
+
+    while ((int)ged_codes.size() < M) ged_codes.push_back(0);
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    cin >> M >> eps;
+
+    int n_ged;
+    if (M <= 11) n_ged = 4;
+    else if (M <= 34) n_ged = 5;
+    else n_ged = 6;
+
+    // Retain the best-performing sizing heuristic from the current program.
+    constexpr double K_SEP = 2.5;
+    const double denom = (0.5 - eps) * (0.5 - eps);
+    double ideal_l = 0.0;
+    if (denom > 1e-15) {
+        ideal_l = K_SEP * K_SEP * (M - 1.0) * (M - 1.0)
+                * eps * (1.0 - eps) / denom;
+    } else {
+        ideal_l = 4950.0;
+    }
+
+    int n_ec = 4;
+    if (ideal_l > 1e-12) {
+        n_ec = (int)ceil((1.0 + sqrt(1.0 + 8.0 * ideal_l)) * 0.5);
+    }
+    n_ec = max(4, min(100, n_ec));
+
+    if (eps < 0.005) {
+        use_ged = true;
+        N = n_ged;
+    } else if (n_ec > n_ged) {
+        use_ged = false;
+        N = n_ec;
+    } else {
+        use_ged = true;
+        N = n_ged;
+    }
+
+    L = N * (N - 1) / 2;
+
+    cout << N << '\n';
+
+    if (use_ged) {
+        build_ged_codes();
+        for (int i = 0; i < M; ++i) {
+            cout << mask_to_string(ged_codes[i]) << '\n';
+        }
+    } else {
+        edge_counts.assign(M, 0);
+
+        for (int i = 0; i < M; ++i) {
+            edge_counts[i] = (int)llround((double)i * L / (M - 1.0));
+        }
+
+        for (int i = 1; i < M; ++i) {
+            edge_counts[i] = max(edge_counts[i], edge_counts[i - 1] + 1);
+        }
+        if (edge_counts.back() > L) {
+            int excess = edge_counts.back() - L;
+            for (int& x : edge_counts) x -= excess;
+        }
+
+        for (int i = 0; i < M; ++i) {
+            edge_counts[i] = max(0, min(L, edge_counts[i]));
+            string g(L, '0');
+            for (int j = 0; j < edge_counts[i]; ++j) g[j] = '1';
+            cout << g << '\n';
+        }
+    }
+
+    cout.flush();
+
+    for (int q = 0; q < 100; ++q) {
+        string h;
+        cin >> h;
+
+        int answer = 0;
+
+        if (use_ged) {
+            uint16_t hm = string_to_mask(h);
+            int best_dist = L + 1;
+
+            for (int i = 0; i < M; ++i) {
+                int d = min_edit_distance(hm, ged_codes[i], N);
+                if (d < best_dist) {
+                    best_dist = d;
+                    answer = i;
+                    if (d == 0) break;
+                }
+            }
+        } else {
+            int observed = (int)count(h.begin(), h.end(), '1');
+            double best_difference = 1e100;
+            const double slope = 1.0 - 2.0 * eps;
+
+            for (int i = 0; i < M; ++i) {
+                double expected = edge_counts[i] * slope + L * eps;
+                double d = abs(observed - expected);
+                if (d < best_difference) {
+                    best_difference = d;
+                    answer = i;
+                }
+            }
+        }
+
+        cout << answer << '\n';
+        cout.flush();
+    }
+
+    return 0;
+}
+# EVOLVE-BLOCK-END

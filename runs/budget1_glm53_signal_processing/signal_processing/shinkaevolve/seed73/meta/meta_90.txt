@@ -1,0 +1,641 @@
+# INDIVIDUAL PROGRAM SUMMARIES
+
+The following are summaries of individual programs evaluated since the last meta update:
+
+**Program Name: Sliding Window Weighted Moving Average Filter**
+- **Implementation**: Applies a per-sample loop with a sliding window; the "enhanced" variant uses exponentially decaying weights (normalized, emphasizing recent samples) over a simple moving average, with output length len(x) - W + 1.
+- **Performance**: Combined score 0.50 with correlation 0.84, noise reduction 0.33, high efficiency (1.00, 0.01s), but weak smoothness (0.08), high false reversals (175.40), and lag error of 0.38.
+- **Feedback**: The fixed exponential weighting is efficient and responsive (0.73) but barely smooths noise — likely over-weighting recent samples leaves residual noise causing false reversals. Improving adaptivity (e.g., noise-estimation-based weight adjustment) could raise noise reduction and smoothness without sacrificing speed.
+**Program Identifier:** Generation 0 - Patch Name initial_program - Correct Program: True
+
+**Program Name: Zero-Lag Dual EMA + Savitzky-Golay Hybrid Signal Filter**
+- **Implementation**: Cascades two zero-lag forward/backward EMA passes (alpha = 2/(W+1)) for noise suppression, then applies a centered Savitzky-Golay cubic fit (via pinv of the Vandermonde normal equations) over the smoothed signal, blending both stages 50/50; output is sliced from index `half` to match the original length contract of `n - W + 1`.
+- **Performance**: Scored 0.00 across all metrics (correlation 0, noise_reduction 0, slope_changes 100, false_reversals 50, lag_error 1, avg_error 1) with error "All test signals failed" — complete failure on every test signal.
+- **Feedback**: The slicing logic is broken: the interior slice `y[half:half+output_length]` yields length `n - 2*half`, which mismatches the promised `n - W + 1` contract (especially for even windows, where `n - W + 2`), and the even-window convolution centering branch is identical to the odd case, indicating unhandled alignment; the algorithm apparently raises errors or produces wrong-length outputs, so no validation test passes despite a structurally sound (though overly smoothed double-EMA cascade) design.
+**Program Identifier:** Generation 1 - Patch Name zerolag_dualpass_filter - Correct Program: False
+
+**Program Name: Zero-Phase Sliding Polynomial Filter with IRLS Robust Reweighting**
+- **Implementation**: Uses a sliding window that fits a degree-2 polynomial via least squares and evaluates at the window center (Savitzky-Golay style, zero phase delay); the "enhanced" variant adds one Huber-like IRLS reweighting pass with a weighted lstsq refit to downweight outliers.
+- **Performance**: Combined score 0.43 (composite 0.42), with correlation 0.61, noise reduction 0.26, lag error 0.55, avg error 0.67, and high slope changes (197.60) and false reversals (154.20), though efficiency is excellent (1.00, 0.09s execution).
+- **Feedback**: The zero-phase polynomial fit successfully avoids lag (efficiency and responsiveness 0.64 are strong), but the quadratic-only fit over-smooths locally while still leaving spurious reversals and slope changes — indicating the robustness pass and degree-2 trend model are insufficient to suppress high-frequency artifacts; noise reduction (0.26) and smoothness (0.09) are the weakest areas needing improvement.
+**Program Identifier:** Generation 2 - Patch Name zero_phase_poly_filter - Correct Program: True
+
+**Program Name: Adaptive Savitzky-Golay Filter with Trend Preservation**
+- **Implementation**: Builds Savitzky-Golay smoothing kernels via Vandermonde pseudo-inverse for centered (zero-phase) cubic polynomial fits, pads edges reflectively to preserve output length, estimates noise via MAD of first differences, and blends weak-slope regions toward an extra moving average to suppress spurious reversals.
+- **Performance**: Scored 0.00 with all tests failing ("All test signals failed"); correlation, noise reduction, and success rate are all 0.00, with avg_error and lag_error of 1.00.
+- **Feedback**: The program crashes during evaluation—most likely due to edge-padding logic (`x[-2 : n - half - 2 : -1]`) or kernel/convolution length mismatches on short signals—rather than merely filtering poorly. The adaptive blending adds complexity without validation that the output length/alignment matches what the test harness expects, so robustness fixes (safe padding, length checks) are needed before accuracy can even be assessed.
+**Program Identifier:** Generation 3 - Patch Name zero_phase_adaptive_kalman_filter - Correct Program: False
+
+**Program Name: Adaptive Kalman + Savitzky-Golay Trend-Preserving Signal Filter**
+- **Implementation**: Two-stage pipeline: (1) an innovation-adaptive 1D Kalman filter with [level, velocity] state that scales process noise based on normalized innovation squared (NIS), with robust MAD-based measurement noise estimation from first differences, followed by (2) Savitzky-Golay smoothing (order 2-3, odd window) and exponential-weighted windowed averaging biased toward recent samples to reduce lag. Maintains sliding-window output convention (length = len(x) - window_size + 1) with basic moving-average fallback.
+- **Performance**: Combined score of 0.58 with strong responsiveness (0.71), accuracy (0.78), and perfect efficiency (1.00, 0.03s execution), but weak noise reduction (0.33) and smoothness (0.33); 41.2 slope changes and 36.6 false reversals indicate over-responsiveness.
+- **Feedback**: The aggressive NIS-based process noise scaling (up to 10x q_base) makes the filter highly responsive but lets noise through, hurting smoothness and noise reduction scores. Reducing adaptive gain or strengthening the Savitzky-Golay stage could trade some of the excellent responsiveness (lag_error 0.41) for better noise suppression and fewer false slope reversals.
+**Program Identifier:** Generation 4 - Patch Name kalman_savgol_hybrid - Correct Program: True
+
+**Program Name: Adaptive Two-Pass Kalman Smoother with Trend Gating**
+- **Implementation**: Implements a local linear trend Kalman filter (state = [level, slope]) with forward filtering and a backward RTS smoothing pass to cancel phase lag, using robust MAD-based measurement noise estimation and volatility-scaled adaptive process noise. A slope-gating step zeroes small trend changes below a noise-scaled threshold and blends the gated trend reconstruction (0.4 weight) with the smoothed level (0.6 weight), then aligns output to window centers.
+- **Performance**: Achieved a combined score of 0.42 (composite 0.44) with efficiency 1.00, responsiveness 0.65, and execution time 0.05s, but weak accuracy (correlation 0.49, avg_error 0.79) and poor smoothness (0.08) with high slope changes (217.20) and false reversals (167.40).
+- **Feedback**: The RTS smoother's zero-lag design supports responsiveness (0.65), but the trend-gating threshold (0.25·σ) is too permissive, failing to suppress jitter and false reversals. The heavy blending of gated slopes with smoothed levels and possibly over-aggressive process noise tuning trade smoothness for tracking, leaving noise reduction at only 0.22 — future iterations should strengthen smoothing and noise suppression while maintaining lag cancellation.
+**Program Identifier:** Generation 5 - Patch Name adaptive_kalman_zero_lag_filter - Correct Program: True
+
+**Program Name: Robust Zero-Lag Weighted Linear Regression Filter**
+- **Implementation**: Two-pass sliding-window filter using exponential weights (e⁻²→e⁰, emphasizing recent samples) with a weighted local linear regression evaluated at the window's end (t=0) for zero trend lag, followed by a Huber-style reweighting pass (residuals >2σ downweighted by scale/|resid|) and refit at t=0; normal-equation sums (Sw, St, Stt) are precomputed outside the loop, with degenerate cases falling back to weighted means, plus a simple moving-average baseline.
+- **Performance**: Combined score 0.52 (composite 0.43) with excellent correlation (0.92), accuracy (0.92), responsiveness (0.77), and efficiency (1.00, 0.05s execution), but very poor smoothness (0.07), high false reversals (200.2) and slope changes (256.6), and only moderate noise reduction (0.47).
+- **Feedback**: The endpoint-anchored fit and recency weighting successfully eliminate trend lag (lag_error 0.30), but evaluating the regression at the window boundary is inherently high-variance and the per-window adaptive Huber weights create discontinuities between consecutive outputs, producing a jumpy signal with many false reversals; improving inter-window consistency or constraining the adaptive reweighting is the key path to a higher score.
+**Program Identifier:** Generation 6 - Patch Name robust_weighted_trend_regression - Correct Program: True
+
+**Program Name: Robust Zero-Lag Weighted Quadratic Filter with Huber Reweighting**
+
+- **Implementation**: Sliding-window exponentially-weighted local quadratic regression evaluated at the window's most recent sample (t=0) to eliminate phase lag, with a second Huber-style robust reweighting pass on outliers and a light 3-tap [0.25, 0.5, 0.25] post-smoothing to suppress false reversals.
+- **Performance**: Combined score 0.54 with correlation 0.94, noise reduction 0.57, lag error 0.29, but weak smoothness (0.11) and high slope changes (162.80) and false reversals (125).
+- **Feedback**: The zero-lag endpoint evaluation successfully achieves strong responsiveness (0.78) and accuracy (0.94), but the light post-smoothing is insufficient to control slope churn and false reversals, making smoothness the dominant weakness. The robust reweighting helps noise (0.57 reduction) yet quadratic fits may be overfitting noise-driven curvature within windows, causing excessive direction changes.
+**Program Identifier:** Generation 7 - Patch Name robust_quadratic_endpoint_filter - Correct Program: True
+
+**Program Name: Adaptive Kalman + Holt Double-Exponential Signal Filter**
+- **Implementation**: A three-stage pipeline: (1) a local-level+slope Kalman filter with innovation-adaptive measurement noise (EWMA of squared innovations) and Huber-style outlier downweighting, (2) a slope-gated Holt double-exponential smoother that reduces smoothing when trend strength is high, and (3) slope-gated reversal suppression using a median filter on gated slopes followed by reintegration. Process noise is scaled inversely with window_size, and output is window-aligned to length n − W + 1.
+- **Performance**: Combined score 0.53 with strong efficiency (1.00, 0.05s execution) and perfect success rate, correlation 0.83, responsiveness 0.70, but weak smoothness (0.16), poor noise reduction (0.33), high lag error (0.42), 103 slope changes, and 85.4 false reversals.
+- **Feedback**: The slope-gated reversal suppression stage failed to actually suppress reversals (85.4 false reversals), suggesting the gate threshold (0.5×slope-noise std) is too permissive and the median filter window (3) is too small. The aggressive Kalman gain plus trend-adaptive Holt smoothing preserves responsiveness at the cost of smoothness and noise reduction; tightening R adaptation bounds or strengthening the reversal gate would likely improve the combined score.
+**Program Identifier:** Generation 8 - Patch Name adaptive_kalman_double_smoothing - Correct Program: True
+
+**Program Name: Adaptive Kalman Signal Processing Pipeline for Non-Stationary Time Series**
+- **Implementation**: Uses a constant-velocity (level + slope) Kalman filter with online process-noise adaptation driven by squared innovation (EMA-based, forgetting factor 0.94), a MAD-based measurement-noise variance estimator, and a warmup stage (window-1 samples) before streaming outputs, preserving the len(x)-window+1 output contract.
+- **Performance**: Combined score 0.51 (composite 0.44), with excellent correlation (0.91), responsiveness (0.81), efficiency (1.00, 0.02s), and perfect success rate, but weak smoothness (0.06) and only 0.42 noise reduction.
+- **Feedback**: The adaptive Q expansion (tracking responsiveness) works well, but the filter is far too reactive: 304.80 slope changes and 247 false reversals indicate the output is noisy and wiggly rather than smooth; the process-noise adaptation inflates Q too aggressively on innovation excess, letting noise leak into the slope estimate. Future iterations should strengthen smoothing (larger forgetting factor, higher q_slope damping, or stronger innovation gating) to cut false reversals and slope changes while preserving the lag advantage (lag_error 0.23, avg_error 0.22).
+**Program Identifier:** Generation 9 - Patch Name adaptive_kalman_pipeline - Correct Program: True
+
+**Program Name: Adaptive Kalman Filter with Local Linear Trend Model**
+
+- **Implementation**: Causal Kalman filter with [level, slope] state and constant-velocity transition; initializes via warmup linear regression with MAD-based noise estimate, adapts measurement noise via EWMA of squared innovations, and temporarily boosts process noise (up to 50x, 250x for slope) when normalized squared innovation exceeds 4 to track genuine trend changes. Output is truncated to `n - window_size + 1` for alignment compatibility with the original sliding-window filter.
+
+- **Performance**: Combined score 0.49 (composite 0.45, overall 0.49) with correlation 0.80, noise reduction 0.32, efficiency 1.00, and fast execution (0.03s), but lag error 0.47, 216 slope changes, 168.8 false reversals, and poor smoothness (0.08).
+
+- **Feedback**: The adaptive-Q mechanism succeeds at responsiveness (0.68) and zero-phase tracking but over-amplifies noise: very high false reversals and low smoothness indicate the innovation-triggered Q boost is too permissive, letting noise-induced slope reversals through. To improve, the boost should be gated more conservatively (e.g., requiring sustained large innovations or using a smoother variance-adaptation scheme) to reduce reversals and lag error while preserving the strong correlation and efficiency.
+**Program Identifier:** Generation 10 - Patch Name adaptive_kalman_trend_filter - Correct Program: True
+
+**Program Name: Adaptive Kalman Filter with Holt Smoothing and Reversal Suppression**
+
+- **Implementation**: Implements a three-stage pipeline: a constant-velocity (level+slope) Kalman filter with innovation-adaptive measurement noise (EWMA) and Huber-style outlier downweighting, followed by slope-gated Holt double-exponential smoothing, and finally median-gated slope reintegration blended 70/30 with the level-anchored output, plus a fixed 2-step forward lag compensation using the Kalman slope. Process noise scales inversely with window_size, and output is sliced at index window_size−1 to align lengths.
+
+- **Performance**: Achieved a combined score of 0.50 with correlation 0.85, noise reduction only 0.30, very high slope changes (140.80) and false reversals (114.60), smoothness 0.12, lag error 0.37, but excellent efficiency (1.00, 0.05s) and success rate (1.00).
+
+- **Feedback**: The heavy lag-compensation and level-blending choices traded away smoothness and noise suppression for responsiveness (0.73), leaving the output under-smoothed with many residual slope fluctuations and false reversals — indicating the reversal-suppression gate and noise reduction stages are too weak relative to the aggressive forward extrapolation. Future iterations should strengthen smoothing/reversal gating (or reduce the +2-step slope extrapolation) to raise the smoothness/noise-reduction components of the score.
+**Program Identifier:** Generation 11 - Patch Name lag_comp_and_blend_reversal_fix - Correct Program: True
+
+**Program Name: Savitzky-Golay Zero-Phase Adaptive Filter with Noise-Scaled Trend Gating**
+- **Implementation**: Enhanced filter combines MAD-based noise estimation from first differences, Savitzky-Golay quadratic smoothing via reflection-padded convolution, forward/reverse passes for zero-phase smoothing, and slope-gating (threshold 0.3·σ) blended 50/50 with the smoothed path to suppress false reversals. A basic moving-average baseline and a `process_signal` dispatcher select between the two algorithms.
+- **Performance**: Complete failure — combined score 0.00 with all tests failing (correlation 0.00, noise reduction 0.00, avg_error 1.00, lag_error 1.00, 50 false reversals, 100 slope changes, success rate 0%).
+- **Feedback**: The error "All test signals failed" indicates a hard runtime/validity failure (e.g., output-length mismatch from the windowed slicing in `enhanced_filter_with_trend_preservation` or shape errors in the padding logic when n is small), not merely poor smoothing quality. The gating/cumsum reconstruction also introduces slope-quantization artifacts that could drive false reversals if edge cases in slicing or empty-output handling are what's crashing validation.
+**Program Identifier:** Generation 12 - Patch Name zerophase_sg_trendgate - Correct Program: False
+
+**Program Name: Zero-Lag Robust Local-Polynomial Filter with Trend-Lock Damping**
+- **Implementation**: Fits a recency-weighted, Huber-robust quadratic (3-iteration IRLS, normal equations) to each sliding window, evaluating at the window's leading edge to analytically remove group delay; a second pass applies EMA slope smoothing (β=0.55) with a 0.35-weighted level adjustment to damp spurious slope reversals.
+- **Performance**: Combined score 0.53 with strong correlation (0.93), noise reduction (0.59), responsiveness (0.84), and perfect efficiency/success (1.00 each, 0.11s runtime), but poor smoothness (0.06), high slope changes (337) and false reversals (268.4).
+- **Feedback**: The zero-lag leading-edge evaluation achieves excellent accuracy and responsiveness, but the aggressive lag-removal combined with only light slope damping leaves the output noisy with excessive directional flips; increasing smoothing strength or tightening the trend-lock mechanism would improve smoothness and reduce false reversals without sacrificing much lag advantage.
+**Program Identifier:** Generation 13 - Patch Name zlag_robls_trendlock - Correct Program: True
+
+**Program Name: Kalman-Prefiltered Robust Local Quadratic Smoothing Filter**
+- **Implementation**: A three-stage pipeline — innovation-adaptive constant-velocity Kalman pre-filter (MAD-based noise estimation), followed by exponentially-weighted local quadratic regression evaluated at the window end (zero phase lag), plus two IRLS Huber reweighting passes and a light 5-tap binomial post-smoothing pass.
+- **Performance**: Achieved combined score 0.57 with correlation 0.89, noise reduction 0.38, lag error 0.39, smoothness 0.21, false reversals 60.4, and execution time 0.13s (efficiency 1.0).
+- **Feedback**: The endpoint-evaluated quadratic fit and adaptive process noise deliver good responsiveness (0.72) and accuracy (0.89) with minimal lag, but heavy smoothing is insufficient — high false reversals (60.4) and low smoothness (0.21) suggest the post-smoothing pass is too weak and trend tracking overreacts to residual noise.
+**Program Identifier:** Generation 15 - Patch Name kalman_prefilter_robust_quadratic - Correct Program: True
+
+**Program Name: Adaptive Kalman + Savitzky-Golay Trend-Preserving Filter**
+- **Implementation**: Two-stage pipeline: an innovation-adaptive 1D Kalman filter (level+velocity state, NIS-scaled process noise) for low-lag noise reduction, followed by Savitzky-Golay polynomial smoothing, an exponentially-weighted (front-loaded) convolution for output convention, and a final slope-consistency pass that snaps noise-level steps toward a 5-tap running median.
+- **Performance**: Combined score 0.58 (composite 0.56); strong responsiveness (0.71), efficiency (1.00), correlation (0.78), and accuracy (0.78), but weak noise reduction (0.33), smoothness (0.33), high slope changes (41), false reversals (36.4), and moderate lag error (0.41).
+- **Feedback**: The adaptive Kalman design achieves good tracking and near-zero lag, but the heavy smoothing stages under-remove noise and the many residual slope changes/false reversals indicate over-segmentation of noise-level fluctuations; tuning the median-snapping threshold and SG window could trade some responsiveness for better smoothness and noise reduction.
+**Program Identifier:** Generation 16 - Patch Name vectorize_window_median_snap - Correct Program: True
+
+**Program Name: Adaptive Kalman + Robust Local Quadratic Filter**
+
+- **Implementation**: Combines an innovation-adaptive constant-velocity Kalman pre-filter (MAD-based noise estimation, NIS-driven process noise expansion) with exponentially-weighted local quadratic regression evaluated at each window's most recent sample (zero trend lag), plus Huber-style reweighting and a light 3-tap smoothing pass.
+
+- **Performance**: Achieved a combined score of 0.54 (correlation 0.93, noise reduction 0.50, efficiency 1.00, execution time 0.06s, 100% success rate).
+
+- **Feedback**: Strong accuracy, efficiency, and responsiveness (0.75), but weak smoothness (0.14) with high false reversals (99.40) and slope changes (127.60) suggest the adaptive responsiveness comes at the cost of output stability; future iterations should prioritize smoother dynamics, likely by strengthening the post-smoothing or dampening the Kalman's aggressive innovation response.
+**Program Identifier:** Generation 17 - Patch Name kalman_prefilter_before_robust_quad - Correct Program: True
+
+**Program Name: Kalman-Holt Adaptive Filter with Slope-Gated Reversal Suppression**
+- **Implementation**: Three-stage pipeline: (1) a constant-velocity (level+slope) Kalman filter with process noise scaled by 1/window_size, EWMA-adaptive measurement noise clipped to [0.1R, 10R], and Huber-style R-inflation when Mahalanobis² > 9; (2) a Holt double-exponential smoother with trend-adaptive alpha (0.6 minus 0.4×trend_strength, floored at 0.2); (3) a 5-tap median-gated slope reintegration blended 0.7/0.3 with Holt levels to avoid integrator drift, plus 2-step forward extrapolation along the Kalman slope for lag compensation, with output window-aligned as y_full[W-1:].
+- **Performance**: Combined score 0.50 (composite 0.45), with strong accuracy (0.85), correlation (0.85), responsiveness (0.73), perfect efficiency (1.00 at 0.05s) and 100% success rate, but weak smoothness (0.12), low noise reduction (0.30), and high false reversals (116.80) and slope changes (143.20), with lag_error 0.38 and avg_error 0.44.
+- **Feedback**: The responsiveness-oriented choices (light base smoothing, aggressive 2-step lag extrapolation, and R-inflation for outliers) preserved signal dynamics but let noise pass through, explaining the very low smoothness and noise-reduction scores. Notably, the median gating condition (`abs(slope - med) < gate`) only replaces slopes already near the median, so extreme noise-induced slope spikes pass through unchanged—driving the high false_reversals/slope_changes; inverting the gate to catch large deviations and increasing smoothing strength would trade a little lag for substantial smoothness and noise-reduction gains.
+**Program Identifier:** Generation 18 - Patch Name anchor_reintegration_and_lag_compensation - Correct Program: True
+
+**Program Name: Adaptive Kalman + Holt Smoother with Slope-Gated Reversal Suppression**
+- **Implementation**: A three-stage pipeline: (1) a local-level-plus-slope Kalman filter with NIS-driven adaptive process noise (capped at 3x) and Huber-style outlier downweighting, (2) slope-gated Holt double-exponential smoothing that reduces smoothing during strong trends, and (3) median-filtered slope gating with reintegration to suppress false reversals. Process noise is inversely scaled by window_size, with output extracted from index window_size-1 onward.
+- **Performance**: Combined score 0.53 (composite 0.47) with correlation 0.85, noise reduction 0.38, avg_error 0.46, lag_error 0.43, but weak smoothness (0.15) and high false_reversals (93.20) / slope_changes (114.20); efficiency is excellent (1.00, 0.05s execution).
+- **Feedback**: The Kalman stage's responsiveness and efficiency are strengths, but the slope-gated reversal suppression fails to adequately smooth the output, leaving excessive slope churn and false reversals that drag down the composite score. Future iterations should strengthen Stage 3 gating or increase smoothing aggressiveness to trade a bit of responsiveness for much better smoothness and noise reduction.
+**Program Identifier:** Generation 20 - Patch Name nis_capped_adaptive_q - Correct Program: True
+
+**Program Name: Zero-Lag Robust Local-Polynomial Filter with Trend-Lock Damping**
+- **Implementation**: Per-window quadratic fit evaluated at the leading edge with IRLS Huber reweighting and exponential recency weights, followed by slope EMA trend-lock adjustment, a two-sided hysteresis reversal gate (MAD-based threshold, 2-window persistence), and a final 75/25 blend of the zero-lag level with a gated-slope-reconstructed level.
+- **Performance**: Combined score 0.30 with poor correlation (0.25), zero noise reduction, high lag error (10.47) and avg error (5.28), 328 slope changes with 260 false reversals, and very low smoothness (0.06) and responsiveness (0.09); execution was fast (0.11s) and 100% successful.
+- **Feedback**: Despite the elaborate three-pass trend-lock/hysteresis machinery, the filter fails at its core goals—noise reduction and false-reversal suppression—likely because the gated slope reconstruction amplifies residual slope noise while the quadratic leading-edge fit is unstable under heavy noise and the random-walk test component. The complexity added (gates, blending) worsened rather than improved accuracy, suggesting simpler, better-validated smoothing of the level estimate would outperform this design.
+**Program Identifier:** Generation 21 - Patch Name hysteresis_reversal_gate - Correct Program: True
+
+**Program Name: Capped-Q Kalman Filter with Trend-Lock Hysteresis**
+
+- **Implementation**: A constant-velocity 2-state (level, slope) Kalman filter with innovation-adaptive process noise capped at 4× baseline Q (via NIS-based multiplier in [1,4]), MAD-based measurement variance estimation from first differences, quiet-regime velocity shrinkage toward a slope EMA, trend-lock hysteresis rejecting insignificant slope sign flips (threshold scaled by online slope variance), and a light symmetric 3-tap post-smoother. The "basic" fallback path is a simple cumulative-sum moving average.
+
+- **Performance**: Combined score 0.53 (composite 0.48), with correlation 0.90, noise reduction 0.34, accuracy 0.90, responsiveness 0.74, and efficiency 1.00 (10 ms execution), but weak smoothness (0.14), 126 slope changes, 99.8 false reversals, and lag error 0.35.
+
+- **Feedback**: The capped adaptive Q successfully preserves tracking responsiveness and correlation, but the hysteresis/trend-lock machinery fails its intended purpose — false reversals remain very high (~100) and smoothness is poor, suggesting the slope significance threshold is too permissive and the velocity state still chatters. Next steps should focus on stronger slope suppression (higher lock factor, heavier shrinkage, or explicit regime detection) rather than further Q tuning, since lag and accuracy are already acceptable.
+**Program Identifier:** Generation 14 - Patch Name capped_nis_kalman_trendlock - Correct Program: True
+
+**Program Name: Robust EW Quadratic Regression with Slope-Gated Reversal Suppression**
+- **Implementation**: Fits exponentially-weighted local quadratic regression per window, evaluated at the window's most recent sample (t=0) for zero phase lag, with Huber-style reweighting for outliers, median-gated slope reintegration (75/25 blend with level-anchored fit), 3-tap smoothing, and forward extrapolation along the fitted slope.
+- **Performance**: Combined score 0.50 with strong accuracy (correlation 0.92, efficiency 1.00, responsiveness 0.75) but weak smoothness (0.09), high slope changes (198.20), and 153 false reversals; lag error 0.33 and noise reduction only 0.23.
+- **Feedback**: The zero-lag endpoint evaluation and lag compensation boost responsiveness and accuracy, but aggressive forward extrapolation (adding full fitted slope b) amplifies noise and creates many spurious slope flips, undermining the reversal-suppression stage. Future work should soften the extrapolation and strengthen the slope gating to reduce false reversals and improve smoothness.
+**Program Identifier:** Generation 19 - Patch Name hybrid_quadfit_kalman_gate - Correct Program: True
+
+**Program Name: Weighted Local-Linear Trend Filter with Robust Reweighting**
+- **Implementation**: Enhanced filter fits an exponentially-weighted local linear trend per window evaluated at the window edge (t=0) for near-zero lag, fully vectorized via `np.convolve` for running weighted sums, followed by a targeted robust-reweighting pass (Huber-like downweighting) only on windows whose weighted RMS residual exceeds 2× the global median, plus a final MAD-thresholded pass that blends sub-noise output steps 50/50 toward a 3-tap running median.
+- **Performance**: Combined score 0.52 with strong accuracy (correlation 0.92, accuracy 0.92), perfect efficiency (1.00, execution_time ~0 due to convolution vectorization), decent responsiveness (0.76, lag_error 0.31), but weak smoothness (0.08) and only moderate noise reduction (0.46), with 245.6 slope changes and 192.6 false reversals remaining.
+- **Feedback**: The accuracy-first design choices (edge-evaluated trend fit, gentle 50% median blending, targeted-only reweighting) successfully preserve signal dynamics and lag, but leave substantial high-frequency churn that tanks the smoothness component. The main improvement lever is strengthening the sub-noise smoothing/snap step to cut false reversals without sacrificing the achieved low lag and high correlation.
+**Program Identifier:** Generation 22 - Patch Name vectorize_wls_with_slope_consistency_snap - Correct Program: True
+
+**Program Name: Adaptive Kalman Filter with Innovation-Driven Process Noise**
+- **Implementation**: A constant-velocity (level+slope) Kalman filter adapts process noise Q via an EMA of squared innovations (expanding Q on large innovations, collapsing otherwise), preceded by a MAD-based measurement-variance estimator, warmup over window-1 samples, and zero-phase post-conditioning (two binomial 3-tap smoother passes plus slope-gated 5-tap running-median snapping). The `enhanced_filter_with_trend_preservation` entry point routes to this Kalman pipeline, while `adaptive_filter` retains a simple moving-average baseline.
+- **Performance**: Combined score 0.00 with 100 slope changes, lag_error 1.00, avg_error 1.00, 50 false reversals, 0.00 correlation and noise reduction — all test signals failed (success_rate 0.00).
+- **Feedback**: The program is incorrect and does not pass validation; the uniform failure across all signals suggests a runtime exception or shape/value error in the evolved block (e.g., in the post-conditioning median-snap logic or the unconventional covariance update `IKH @ P @ IKH.T`, which lacks the R-correcting Joseph term), rather than mere accuracy loss. The reported lag_error and avg_error of 1.00 with 0.00 correlation indicate the filter effectively produced no usable output, so the adaptive-Q and post-smoothing design could not demonstrate its intended lag/smoothness tradeoff.
+**Program Identifier:** Generation 23 - Patch Name post_smoothing_median_snap - Correct Program: False
+
+**Program Name: Recency-Weighted Quadratic Filter with Trend-Lock Slope Damping**
+- **Implementation**: Sliding-window local quadratic fit (Savitzky-Golay style) with exponential recency weights (exp decay of 1.5 over window), evaluated at the window's leading edge for zero analytical group delay, followed by EMA-based slope damping (β=0.55) with a mild 0.35 level correction to suppress spurious reversals; normal equations matrix is precomputed once for efficiency.
+- **Performance**: Combined score of 0.52 with high correlation (0.92), efficiency (1.00), and responsiveness (0.77), but weak smoothness (0.07) and moderate noise reduction (0.44), with 228 false reversals and 285.8 slope changes indicating substantial slope churn remains.
+- **Feedback**: The leading-edge evaluation successfully minimizes lag (0.29) and preserves accuracy, but the aggressive recency weighting trades away noise suppression and smoothness; a stronger slope-damping factor or smoother level estimation could reduce false reversals and improve the smoothness score without sacrificing much responsiveness.
+**Program Identifier:** Generation 25 - Patch Name recency_weighted_sg_leading_edge - Correct Program: True
+
+**Program Name: Adaptive Kalman + Savitzky-Golay Trend-Preserving Filter**
+- **Implementation**: Three-stage pipeline: (1) a 1D constant-velocity Kalman filter with innovation-adaptive process noise (NIS-scaled Q) and robust MAD-based measurement noise estimation, (2) Savitzky-Golay smoothing (order-2, enlarged 2W−1 window) for trend/slope preservation, (3) exponential recency-weighted convolution for lag compensation plus a 5-tap running-median snap pass that pulls noise-level steps toward the local median.
+- **Performance**: Combined score of 0.62 with strong correlation (0.80), efficiency (1.00), and responsiveness (0.71), but weak noise reduction (0.34), smoothness (0.40), and high false reversals (26.40) and slope changes (30.20); lag error 0.41, avg error 0.51, execution time 0.03s.
+- **Feedback**: The lag-compensation and responsiveness mechanisms (adaptive Q, recency weighting) work well, but the aggressive smoothing cascade fails to eliminate noise-induced slope reversals, and noise reduction is only 34%. Future iterations should strengthen smoothing (e.g., larger effective window or higher-order median filtering) while keeping the lag compensation, since false reversals and smoothness are the primary score drags.
+**Program Identifier:** Generation 26 - Patch Name sg_lower_order_larger_window - Correct Program: True
+
+**Program Name: Adaptive Weighted Regression Filter with Median Snapping**
+- **Implementation**: Uses exponentially-weighted local linear regression computed vectorized via `np.convolve` (weighted trend fits evaluated at window start), preceded by a 5-tap median pre-snap of noise-sized deviations on the raw input, followed by a targeted robust reweighting pass on high-residual windows and a final 3-tap median snap of sub-noise output steps for slope consistency.
+- **Performance**: Achieved a combined score of 0.54 with correlation 0.92, noise reduction 0.50, responsiveness 0.76, and perfect efficiency (execution_time 0.00, success_rate 1.00), but smoothness_score was very low (0.10) with high slope_changes (177.2) and false_reversals (134.6).
+- **Feedback**: The convolution-based weighted regression and robust reweighting deliver strong accuracy, correlation, and speed, but the output remains too noisy at fine scale — the 3-tap median snap with a 0.5σ threshold is too conservative to suppress directional churn, as reflected by poor smoothness and many false reversals. A stronger post-smoothing or more aggressive snap threshold (or larger effective window weighting) would likely raise the combined score by cutting slope changes without sacrificing much of the 0.92 correlation.
+**Program Identifier:** Generation 27 - Patch Name pre_convolution_median_snap - Correct Program: True
+
+**Program Name: Adaptive Multi-Stage Sliding Window Filter with Trend Preservation**
+- **Implementation**: A weighted (exponentially recency-weighted) linear regression filter evaluated at the window's last sample for zero phase delay, preceded by a 5-tap median noise-snap on raw input, followed by a Savitzky-Golay quadratic smoothing stage (blended 0.6/0.4), targeted robust reweighting on poorly-fit windows, and a final 3-tap median slope-consistency snap — all vectorized via precomputed convolution kernels.
+- **Performance**: Combined score 0.47 with perfect efficiency (1.00) and success rate, strong responsiveness (0.68) and accuracy/correlation (0.64), but weak smoothness (0.12) and low noise reduction (0.33), plus high false reversals (115.20) and slope changes (144.20).
+- **Feedback**: The zero-lag endpoint evaluation and multiple smoothing stages successfully keep lag error low (0.47) and responsiveness high, but the aggressive noise-snapping and blending still leave sub-noise churn, yielding many false reversals and poor smoothness — further smoothing (or stricter snap thresholds) at the cost of some responsiveness would likely improve the combined score.
+**Program Identifier:** Generation 28 - Patch Name sg_second_order_stage_with_recency_reweighting - Correct Program: True
+
+**Program Name: Capped-Q Adaptive Kalman with Trend-Lock and Median-Snap**
+- **Implementation**: A constant-velocity Kalman pre-filter with NIS-adaptive process noise (capped at ~4x baseline Q) feeds a weighted local quadratic regression evaluated at the window end (zero trend lag), followed by Huber-style robust reweighting, a locally-adaptive median-snap on output diffs using rolling MAD, and a light 3-tap post-smoother.
+- **Performance**: Combined score 0.54 with correlation 0.93, noise reduction 0.47, efficiency 1.00, but suffers 126.8 slope changes, 98.6 false reversals, and a low smoothness score of 0.14.
+- **Feedback**: The multi-stage anti-churn machinery (capped Q, trend-lock, median-snap, post-smoothing) did not prevent high slope churn and false reversals, suggesting the trend-lock hysteresis described in the docstring is not actually implemented — only the median-snap is present in the code. Strong responsiveness (0.71) and accuracy (0.93) with modest lag (0.40) indicate the zero-lag window-end quadratic fit works well; the main gap is residual output jitter that the post-smoothing stages insufficiently suppress.
+**Program Identifier:** Generation 30 - Patch Name kalman_quad_adaptive_mediansnap - Correct Program: True
+
+**Program Name: Recency-Weighted Savitzky-Golay Adaptive Signal Filter**
+- **Implementation**: Uses a quadratic Savitzky-Golay fit over an odd window (2×window_size−1) with exponential recency weighting (steepness e^−1.5) and weighted least-squares to evaluate the polynomial at the newest sample, with edge handling via reflection padding and `np.convolve` in "valid" mode; despite the docstring claiming a Kalman/Holt approach, the actual evolved code is a single-pass weighted SG filter.
+- **Performance**: Achieves combined score 0.34 (composite 0.40), with excellent efficiency (1.00, ~0s execution) but poor accuracy metrics — correlation 0.37, noise_reduction 0.00, lag_error 0.70, false_reversals 365.20, slope_changes 441.60, and smoothness 0.04.
+- **Feedback**: The recency-weighting and end-point evaluation successfully avoid group-delay lag in principle, but the wide filter window (2W−1 = 39 samples) fails to suppress noise (0% reduction), suggesting the recency tilt is too aggressive and the kernel effectively behaves like a near-causal filter with poor smoothing; reducing false reversals and slope-change counts would require a stronger low-pass component (smoother weighting or higher poly-order/longer effective smoothing) at the cost of the currently-good responsiveness (0.59).
+**Program Identifier:** Generation 32 - Patch Name recency_weighted_sg_filter - Correct Program: True
+
+**Program Name: Zero-Phase Dual Kalman Filter with Trend-Lock State Machine**
+- **Implementation**: Runs a capped-Q innovation-adaptive constant-velocity Kalman filter forward and backward over the batch, blends them (0.55/0.45) for zero-phase tracking, then applies a MAD-threshold slope-significance trend-lock, 3-tap median slope filtering, slope reintegration blended with levels, and 3-tap binomial smoothing; output is sliced to `len(x) - window_size + 1`.
+- **Performance**: Combined score of 0.0 — the program is incorrect and fails validation tests.
+- **Feedback**: Despite sophisticated architecture, the algorithm fails basic validation; likely culprits include the complex per-sample Python loops (O(n) loops with potential numerical drift), the heuristic trend-lock damping/anchoring logic distorting levels, or output contract violations on edge cases (e.g., n == window_size). The simpler cumulative-sum moving average fallback (`adaptive_filter`) suggests the enhanced path may not match expected filtering behavior on test signals.
+**Program Identifier:** Generation 24 - Patch Name zerophase_dualkalman_trendlock - Correct Program: False
+
+**Program Name: Adaptive Kalman + Robust Local Quadratic Filter**
+- **Implementation**: A three-stage pipeline: an innovation-adaptive constant-velocity Kalman pre-filter (MAD-based noise estimation, capped dynamic Q inflation), followed by exponentially-weighted local quadratic regression evaluated at the window's last sample (zero phase lag) with two IRLS Huber reweighting passes, and a final 7-tap binomial smoothing pass with edge padding.
+- **Performance**: Combined score of 0.0 — the program is incorrect and does not pass all validation tests.
+- **Feedback**: The elaborate multi-stage design (adaptive Kalman + robust IRLS quadratic fit + post-smoothing) failed validation entirely, suggesting a bug or incompatibility with expected interface/output semantics rather than mere quality issues. Likely culprits include the complexity of the stacked stages introducing edge-case failures, or output length/alignment mismatches versus what the test harness expects.
+**Program Identifier:** Generation 29 - Patch Name cap_nis_q_and_stronger_postsmooth - Correct Program: False
+
+**Program Name: Capped-NIS Adaptive Kalman Filter with Slope Gating Pipeline**
+- **Implementation**: Five-stage pipeline: constant-velocity Kalman filter with innovation-adaptive process noise (NIS multiplier capped at 4x), median-based slope gating to suppress false sign reversals, Savitzky-Golay polynomial smoothing (graceful fallback to no smoothing if scipy unavailable), exponentially-weighted window aggregation to meet the output length contract, and 1.5x forward slope extrapolation for lag compensation. Measurement noise is estimated robustly via median absolute deviation of first differences.
+- **Performance**: Combined score of 0.42 (composite 0.44) with excellent efficiency (1.00, 0.03s execution) and success rate (1.00), but weak accuracy (correlation 0.53, avg_error 1.63), high lag_error of 2.32, 88 slope changes, 71.60 false reversals, and near-zero noise reduction (0.00).
+- **Feedback**: The capped adaptive process noise and slope gating were designed to reduce false reversals but appear ineffective in practice (71.6 false reversals), suggesting the cap is too tight for genuine turns while insufficiently suppressing noise-induced flips. The near-zero noise reduction and low smoothness score (0.19) indicate the multi-stage pipeline is adding lag (2.32) without adequately attenuating noise, likely due to the Kalman measurement noise estimate and aggressive forward extrapolation overcompensating and amplifying residual noise into the output.
+**Program Identifier:** Generation 31 - Patch Name capped_nis_kalman_sg - Correct Program: True
+
+**Program Name: Median-Snap Double Filter with Exponential Convolution**
+- **Implementation**: Applies a 5-tap noise-scaled median "snap" before and after a zero-phase exponential convolution (forward+backward EMA pass with alpha = 2/(window_length+1)), quantizing only noise-sized deviations to the local median while preserving trends.
+- **Performance**: Combined score of 0.0; the program is incorrect and fails all validation tests, primarily because `filter_signal` is defined but `run_signal_processing` calls an undefined `process_signal` function, causing a NameError.
+- **Feedback**: The core filtering logic (median snap + zero-phase EMA) is conceptually sound, but the integration is broken — the harness expects a `process_signal` entry point, and the assumed `window_size - 1` delay alignment is inconsistent with the filter's zero-phase design. Fixing the function name and delay handling should recover functionality.
+**Program Identifier:** Generation 33 - Patch Name dual_median_snap_prefilter - Correct Program: False
+
+**Program Name: Adaptive Kalman + Robust Zero-Lag Quadratic Regression Filter**
+- **Implementation**: Three-stage pipeline: (1) a constant-velocity Kalman pre-filter with MAD-based noise estimation and innovation-gated (NIS > 1) process noise that instantly expands Q for genuine dynamics, (2) exponentially-weighted local quadratic regression (Huber/IRLS reweighting, up to 3 fits per window) evaluated at the window's last sample (t=0) for zero phase lag, and (3) a light 5-tap binomial post-smoothing pass.
+- **Performance**: Combined score 0.56 (composite 0.47) with strong correlation (0.94), accuracy (0.94), responsiveness (0.75), and perfect efficiency (1.00, 0.13s), but weak smoothness (0.16), high slope changes (108.20) and false reversals (85.20), with lag_error 0.33 and avg_error 0.32.
+- **Feedback**: The zero-lag design (slope-state extrapolation + edge-evaluated quadratic fit plus NIS-adaptive Q) successfully preserves signal dynamics and accuracy, but this aggressive responsiveness lets noise pass through—manifesting as many spurious slope changes and reversals. The light binomial post-smoother is insufficient to fix this; improving smoothness (e.g., stronger reversal suppression or a responsiveness/smoothness trade-off in the adaptive Q gating) is the clearest path to a higher combined score without sacrificing the excellent lag and correlation results.
+**Program Identifier:** Generation 34 - Patch Name restore_5tap_binomial_robust_irls - Correct Program: True
+
+**Program Name: Kalman+RTS Smoother with Local Robust Slope Gating**
+- **Implementation**: Runs a constant-velocity Kalman filter (with innovation-adaptive R and Huber-style outlier robustification) followed by an RTS backward smoothing pass, then gates sign flips in the smoothed diffs using blockwise MAD-based local sigma and re-integrates the gated slopes, anchored at the first smoothed level.
+- **Performance**: Combined score 0.43 (composite 0.39) with correlation 0.74, lag_error 1.66, avg_error 1.06, but 107.8 false_reversals, 134 slope changes, noise_reduction 0.00, and poor smoothness (0.13); execution is fast (0.04s, efficiency 1.00).
+- **Feedback**: The RTS smoothing successfully achieves near-zero lag (1.66) as intended, but the aggressive slope-gating/reintegration fails to reduce noise (0% reduction) and produces many false reversals, indicating the local gating threshold (0.6×local_sigma) is too permissive and the reconstructed signal tracks noise rather than the underlying clean trend. Tuning process noise scaling with window_size and strengthening the gating criterion are the main improvement levers.
+**Program Identifier:** Generation 35 - Patch Name rts_local_sigma_smoother - Correct Program: True
+
+**Program Name: Adaptive Kalman + Robust Savitzky-Golay Signal Filter**
+- **Implementation**: Two-stage pipeline — an innovation-adaptive 1D Kalman filter (constant-velocity model with NIS-scaled process noise) followed by Huber-style iterative reweighted Savitzky-Golay smoothing (quadratic polynomial, MAD-based winsorizing), then a recency-weighted convolution to preserve the sliding-window output convention with lag compensation, plus a median-based slope-consistency pass to suppress small spurious reversals.
+- **Performance**: Combined score 0.62 with correlation 0.80, noise reduction 0.34, smoothness 0.40, responsiveness 0.71, efficiency 1.00 (0.03s), but 26.80 false reversals, 30.40 slope changes, lag error 0.41, and avg error 0.51.
+- **Feedback**: The heavy multi-stage smoothing achieves high correlation and efficiency but over-smooths, leaving substantial lag error and many false slope reversals, indicating the enlarged SG window (2W-1) and aggressive reweighting trade dynamic tracking for noise suppression; reducing smoothing strength or window size could improve lag and reversal metrics at modest cost to correlation.
+**Program Identifier:** Generation 36 - Patch Name none - Correct Program: True
+
+**Program Name: Savitzky-Golay with recency tilt and slope-gated reversal suppression**
+- **Implementation**: Builds order-2 Savitzky-Golay FIR taps (evaluated at the window endpoint via `V @ VtV_inv @ V.T`), applies an exponential recency-tilt weighting, convolves with the input, then applies a median-filtered slope-gating stage that re-integrates gated slopes to suppress false reversals; output is the last `n - window_size + 1` samples.
+- **Performance**: Combined score 0.00 — all test signals failed (success_rate 0.00, correlation 0.00, noise_reduction 0.00, avg_error 1.00, lag_error 1.00, slope_changes 100, false_reversals 50).
+- **Feedback**: The pipeline evidently raises or produces invalid output on every test signal (likely a shape/length mismatch from the convolution padding or the slope re-integration loop, plus leftover dead code like the unused `a_last, b_last` unpacking), causing total failure rather than degraded accuracy; the multi-stage approach never got to be evaluated on its merits.
+**Program Identifier:** Generation 38 - Patch Name savitzky_golay_with_recency_tilt - Correct Program: False
+
+**Program Name: Staged Adaptive Pipeline: Despike, Leading-Edge Fit, Local Snap**
+- **Implementation**: Three-stage pipeline — a MAD-based 5-tap median impulse despike, an exponentially-weighted linear regression evaluated at the window's leading edge (zero group delay, fully vectorized via convolution normal equations with targeted IRLS refinement), and a locally adaptive snapping stage using rolling MAD-of-diffs thresholds plus a 3-tap median blend.
+- **Performance**: Combined score 0.54 (composite 0.47) with correlation 0.92, noise reduction 0.50, responsiveness 0.76, efficiency 1.00, but weak smoothness (0.11), high slope changes (167.80) and false reversals (127.40), and lag error 0.31.
+- **Feedback**: The zero-lag leading-edge regression and fast vectorized execution deliver strong accuracy and efficiency, but aggressive per-window responsiveness causes excessive slope churn and false reversals that hurt smoothness; the local snapping stage is too weakly tuned to suppress these artifacts, suggesting the blend/k parameters or Stage 3 design need stronger churn damping.
+**Program Identifier:** Generation 39 - Patch Name staged_adaptive_snap_filter - Correct Program: True
+
+**Program Name: Adaptive Kalman + Robust Savitzky-Golay Two-Stage Signal Filter**
+- **Implementation**: A two-stage pipeline: (1) a constant-velocity Kalman filter with innovation-adaptive process noise (NIS-scaled Q) and MAD-estimated measurement noise, followed by (2) iteratively reweighted (Huber-style winsorized residuals) Savitzky-Golay quadratic smoothing over a widened window (2W+3), with recency-weighted exponential convolution for lag compensation and a median-based inter-window slope-consistency pass.
+- **Performance**: Achieved a combined score of 0.62 with excellent efficiency (1.00, 0.03s runtime) and success rate (1.00), strong correlation (0.80) and responsiveness (0.71), but weak noise reduction (0.34), smoothness (0.40), and high false reversals (26.40) and slope changes (29.60).
+- **Feedback**: The aggressive lag-compensation mechanisms (recency-weighted taps, widened SG window with adaptive Kalman) preserve responsiveness and accuracy but at the cost of passing through noise, limiting smoothness and noise reduction; tuning the trade-off toward more smoothing (e.g., larger effective window or stronger Q damping) could reduce spurious slope reversals without severely hurting lag.
+**Program Identifier:** Generation 42 - Patch Name larger_sg_window_sweep - Correct Program: True
+
+**Program Name: Bidirectional Kalman Fusion with Sign-Locked Slope Projection**
+
+- **Implementation**: Three-stage pipeline: (1) forward+backward 2-state (level+velocity) Kalman passes with NIS-adaptive process noise and MAD-estimated measurement noise, fused by inverse level-error variance to cancel lag; (2) derivative-domain "sign locking" that replaces diffs below 0.75×local MAD-sigma with the windowed-median dominant slope (80% blend), reintegrated via cumsum with a linear endpoint ramp correction; (3) a valid-mode uniform convolution producing the required output length n−W+1.
+
+- **Performance**: Combined score of 0.0 — the program is judged incorrect and does not pass all validation tests, despite the intended reductions in slope_changes and false_reversals.
+
+- **Feedback**: The sign-locking step's wholesale replacement of small diffs and the cumulative-sum reintegration with global endpoint ramp correction can inject drift/staircase artifacts that corrupt signal fidelity rather than preserving trend turns. The elaborate bidirectional lag-compensation design did not translate into passing behavior, indicating the validation tests penalize the distortion introduced by the derivative-domain rewriting and offset correction.
+**Program Identifier:** Generation 37 - Patch Name bidirectional_kalman_signlock - Correct Program: False
+
+**Program Name: Adaptive Kalman + Robust Savitzky-Golay Hybrid Filter**
+- **Implementation**: Two-stage pipeline: an innovation-adaptive 1D Kalman filter (constant-velocity model with NIS-scaled process noise and MAD-estimated measurement noise) followed by Huber-style iteratively reweighted Savitzky-Golay smoothing (quadratic fit on a widened 2W+3 window), plus a recency-weighted convolution and a locally-adaptive MAD-threshold slope-consistency pass for lag compensation.
+- **Performance**: Composite score 0.62 with correlation 0.80, responsiveness 0.71, efficiency 1.00 (0.04s execution), but lag_error 0.41, noise_reduction only 0.34, and 26 false reversals across 29 slope changes.
+- **Feedback**: The aggressive Kalman-plus-SG smoothing preserves trend accuracy and runs fast, but the widened SG window and heavy smoothing leave residual lag and fail to remove enough noise; the locally-adaptive slope-snapping pass did not sufficiently suppress false reversals, suggesting the lag-compensation convolution under-corrects the added group delay.
+**Program Identifier:** Generation 43 - Patch Name adaptive_local_snap_threshold - Correct Program: True
+
+**Program Name: Capped-Kalman Modular Pipeline with Edge Polynomial Trend Governor**
+
+- **Implementation**: A five-stage linear pipeline: MAD-based noise variance estimation feeds a constant-velocity Kalman filter with innovation-adaptive process noise capped at 4× baseline Q (plus quiet-regime velocity shrinkage toward a slope EMA), followed by a vectorized recency-weighted quadratic local-poly fit precomputed as a projection kernel and evaluated at each window's leading edge for zero trend lag, then a trend-governor (rolling median/MAD deadband snapping + sign-flip hysteresis + anchored 60/40 reintegration blend), and finally a symmetric 3-tap binomial smoother.
+
+- **Performance**: Combined score 0.52 (composite 0.49) with near-perfect efficiency (1.00, 0.01s execution) and solid accuracy (0.79 correlation, 0.79 accuracy score, 0.59 responsiveness), but weak smoothness (0.20) and noise reduction (0.27), plus high slope changes (80.0), false reversals (66.8), and lag/avg error (0.68).
+
+- **Feedback**: The capped adaptive Q and edge-evaluated vectorized fit successfully preserve responsiveness and runtime speed, but the hysteresis gate and deadband thresholds fail to curb slope churn and false reversals as designed, while the light 3-tap finish and the 40% unfiltered component in the anchored blend let measurement noise pass through. Smoothness and noise reduction are the dominant weaknesses — accuracy gains were achieved at the cost of leaving the output too noisy, suggesting future iterations should strengthen post-filtering or tighten governor thresholds rather than adding more responsiveness.
+**Program Identifier:** Generation 44 - Patch Name modular_staged_pipeline_governor - Correct Program: True
+
+**Program Name: Staged Adaptive Pipeline with Leading-Edge Robust Regression**
+- **Implementation**: Four-stage pipeline (ImpulseDespike via 5-tap median blending, vectorized convolution-based leading-edge weighted regression with targeted IRLS reweighting, slope-EMA TrendLock, and sign-hysteresis median snapping with local robust sigma) evaluated at t=0 for zero group delay on the window's leading edge.
+- **Performance**: Combined score 0.54 with strong correlation (0.92), efficiency (1.00), and responsiveness (0.76), but weak smoothness (0.11) and noise reduction (0.49); 165.8 slope changes and 125.8 false reversals indicate residual high-frequency jitter.
+- **Feedback**: The zero-lag leading-edge fit achieves excellent accuracy and responsiveness, but the anti-churn stages (TrendLock and HysteresisSnap) are too mild to suppress noise-induced reversals—stronger damping or wider local thresholds would improve smoothness and cut false reversals without much lag cost.
+**Program Identifier:** Generation 45 - Patch Name despike_edgefit_hysteresis_snap - Correct Program: True
+
+**Program Name: Kalman Adaptive Smoother with Slope Hysteresis Damping**
+- **Implementation**: Runs a local-linear Kalman filter (state=[level, slope], F=[[1,1],[0,1]]) with process noise q=1e-4·σ² and Huber-style adaptive measurement noise (R inflated 4× per innovation z-score beyond 1, scaled by MAD of a 50-sample innovation window), where σ is estimated robustly from MAD of first differences. A hysteresis post-pass then EMA-smooths the slope (β=0.6) and blends the level toward a 3-tap median (35% weight) wherever slope deviations fall below 0.6·MAD of slope increments, with output sampled causally at index W−1 to preserve moving-average alignment (length n−W+1).
+- **Performance**: Achieved combined score 0.50 (composite 0.45) with correlation 0.85, accuracy 0.85, noise reduction 0.32, smoothness 0.09, responsiveness 0.71, lag error 0.41, 214 slope changes, and 166 false reversals, while efficiency was perfect (1.00, 0.03 s) at 100% success rate.
+- **Feedback**: The low-lag design goal is met (lag 0.41, responsiveness 0.71), but the filter under-smooths — only 32% noise reduction and smoothness of 0.09 — and the gentle EMA/3-tap-median hysteresis fails its stated aim of killing spurious reversals (166 false reversals, 214 slope changes). Notably, despite the docstring's claim of fixed-interval RTS smoothing, the implementation is purely causal filtering plus a weak median blend, so strengthening the smoothing stage (process-noise tuning or true RTS smoothing) is the clearest path to a higher combined score.
+**Program Identifier:** Generation 46 - Patch Name kalman_rts_adaptive_smoother - Correct Program: True
+
+**Program Name: Adaptive Kalman Pre-Filter with Robust Local Quadratic Regression**
+- **Implementation**: A constant-velocity Kalman filter with innovation-adaptive process noise (MAD-based noise estimation) preprocesses the signal, followed by exponentially-weighted local quadratic regression (3 IRLS passes with Huber reweighting) evaluated at the window's most recent sample for zero trend lag, plus a vectorized rolling MAD-based "snap" stage that flattens sub-threshold sample-to-sample changes to suppress spurious reversals.
+- **Performance**: Achieved combined score 0.51 with correlation 0.91, noise reduction 0.37, lag error 0.52, avg error 0.35, but high false reversals (163.4) and slope changes (206.4) with a weak smoothness score of 0.09; efficiency was excellent (1.00, 0.13s execution).
+- **Feedback**: The zero-lag design (endpoint evaluation, Kalman slope extrapolation) delivered strong responsiveness (0.66) and accuracy, but the aggressive dynamics preservation leaves excessive roughness and reversals; the composite score (0.42) is dragged down by poor smoothness, suggesting the snap-stage threshold (0.5·σ with only 50% blending) is too conservative to flatten residual noise.
+**Program Identifier:** Generation 47 - Patch Name local_adaptive_snap_threshold - Correct Program: True
+
+**Program Name: Adaptive Kalman + Robust Savitzky-Golay Signal Filter**
+- **Implementation**: Two-stage pipeline: an innovation-adaptive 1D Kalman filter (NIS-driven process noise scaling with MAD-estimated measurement noise) followed by Huber-style iteratively reweighted Savitzky-Golay smoothing (quadratic fit, widened 2W+3 window), then exponential recency-weighted convolution to compensate group delay and a locally adaptive MAD-threshold slope-consistency median pass.
+- **Performance**: Combined score of 0.62 with correlation 0.80, noise reduction 0.34, lag error 0.41, avg error 0.51, 29 slope changes, 26 false reversals, smoothness 0.41, responsiveness 0.71, and efficiency 1.00 at 0.04s execution time.
+- **Feedback**: The lag-compensation mechanisms (recency-weighted taps, widened SG window, local noise-adaptive snapping) keep responsiveness strong (0.71) with perfect efficiency, but noise reduction remains weak (0.34) and false reversals (26) are still high, suggesting the second-stage robust reweighting isn't suppressing enough residual dither despite heavy multi-pass smoothing.
+**Program Identifier:** Generation 48 - Patch Name locally_adaptive_threshold_tuning - Correct Program: True
+
+**Program Name: Adaptive Kalman-Prefiltered Robust Local Quadratic Filter**
+- **Implementation**: Cascades an innovation-adaptive constant-velocity Kalman pre-filter (MAD-estimated measurement noise, NIS-driven process noise with softened gain) into exponentially-weighted local quadratic regression evaluated at the window's most recent sample for zero phase lag, refined by two Huber-style IRLS reweighting passes and a final 5-tap edge-preserving median snap.
+- **Performance**: Combined score 0.56, driven by strong accuracy (0.88), correlation (0.88), responsiveness (0.72), and perfect efficiency (1.00, 0.13s execution); however, smoothness (0.21), noise reduction (0.33), false reversals (57.60), and slope changes (73.20) remain weak, with lag_error at 0.38.
+- **Feedback**: The zero-lag window-end evaluation and deliberately softened Kalman tracking successfully preserve trend dynamics and accuracy, but the responsiveness-over-smoothness trade-off leaves residual noise and spurious reversals that the median snap only partially suppresses; gains in the combined score likely require stronger smoothing or more aggressive outlier suppression at minimal lag cost.
+**Program Identifier:** Generation 49 - Patch Name median_snap_soften_kalman - Correct Program: True
+
+**Program Name: Adaptive Kalman + Robust Savitzky-Golay Signal Filter**
+
+- **Implementation**: A three-stage pipeline: (1) a 2D constant-velocity Kalman filter with innovation-adaptive process noise (NIS-based Q scaling) and MAD-estimated measurement noise, (2) iterative reweighted Savitzky-Golay smoothing with Huber-style residual winsorization (2 iterations, clip_sigma=2.5), and (3) a locally adaptive hysteresis pass using rolling MAD noise scales, 5-tap running medians, and slope-flip suppression. Output uses exponentially recency-weighted convolution to match the sliding-window length convention (n - W + 1) while compensating lag.
+
+- **Performance**: Achieved a combined score of 0.62 with correlation 0.80, noise reduction 0.34, lag error 0.41, 29 slope changes, 26 false reversals, and perfect efficiency (1.00, 0.04s execution).
+
+- **Feedback**: The pipeline delivers strong trend responsiveness (0.71) and efficiency, but moderate noise reduction (0.34) and high false reversals (26) suggest the hysteresis threshold (0.7×local noise scale) is too permissive — noise-induced slope flips still survive, indicating the reversal suppression pass needs stricter magnitude thresholds or more median snapping to cut false_reversals and avg_error (0.51) without sacrificing the already-good lag performance.
+**Program Identifier:** Generation 50 - Patch Name kalman_robustsg_local_sigma_hysteresis - Correct Program: True
+
+**Program Name: Capped-Q Kalman + Leading-Edge Fit 4-Stage Pipeline**
+
+- **Implementation**: Four-stage pipeline: (1) constant-velocity Kalman prefilter with NIS-adaptive process noise capped at 4x and q_base=0.02*r to keep noise out of the slope state, (2) zero-lag exponentially-weighted linear regression evaluated at the window's leading edge with targeted IRLS reweighting for anomalous windows, (3) TrendLock slope-EMA damping of level jitter, and (4) HysteresisSnap locally-adaptive median-snapping of sub-noise sign-flipping steps.
+
+- **Performance**: Combined score 0.55 (composite 0.51) with strong responsiveness (0.71), accuracy (0.86), correlation (0.86), and efficiency (1.00, 0.01s runtime), but weak smoothness (0.17) and only 36% noise reduction; 99.6 slope changes and 80 false reversals remain problematic.
+
+- **Feedback**: The capped-Q Kalman and leading-edge fit successfully achieve low lag (0.40) and high responsiveness, but the pipeline's local output remains too noisy — high slope churn and false reversals indicate the hysteresis snapping threshold (k=0.8 × local sigma) and blend (0.75) are too conservative to suppress noise-induced reversals without hurting genuine transitions. Future work should strengthen smoothing after the fit stage (e.g., stronger trend-lock or slope-churn suppression) since lag budget appears available.
+**Program Identifier:** Generation 51 - Patch Name capped_q_kalman_leading_edge - Correct Program: True
+
+**Program Name: Adaptive Kalman + Robust Savitzky-Golay Signal Filter**
+- **Implementation**: Three-stage pipeline: (1) 1D Kalman filter with NIS-adaptive process noise, (2) Huber-style iterative reweighted Savitzky-Golay smoothing (window 2W+3, poly order 2), followed by exponential-weighted convolution, quadratic-trend lag compensation capped by local MAD noise scale, and hysteresis-based reversal suppression snapping noise-level steps to a 5-tap running median.
+- **Performance**: Combined score of 0.0; the program failed validation tests entirely.
+- **Feedback**: The elaborate multi-stage pipeline (lag compensation, reversal suppression, median snapping) likely introduced discontinuities or edge-case failures (e.g., degenerate indexing/shape issues in flip handling) causing test failures despite sophisticated design intent; correctness of output length alignment and the reversal-suppression index arithmetic are suspect failure points.
+**Program Identifier:** Generation 40 - Patch Name trend_prediction_lag_compensation - Correct Program: False
+
+**Program Name: Adaptive Kalman + Robust Savitzky-Golay Signal Filter**
+- **Implementation**: A three-stage pipeline — innovation-adaptive (NIS-based) 2D Kalman filter (constant-velocity model), iterative Huber-style reweighted Savitzky-Golay smoothing with MAD-based winsorization (window 2W+7, quadratic fit), and a recency-weighted exponential convolution for lag compensation, followed by a locally-adaptive MAD-thresholded slope-consistency snapping pass with sign hysteresis.
+- **Performance**: Combined score of 0.0 — the program is incorrect and fails validation tests.
+- **Feedback**: Despite sophisticated engineering (adaptive process noise, robust reweighting, local noise scale, sign hysteresis), the complex multi-stage pipeline did not pass validation, suggesting accumulated edge-case failures (e.g., window clamping, padding/threshold alignment, or divergence in the snapping pass) rather than a fundamental flaw in any single stage; a simpler, incrementally validated design would be more robust.
+**Program Identifier:** Generation 41 - Patch Name sign_hysteresis_local_snap_coparamsweep - Correct Program: False
+
+**Program Name: Five-Stage Coarse-to-Fine Adaptive Signal Smoothing Pipeline**
+
+- **Implementation**: A composable 5-stage pipeline: MAD-based noise estimation → constant-velocity Kalman filter with capped NIS-adaptive process noise (Q limited to 4× baseline to prevent noise spikes flooding the velocity state) → iterative-reweighted (Huber-winsorized, 2.5σ) Savitzky-Golay smoothing over a deliberately widened 2W+7 window → recency-weighted valid-mode convolution (exponential tilt e^-1.2) that recovers the wide SG window's group delay while preserving the output length contract → local rolling-MAD hysteresis snapping (5-tap median blend, sign-flip gated). The SG window and recency tilt are explicitly co-swept as a paired mutation, since cross-generation evidence showed they interact destructively when tuned independently; scipy's savgol_filter is used with a moving-average fallback.
+
+- **Performance**: Combined score 0.64 (composite 0.65) with strong efficiency (1.00, 0.01s execution, 100% success), correlation/accuracy of 0.79, and responsiveness 0.70, but weaker noise reduction (0.33), smoothness (0.45), lag error 0.43, and 21.2 false reversals across 24.2 slope changes.
+
+- **Feedback**: The paired co-sweep of window width and recency tilt plus the capped adaptive Q successfully traded smoothness for low lag (responsiveness 0.70 with only 0.43 lag error despite a 2W+7≈47-tap SG window), confirming the group-delay-recovery strategy works. However, residual churn remains the bottleneck: 21.2 false reversals and 0.45 smoothness indicate Stage 5's hysteresis snapping (k=0.6, blend=0.6) is too conservative to suppress sub-noise oscillations, while noise reduction (0.33) shows the pipeline favors tracking fidelity over variance suppression — future gains likely require more aggressive snap thresholds or stronger Stage 3 smoothing without sacrificing the lag advantage already earned.
+**Program Identifier:** Generation 52 - Patch Name kalman_sg_coarse_fine_pipeline - Correct Program: True
+
+**Program Name: Multi-Stage Adaptive Kalman–SavGol Trend-Lock Filter**
+
+- **Implementation**: Five-stage crossover pipeline: (1) constant-velocity Kalman pre-filter with innovation-adaptive process noise (soft NIS cap `min(nis,12)`, MAD-estimated measurement noise), (2) Savitzky-Golay smoothing via SciPy with pure-NumPy hat-matrix fallback, (3) vectorized exponentially recency-weighted sliding-window aggregation (`sliding_window_view @ weights`) preserving the output contract `len(y) = len(x) - window_size + 1`, (4) 5-tap edge-preserving median snap, and (5) MAD-based trend-lock hysteresis on output diffs with convex blend (0.6) anchoring to prevent drift.
+
+- **Performance**: Combined score 0.58 with strong efficiency (1.00, 0.02s execution) and success rate (1.00); correlation 0.74, accuracy 0.74, responsiveness 0.68, lag_error 0.46, but weaker noise_reduction (0.31) and smoothness (0.37), with 33.4 slope changes and 29.8 false reversals.
+
+- **Feedback**: The softened NIS adaptation and recency-weighted aggregation successfully keep lag low (0.46) and correlation/accuracy competitive, but the responsiveness-oriented tuning sacrifices noise reduction and smoothness—leaving roughly a third of the noise in the output. Despite the explicit trend-lock hysteresis stage, false reversals remain high (~30), indicating the diff-based snapping with k=1.5 significance threshold and 0.6 blend is not aggressive enough to suppress spurious direction changes on this non-stationary test signal.
+**Program Identifier:** Generation 53 - Patch Name kalman_sg_trendlock_hybrid - Correct Program: True
+
+**Program Name: Zero-Lag Staged Adaptive Signal Processing Pipeline**
+- **Implementation**: Four-stage pipeline — MAD-based impulse despike, convolution-vectorized weighted linear regression evaluated at the window's leading edge (t=0) for zero group delay with targeted IRLS reweighting only on anomalous windows, TrendLock EMA slope-damping, and rolling local-MAD adaptive snapping toward a 3-tap running median — plus a simple moving-average "basic" fallback.
+- **Performance**: Achieved combined score 0.55 (composite 0.47) with correlation 0.92, accuracy 0.92, noise reduction 0.49, lag_error 0.31, responsiveness 0.76, and perfect efficiency (1.00, 0.01s), but smoothness was only 0.11 with 159.8 slope changes and 120.4 false reversals.
+- **Feedback**: The leading-edge fit and fully vectorized convolution normal equations successfully deliver zero-lag responsiveness and O(n) execution, but the downstream churn-suppression stages underperform — high false reversals and near-zero smoothness show the TrendLock (beta=0.55, gain=0.35) and LocalAdaptiveSnap (k=0.65, blend=0.55) parameters are too weak to damp directional reversals without sacrificing the responsiveness they were tuned to preserve.
+**Program Identifier:** Generation 54 - Patch Name add_trend_lock_slope_damping_stage - Correct Program: True
+
+**Program Name: Dual-State Adaptive Kalman Filter with Robust SG Polish**
+- **Implementation**: A constant-velocity Kalman filter (level + slope states) with NIS-capped adaptive process noise and MAD-based measurement noise estimation, followed by Huber-IRLS Savitzky-Golay smoothing, slope-extrapolation blending at high-NIS points, and MAD-gated reversal hysteresis; the length contract is met via a recency-weighted sliding window projection.
+- **Performance**: Achieved a combined score of 0.58 (correlation 0.77, noise reduction 0.31, responsiveness 0.69, smoothness 0.34, efficiency 1.00), with notable weaknesses in false reversals (34.40), slope changes (38.40), and lag error (0.45).
+- **Feedback**: The causal Kalman core keeps efficiency perfect and lag moderate, but the noisy slope state and modest SG window leave too many spurious reversals and limited smoothing; the design trades smoothness for responsiveness more than the metrics reward, suggesting stronger noise suppression or a stricter reversal gate would improve the composite score.
+**Program Identifier:** Generation 55 - Patch Name dual_stage_kalman_irwls_reversal_gate - Correct Program: True
+
+**Program Name: Adaptive Kalman + Robust Savitzky-Golay Signal Filter**
+- **Implementation**: Three-stage pipeline: an innovation-adaptive 1D Kalman filter (NIS-driven process noise scaling with MAD-estimated measurement noise), Huber-style iteratively reweighted Savitzky-Golay smoothing (quadratic fit, widened 2W+3 window, MAD-based winsorizing), and a recency-weighted exponential convolution for lag compensation plus a median-based slope-consistency pass on small steps.
+- **Performance**: Combined score 0.62 with correlation 0.80, noise reduction 0.34, responsiveness 0.71, efficiency 1.00 (0.02s), but slope changes 29.60 and false reversals 26.40 indicate remaining over-fluctuation.
+- **Feedback**: The lag-compensation convolution and enlarged SG window effectively control lag error (0.41) but at the cost of noise reduction (only 0.34) and residual slope reversals; smoothing strength or the slope-consistency threshold could be tuned to trade responsiveness (0.71) for fewer spurious reversals.
+**Program Identifier:** Generation 56 - Patch Name vectorize_median_snap - Correct Program: True
+
+**Program Name: Adaptive Kalman + Savitzky-Golay Two-Stage Signal Filter**
+- **Implementation**: A constant-velocity Kalman filter with NIS-adaptive process noise (robust MAD-based measurement noise estimate, Q scaling capped at 4x baseline) followed by Savitzky-Golay polynomial smoothing and an exponentially-weighted window aggregation to match the sliding-window output convention.
+- **Performance**: Combined score 0.57 with correlation 0.78, noise reduction 0.33, lag error 0.41, avg error 0.53, smoothness 0.32, and perfect efficiency (1.00, 0.03s execution).
+- **Feedback**: The design prioritizes responsiveness (0.71) and speed over smoothing—smoothness (0.32) and noise reduction (0.33) are the weak points, with 43.2 slope changes and 37.4 false reversals indicating residual jitter; increasing smoothing strength or tightening the adaptive Q would likely improve the combined score at modest lag cost.
+**Program Identifier:** Generation 58 - Patch Name soften_nis_q_adaptation - Correct Program: True
+
+**Program Name: Adaptive Kalman + Robust Local Quadratic Regression Filter**
+- **Implementation**: A two-stage pipeline: an innovation-adaptive constant-velocity Kalman pre-filter (MAD-estimated noise, NIS-triggered process noise expansion) followed by exponentially-weighted local quadratic regression evaluated at the window's end (zero phase lag), with two IRLS Huber reweighting iterations, 5-tap binomial smoothing, and median-filtered slope stabilization via re-integration of the first difference.
+- **Performance**: Combined score 0.56 (composite 0.50) with strong correlation (0.90), perfect efficiency (1.00, 0.14s runtime), good responsiveness (0.69) and low lag error (0.45), but weak noise reduction (0.35), low smoothness (0.21), and high false reversals (60) / slope changes (75.4).
+- **Feedback**: The zero-lag design (endpoint evaluation, slope extrapolation) succeeds at tracking dynamics and responsiveness but under-smooths, leaving substantial noise and spurious reversals; the median-of-derivative stabilization and binomial post-smoothing are insufficient to suppress reversal artifacts. Future work should prioritize stronger noise attenuation even at slight cost to responsiveness.
+**Program Identifier:** Generation 59 - Patch Name slope_median_stabilizer - Correct Program: True
+
+**Program Name: Adaptive Kalman + Savitzky-Golay Trend-Preserving Filter**
+
+- **Implementation**: A three-stage pipeline: (1) an innovation-adaptive 1D Kalman filter with a [level, velocity] state model, MAD-based robust measurement noise estimation, and NIS-driven process noise scaling capped at 4x to balance smoothing vs. responsiveness; (2) Savitzky-Golay polynomial smoothing (order ≤3) for slope preservation without phase delay; (3) a vectorized exponential-weighted convolution with backward-emphasized weights plus a slope-consistency pass that snaps noise-level steps (< 0.5σ) toward a 5-tap running median while preserving genuine trend changes.
+
+- **Performance**: Achieved a combined score of 0.58 with perfect efficiency (1.00, 0.03s execution) and success rate (1.00), correlation of 0.78, responsiveness of 0.71, but weaker noise reduction (0.33), smoothness (0.33), and high false reversals (36.80) with slope changes of 41.40 and lag error of 0.41.
+
+- **Feedback**: The adaptive Kalman + SG design succeeds at speed, stability, and trend responsiveness (lag error 0.41, responsiveness 0.71), but the light final smoothing window and slope-snapping threshold leave too much residual noise and spurious slope reversals, indicating the smoothness/noise-reduction components were sacrificed in favor of responsiveness. Future iterations should tune the SG window, exponential weight decay, and the 0.5σ snapping threshold more aggressively toward noise suppression to improve the smoothness and false-reversal metrics without severely degrading lag.
+**Program Identifier:** Generation 61 - Patch Name soften_nis_q_multiplier - Correct Program: True
+
+**Program Name: Staged Quadratic Leading-Edge Adaptive Signal Pipeline**
+- **Implementation**: Five-stage pipeline (impulse despike → vectorized weighted quadratic regression evaluated at window leading edge for zero lag → EMA trend-lock slope damping → locally adaptive median snap → 3-tap smoothing), with convolution-based windowed moments and targeted IRLS robust reweighting only where pass-1 residuals are anomalous.
+- **Performance**: Combined score 0.58 (composite 0.55), with correlation 0.98, noise reduction 0.65, responsiveness 0.86, efficiency 1.00, but only 0.40 success rate, 41.5 false reversals, 50.5 slope changes, and lag error 0.16.
+- **Feedback**: Zero-lag leading-edge fitting delivers excellent accuracy and responsiveness, but the multi-stage slope manipulation and smoothing fail to suppress false reversals and output churn, dragging down the success rate and smoothness (0.28). The robust reweighting loop contains a vestigial/dead code line (`fit = ... if 'b' in dir() else None` immediately overwritten), indicating room for cleanup.
+**Program Identifier:** Generation 57 - Patch Name quad_edge_adaptive_pipeline - Correct Program: True
+
+**Program Name: Bidirectional Adaptive-Kalman Fused Robust Smoothing Pipeline**
+- **Implementation**: A four-stage cascade: (1) forward innovation-adaptive-Q Kalman filter fused 50/50 with a time-reversed backward pass to cancel interior phase error, (2) Huber-style iterative reweighted Savitzky-Golay (2 iterations, clip_sigma 2.5, quadratic fit), (3) recency-weighted exponential convolution to preserve sliding-window output convention, and (4) a level-domain median snap with locally adaptive rolling-MAD thresholds.
+- **Performance**: Achieved a combined score of 0.63 with correlation 0.80, noise reduction 0.34, lag error 0.41, avg error 0.51, 28.20 slope changes, 25.80 false reversals, smoothness 0.41, responsiveness 0.71, and full efficiency (execution time 0.05s, 100% success).
+- **Feedback**: The bidirectional fusion mutation improves lag (0.41) and responsiveness (0.71) without smoothness cost, and efficiency is perfect, but noise reduction (0.34) and smoothness (0.41) remain weak, and the relatively high false reversal count (25.80) suggests the median snap / robust SG stages still admit spurious slope reversals — pointing to stronger outlier suppression or smoother downstream weighting as the next improvement target.
+**Program Identifier:** Generation 62 - Patch Name bidir_kalman_fusion_cascade - Correct Program: True
+
+**Program Name: Innovation-Adaptive Kalman Prefilter with Robust Weighted Quadratic Regression**
+
+- **Implementation**: Two-stage pipeline combining a constant-velocity Kalman pre-filter (MAD-based noise estimation, innovation-adaptive process noise) with vectorized exponentially-weighted (e^-1.2/step) local quadratic regression over a widened window (M=2W+7) evaluated at each window's last sample for zero phase, followed by a vectorized Huber/MAD robust reweight pass and 5-tap binomial smoothing. Efficiency was prioritized throughout — precomputed moment-matrix inverse, sliding_window_view, and a notable shortcut where the robust pass reuses the base `A_inv` for reweighted right-hand sides instead of solving per-window systems (mathematically incorrect but fast).
+
+- **Performance**: Achieves perfect efficiency (efficiency_score 1.00, execution_time 0.02s, success_rate 1.00) but near-zero quality across the board: combined_score 0.00, overall_score 0.00, correlation 0.08, smoothness 0.08, responsiveness 0.02, accuracy 0.08, with very high lag_error (43.26), avg_error (36.56), false_reversals (177.60), and slope_changes (216.60).
+
+- **Feedback**: The core zero-lag design claims (trend-extrapolating Kalman slope state, end-anchored regression fits, near-zero-lag binomial smoothing) completely failed to materialize — lag error and false reversals are enormous and correlation is essentially zero, indicating the output barely tracks the underlying signal. The `A_inv` reuse in the robust reweight pass, combined with the co-mutated wide-window/steep-tilt parameters, appears to have introduced systematic error, showing that heavy algorithmic complexity and vectorization-first shortcuts delivered speed at the total expense of correctness.
+**Program Identifier:** Generation 63 - Patch Name joint_window_recency_tilt_2w7 - Correct Program: True
+
+**Program Name: Staged Adaptive Pipeline with Zero-Lag Quadratic Edge Fit**
+- **Implementation**: Six-stage composable pipeline — MAD-based impulse despike, fully-vectorized exponentially-weighted quadratic regression evaluated at the window's leading edge (t=0) for zero group delay with targeted IRLS reweighting of anomalous windows, EMA slope TrendLock, sigma-thresholded 5-tap median snap, local adaptive 3-tap median snap, and light 3-tap smoothing — all hardened with length guards, try/except fallbacks, and non-finite imputation.
+- **Performance**: Combined score 0.58 with strong correlation (0.95), accuracy (0.95), noise reduction (0.63), perfect efficiency (1.00, 0.01s) and success rate (1.00), but weak smoothness (0.15), high false reversals (85.20), and high slope changes (110.80).
+- **Feedback**: The zero-lag leading-edge design delivers excellent accuracy, speed, and full reliability on degenerate inputs (the intended success_rate fix), yet the output still churns with too many direction reversals and residual lag error (0.29) despite three snapping/smoothing stages — indicating stronger slope-churn suppression is needed to lift smoothness without sacrificing the solid responsiveness (0.78).
+**Program Identifier:** Generation 64 - Patch Name robust_median_snap_pipeline - Correct Program: True
+
+**Program Name: Bidirectional Kalman + Robust Savgol + Median Snap Pipeline**
+
+- **Implementation**: A five-stage pipeline: bidirectional adaptive-Q Kalman (forward/backward fused 50/50 for phase-error cancellation), Huber-style iterative reweighted Savitzky-Golay, a new Stage 3.5 5-tap median snap with 0.5x local-MAD threshold on the smoothed output, recency-weighted convolution for lag compensation, and a final adaptive median snap.
+
+- **Performance**: Combined score 0.63 with correlation 0.81, noise_reduction 0.34, lag_error 0.41, false_reversals 25.8, slope_changes 28.2, and perfect efficiency (1.00, 0.03s execution).
+
+- **Feedback**: The new Stage 3.5 median snap targets noise_reduction directly but that metric remains low (0.34), suggesting residual noise still dominates variance against the clean signal; false reversals and slope changes are elevated, indicating over-aggressive thresholding or residual jitter. Strengths are responsiveness (0.71), accuracy (0.81), and speed — the main improvement levers are noise reduction and reducing spurious slope reversals.
+**Program Identifier:** Generation 65 - Patch Name median_snap_stage35_noise_boost - Correct Program: True
+
+**Program Name: Adaptive Kalman + Savitzky-Golay Multi-Stage Signal Filter**
+- **Implementation**: A four-stage pipeline: MAD-thresholded 5-tap median impulse despiking, an innovation-adaptive constant-velocity Kalman filter (NIS-scaled process noise for lag-free tracking), Savitzky-Golay polynomial smoothing, followed by slope-consistency median snapping and EMA trend-lock slope damping; output is length n−W+1 via exponential-weighted convolution. Note: the "basic" moving-average path contains dead code (the loop is unreachable inside `_impulse_despike`), but the enhanced path is self-contained and functional.
+- **Performance**: Combined score 0.58 (composite 0.56), with correlation 0.78, noise reduction 0.33, lag error 0.41, slope changes 42.60, false reversals 36.00, smoothness 0.32, responsiveness 0.71, and perfect efficiency (1.00) at 0.03s execution.
+- **Feedback**: The adaptive Kalman + SG design achieves excellent responsiveness and zero lag penalty, but the aggressive multi-stage smoothing yields modest noise reduction (0.33) and low smoothness (0.32), while false reversals (36) and slope changes (42.6) remain high — suggesting the slope-lock/snapping thresholds are too permissive, letting noise-level fluctuations pass as trend changes. Future iterations should tighten the sigma-based thresholds or strengthen the trend-lock damping to trade a little responsiveness for smoothness and reversal suppression.
+**Program Identifier:** Generation 66 - Patch Name despike_and_trendlock_stages - Correct Program: True
+
+**Program Name: Dual-State Adaptive Kalman with Robust SG Polish**
+- **Implementation**: Forward-backward fused constant-velocity Kalman filter (level + slope states, NIS-capped adaptive process noise, MAD-based noise estimation) followed by Huber-IRLS Savitzky-Golay polish, NIS-gated slope-extrapolation blending, and hysteresis-gated reversal snapping, then a recency-weighted sliding-window output.
+- **Performance**: Combined score 0.58 (correlation 0.78, noise reduction 0.32, responsiveness 0.70, accuracy 0.78, efficiency 1.00), with lag error 0.54 and 37.8 slope changes / 34 false reversals.
+- **Feedback**: Efficiency is excellent (0.02s, 100% success) and responsiveness/accuracy are solid, but weak smoothness (0.35), low noise reduction (0.32), and a high false-reversal count indicate the reversal-gate and denoising stages underperform; the pipeline trades too much smoothness for lag compensation at turning points.
+**Program Identifier:** Generation 67 - Patch Name forward_backward_kalman_fusion - Correct Program: True
+
+**Program Name: Multi-Stage Bidirectional Kalman + Robust SG Median-Snap Filter**
+- **Implementation**: Four-stage cascade: (1) forward/backward adaptive-Q Kalman fused 50/50 (NIS-based process-noise scaling, MAD-estimated measurement noise) for phase-error cancellation; (2) Huber-style iterative-reweighted Savitzky-Golay (2W+1 crossover window, poly=2, 2 iterations, clip at 2.5σ); (3) dual 5-tap median snaps with locally adaptive rolling-MAD thresholds (block=51, 0.5σ, blend 0.6) bracketing a recency-weighted exponential convolution for lag compensation; output length n−W+1.
+- **Performance**: Combined score 0.63, with strong correlation (0.81), responsiveness (0.71), and perfect efficiency (1.00 at 0.04s), but weak noise_reduction (0.34), mediocre smoothness (0.42), high false_reversals (23.8), and moderate lag_error (0.41).
+- **Feedback**: The bidirectional Kalman fusion and robust SG preserve signal fidelity and responsiveness well but under-suppress noise — the 0.5σ median-snap thresholds are too lenient to catch residual jitter, leaving many spurious slope reversals (23.8) despite the heavy filter stack. Tightening snap thresholds (lower thr_factor, higher blend) or widening SG smoothing would trade modest responsiveness for meaningful gains in noise reduction and smoothness, the two metrics currently capping the composite score.
+**Program Identifier:** Generation 68 - Patch Name bidir_kalman_robust_sg_dual_snap - Correct Program: True
+
+**Program Name: Multi-Stage Adaptive Kalman + Savitzky-Golay Signal Filter**
+- **Implementation**: A four-stage pipeline — MAD-thresholded 5-tap median impulse despiking, an innovation-adaptive Kalman filter (NIS-based process noise scaling capped at 4x, constant-velocity state), double Savitzky-Golay smoothing passes, then a weighted exponential convolution with slope-consistency median snapping and EMA trend-lock damping to suppress false reversals without adding group delay.
+- **Performance**: Achieved combined score 0.63 with correlation 0.78, noise reduction 0.33, efficiency 1.00 (0.03s), but weak smoothness (0.45) and high false reversals (23.20) and slope changes (24.80), with lag error 0.42.
+- **Feedback**: The pipeline's heavy emphasis on responsiveness (0.70) via zero-lag Kalman tracking and trend-lock damping leaves the output too noisy and jittery — the aggressive reversal-suppression heuristics (sigma-threshold snapping, slope locking) evidently fail to prevent false reversals at the current thresholds. Trading some responsiveness for stronger smoothing (e.g., larger SG windows or lower Kalman responsiveness caps) would likely improve correlation, noise reduction, and smoothness simultaneously.
+**Program Identifier:** Generation 69 - Patch Name fix_despike_and_two_scale_sg - Correct Program: True
+
+**Program Name: Coarse-to-Fine Five-Stage Adaptive Signal Pipeline**
+- **Implementation**: A staged pipeline combining MAD-based noise estimation, capped NIS-adaptive Kalman filtering, iterative-reweighted Savitzky-Golay smoothing on a widened (2W+7) window, recency-weighted (e^-1.2 tilt) valid-mode convolution to recover group delay, and local hysteresis snapping with a 5-tap median blend; window and tilt are co-swept as interacting parameters.
+- **Performance**: Combined score 0.64 with correlation 0.79, noise_reduction 0.33, smoothness 0.45, lag_error 0.43, avg_error 0.52, and 21.4 false reversals; efficiency is 1.00 (0.01s) with 100% success rate.
+- **Feedback**: The widened SG window with recency tilt keeps lag low (responsiveness 0.70) and runtime excellent, but noise_reduction (0.33) and smoothness (0.45) remain the weakest metrics, with relatively high false reversals (21.4) suggesting the median-snap stages are insufficient to suppress residual churn. Slope changes at 24.60 indicate over-segmentation relative to the true signal dynamics, pointing toward stronger trend-preserving smoothing as the next improvement target.
+**Program Identifier:** Generation 70 - Patch Name stage35_median_snap_on_x_smooth - Correct Program: True
+
+**Program Name: Multi-Scale Wavelet Trend Fusion Filter (à Trous)**
+- **Implementation**: Uses stationary B3-spline à trous wavelet decomposition (zero-phase) with per-scale adaptive soft-thresholding driven by MAD-based noise estimates, followed by robust local-linear (median-slope) trend fusion and a forward-extrapolated quadratic edge smoother; output is tail-aligned to preserve the len(x)−W+1 contract with low delay.
+- **Performance**: Combined score 0.68 with correlation 0.88, noise reduction 0.37, lag error 0.38, and 17.8 false reversals; efficiency is excellent (execution_time ≈ 0, efficiency_score 1.0).
+- **Feedback**: The aggressive noise-shrinking at noise-dominated scales succeeds at reducing lag (0.38) but under-smooths, leaving residual slope churn (17.8 false reversals, smoothness 0.50) and mediocre noise reduction (0.37); accuracy (0.88) and responsiveness (0.73) are solid. Looser thresholding or stronger final smoothing would trade a small lag penalty for fewer spurious reversals and higher combined score.
+**Program Identifier:** Generation 71 - Patch Name wavelet_trend_fusion_filter - Correct Program: True
+
+**Program Name: Two-Pass Capped-NIS Kalman Filter with Slope-Gated Reversal Suppression**
+- **Implementation**: Runs a constant-acceleration Kalman filter (with capped-NIS adaptive measurement noise inflation for outlier robustness) forward and on the time-reversed signal, then blends via a linear crossfade weight plus midpoint seam smoothing, followed by median-gated slope reintegration, a 3-tap smoother, and 0.5×velocity lag compensation.
+- **Performance**: Combined score 0.48 (composite 0.43, overall 0.48); strong efficiency (1.00), responsiveness (0.72), and accuracy (0.86, correlation 0.86), but weak smoothness (0.08), low noise reduction (0.24), high false reversals (194.4) and slope changes (244).
+- **Feedback**: The capped-NIS adaptive R and two-pass zero-phase blending effectively preserve trend and endpoints (good correlation/lag), but the filter under-smooths and the slope-gated reversal suppression plus aggressive slope-based lag compensation leave many spurious slope flips, making smoothness and reversal metrics the main remaining weaknesses.
+**Program Identifier:** Generation 72 - Patch Name hybrid_twopass_kalman_fwd_bwd - Correct Program: True
+
+**Program Name: Six-Stage Coarse-to-Fine Adaptive Signal Pipeline**
+- **Implementation**: A staged pipeline (robust MAD noise estimate → capped-NIS adaptive Kalman → widened 2W+7 robust iterative SG → recency-weighted convolution with e^-1.2 tilt → local hysteresis median snap → zero-phase 7-tap SG polish), with the SG window and recency tilt co-swept as an interacting parameter pair to trade smoothness against group delay.
+- **Performance**: Achieved combined score 0.64 (composite 0.65) with strong responsiveness (0.70), accuracy (0.79), efficiency (1.00, 0.02s), and correlation 0.79, but weak noise reduction (0.33) and smoothness (0.45); slope changes 24.20, false reversals 21.0, lag error 0.43.
+- **Feedback**: The widened window plus recency-tilt convolution plus zero-phase polish successfully keeps lag low (lag_error 0.43), but the pipeline under-suppresses noise and residual slope churn, indicating the median snaps and hysteresis blending are too conservative; false reversals (21) and high slope-change counts suggest smoothing depth should be increased rather than relying on local snapping.
+**Program Identifier:** Generation 73 - Patch Name add_zero_phase_polish_stage - Correct Program: True
+
+**Program Name: Multi-Stage Adaptive Kalman + Savitzky-Golay Signal Filter**
+- **Implementation**: A four-stage pipeline: MAD-thresholded 5-tap median impulse despiking, an innovation-adaptive 2-state (level/velocity) Kalman filter with NIS-scaled process noise capped at 4x, two zero-phase Savitzky-Golay passes (window 2W+11, then a coarser odd window), followed by an exponentially-weighted convolution emphasizing recent samples, plus median-snap and EMA trend-lock slope-damping post-passes.
+- **Performance**: Combined score 0.68 (composite 0.70) with correlation 0.75, noise reduction 0.34, lag error 0.47, slope changes 14.60, false reversals 12.60, and perfect efficiency (1.00, 0.03s execution).
+- **Feedback**: The aggressive multi-stage smoothing achieves good accuracy and near-zero lag (0.47) but over-smooths, yielding only 0.34 noise reduction and elevated false reversals (12.60); the Kalman process-noise cap and trend-lock damping trade responsiveness for stability, leaving room to reduce the heavy SG stacking in favor of stronger noise attenuation.
+**Program Identifier:** Generation 74 - Patch Name widen_sg_window_and_steepen_tilt - Correct Program: True
+
+**Program Name: Multi-Stage Adaptive Kalman/SG Denoising Pipeline**
+- **Implementation**: An 8-stage crossover pipeline (MAD noise estimate → NIS-adaptive constant-velocity Kalman → iterative-reweighted Savitzky-Golay (2W+7 window) → 5-tap median snap → recency-weighted convolution (e^-1.2 tilt) → local hysteresis snap → second median snap → zero-phase SG polish), with a basic cumsum moving-average fallback in `adaptive_filter`.
+- **Performance**: Complete failure — combined score 0.00, all test signals failed (correlation 0.00, noise reduction 0.00, lag/avg error 1.00, 100 slope changes, 50 false reversals).
+- **Feedback**: A critical bug in `LocalHysteresisSnap.run` uses `np.median(windows5, axis=0)` (yielding a 5-element array) instead of `axis=1` (yielding per-sample medians), causing an IndexError/out-of-bounds indexing that crashes every test run. The overall architecture (valid-mode convolution preserving the length contract len(x)-W+1, robust statistics, hysteresis snapping) is sound, but the implementation error renders the entire pipeline non-functional; fixing the axis parameter is the immediate priority.
+**Program Identifier:** Generation 75 - Patch Name kalman_savgol_zerophase_pipeline - Correct Program: False
+
+**Program Name: Adaptive Kalman + Robust Savitzky-Golay Filter with Reversal Suppression**
+- **Implementation**: A three-stage pipeline: (1) innovation-adaptive 1D Kalman filter (NIS-scaled process noise, MAD-estimated measurement noise), (2) Huber-style iteratively reweighted Savitzky-Golay smoothing with MAD-based outlier clipping, and (3) hysteresis-based reversal suppression using local rolling-MAD noise scales that snaps sub-noise steps toward a 5-tap running median, with a recency-weighted exponential convolution used for lag-compensated output.
+- **Performance**: Combined score 0.62 with correlation 0.80, noise reduction 0.34, efficiency 1.00, but high false reversals (26) and slope changes (29.4), lag error 0.41, and avg error 0.51.
+- **Feedback**: The aggressive multi-stage smoothing pipeline achieves good trend tracking and accuracy (0.80 correlation, 1.00 efficiency) but under-smooths noise (only 0.34 noise reduction) and fails to suppress spurious reversals — the 0.45 threshold and 0.75 median-blend hysteresis pass are insufficient, leaving 26 false reversals and poor smoothness (0.40). The dominant score bottlenecks are false reversals/slope changes and noise reduction, suggesting the local MAD thresholds are too permissive relative to actual residual noise in the filtered output.
+**Program Identifier:** Generation 76 - Patch Name co_sweep_snap_k_blend - Correct Program: True
+
+**Program Name: Matched-Pair Kalman + Savitzky-Golay Adaptive Filter Pipeline**
+- **Implementation**: A 5-stage crossover pipeline: (1) constant-velocity Kalman pre-filter with soft NIS-capped adaptive process noise, (2) wide Savitzky-Golay smoothing (window 2W+11, order 3) with SciPy/NumPy fallback, (3) recency-weighted sliding-window aggregation using matched steep exponential tilt (e^-1.0) to hold lag constant with the wide SG window, (4) vectorized 5-tap median snap, and (5) MAD-based trend-lock hysteresis on diffs (blend 0.6) to suppress insignificant slope reversals.
+- **Performance**: Combined score 0.64 (composite 0.65) with correlation 0.75, noise reduction 0.31, lag error 0.47, false reversals 18.40, smoothness 0.49, efficiency 1.00, and perfect success rate in 0.02s.
+- **Feedback**: The matched window/tilt pair design keeps lag moderate (0.47) and responsiveness high (0.68) while maintaining strong accuracy, but noise reduction (0.31) and smoothness (0.49) remain weak points—suggesting the Kalman pre-filter and median/trend-lock snapping pass through more residual variance than the wide SG window can remove. Residual false reversals (18.4) indicate the hysteresis threshold (k=1.5 MAD) may be too lenient for this noise regime.
+**Program Identifier:** Generation 77 - Patch Name sg_tilt_matched_pair_2w11 - Correct Program: True
+
+**Program Name: Multi-Scale Wavelet Trend Fusion Filter with Kalman Pre-Denoising**
+- **Implementation**: A five-stage cascade: MAD-based robust noise estimation, bidirectional capped-NIS constant-velocity Kalman pre-denoising, stationary (à trous) B3-spline wavelet decomposition with per-scale adaptive soft-thresholding, Theil-Sen-style local-linear trend fusion, and predictive edge-corrected quadratic smoothing — all designed to be zero-phase with tail-aligned output (len(y) = len(x) - W + 1).
+- **Performance**: Combined score 0.69 with strong correlation (0.89), responsiveness (0.73), efficiency (1.00), and accuracy (0.89), but weaker noise reduction (0.37), smoothness (0.50), and lag error (0.37), with 20.4 slope changes and 17.4 false reversals.
+- **Feedback**: The heavy multi-stage zero-phase design preserves dynamics and tracking accuracy well, but the many blended smoothing stages trade away noise reduction and smoothness, and residual false reversals/slope churn suggest the aggressive detail-shrinking thresholds and trend-fusion blending are insufficiently suppressing noise-induced slope flips. The predictive edge extrapolation plus bidirectional Kalman largely cancels lag, but the remaining 0.37 lag error indicates some net delay persists in the fusion stages.
+**Program Identifier:** Generation 78 - Patch Name pre-wavelet_bidirectional_kalman_denoise - Correct Program: True
+
+**Program Name: Coarse-to-Fine Adaptive Kalman-Savgol Staged Pipeline**
+- **Implementation**: Six-stage pipeline: MAD-based noise estimation feeding a capped NIS-adaptive constant-velocity Kalman filter, widened (2W+7) iterative-reweighted Savitzky-Golay smoothing, recency-weighted convolution (tilt e^-1.2) to recover SG group delay, local MAD-based hysteresis snapping, and a zero-phase 7-tap SG polish — window and tilt co-swept as a pair.
+- **Performance**: Combined score 0.64 with correlation 0.79, noise reduction 0.33, lag error 0.43, false reversals 21, and perfect efficiency (execution time 0.01s, efficiency 1.0).
+- **Feedback**: The heavy multi-stage smoothing structure excels at speed and accuracy but underperforms on noise reduction (0.33) and smoothness (0.45), with elevated false reversals (21) suggesting the snap stages are not sufficiently suppressing slope churn; lag remains moderate (0.43) despite the recency-convolution delay compensation.
+**Program Identifier:** Generation 79 - Patch Name co_sweep_stage5_snap_params - Correct Program: True
+
+**Program Name: Coarse-to-Fine Staged Adaptive Signal Processing Pipeline**
+- **Implementation**: Six-stage pipeline: MAD-based noise estimation feeding a capped-NIS adaptive Kalman filter, widened (2W+7) iterative-reweighted Savitzky-Golay smoothing with a pre-convolution median snap, recency-weighted (e^-1.2) valid-mode convolution to recover group delay, local hysteresis snap, and a zero-phase 7-tap SG polish; the SG window and recency tilt are co-swept as interacting parameters.
+- **Performance**: Achieved combined score 0.64 (correlation 0.79, noise reduction 0.33, lag error 0.43, smoothness 0.45, responsiveness 0.70, efficiency 1.00, execution 0.01s) with high false reversals (21.0) and slope changes (24.20) as main weaknesses.
+- **Feedback**: The widened-window plus recency-tilt co-sweep successfully keeps lag low while improving noise suppression, and the fully vectorized stages preserve O(n) efficiency; however, noise_reduction (0.33) and smoothness remain the largest gaps, with residual slope churn and reversals surviving the hysteresis and polish stages—suggesting further churn suppression or stronger smoothing without added delay is the highest-value next step.
+**Program Identifier:** Generation 80 - Patch Name stage5_snap_pair_k0.45_blend0.75 - Correct Program: True
+
+**Program Name: Bidirectional Adaptive Kalman + Robust Savgol + Median Snap Pipeline**
+
+- **Implementation**: Four-stage cascade: (1) bidirectional adaptive-Q Kalman (forward/backward 50/50 fusion to cancel phase error), (2) Huber-style iteratively reweighted Savitzky-Golay (window 2W+1, poly order 2), (3.5) a new 5-tap median snap with 0.5× local-sigma threshold on the SG output, (3) recency-weighted exponential convolution, and (4) a final level-domain median snap with rolling-MAD adaptive thresholds — all fully vectorized except the Kalman recursions.
+
+- **Performance**: Combined score 0.63 with strong efficiency (1.00, 0.04s) and accuracy (0.81 correlation), but weak noise reduction (0.34) and smoothness (0.42), with 23.8 false reversals, 27.2 slope changes, and 0.41 lag error.
+
+- **Feedback**: The Stage 3.5 median snap (described as targeting noise_reduction directly) did not deliver on that goal — noise reduction of 0.34 and smoothness of 0.42 remain the weakest metrics, suggesting the heavy smoothing stages introduce lag-induced reversals (0.41 lag error) while the median snaps trade off trend fidelity. Future mutations should focus on stronger noise suppression without adding group delay, since responsiveness (0.71) is already adequate.
+**Program Identifier:** Generation 81 - Patch Name adopt_champion_sgwin_and_tune_snaps - Correct Program: True
+
+**Program Name: Crossover Hybrid Multi-Stage Adaptive Signal Pipeline**
+- **Implementation**: Six-stage pipeline (MAD noise estimation → capped NIS-adaptive Kalman → iteratively-reweighted Savitzky-Golay with 2W+7 window → median snap → recency-weighted convolution → local hysteresis snap → zero-phase 9-tap SG polish), with crossover parameters k=0.5, blend=0.7 interpolating parent settings and a co-swept window/tilt pair (e^-1.2) to balance lag against smoothness.
+- **Performance**: Combined score 0.64 (composite 0.65) with correlation 0.79, noise_reduction 0.33, smoothness 0.46, lag_error 0.43, false_reversals 20.8, and perfect efficiency (1.00, 0.02s execution).
+- **Feedback**: The pipeline is robust and fully validated (success_rate 1.00) but noise_reduction and smoothness remain the weakest metrics despite the widened SG window and zero-phase polish, suggesting further smoothing gains would require sacrificing the already-decent lag/responsiveness (0.70). High false reversal count (20.8) indicates the hysteresis snap and median stages aren't fully suppressing slope churn in non-stationary segments.
+**Program Identifier:** Generation 82 - Patch Name crossover_hybrid_pipeline - Correct Program: True
+
+**Program Name: Multi-Stage Adaptive Kalman + Savitzky-Golay Signal Filter**
+- **Implementation**: A four-stage pipeline: MAD-thresholded 5-tap median impulse despiking, bidirectional (forward + time-reversed fused) adaptive-Q Kalman filtering with NIS-based process noise scaling capped at 4x, dual zero-phase Savitzky-Golay passes (wide ~2W+11 window with order-2/3 polynomials), and finally a lag-compensating exponential-tilt convolution plus slope-consistency/trend-lock median snapping passes.
+- **Performance**: Combined score 0.68 (composite 0.70) with strong lag error (0.47), responsiveness (0.68), efficiency (1.00, 0.04s execution), and correlation (0.76), but weak noise reduction (0.34) and moderate false reversals (13.0) and slope changes (14.60).
+- **Feedback**: The wide-SG-window-plus-steep-exponential-tilt matched pair and bidirectional Kalman fusion effectively control phase lag, but the heavy smoothing stages leave residual variance high and the trend-lock/slope-damping thresholds only partially suppress spurious reversals; future gains likely lie in stronger noise attenuation without sacrificing the achieved low lag.
+**Program Identifier:** Generation 83 - Patch Name bidir_kalman_fusion_tilt_boost - Correct Program: True
+
+**Program Name: Zero-Phase Bidirectional Kalman Signal Filter**
+- **Implementation**: Runs a capped-NIS adaptive constant-velocity Kalman filter forward and on the time-reversed signal, averaging the two passes to cancel group delay; then applies symmetric raised-cosine window aggregation (to satisfy the length contract), taut-string-style diff shrinkage (snapping insignificant trend-opposing diffs to the local median slope), and a blended 3-tap median for spike removal.
+- **Performance**: Combined score 0.53 with perfect efficiency (1.00, ~0.01s), success rate 1.00, correlation 0.61, noise reduction 0.27, but weak smoothness (0.32), high lag error (0.52), and many false reversals (34.60).
+- **Feedback**: The bidirectional averaging and zero-phase symmetric windows reduce lag but apparently at the cost of noise suppression and smoothness — noise reduction (0.27) is notably poor despite the heavy pipeline. The taut-string shrinkage stage (blend 0.55, k=1.2, block=15) isn't sufficiently suppressing reversals (42.20 slope changes), suggesting its snap threshold is too conservative relative to the actual noise level.
+**Program Identifier:** Generation 84 - Patch Name bidir_kalman_tautstring - Correct Program: True
+
+**Program Name: Coarse-to-Fine Staged Adaptive Signal Pipeline**
+- **Implementation**: Six-stage pipeline: MAD-based noise estimation → capped NIS-adaptive Kalman → robust iterative-reweighted Savitzky-Golay (window 2W+7) → recency-weighted convolution (tilt e^-1.2) → local hysteresis median snap → zero-phase small-window SG polish; SG window and recency tilt co-swept as an interacting pair.
+- **Performance**: Combined score 0.64 (correlation 0.79, noise_reduction 0.33, lag_error 0.43, false_reversals 21, efficiency 1.00, execution_time 0.01s).
+- **Feedback**: Noise reduction (0.33) remains the largest gap despite the added median-snap and polish stages, indicating residual high-frequency noise survives smoothing; efficiency is excellent and lag is moderate, so future gains should target stronger noise suppression without further widening windows that hurt responsiveness.
+**Program Identifier:** Generation 85 - Patch Name aggressive_median_snap_wider_polish - Correct Program: True
+
+**Program Name: Bidirectional Adaptive Kalman Multi-Stage Crossover Filtering Pipeline**
+
+- **Implementation**: A 7-stage pipeline combining a MAD-based noise estimator, a capped NIS-adaptive constant-velocity Kalman filter run both forward and time-reversed then fused 50/50 to cancel interior phase lag, iterative-reweighted (Huber-winsorized) Savitzky-Golay smoothing with a widened co-swept window (2W+7) paired with a recency-tilted exponential convolution (e^-1.2), plus a graded 5-tap median snap, local hysteresis snap with sign-flip detection, and a zero-phase 7-tap SG polish.
+
+- **Performance**: Achieved a combined score of 0.64 (correlation 0.79, responsiveness 0.70, efficiency 1.00, execution time 0.02s, 100% success rate), but with weak noise reduction (0.34), poor smoothness (0.46), and high residual artifact counts (23.2 slope changes, 20.4 false reversals).
+
+- **Feedback**: The bidirectional Kalman fusion and co-sweep of SG window with recency tilt successfully deliver strong responsiveness and accuracy with zero runtime overhead, but the pipeline under-smooths — the capped adaptive Q, while preventing noise flooding, leaves too much high-frequency residual that the downstream snaps and small-window polish fail to fully suppress. The elevated false reversals (20.4) suggest the hysteresis snap's thresholds (k=0.45, blend=0.75) are too conservative; a stronger smoothing stage or more aggressive snap blending would improve the smoothness/reversal metrics without sacrificing the achieved responsiveness.
+**Program Identifier:** Generation 86 - Patch Name bidir_kalman_staged_pipeline - Correct Program: True
+
+**Program Name: Multi-Stage Adaptive Kalman + Savitzky-Golay Signal Filter**
+- **Implementation**: A four-stage pipeline: MAD-based impulse despiking, bidirectional (forward/backward fused) innovation-adaptive Kalman filtering to cancel phase lag, dual zero-phase Savitzky-Golay smoothing with wide windows (2W+11), followed by exponential-tilt convolution, median-based slope-consistency snapping, and EMA trend-lock slope damping; the basic variant is an O(n) cumsum moving average.
+- **Performance**: Combined score 0.68 with composite 0.70, achieving perfect efficiency (1.00, 0.05s execution), 100% success rate, correlation 0.76, lag error 0.47, and noise reduction 0.34, but weak slope preservation (14.60 slope changes, 13 false reversals).
+- **Feedback**: The bidirectional Kalman fusion and steeper exponential tilt (-1.5) successfully hold lag error low despite the wide SG window, matching the intended design; however, the heavy smoothing stack trades away dynamics tracking, as high false reversals and slope-change counts indicate residual slope churn and over-smoothing — a future lever would be relaxing the trend-lock/median snap thresholds to improve responsiveness and slope fidelity without sacrificing the strong efficiency and accuracy scores.
+**Program Identifier:** Generation 87 - Patch Name restore_bidir_kalman_and_tilt - Correct Program: True
+
+**Program Name: Hybrid Kalman + Robust Savitzky-Golay Adaptive Signal Filter**
+- **Implementation**: A five-stage pipeline: MAD noise estimation feeding a capped-NIS adaptive constant-velocity Kalman filter, followed by iterative Huber-reweighted Savitzky-Golay smoothing (wide 2W+11 window, order 3), conditional 5-tap median snapping, exponentially recency-weighted sliding-window aggregation (e^-1.2 tilt), and local sign-hysteresis snap with trend-lock re-integration blend.
+- **Performance**: Achieved a combined score of 0.65 with high correlation (0.79), strong efficiency (1.00), perfect success rate, and low lag error (0.42), but moderate noise reduction (0.34) and smoothness (0.49) with 21.2 slope changes and 18 false reversals.
+- **Feedback**: The Kalman pre-filter plus recency-weighted aggregation successfully minimizes lag (0.42) and maintains responsiveness (0.70), but the noise reduction remains weak (0.34), suggesting the capped-Q Kalman lets too much measurement noise through and the light-blend snapping stages under-suppress slope churn. The relatively high false-reversal count (18) indicates the hysteresis/trend-lock stages are not aggressive enough, leaving room to trade a bit of the excellent lag performance for stronger smoothing.
+**Program Identifier:** Generation 88 - Patch Name hybrid_kalman_savgol_hysteresis_pipeline - Correct Program: True
+
+**Program Name: Multi-Stage Adaptive Kalman + Savitzky-Golay Signal Filter**
+- **Implementation**: A multi-stage pipeline: MAD-thresholded impulse despiking, bidirectional adaptive-Q Kalman pre-pass and main pass (NIS-driven process noise capped at 4x), zero-phase Savitzky-Golay smoothing (wide 2W+11 window plus a coarser second pass), followed by an exponentially tilted weighted-average output with median-snapping and EMA trend-lock slope damping to suppress false reversals.
+- **Performance**: Achieved a combined score of 0.68 (composite 0.70) with efficiency 1.00, responsiveness 0.68, correlation 0.76, lag error 0.47, and noise reduction 0.34.
+- **Feedback**: The bidirectional Kalman fusion and steeper exponential tilt (-1.5) successfully cancel phase lag and keep responsiveness high, but the heavy smoothing stack trades away noise reduction (0.34) and still permits ~12.8 false reversals and 14.6 slope changes, suggesting the trend-lock damping thresholds could be tightened for further improvement.
+**Program Identifier:** Generation 90 - Patch Name weaker_bidirectional_kalman_prepass - Correct Program: True
+
+**Program Name: Multi-Scale Wavelet Trend Fusion with Kalman Pre-Denoising**
+- **Implementation**: Five-stage cascade: MAD-based robust noise estimation, bidirectional capped-NIS Kalman pre-denoising, stationary (à trous) wavelet decomposition with per-scale adaptive soft-thresholding, robust Theil-Sen-style local-linear trend fusion, and predictive edge-corrected quadratic smoothing to cancel phase lag; output is tail-aligned to preserve low delay.
+- **Performance**: Combined score 0.69 with correlation 0.89, efficiency 1.00 (0.01s), noise reduction 0.37, lag error 0.37, but relatively weak smoothness (0.50) and high false reversals (17.4) / slope changes (20.4).
+- **Feedback**: The bidirectional zero-phase design achieves strong accuracy and minimal lag, but the wavelet thresholding under-smooths (noise-dominated scales are zeroed yet transitional detail survives), leaving residual churn that drives spurious slope reversals and mediocre smoothness. More aggressive detail suppression or a stronger final smoothing pass could improve smoothness and false-reversal metrics without sacrificing the low-lag advantage.
+**Program Identifier:** Generation 92 - Patch Name hard_shrink_noise_scales - Correct Program: True
+
+# GLOBAL INSIGHTS SCRATCHPAD
+
+The following are global insights about optimization approaches and their effectiveness:
+
+# Updated Global Insights
+
+## Successful Algorithmic Patterns
+
+- **The wavelet family (Gen 78 / Gen 92, 0.69) is confirmed champion and re-validated as the top architecture.** Gen 92's variant (MAD noise estimate → bidirectional capped-NIS Kalman pre-denoise → à-trous B3-spline wavelet decomposition with per-scale adaptive soft-thresholding → Theil-Sen-style local-linear trend fusion → predictive edge-corrected quadratic smoothing) achieved the batch-best correlation (0.89), noise_reduction (0.37), and lag_error (0.37). Two generations (78, 92) now independently score 0.69 with this architecture.
+- **Raw-input noise calibration before pre-denoising remains the key threshold-honesty insight**: Gen 92 computes σ from the raw signal *before* the bidirectional Kalman pass, keeping wavelet thresholds calibrated to true noise and avoiding over-shrinking signal-bearing scales — this is why the wavelet stage achieves 0.89 correlation where the SG family caps at 0.79.
+- **The bidirectional capped-NIS Kalman pre-denoise is a structurally validated, reusable stage**: it appears in the two top-scoring programs (0.69) and also in the best SG-family programs (Gens 83/87/90, 0.68), where it delivers lag_error 0.47 and the family's lowest false reversals (12.8–13.0). It is the single most transferable component across both families.
+- **Per-scale adaptive thresholding (hard-shrink noise-dominated scales 0.6×, soft-threshold transitional, pass-through signal-bearing) is the only mechanism that has moved noise_reduction beyond the 0.31–0.34 plateau** — reaching 0.37 while preserving responsiveness 0.73.
+
+## Ineffective Approaches
+
+- **The Kalman+SG family has now definitively plateaued at 0.64–0.68 across nine programs (Gens 81–90)**: no parametric variation — widened SG windows (2W+7 to 2W+11), steeper exponential tilts (e^-1.2 to -1.5), crossover blends, added median/hysteresis snap stages — broke past noise_reduction 0.31–0.34 or smoothness 0.41–0.49. The bottleneck is architectural, not parametric.
+- **More snap/polish stages still do not reduce noise or reversals**: Gen 81's dedicated Stage 3.5 median snap "targeting noise_reduction" delivered only 0.34; Gen 82's six-stage variant with hysteresis snap and zero-phase polish still had 20.8 false reversals. Snapping suppresses slope churn only marginally and never suppresses high-frequency residual variance.
+- **Slope-domain reversal suppression remains catastrophic** (carried from Gen 72: 194.4 reversals, score 0.48); the entire batch's feedback consistently attributes elevated reversals to residual level-domain noise, not insufficient slope gating.
+- **Conservative snap thresholds waste the reversal budget**: Gen 84's taut-string shrinkage (blend 0.55, k=1.2) left 34.6 false reversals and scored 0.53 — the weakest correct program in the batch — confirming that shrinkage thresholds must be calibrated against actual noise level or they under-correct.
+
+## Implementation Insights
+
+- **Tail-aligned output (y = x_final[n - out_len:]) is a proven zero-cost lag reducer**: Gen 92 uses it instead of recency-weighted convolution, achieving lag_error 0.37 vs 0.43–0.47 for the tilt-compensated SG family, at identical efficiency (0.01s, efficiency 1.00).
+- **Controlled predictive edge extrapolation works**: Gen 92 evaluates the local quadratic fit at t_eval = 0.5×half then blends 50/50 with the center value — bounded extrapolation keeps churn in check where earlier uncontrolled leading-edge regression (Gens 57, 64) collapsed smoothness.
+- **Strided-view à-trous decomposition preserves O(n) efficiency**: the `_atrous_decompose_fast` variant with 5 shifted-slice gathering runs in 0.01s, matching the fastest vectorized SG pipelines — the wavelet advantage carries no runtime cost.
+- **Capped NIS adaptivity (mult ∈ [1, 4]) on the Kalman process noise is the validated form**: it prevents noise spikes from flooding the velocity state while still adapting to non-stationarity — used identically in both the 0.69 champions and the 0.68 SG variants.
+
+## Performance Analysis
+
+- **Final ranking: Gen 78 = Gen 92 (0.69, wavelet+Kalman) > Gen 71/74/83/87/90 (0.68) > SG-family plateau (0.64, Gens 82/85/86, 0.63 Gen 81, 0.65 Gen 88) > Gen 84 (0.53, taut-string)**. The wavelet family holds the top tier; the SG family clusters tightly at 0.63–0.68.
+- **Correlation is now the decisive differentiator**: wavelet programs hold 0.88–0.89 correlation vs 0.75–0.79 for the SG family, which fully explains the ~0.05 score gap at comparable reversal counts (17.4 vs 12.8–21).
+- **False reversals remain the strongest rank predictor**: 17.4 → 0.69; 12.8–13 → 0.68; 18–24 → 0.63–0.65; 34.6 → 0.53; 194 → 0.48.
+- **The champion's remaining bottleneck is unchanged**: noise_reduction (0.37), smoothness (0.50), and residual reversals (17.4) — with feedback noting the wavelet thresholding leaves "transitional detail" surviving and suggesting stronger detail suppression or a stronger final smoothing pass as the lever that would not sacrifice its lag (0.37) and correlation (0.89) advantages.
+
+# META RECOMMENDATIONS
+
+The following are actionable recommendations for the next program generations:
+
+# Recommendations for Future Program Mutations
+
+1. **Zero out (hard-shrink) noise-dominated scales instead of the 0.6× residual pass.** In `_threshold_details`, the `mag < 0.5` branch currently applies soft-threshold then multiplies survivors by 0.6; change to full hard kill (`c_t = np.sign(c) * np.maximum(np.abs(c) - thr, 0.0)` with no 0.6 factor, or `c_t *= 0.3`). The champion's weakest metric is noise_reduction (0.37) and feedback cites surviving "transitional detail" in fine scales; since signal-bearing scales pass untouched, correlation (0.89) should survive while residual variance drops. Sweep the hard zone boundary (mag < 0.4 vs 0.5) as an atomic pair with the universal-threshold multiplier (0.75 → 0.85).
+
+2. **Add correct per-scale sigma calibration for the à-trous decomposition.** Replace `sigma_j = noise_std` with the true per-level noise gain: for B3-spline à-trous, `sigma_j = noise_std * sqrt(sum(k * kernel^2))` where kernel taps at dilation step j are `np.concatenate([kernel[0:1:k], kernel])` — or empirically via `sigma_j = MAD(c_j)/0.6745` for the finest scale and propagating gains upward. Correct thresholds let coarser scales shrink proportionally more noise without touching the signal-bearing logic — directly attacking noise_reduction. Guard against division by zero when MAD(c_j)≈0 (keep a floor at 1e-12·noise_std).
+
+3. **Insert a 3-tap running median between reconstruction and `_local_linear_trend`, blended 0.5/0.5.** After `x_wav` reconstruction, apply an edge-padded 3-tap median (`sliding_window_view` + `np.median(sw, axis=1)` — **always axis=1**; Gen 75's crash was exactly this axis bug), blended half with `x_wav`. This kills isolated single-sample spikes that survive soft-thresholding at zero phase cost, targeting smoothness (0.50) without adding a smoothing stage — the SG family's failed snap-stacking (Gen 64: 85 reversals) proves stacked smoothers don't work, but a spike-only median does not attenuate signal.
+
+4. **Co-sweep the trend-fusion blend and Kalman strength as a matched pair, never independently.** Currently `x_fused = 0.6*x_wav + 0.4*x_trend` with one bidirectional Kalman pass. Try (a) 0.5/0.5 fusion with a second weaker pass (q_base = 0.005×r), or (b) 0.7/0.3 fusion with no second pass. The family's history (widened windows/tilts moved independently) shows single-knob changes are destructive; move both together to test whether the trend stage wants more or less smoothed input. Keep the raw-input σ calibration (before the Kalman pre-pass) untouched — that threshold honesty is the wavelet family's core advantage over SG (0.89 vs 0.79 correlation).
+
+5. **Strengthen the final smoothing pass within the validated bounded-extrapolation envelope, targeting the 17.4 residual false reversals.** In `_predictive_edge_smooth`, try half2 = window_size//2 (vs //3) with the t_eval = 0.5×half blend retained, or add a second quadratic pass at half3 = window_size//5 after Stage 5. Keep the 50/50 edge/center blend fixed — Gens 57/64 showed uncontrolled leading-edge regression collapses smoothness, but Gen 92's bounded 0.5×half form is the validated lag mechanism (lag 0.37). Also protect correctness: validate any change on short inputs (n = window_size, window_size+1) and keep `n_levels = clip(log2(W), 1, 6)` and tail-aligned output `y = x_final[n - out_len:]` as invariants — a single wrong pad offset or axis in the strided decomposition zeroes the score (Gen 75).
+
+**Common thread**: push the champion's two weak metrics (noise_reduction 0.37, smoothness 0.50) with zero-phase variance-suppression mechanisms inside the wavelet framework — never slope-domain gating or endpoint extrapolation beyond the validated 0.5×half blend.

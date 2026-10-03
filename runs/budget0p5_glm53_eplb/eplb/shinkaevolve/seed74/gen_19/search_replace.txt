@@ -1,0 +1,130 @@
+<NAME>
+vectorize_packing_and_batch_replication</NAME>
+<DESCRIPTION>
+Three changes targeting both goals:
+
+1. **Vectorize `balanced_packing`**: the current version has a pure-Python double loop (layer × groups) with a `min()` scan per item — this is why `times_algorithm` blew up to 0.55s. Replace with the fully vectorized greedy LPT from the earlier generation (loop only over item positions, all layer rows processed at once with `scatter_`/`argmin`), which scored `times_algorithm ≈ 0.01` with the same (or slightly better) balance quality (expert 0.25 vs 0.24).
+
+2. **Batch `replicate_experts` with one top-k**: the per-iteration scatter loop runs `num_redundant` kernel launches. Key insight: giving expert `e` its `j`-th duplicate has marginal gain `w/(j*(j+1))`, which strictly decreases in `j`. Therefore the greedy "pick max marginal gain each step" sequence is exactly the sorted top-k over the static candidate set `{(e, j)}` — a candidate `(e, j)` can never be selected before `(e, j-1)` since it has strictly smaller gain. So a single `topk` over `[n, num_log × num_redundant]` candidates reproduces the greedy picks, replica ranks (`j`), and final counts in O(1) kernel launches instead of O(num_redundant).
+
+3. **Remove the `.cpu()` round-trip** in `rebalance_experts`: `weight.float().cpu()` forces a device copy and moves all subsequent ops (and the returned maps) off the GPU. Keeping the tensor on its original device lets all the sort/gather/scatter ops run on-device with float32, cutting the dominant inference-time cost noted in the recommendations.
+
+These are mutually consistent: all three operate device-agnostically and on the same tensor layouts.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    # Greedy LPT assignment (next heaviest item -> least loaded pack that
+    # still has capacity), vectorized across the layer dimension so the
+    # Python loop only runs once per item position instead of once per
+    # (layer, item) pair.
+    w = weight.float()
+    indices = w.sort(-1, descending=True).indices  # [X, n]
+
+    pack_weights = torch.zeros(num_layers,
+                               num_packs,
+                               dtype=w.dtype,
+                               device=w.device)
+    pack_items = torch.zeros(num_layers,
+                            num_packs,
+                            dtype=torch.int64,
+                            device=w.device)
+    pack_index = torch.empty(num_layers,
+                             num_groups,
+                             dtype=torch.int64,
+                             device=w.device)
+    rank_in_pack = torch.empty_like(pack_index)
+
+    inf = float("inf")
+    ones = torch.ones(num_layers, 1, dtype=torch.int64, device=w.device)
+    for j in range(num_groups):
+        col = indices[:, j:j + 1]  # [X, 1] next heaviest item per row
+        # Packs that can still accept an item
+        eligible = pack_items < groups_per_pack
+        # Pick the least-loaded eligible pack per row
+        cand = torch.where(eligible, pack_weights,
+                           torch.full_like(pack_weights, inf))
+        pack = cand.argmin(-1, keepdim=True)  # [X, 1]
+        item_rank = pack_items.gather(1, pack)
+        pack_index.scatter_(1, col, pack)
+        rank_in_pack.scatter_(1, col, item_rank)
+        pack_weights.scatter_add_(1, pack, w.gather(1, col))
+        pack_items.scatter_add_(1, pack, ones)
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+<DIFF>
+<<<<<<< SEARCH
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+=======
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    if num_redundant > 0:
+        # Greedy marginal-gain replication, batched into a single top-k.
+        # Giving expert e its j-th duplicate (rank j) reduces its
+        # per-replica load by w/(j*(j+1)). These gains strictly decrease
+        # in j, so a candidate (e, j) can only be picked after (e, j-1).
+        # Hence the sorted top-k over the static candidate set
+        # {(e, j)} exactly reproduces the sequential greedy pick order.
+        j = torch.arange(1,
+                         num_redundant + 1,
+                         dtype=weight.dtype,
+                         device=device)
+        denom = j * (j + 1)  # 2, 6, 12, ...
+        # [n, num_log, num_redundant] marginal gains of each duplicate
+        vals = weight.unsqueeze(-1) / denom
+        flat = vals.flatten(-2)  # [n, num_log * num_redundant]
+        idx = flat.topk(num_redundant, dim=-1, sorted=True).indices
+        expert = idx // num_redundant  # [n, num_redundant]
+        copy = idx % num_redundant  # j - 1
+        phy2log[:, num_log:] = expert
+        rank[:, num_log:] = copy + 1
+        logcnt.scatter_add_(-1, expert, torch.ones_like(expert))
+    return phy2log, rank, logcnt
+>>>>>>> REPLACE
+<DIFF>
+<<<<<<< SEARCH
+    num_layers, num_logical_experts = weight.shape
+    weight = weight.float().cpu()
+    if num_groups % num_nodes == 0:
+=======
+    num_layers, num_logical_experts = weight.shape
+    # Keep the tensor on its original device; all downstream ops are
+    # device-agnostic, and avoiding the host round-trip saves both the
+    # copy and the CPU execution of the sort/gather/scatter kernels.
+    weight = weight.float()
+    if num_groups % num_nodes == 0:
+>>>>>>> REPLACE
+</DIFF>

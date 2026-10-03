@@ -1,0 +1,82 @@
+<NAME>
+dynamics_blended_third_pass
+</NAME>
+<DESCRIPTION>
+Add a gated, dynamics-blended third forward/backward RTS pass as a post-processing stage. A new helper function runs a third Kalman forward+RTS cycle on the two-pass output with q3 = qa/16 (4x geometric decay), estimated from the data. It is skipped when the two-pass output has already converged (max |second difference| < 0.05 sigma_r), and the third-pass result is blended back with a tanh-squashed curvature weight so that noise-dominated segments receive extra smoothing while genuine turns are preserved. This is implemented entirely at the dispatcher's return site so it composes with the existing two-pass smoother without touching its internals.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        # All modes route through the hybrid smoother: identical output contract,
+        # strictly dominates moving-average variants on every objective.
+        return kalman_rts_filter(input_signal, window_size)
+=======
+        # All modes route through the hybrid smoother: identical output contract,
+        # strictly dominates moving-average variants on every objective.
+        return _dynamics_blend_third_pass(
+            input_signal, kalman_rts_filter(input_signal, window_size)
+        )
+
+
+def _dynamics_blend_third_pass(raw, y):
+    # Third forward+RTS cycle, dynamics-blended (not a wholesale replacement).
+    y = np.asarray(y, dtype=float)
+    raw = np.asarray(raw, dtype=float)
+    n = len(y)
+    if n < 5:
+        return y
+
+    # Local curvature of the two-pass output.
+    d2 = np.zeros_like(y)
+    d2[1:-1] = y[2:] - 2.0 * y[1:-1] + y[:-2]
+    d2[0] = d2[1]
+    d2[-1] = d2[-2]
+
+    # Noise scale from the residual (robust MAD estimate).
+    resid = raw - y
+    sigma_r = 1.4826 * np.median(np.abs(resid - np.median(resid)))
+    if not np.isfinite(sigma_r) or sigma_r <= 1e-12:
+        sigma_r = max(np.std(resid), 1e-12)
+
+    # Convergence gate: skip the third pass entirely if the two-pass
+    # output is already smooth relative to the noise floor.
+    if np.max(np.abs(d2)) < 0.05 * sigma_r:
+        return y
+
+    # Process noise continues the validated 4x geometric decay.
+    qa = max((sigma_r ** 2) / 4.0, 1e-12)
+    q3 = 0.0625 * qa
+    r3 = sigma_r ** 2
+
+    # Forward Kalman pass.
+    x_pred = np.empty_like(y)
+    p_pred = np.empty_like(y)
+    x_filt = np.empty_like(y)
+    p_filt = np.empty_like(y)
+    x_pred[0] = y[0]
+    p_pred[0] = r3
+    x_filt[0] = y[0]
+    p_filt[0] = r3
+    for i in range(1, n):
+        x_pred[i] = x_filt[i - 1]
+        p_pred[i] = p_filt[i - 1] + q3
+        gain = p_pred[i] / (p_pred[i] + r3)
+        x_filt[i] = x_pred[i] + gain * (y[i] - x_pred[i])
+        p_filt[i] = (1.0 - gain) * p_pred[i]
+
+    # Backward RTS smoothing pass.
+    y3 = x_filt.copy()
+    p_smooth = p_filt.copy()
+    for i in range(n - 2, -1, -1):
+        denom = p_pred[i + 1]
+        if denom < 1e-12:
+            denom = 1e-12
+        g = p_filt[i] / denom
+        y3[i] = x_filt[i] + g * (y3[i + 1] - x_pred[i + 1])
+        p_smooth[i] = p_filt[i] + g * g * (p_smooth[i + 1] - p_pred[i + 1])
+
+    # Dynamics blending: w -> 1 in noise-dominated (low-curvature) segments,
+    # w -> 0 near genuine turns (high curvature) so they are preserved.
+    w = np.tanh(sigma_r / (np.abs(d2) + 1e-12))
+    return y + w * (y3 - y)
+>>>>>>> REPLACE
+</DIFF>

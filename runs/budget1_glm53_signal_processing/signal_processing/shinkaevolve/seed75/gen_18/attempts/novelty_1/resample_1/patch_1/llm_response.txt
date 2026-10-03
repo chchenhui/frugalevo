@@ -1,0 +1,55 @@
+<NAME>
+denoised_kalman_slope_lead_compensation
+</NAME>
+<DESCRIPTION>
+The current program (combined_score 0.59) already pairs a causal constant-velocity Kalman filter with a zero-phase Savitzky-Golay pass, which is why it leads on smoothness (slope_changes 107, false_reversals 83) and correlation (0.95). Its remaining weakness is the residual group delay of the causal Kalman stage: lag_error 0.29, responsiveness 0.77, noise_reduction 0.69. The evaluation feedback recommends compensating this lag with a trend lead of ~0.4× the SG half-window, but stresses that the slope feeding the lead must come from a *denoised* estimate — a raw `np.gradient(smoothed)` would re-inject high-frequency energy and undo the double smoothing, spiking slope changes and false reversals.
+
+The edit implements exactly that in three coordinated steps:
+
+1. **Store the Kalman slope state per step.** The constant-velocity filter already maintains `s[1]`, a model-based (inherently denoised) per-sample slope estimate that is far cleaner than any finite-difference of the output. Storing it during the forward loop costs one array write per iteration — efficiency stays ~1.00.
+
+2. **Add a short zero-phase box pass over the stored slope.** The raw slope state still carries residual jitter; a short odd-length box filter (length ≈ 2·(sg_half//2)+1, i.e. 5 taps for window_size 20) suppresses it. Because the whole pipeline is batch (the SG stage is already zero-phase), a *centered* box on the slope adds no phase delay — it only slightly under-compensates at true turning points, which is precisely where overshoot would create false reversals. Edge handling uses point-reflection padding (2·edge − reflected), which extends a locally linear trend correctly at the boundaries instead of flattening it, preserving trend fidelity at the array ends where the trimmed output actually lives.
+
+3. **Apply `lead = 0.4 * sg_half` and emit the compensated signal.** If the smoothed estimate approximates the true signal delayed by L samples, adding `lead·slope` advances it to an effective lag of L − lead, cutting lag_error while holding tracking accuracy. The lead scales with window size, so it generalizes across window_size settings, and the compensation is conservative (the causal slope is slightly attenuated), preventing over-lead artifacts.
+
+Net expected effect: lag_error drops below 0.29, responsiveness rises from 0.77, and since lag bias is a systematic component of `filtered − clean`, correlation, avg_error and noise_reduction all improve; using the denoised slope protects the hard-won slope_changes/false_reversals/smoothness gains. Guards for tiny inputs (n ≤ bh+1) and the existing degenerate-convolution fallback keep success_rate at 1.00.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    n = len(x)
+    kf_out = np.zeros(n)
+    kf_out[0] = x[0]
+    for i in range(1, n):
+=======
+    n = len(x)
+    kf_out = np.zeros(n)
+    slope_kf = np.zeros(n)  # per-step Kalman slope state (denoised trend estimate)
+    kf_out[0] = x[0]
+    for i in range(1, n):
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+        s = s + (K.flatten() * innov)
+        P = P - K @ H @ P
+        kf_out[i] = s[0]
+=======
+        s = s + (K.flatten() * innov)
+        P = P - K @ H @ P
+        kf_out[i] = s[0]
+        slope_kf[i] = s[1]
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    smoothed = np.convolve(padded, coeffs[::-1], mode="valid")
+    if len(smoothed) < n:
+        smoothed = kf_out  # degenerate case fallback
+
+    # --- Trim to sliding-window output length, aligning end (minimal lag) ---
+    y = smoothed[-output_length:] if len(smoothed) >= output_length else kf_out[-output_length:]
+
+    return y
+=======
+    smoothed = np.convolve(padded, coeffs[::-1], mode="valid")
+    if len(smoothed) < n:
+        smoothed = kf_out  # degenerate

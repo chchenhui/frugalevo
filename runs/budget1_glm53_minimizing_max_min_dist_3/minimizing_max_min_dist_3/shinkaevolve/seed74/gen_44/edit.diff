@@ -1,0 +1,302 @@
+--- a/original.py
++++ b/original.py
+@@ -1,143 +1,176 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
++from scipy.optimize import minimize
+ 
++def min_max_dist_dim3_14():
++    N, D = 14, 3
++    pairs = [(i, j) for i in range(N) for j in range(i + 1, N)]
++    npair = len(pairs)
++    rng = np.random.default_rng(20240514)
+ 
+-def _normalize(points):
+-    d = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=-1)
+-    i, j = np.unravel_index(np.argmax(d), d.shape)
+-    dmax = d[i, j]
+-    if dmax <= 0:
+-        return points, d, 0.0
+-    return points / dmax, d / dmax, dmax
++    def sq_dist_matrix(P):
++        d = P[:, None, :] - P[None, :, :]
++        return np.einsum('ijk,ijk->ij', d, d)
+ 
++    def exact_stats(P):
++        M = sq_dist_matrix(P)
++        iu = np.triu_indices(N, 1)
++        vals = M[iu]
++        return vals.min(), vals.max()
+ 
+-def _min_dist(points):
+-    n = points.shape[0]
+-    diff = points[:, None, :] - points[None, :, :]
+-    d = np.linalg.norm(diff, axis=-1)
+-    iu = np.triu_indices(n, 1)
+-    return d[iu].min(), d
++    def ratio_sq(P):
++        dmin, dmax = exact_stats(P)
++        if dmax <= 0:
++            return 0.0
++        return dmin / dmax
+ 
++    def rescale_unit_diam(P):
++        _, dmax = exact_stats(P)
++        if dmax <= 0:
++            return P
++        return P / dmax
+ 
+-def _local_search(points, iters=3000, seed=0, step0=0.05):
+-    """Gradient-style annealing for the spread ratio dmin/dmax.
++    def solve_epigraph(P0, rounds=3):
++        """Maximize s s.t. d_ij^2 >= s, d_ij^2 <= 1, with rescale-refit rounds."""
++        P = rescale_unit_diam(np.asarray(P0, dtype=float))
++        best_P = P.copy()
++        best_r = ratio_sq(P)
++        for _ in range(rounds):
++            M = sq_dist_matrix(P)
++            dmin2 = min(M[i, j] for i, j in pairs)
++            s0 = max(dmin2, 1e-6)
++            z = np.concatenate([P.ravel(), [s0]])
+ 
+-    Pushes apart pairs near the current minimum distance, mildly pulls
+-    together pairs near the diameter, adds decaying jitter, then rescales
+-    the configuration so that dmax = 1.
+-    """
+-    rng = np.random.default_rng(seed)
+-    pts, _, _ = _normalize(np.asarray(points, dtype=float).copy())
+-    n = pts.shape[0]
+-    iu = np.triu_indices(n, 1)
+-    best = pts.copy()
+-    best_m = _min_dist(pts)[0]
+-    for it in range(iters):
+-        f = 1.0 - it / iters
+-        step = step0 * f + 2e-4
+-        T = 0.03 * f
+-        diff = pts[:, None, :] - pts[None, :, :]
+-        d = np.sqrt((diff ** 2).sum(-1))
+-        np.fill_diagonal(d, np.inf)
+-        m = d[iu].min()
+-        close = (d < m + 0.12 * f + 0.005).astype(float)
+-        far = (d > 1.0 - 0.02).astype(float)
+-        inv = diff / d[..., None]
+-        gc = (inv * close[..., None]).sum(axis=1)
+-        gf = (inv * far[..., None]).sum(axis=1)
+-        disp = step * gc - 0.6 * step * gf + rng.normal(0, T, pts.shape)
+-        nd = np.linalg.norm(disp, axis=1, keepdims=True)
+-        cap = 3.0 * step + 0.1
+-        disp = np.where(nd > cap, disp / np.maximum(nd, 1e-12) * cap, disp)
+-        pts, _, _ = _normalize(pts + disp)
+-        mm = _min_dist(pts)[0]
+-        if mm > best_m:
+-            best_m = mm
+-            best = pts.copy()
+-    return best, best_m
++            def obj(z):
++                return -z[-1]
+ 
++            def obj_grad(z):
++                g = np.zeros_like(z)
++                g[-1] = -1.0
++                return g
+ 
+-def min_max_dist_dim3_14() -> np.ndarray:
+-    n, dim = 14, 3
+-    seeds = []
++            cons = []
++            # d_ij^2 - s >= 0
++            for (i, j) in pairs:
++                def make_c(i, j):
++                    def c(z):
++                        Pm = z[:N * D].reshape(N, D)
++                        v = Pm[i] - Pm[j]
++                        return float(v @ v - z[-1])
++                    def gc(z):
++                        g = np.zeros(N * D + 1)
++                        Pm = z[:N * D].reshape(N, D)
++                        v = Pm[i] - Pm[j]
++                        g[i * D:i * D + D] = 2 * v
++                        g[j * D:j * D + D] = -2 * v
++                        g[-1] = -1.0
++                        return g
++                    return {'type': 'ineq', 'fun': c, 'jac': gc}
++                cons.append(make_c(i, j))
++            # 1 - d_ij^2 >= 0
++            for (i, j) in pairs:
++                def make_d(i, j):
++                    def c(z):
++                        Pm = z[:N * D].reshape(N, D)
++                        v = Pm[i] - Pm[j]
++                        return float(1.0 - v @ v)
++                    def gc(z):
++                        g = np.zeros(N * D + 1)
++                        Pm = z[:N * D].reshape(N, D)
++                        v = Pm[i] - Pm[j]
++                        g[i * D:i * D + D] = -2 * v
++                        g[j * D:j * D + D] = 2 * v
++                        return g
++                    return {'type': 'ineq', 'fun': c, 'jac': gc}
++                cons.append(make_d(i, j))
+ 
+-    # structured seed: icosahedron vertices + center-ish cluster
+-    phi = (1 + 5 ** 0.5) / 2
+-    ico = []
+-    for a in (-1, 1):
+-        for b in (-phi, phi):
+-            ico.append((0, a, b))
+-            ico.append((a, b, 0))
+-            ico.append((b, 0, a))
+-    ico = np.array(ico, dtype=float)
+-    # two-layer: two staggered heptagons
+-    for k in range(7):
+-        ang1 = 2 * np.pi * k / 7
+-        ang2 = ang1 + np.pi / 7
+-        seeds.append(np.vstack([
+-            np.array([np.cos(ang1), np.sin(ang1), 0.8]),
+-            np.array([np.cos(ang2), np.sin(ang2), -0.8]),
+-        ]))
+-    seeds.append(ico[:14])
++            try:
++                res = minimize(obj, z, jac=obj_grad, constraints=cons,
++                               method='SLSQP',
++                               options={'maxiter': 250, 'ftol': 1e-12})
++                Pn = res.x[:N * D].reshape(N, D)
++            except Exception:
++                Pn = P
++            if not np.all(np.isfinite(Pn)):
++                Pn = P
++            Pn = rescale_unit_diam(Pn)
++            r = ratio_sq(Pn)
++            if r > best_r:
++                best_r = r
++                best_P = Pn.copy()
++            P = Pn
++        return best_P, best_r
+ 
+-    rng = np.random.default_rng(12345)
+-    for _ in range(8):
+-        seeds.append(rng.normal(0, 1, (n, dim)))
++    def fibonacci_sphere(n, jitter=0.0):
++        k = np.arange(n) + 0.5
++        phi = np.arccos(1 - 2 * k / n)
++        theta = np.pi * (1 + 5 ** 0.5) * k
++        P = np.stack([np.cos(theta) * np.sin(phi),
++                      np.sin(theta) * np.sin(phi),
++                      np.cos(phi)], axis=1)
++        if jitter > 0:
++            P = P + jitter * rng.standard_normal((n, 3))
++        return P
+ 
+-    # --- diversified structured starts to escape the 0.24 basin ---
++    def icosahedron_plus():
++        t = (1 + 5 ** 0.5) / 2
++        V = np.array([
++            [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
++            [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
++            [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1],
++        ], dtype=float)
++        V /= np.linalg.norm(V[0])
++        extra = fibonacci_sphere(2) * 0.9
++        return np.vstack([V, extra])
+ 
+-    # Fibonacci spherical spiral: 14 near-uniform points on the unit sphere
+-    k = np.arange(14) + 0.5
+-    z = 1.0 - 2.0 * k / 14.0
+-    r_sq = np.maximum(0.0, 1.0 - z ** 2)
+-    ang = np.pi * (1.0 + 5.0 ** 0.5) * k
+-    fib = np.stack([np.sqrt(r_sq) * np.cos(ang), np.sqrt(r_sq) * np.sin(ang), z], axis=1)
+-    seeds.append(fib)
++    def two_rings():
++        pts = [np.array([0, 0, 1.0]), np.array([0, 0, -1.0])]
++        for zc, r in ((0.5, 0.55), (-0.5, 0.55)):
++            for k in range(6):
++                th = 2 * np.pi * k / 6 + (0.3 if zc < 0 else 0.0)
++                pts.append([r * np.cos(th), r * np.sin(th), zc])
++        return np.array(pts)
+ 
+-    # cuboctahedron vertices (12) + 2 poles, sweeping pole radius
+-    cubo = []
+-    for x in (-1, 1):
+-        for y in (-1, 1):
+-            cubo.append((x, y, 0))
+-            cubo.append((x, 0, y))
+-            cubo.append((0, x, y))
+-    cubo = np.array(cubo[:12], dtype=float)
+-    for pr in (0.5, 0.8, 1.0, 1.3, 1.7, 2.2, 3.0):
+-        seeds.append(np.vstack([cubo, [[0, 0, pr], [0, 0, -pr]]]))
++    def rings_staggered():
++        pts = []
++        for zc, r, off in ((0.6, 0.6, 0.0), (-0.6, 0.6, np.pi / 5)):
++            for k in range(5):
++                th = 2 * np.pi * k / 5 + off
++                pts.append([r * np.cos(th), r * np.sin(th), zc])
++        for zc in (1.2, -1.2, 0.0):
++            pts.append([0, 0, zc] if zc != 0 else [0.0, 0.0, 0.0])
++        P = np.array(pts, dtype=float)
++        while len(P) < N:
++            P = np.vstack([P, fibonacci_sphere(1)[0]])
++        return P[:N]
+ 
+-    # rhombic dodecahedron vertices: 8 cube corners + 6 octahedron vertices
+-    rhomb = np.array(
+-        [[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)] +
+-        [[s * 2, 0, 0] for s in (-1, 1)] +
+-        [[0, s * 2, 0] for s in (-1, 1)] +
+-        [[0, 0, s * 2] for s in (-1, 1)], dtype=float)
+-    seeds.append(rhomb)
++    starts = []
++    starts.append(fibonacci_sphere(N))
++    starts.append(fibonacci_sphere(N, jitter=0.05))
++    starts.append(icosahedron_plus())
++    starts.append(two_rings())
++    starts.append(rings_staggered())
++    starts.append(rng.standard_normal((N, 3)) * 0.5)
++    starts.append(rng.uniform(-0.5, 0.5, (N, 3)))
++    # random perturbations of the structured starts
++    for base in (fibonacci_sphere(N), icosahedron_plus(), two_rings()):
++        for _ in range(4):
++            starts.append(base + 0.1 * rng.standard_normal((N, 3)))
++    for _ in range(10):
++        starts.append(0.4 * rng.standard_normal((N, 3)))
+ 
+-    # icosahedron + poles along z, sweeping pole radius (0.5 .. 3.0)
+-    # and one variant with poles along the x-axis to break symmetry
+-    for pr in (0.5, 0.8, 1.1, 1.5, 2.0, 2.6, 3.0):
+-        seeds.append(np.vstack([ico, [[0, 0, pr], [0, 0, -pr]]]))
+-    for pr in (1.0, 1.6, 2.4):
+-        seeds.append(np.vstack([ico, [[pr, 0, 0], [-pr, 0, 0]]]))
++    best_P = None
++    best_r = -1.0
++    for P0 in starts:
++        P, r = solve_epigraph(P0)
++        if r > best_r:
++            best_r = r
++            best_P = P.copy()
+ 
+-    best_pts, best_val = None, -1.0
+-    total = len(seeds)
+-    for s, pts in enumerate(seeds):
+-        if pts.shape != (n, dim):
+-            continue
+-        # spread iteration budget so runtime stays bounded
+-        it = 2200 if s < total - 20 else 1200
+-        p, v = _local_search(pts, iters=it, seed=s)
+-        if v > best_val:
+-            best_val, best_pts = v, p
+-
+-    # final polish with small steps
+-    p, v = _local_search(best_pts, iters=4000, seed=999)
+-    if v > best_val:
+-        best_val, best_pts = v, p
+-
+-    best_pts, _, _ = _normalize(best_pts)
+-    return best_pts
+-
+-
++    best_P = rescale_unit_diam(best_P)
++    # tiny polish pass on the overall best
++    P, r = solve_epigraph(best_P + 0.01 * rng.standard_normal((N, 3)), rounds=2)
++    if r > best_r:
++        best_P = rescale_unit_diam(P)
++    return np.ascontiguousarray(best_P, dtype=float)
+ # EVOLVE-BLOCK-END

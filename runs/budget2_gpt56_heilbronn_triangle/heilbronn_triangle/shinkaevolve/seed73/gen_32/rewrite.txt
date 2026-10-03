@@ -1,0 +1,223 @@
+# EVOLVE-BLOCK-START
+import itertools
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Return a deterministic 11-point configuration in the equilateral triangle.
+
+    Coordinates are optimized as the final two barycentric coordinates (u, v).
+    For any triple, abs(det) in these coordinates is its area normalized by
+    the area of the enclosing equilateral triangle.
+    """
+    n = 11
+    fixed = 3
+    movable = n - fixed
+    rng = np.random.default_rng(82736419)
+
+    triples = np.asarray(list(itertools.combinations(range(n), 3)), dtype=np.intp)
+    height = np.sqrt(3.0) * 0.5
+
+    population_size = 112
+    elite_count = 20
+    generations = 3800
+
+    def project(uv: np.ndarray) -> np.ndarray:
+        """Map arbitrary coordinate pairs into the closed barycentric simplex."""
+        w0 = 1.0 - uv[..., 0] - uv[..., 1]
+        weights = np.stack((w0, uv[..., 0], uv[..., 1]), axis=-1)
+        np.maximum(weights, 1.0e-10, out=weights)
+        weights /= weights.sum(axis=-1, keepdims=True)
+        return weights[..., 1:]
+
+    def areas(configs: np.ndarray) -> np.ndarray:
+        chosen = configs[:, triples]
+        d1 = chosen[:, :, 1] - chosen[:, :, 0]
+        d2 = chosen[:, :, 2] - chosen[:, :, 0]
+        return np.abs(d1[..., 0] * d2[..., 1] - d1[..., 1] * d2[..., 0])
+
+    def score(configs: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Return true minima, support-guided ranking values, and all areas.
+
+        The support term is deliberately restricted to the low determinant
+        tail: it distinguishes layouts which have the same apparent minimum
+        but different capacity to improve their active constraints.
+        """
+        all_areas = areas(configs)
+        low = np.partition(all_areas, 9, axis=1)[:, :10]
+        minimum = low[:, 0]
+        ranking = minimum + 0.026 * low.mean(axis=1)
+        return minimum, ranking, all_areas
+
+    def initial_population(size: int) -> np.ndarray:
+        pop = rng.dirichlet((0.72, 0.72, 0.72), size=(size, n))[..., 1:]
+        pop[:, 0] = (0.0, 0.0)
+        pop[:, 1] = (1.0, 0.0)
+        pop[:, 2] = (0.0, 1.0)
+
+        # Deterministic quasi-uniform seeds, including useful boundary-rich
+        # arrangements that random Dirichlet sampling underrepresents.
+        seed_count = min(18, size)
+        golden = 0.6180339887498949
+        for s in range(seed_count):
+            phase = (s + 0.5) / seed_count
+            points = np.empty((movable, 2), dtype=float)
+            for j in range(movable):
+                a = (j * golden + phase) % 1.0
+                b = (j * (1.0 - golden) + 0.31 * phase) % 1.0
+                if s % 3 == 0 and j < 3:
+                    # Spread a few points over the three sides.
+                    t = (j * 0.37 + phase) % 1.0
+                    if j == 0:
+                        points[j] = (t, 0.0)
+                    elif j == 1:
+                        points[j] = (0.0, t)
+                    else:
+                        points[j] = (t, 1.0 - t)
+                else:
+                    points[j] = (a, b)
+            pop[s, fixed:] = project(points)
+        return pop
+
+    population = initial_population(population_size)
+    minima, rankings, _ = score(population)
+    best_index = int(np.argmax(minima))
+    best = population[best_index].copy()
+    best_area = float(minima[best_index])
+
+    for generation in range(generations):
+        progress = generation / (generations - 1)
+        order = np.argsort(rankings)[::-1]
+        elites = population[order[:elite_count]].copy()
+
+        elite_minima, _, _ = score(elites)
+        ib = int(np.argmax(elite_minima))
+        if elite_minima[ib] > best_area:
+            best_area = float(elite_minima[ib])
+            best = elites[ib].copy()
+
+        offspring_count = population_size - elite_count
+        offspring = elites[rng.integers(0, elite_count, size=offspring_count)].copy()
+
+        # Broad differential offspring find alternate combinatorial layouts.
+        de_count = 46 if progress < 0.56 else 18
+        ia = rng.integers(0, population_size, size=de_count)
+        ib = rng.integers(0, population_size, size=de_count)
+        ic = rng.integers(0, population_size, size=de_count)
+        factor = 0.58 * (1.0 - progress) ** 1.25 + 0.08
+        donor = population[ia, fixed:] + factor * (
+            population[ib, fixed:] - population[ic, fixed:]
+        )
+        cross_probability = 0.63 - 0.25 * progress
+        cross = rng.random((de_count, movable, 1)) < cross_probability
+        force = rng.integers(0, movable, size=de_count)
+        cross[np.arange(de_count), force, 0] = True
+        offspring[:de_count, fixed:] = np.where(
+            cross, donor, offspring[:de_count, fixed:]
+        )
+
+        # Standard sparse mutations maintain diversity at all stages.
+        sigma = 0.055 * (1.0 - progress) ** 1.65 + 0.00028
+        ordinary_probability = 0.48 - 0.27 * progress
+        ordinary = rng.random((offspring_count, movable, 1)) < ordinary_probability
+        offspring[:, fixed:] += ordinary * rng.normal(
+            0.0, sigma, size=(offspring_count, movable, 2)
+        )
+
+        # Late-run active-constraint offspring: extract points in each
+        # parent's eight smallest triangles and mutate them more frequently,
+        # with a notably smaller step than exploratory mutation.
+        if progress > 0.30:
+            active_start = de_count
+            parent_subset = offspring[active_start:]
+            _, _, pa = score(parent_subset)
+            threshold = np.partition(pa, 7, axis=1)[:, 7]
+            active_triangles = pa <= threshold[:, None]
+            active_points = np.zeros((len(parent_subset), n), dtype=bool)
+            rows, cols = np.nonzero(active_triangles)
+            active_points[rows, triples[cols, 0]] = True
+            active_points[rows, triples[cols, 1]] = True
+            active_points[rows, triples[cols, 2]] = True
+
+            active_mask = active_points[:, fixed:, None] & (
+                rng.random((len(parent_subset), movable, 1))
+                < (0.62 if progress < 0.78 else 0.46)
+            )
+            local_sigma = 0.016 * (1.0 - progress) ** 1.35 + 0.00012
+            offspring[active_start:, fixed:] += active_mask * rng.normal(
+                0.0, local_sigma, size=(len(parent_subset), movable, 2)
+            )
+
+        offspring[:, fixed:] = project(offspring[:, fixed:])
+
+        # A small number of immigrants early in the search prevents all
+        # surviving candidates from sharing one initially mediocre geometry.
+        if generation < 850 and generation % 50 == 0:
+            offspring[-6:] = initial_population(6)
+
+        population = np.concatenate((elites, offspring), axis=0)
+        minima, rankings, _ = score(population)
+
+    current = int(np.argmax(minima))
+    if minima[current] > best_area:
+        best = population[current].copy()
+        best_area = float(minima[current])
+
+    # Batched local maximin refinement around the strongest configuration.
+    # Most moves address points appearing in active triangles, but a minority
+    # remain unconstrained sparse moves to permit active-set transitions.
+    incumbent = best.copy()
+    incumbent_area = best_area
+    _, incumbent_rank, incumbent_areas = score(incumbent[None, ...])
+    incumbent_rank = float(incumbent_rank[0])
+
+    for step in range(760):
+        batch = 64
+        fraction = step / 760.0
+        trials = np.repeat(incumbent[None, :, :], batch, axis=0)
+
+        cutoff = np.partition(incumbent_areas[0], 7)[7]
+        active_tris = incumbent_areas[0] <= cutoff
+        point_active = np.zeros(n, dtype=bool)
+        point_active[triples[active_tris].ravel()] = True
+
+        local_scale = 0.010 * (1.0 - fraction) ** 1.75 + 0.000055
+        active_move = point_active[fixed:][None, :, None] & (
+            rng.random((batch, movable, 1)) < (0.58 if step < 440 else 0.35)
+        )
+        global_move = rng.random((batch, movable, 1)) < (
+            0.10 if step < 360 else 0.045
+        )
+        move = active_move | global_move
+        trials[:, fixed:] += move * rng.normal(
+            0.0, local_scale, size=(batch, movable, 2)
+        )
+        trials[:, fixed:] = project(trials[:, fixed:])
+
+        tm, tr, ta = score(trials)
+        candidate = int(np.argmax(tr))
+        if (
+            tm[candidate] > incumbent_area
+            or (
+                tm[candidate] >= incumbent_area * 0.9993
+                and tr[candidate] > incumbent_rank
+            )
+        ):
+            incumbent = trials[candidate].copy()
+            incumbent_area = float(tm[candidate])
+            incumbent_rank = float(tr[candidate])
+            incumbent_areas = ta[candidate:candidate + 1]
+
+        if tm[candidate] > best_area:
+            best = trials[candidate].copy()
+            best_area = float(tm[candidate])
+
+    return np.column_stack((
+        best[:, 0] + 0.5 * best[:, 1],
+        height * best[:, 1],
+    ))
+
+
+# EVOLVE-BLOCK-END

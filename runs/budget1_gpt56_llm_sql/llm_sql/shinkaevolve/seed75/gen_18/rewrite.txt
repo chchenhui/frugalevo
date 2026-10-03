@@ -1,0 +1,298 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-cache-oriented column reordering.
+
+    Values are never normalized in the returned DataFrame.  Normalization is
+    used only to model the evaluator's serialization:
+        "".join(row.fillna("").astype(str).values)
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    @staticmethod
+    def _serialized_value(value) -> str:
+        """Match fillna('').astype(str) without changing the stored value."""
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, (bool, np.bool_)) and missing:
+                return ""
+        except Exception:
+            # Exotic objects may not support pandas missing-value testing.
+            pass
+        try:
+            return str(value)
+        except Exception:
+            return repr(value)
+
+    @staticmethod
+    def _lcp(left: str, right: str) -> int:
+        """Bounded Python-level LCP using C-level slice comparisons."""
+        limit = min(len(left), len(right))
+        if limit == 0:
+            return 0
+        if left == right:
+            return limit
+        lo, hi = 0, limit
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if left[:mid] == right[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_score(self, rows: List[str]) -> int:
+        """Exact ideal serial-Trie reuse for a fixed collection of strings."""
+        if len(rows) < 2:
+            return 0
+        ordered = sorted(rows)
+        score = 0
+        previous = ordered[0]
+        for current in ordered[1:]:
+            score += self._lcp(previous, current)
+            previous = current
+        return score
+
+    @staticmethod
+    def _stable_topological_order(preferred, predecessors):
+        """
+        Return a stable ordering satisfying unit-level dependency constraints.
+        Cycles retain preferred order rather than dropping any source column.
+        """
+        remaining = set(preferred)
+        result = []
+        while remaining:
+            chosen = None
+            for item in preferred:
+                if item in remaining and not (predecessors[item] & remaining):
+                    chosen = item
+                    break
+            if chosen is None:
+                # A cyclic optional dependency must not cause data loss.
+                chosen = next(item for item in preferred if item in remaining)
+            result.append(chosen)
+            remaining.remove(chosen)
+        return result
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        """
+        Return a positional permutation of every source row plus the source
+        column names occupying each returned position.
+
+        ``parallel`` and ``distinct_value_threshold`` remain accepted for API
+        compatibility.  This implementation intentionally avoids worker races:
+        preserving a row's identity is more important than speculative threads.
+        """
+        del parallel, distinct_value_threshold
+
+        nrows, ncols = df.shape
+        names = list(df.columns)
+        if ncols == 0:
+            return df.copy(), [[] for _ in range(nrows)]
+        if nrows == 0:
+            return df.copy(), []
+
+        # Build evaluator-compatible strings once.  The original values remain
+        # untouched in df and are copied to the output only after selection.
+        values = df.to_numpy(dtype=object, copy=False)
+        text = [
+            [self._serialized_value(values[r, c]) for c in range(ncols)]
+            for r in range(nrows)
+        ]
+        lengths = np.array([[len(text[r][c]) for c in range(ncols)]
+                            for r in range(nrows)], dtype=np.int64)
+
+        # A merge constraint is represented as an inseparable positional unit;
+        # unlike the old implementation it does not concatenate or alter cells.
+        name_positions = {}
+        for pos, name in enumerate(names):
+            name_positions.setdefault(name, []).append(pos)
+
+        units = []
+        assigned = set()
+        for merge in col_merge or []:
+            unit = []
+            for name in merge:
+                for pos in name_positions.get(name, []):
+                    if pos not in assigned:
+                        assigned.add(pos)
+                        unit.append(pos)
+            if unit:
+                units.append(unit)
+        for pos in range(ncols):
+            if pos not in assigned:
+                units.append([pos])
+
+        unit_of_col = {}
+        for unit_id, unit in enumerate(units):
+            for col in unit:
+                unit_of_col[col] = unit_id
+
+        # Resolve optional substring dependency semantics used by the original
+        # program, then lift each edge from columns to merge units.
+        predecessors = [set() for _ in units]
+        for before_text, after_text in one_way_dep or []:
+            before = [i for i, name in enumerate(names) if str(before_text) in str(name)]
+            after = [i for i, name in enumerate(names) if str(after_text) in str(name)]
+            if len(before) == 1 and len(after) == 1:
+                left, right = unit_of_col[before[0]], unit_of_col[after[0]]
+                if left != right:
+                    predecessors[right].add(left)
+
+        # Per-unit values permit conditional partitioning while retaining merged
+        # columns as adjacent fields.
+        unit_text = []
+        unit_weight = []
+        for unit in units:
+            unit_text.append(["".join(text[r][c] for c in unit) for r in range(nrows)])
+            unit_weight.append(int(lengths[:, unit].sum()))
+
+        # Global repetition score requested by the experiment: each repeated
+        # serialized field contributes len(value) * count * (count - 1).
+        repetition = []
+        alternate = []
+        for uid in range(len(units)):
+            counts = {}
+            for value in unit_text[uid]:
+                counts[value] = counts.get(value, 0) + 1
+            repetition.append(sum(len(value) * count * (count - 1)
+                                  for value, count in counts.items()))
+            # A distinct cheap frequency/length hypothesis.
+            alternate.append(sum(len(value) * (count - 1)
+                                 for value, count in counts.items()))
+
+        base_units = list(range(len(units)))
+        global_units = self._stable_topological_order(
+            sorted(base_units, key=lambda u: (-repetition[u], -unit_weight[u], u)),
+            predecessors,
+        )
+        alternate_units = self._stable_topological_order(
+            sorted(base_units, key=lambda u: (-alternate[u], -unit_weight[u], u)),
+            predecessors,
+        )
+
+        def expand(unit_order):
+            return [column for uid in unit_order for column in units[uid]]
+
+        global_order = expand(global_units)
+        alternate_order = expand(alternate_units)
+
+        # Conditional prefix partition candidate.  Every leaf gets a
+        # deterministic global tail.  Node and depth limits avoid wide-table
+        # or high-cardinality regressions.
+        conditional_orders = [None] * nrows
+        max_depth = min(len(units), col_stop if col_stop and col_stop > 0 else 12)
+        max_nodes = min(2048, max(32, nrows * 2))
+        candidate_cap = min(32, len(units))
+        nodes_seen = 0
+
+        def fill_tail(row_ids, prefix):
+            used = set(prefix)
+            tail_preferred = [u for u in global_units if u not in used]
+            tail = self._stable_topological_order(
+                tail_preferred,
+                [predecessors[u] & set(tail_preferred) for u in tail_preferred],
+            )
+            order = expand(prefix + tail)
+            for row_id in row_ids:
+                conditional_orders[row_id] = order
+
+        def visit(row_ids, prefix):
+            nonlocal nodes_seen
+            nodes_seen += 1
+            if (len(row_ids) < 2 or len(prefix) >= max_depth or
+                    nodes_seen > max_nodes):
+                fill_tail(row_ids, prefix)
+                return
+
+            used = set(prefix)
+            available = [
+                u for u in global_units
+                if u not in used and not (predecessors[u] - used)
+            ]
+            if not available:
+                fill_tail(row_ids, prefix)
+                return
+            available = available[:candidate_cap]
+
+            best_unit = None
+            best_score = 0
+            best_groups = None
+            for uid in available:
+                groups = {}
+                for row_id in row_ids:
+                    value = unit_text[uid][row_id]
+                    groups.setdefault(value, []).append(row_id)
+                score = sum(len(value) * len(group) * (len(group) - 1)
+                            for value, group in groups.items())
+                if score > best_score or (score == best_score and
+                                          best_unit is not None and uid < best_unit):
+                    best_unit, best_score, best_groups = uid, score, groups
+
+            if best_unit is None or best_score <= early_stop:
+                fill_tail(row_ids, prefix)
+                return
+
+            for group in best_groups.values():
+                visit(group, prefix + [best_unit])
+
+        visit(list(range(nrows)), [])
+        for row_id in range(nrows):
+            if conditional_orders[row_id] is None:
+                conditional_orders[row_id] = global_order
+
+        def serialized_rows(orders):
+            return [
+                "".join(text[row_id][column] for column in orders[row_id])
+                for row_id in range(nrows)
+            ]
+
+        # Candidate one: required global frequency ordering.
+        candidates = [
+            ("global", [global_order] * nrows),
+            ("conditional", conditional_orders),
+        ]
+
+        # A third score is useful on ordinary inputs, but avoid an unnecessary
+        # additional full-string allocation on very large inputs.
+        total_chars = int(lengths.sum())
+        if total_chars <= 12_000_000 and nrows <= 50_000:
+            candidates.append(("alternate", [alternate_order] * nrows))
+
+        best_orders = candidates[0][1]
+        best_score = self._trie_score(serialized_rows(best_orders))
+        for _, orders in candidates[1:]:
+            score = self._trie_score(serialized_rows(orders))
+            if score > best_score:
+                best_score = score
+                best_orders = orders
+
+        # Object dtype preserves mixed values, including original NaN/NA/None,
+        # rather than accidentally coercing them during row reconstruction.
+        output = np.empty((nrows, ncols), dtype=object)
+        for row_id, order in enumerate(best_orders):
+            output[row_id, :] = values[row_id, order]
+
+        result = pd.DataFrame(output, index=df.index.copy(), columns=df.columns.copy())
+        column_orderings = [[names[column] for column in order] for order in best_orders]
+        return result, column_orderings
+
+# EVOLVE-BLOCK-END

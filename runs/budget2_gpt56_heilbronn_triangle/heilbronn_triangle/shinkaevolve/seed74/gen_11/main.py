@@ -1,0 +1,212 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+_CACHED_POINTS = None
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct 11 points in the unit-side equilateral triangle.
+
+    The search is deterministic.  Areas are optimized in barycentric
+    coordinates, where the absolute determinant of three barycentric
+    coordinate pairs is exactly the triangle area normalized by the
+    area of the containing equilateral triangle.
+    """
+    global _CACHED_POINTS
+
+    if _CACHED_POINTS is not None:
+        return _CACHED_POINTS.copy()
+
+    try:
+        rng = np.random.default_rng(11031987)
+        n = 11
+        free_n = 8
+
+        # Barycentric representation stores (weight at vertex (1,0),
+        # weight at vertex (0.5,sqrt(3)/2)); the remaining weight is implicit.
+        fixed = np.array([
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ], dtype=float)
+
+        triples = np.array(
+            [(i, j, k) for i in range(n - 2)
+             for j in range(i + 1, n - 1)
+             for k in range(j + 1, n)],
+            dtype=np.intp,
+        )
+
+        def project_simplex(a):
+            """Project a batch of (p,q) values into p>=0,q>=0,p+q<=1."""
+            a = np.maximum(a, 0.0)
+            s = a[..., 0] + a[..., 1]
+            mask = s > 1.0
+            if np.any(mask):
+                a[mask] /= s[mask, None]
+            return a
+
+        def score_population(pop):
+            """Minimum normalized triangle area for every population member."""
+            m = pop.shape[0]
+            pts = np.empty((m, n, 2), dtype=float)
+            pts[:, :3, :] = fixed
+            pts[:, 3:, :] = pop.reshape(m, free_n, 2)
+
+            a = pts[:, triples[:, 0], :]
+            b = pts[:, triples[:, 1], :]
+            c = pts[:, triples[:, 2], :]
+            det = np.abs(
+                (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
+                - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
+            )
+            return np.min(det, axis=1)
+
+        def greedy_seed():
+            """
+            Add points one at a time.  Each new point is selected from a
+            sizeable random candidate set by its worst triangle with all
+            already placed point pairs.
+            """
+            pts = [fixed[0], fixed[1], fixed[2]]
+
+            for step in range(free_n):
+                count = 900
+                raw = rng.dirichlet((1.15, 1.15, 1.15), size=count)
+                cand = raw[:, 1:3]
+
+                # A few candidates near a regular interior distribution help
+                # avoid wasting all candidates close to the boundary.
+                center = rng.uniform(0.08, 0.82, size=(160, 2))
+                center = project_simplex(center)
+                cand[:160] = center
+
+                old = np.asarray(pts)
+                pairs = np.array(
+                    [(i, j) for i in range(len(old) - 1)
+                     for j in range(i + 1, len(old))],
+                    dtype=np.intp,
+                )
+
+                u = old[pairs[:, 0]]
+                v = old[pairs[:, 1]]
+                w = cand[:, None, :]
+
+                values = np.abs(
+                    (v[None, :, 0] - u[None, :, 0]) * (w[:, :, 1] - u[None, :, 1])
+                    - (v[None, :, 1] - u[None, :, 1]) * (w[:, :, 0] - u[None, :, 0])
+                )
+                candidate_score = np.min(values, axis=1)
+
+                # Randomly select among the top candidates.  This preserves
+                # diversity between seeds while retaining greedy quality.
+                order = np.argpartition(candidate_score, -12)[-12:]
+                chosen = order[np.argmax(candidate_score[order] + rng.random(12) * 2e-5)]
+                pts.append(cand[chosen])
+
+            return np.asarray(pts[3:]).reshape(-1)
+
+        # A population of independently greedily constructed arrangements.
+        population_size = 96
+        population = np.empty((population_size, free_n * 2), dtype=float)
+        for i in range(population_size):
+            population[i] = greedy_seed()
+
+        scores = score_population(population)
+
+        # Differential evolution: replace a parent only if its complete
+        # minimum-area objective is improved.
+        generations = 1450
+        dims = free_n * 2
+        for generation in range(generations):
+            order = np.argsort(scores)
+            elite = population[order[:8]]
+            best = population[order[-1]]
+
+            trials = population.copy()
+            for i in range(population_size):
+                choices = rng.choice(population_size, size=3, replace=False)
+                a, b, c = population[choices]
+
+                scale = 0.48 + 0.22 * rng.random()
+                mutant = a + scale * (b - c)
+
+                # Periodic best-directed moves accelerate final convergence.
+                if generation % 5 == 0:
+                    mutant = best + 0.42 * (mutant - best)
+
+                cross = rng.random(dims) < 0.78
+                cross[rng.integers(dims)] = True
+                trial = np.where(cross, mutant, population[i])
+                trials[i] = trial
+
+            trials = project_simplex(trials.reshape(-1, free_n, 2)).reshape(population_size, dims)
+            trial_scores = score_population(trials)
+
+            improved = trial_scores > scores
+            population[improved] = trials[improved]
+            scores[improved] = trial_scores[improved]
+
+            # Preserve the best arrangements explicitly against population drift.
+            worst = np.argsort(scores)[:8]
+            population[worst] = elite
+            scores[worst] = score_population(elite)
+
+        best = population[np.argmax(scores)].reshape(free_n, 2).copy()
+        best_score = float(np.max(scores))
+
+        # Final targeted hill climb: perturb points participating in currently
+        # smallest triangles, which is more effective than uniform refinement.
+        for iteration in range(18000):
+            all_pts = np.vstack((fixed, best))
+            a = all_pts[triples[:, 0]]
+            b = all_pts[triples[:, 1]]
+            c = all_pts[triples[:, 2]]
+            areas = np.abs(
+                (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+                - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+            )
+
+            bottleneck = triples[np.argmin(areas)]
+            movable = bottleneck[bottleneck >= 3] - 3
+            point_id = int(movable[rng.integers(len(movable))]) if len(movable) else rng.integers(free_n)
+
+            candidate = best.copy()
+            radius = 0.020 * (1.0 - iteration / 18000.0) + 0.00035
+            candidate[point_id] += rng.normal(0.0, radius, size=2)
+            candidate = project_simplex(candidate)
+
+            candidate_score = float(score_population(candidate.reshape(1, -1))[0])
+            if candidate_score > best_score:
+                best = candidate
+                best_score = candidate_score
+
+        bary = np.vstack((fixed, best))
+
+        # Convert barycentric coordinates to Cartesian coordinates.
+        h = np.sqrt(3.0) / 2.0
+        points = np.empty((n, 2), dtype=float)
+        points[:, 0] = bary[:, 0] + 0.5 * bary[:, 1]
+        points[:, 1] = h * bary[:, 1]
+
+        _CACHED_POINTS = points
+        return points.copy()
+
+    except Exception:
+        # Safe nondegenerate fallback in the unlikely event of an environment
+        # or numerical failure.
+        h = np.sqrt(3.0) / 2.0
+        bary = np.array([
+            [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+            [0.15, 0.18], [0.18, 0.53], [0.32, 0.12],
+            [0.38, 0.37], [0.47, 0.17], [0.57, 0.29],
+            [0.66, 0.11], [0.21, 0.34],
+        ])
+        points = np.column_stack((bary[:, 0] + 0.5 * bary[:, 1], h * bary[:, 1]))
+        _CACHED_POINTS = points
+        return points.copy()
+
+
+# EVOLVE-BLOCK-END

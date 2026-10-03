@@ -1,0 +1,107 @@
+<NAME>
+adaptive_contact_polish
+</NAME>
+
+<DESCRIPTION>
+Add a second, contact-graph-aware polishing stage after each successful exact SLSQP solve. The first solve identifies the emergent minimum-distance and diameter contacts. A short regularized solve then reduces slack variation on those contacts while retaining every original feasibility constraint, followed by a final pure max-t solve. This can improve convergence in the degenerate active-set regime where many equivalent diameter/minimum constraints make a single linear-objective SLSQP pass terminate slightly short of the best feasible packing.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            if result.x is None or not np.all(np.isfinite(result.x)):
+                continue
+
+            candidate = diameter_normalize(unpack(result.x))
+            q = dist2(candidate)
+            if q.min() <= 0.0:
+                continue
+            candidate_score = float(q.min() / q.max())
+            if candidate_score > best_score:
+                best_score = candidate_score
+                best = candidate
+=======
+            if result.x is None or not np.all(np.isfinite(result.x)):
+                continue
+
+            # The first exact solve reveals the small contact graph controlling
+            # the packing.  Equalizing the residuals on those contacts makes a
+            # second active-set pass substantially less sensitive to SLSQP's
+            # choice among nearly dependent constraint gradients.
+            y_contact = result.x.copy()
+            q_contact = dist2(unpack(y_contact))
+            t_contact = float(y_contact[-1])
+            low_contact = q_contact <= 1.012 * max(t_contact, 1.0e-10)
+            high_contact = q_contact >= 0.988
+
+            if np.any(low_contact) and np.any(high_contact):
+                low_count = float(np.count_nonzero(low_contact))
+                high_count = float(np.count_nonzero(high_contact))
+
+                def contact_objective(y: np.ndarray) -> float:
+                    qy = dist2(unpack(y))
+                    low_slack = qy[low_contact] - y[-1]
+                    high_slack = 1.0 - qy[high_contact]
+                    return float(
+                        -y[-1]
+                        + 0.25 * np.dot(low_slack, low_slack) / low_count
+                        + 0.25 * np.dot(high_slack, high_slack) / high_count
+                    )
+
+                def contact_gradient(y: np.ndarray) -> np.ndarray:
+                    qy = dist2(unpack(y))
+                    qjac = jacobian(y)[:pairs].copy()
+                    qjac[:, -1] = 0.0
+                    gradient = objective_gradient.copy()
+                    low_slack = qy[low_contact] - y[-1]
+                    high_slack = 1.0 - qy[high_contact]
+                    gradient += (
+                        0.5 / low_count
+                        * np.sum(
+                            low_slack[:, None]
+                            * (qjac[low_contact] + objective_gradient[None, :]),
+                            axis=0,
+                        )
+                    )
+                    gradient -= (
+                        0.5 / high_count
+                        * np.sum(high_slack[:, None] * qjac[high_contact], axis=0)
+                    )
+                    return gradient
+
+                focused = minimize(
+                    contact_objective,
+                    y_contact,
+                    jac=contact_gradient,
+                    method="SLSQP",
+                    bounds=bounds,
+                    constraints=cons,
+                    options={"maxiter": 220, "ftol": 5.0e-13, "disp": False},
+                )
+                if focused.x is not None and np.all(np.isfinite(focused.x)):
+                    y_contact = focused.x
+
+                # Restore the unmodified max-t objective after the contact
+                # balancing pass, so the returned candidate is judged solely
+                # by the original diameter-packing formulation.
+                final_pass = minimize(
+                    lambda y: -y[-1],
+                    y_contact,
+                    jac=lambda y: objective_gradient,
+                    method="SLSQP",
+                    bounds=bounds,
+                    constraints=cons,
+                    options={"maxiter": 320, "ftol": 1.0e-13, "disp": False},
+                )
+                if final_pass.x is not None and np.all(np.isfinite(final_pass.x)):
+                    result = final_pass
+
+            candidate = diameter_normalize(unpack(result.x))
+            q = dist2(candidate)
+            if q.min() <= 0.0:
+                continue
+            candidate_score = float(q.min() / q.max())
+            if candidate_score > best_score:
+                best_score = candidate_score
+                best = candidate
+>>>>>>> REPLACE
+</DIFF>

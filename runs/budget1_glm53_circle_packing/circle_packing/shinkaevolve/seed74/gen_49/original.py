@@ -1,0 +1,227 @@
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles.
+
+Architecture:
+  1. Seed generation: several staggered hex-row layouts.
+  2. Stochastic hill-climb over circle centers with a cheap greedy
+     radius solver used as a pre-screen; exact LP only for promising moves.
+"""
+import numpy as np
+
+N = 26
+RNG = np.random.default_rng(12345)
+
+
+def construct_packing():
+    """Construct 26 circles in the unit square maximizing sum of radii."""
+    global RNG
+    RNG = np.random.default_rng(2024)
+
+    seeds = _make_seeds()
+    best_c, best_r, best_s = None, None, -1.0
+
+    # Evaluate each seed with LP, keep best as start of hill-climb.
+    start_pool = []
+    for c in seeds:
+        r = _lp_radii(c)
+        s = float(np.sum(r))
+        start_pool.append((s, c))
+        if s > best_s:
+            best_c, best_r, best_s = c.copy(), r.copy(), s
+    start_pool.sort(key=lambda t: -t[0])
+
+    # Hill-climb from the top few seeds with a fixed move budget.
+    total_budget = 2600
+    budget = total_budget
+
+    for _, start in start_pool[:4]:
+        cur = start.copy()
+        cur_greedy = _greedy_radii(cur)
+        cur_g = float(np.sum(cur_greedy))
+        cur_r = _lp_radii(cur)
+        cur_s = float(np.sum(cur_r))
+        if cur_s > best_s:
+            best_c, best_r, best_s = cur.copy(), cur_r.copy(), cur_s
+
+        idxs = list(range(N))
+        while budget > 0:
+            i = idxs[int(RNG.integers(0, N))]
+            # Perturbation sizes: mix of fine and coarse moves.
+            step = float(RNG.choice([0.004, 0.01, 0.025, 0.05]))
+            dx, dy = RNG.normal(0.0, step, 2)
+            trial = cur.copy()
+            trial[i, 0] = min(max(trial[i, 0] + dx, 0.005), 0.995)
+            trial[i, 1] = min(max(trial[i, 1] + dy, 0.005), 0.995)
+
+            budget -= 1
+            # Cheap pre-screen: greedy radii (~microseconds).
+            g = _greedy_radii(trial)
+            gs = float(np.sum(g))
+            if gs < cur_g - 0.01:
+                continue  # clearly worse; skip exact LP.
+            # Promising move: exact LP.
+            r = _lp_radii(trial)
+            s = float(np.sum(r))
+            if s > cur_s + 1e-9:
+                cur, cur_r, cur_s = trial, r.copy(), s
+                cur_greedy, cur_g = g, gs
+                if s > best_s:
+                    best_c, best_r, best_s = cur.copy(), cur_r.copy(), s
+
+    centers, radii = best_c, best_r
+    return centers, radii, float(np.sum(radii))
+
+
+def _make_seeds():
+    """Generate staggered hex-row seed layouts (row counts sum to 26)."""
+    seeds = []
+    patterns = [
+        [5, 4, 5, 4, 5, 3],
+        [6, 4, 5, 4, 6],
+        [5, 5, 4, 5, 5],
+        [6, 5, 4, 5, 6],
+        [4, 4, 5, 4, 5, 4],
+        [3, 4, 5, 4, 5, 5],
+        [6, 5, 5, 5, 5],
+        [5, 4, 4, 4, 5, 4],
+        # Denser-edge patterns: heavy rows at top/bottom boundaries
+        [6, 5, 5, 5, 6],
+        [6, 5, 6, 5, 4],
+        [5, 6, 4, 6, 5],
+    ]
+    for rows in patterns:
+        if sum(rows) != N:
+            continue
+        for vscale in (1.0, 0.93, 0.86):
+            layout = _build_layout(rows, vscale)
+            seeds.append(layout)
+            # Vertical mirror doubles seed breadth at negligible cost.
+            seeds.append(layout[::-1].copy())
+    return seeds
+
+
+def _build_layout(rows, vscale=1.0):
+    """Staggered hex-like centers for a row-count pattern."""
+    n_rows = len(rows)
+    dy = (1.0 / (n_rows + 1)) * vscale
+    y0 = 0.5 - (n_rows - 1) * dy / 2.0
+    centers = []
+    for r, count in enumerate(rows):
+        y = y0 + r * dy
+        dx = 1.0 / (count + 1)
+        offset = 0.5 * dx if (r % 2 == 1) else 0.0
+        for c in range(count):
+            x = (c + 1) * dx + offset
+            x = min(max(x, 0.01), 0.99)
+            centers.append([x, y])
+    return np.array(centers)
+
+
+def _pair_dist(centers):
+    d = np.sqrt(((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1))
+    np.fill_diagonal(d, np.inf)
+    return d
+
+
+def _greedy_radii(centers):
+    """Fast greedy shrink: valid, non-overlapping, in-square radii.
+
+    Each radius i = min(wall_i, min_j (d_ij - r_j)) iterated a few times.
+    This is an underestimate of the LP optimum, ideal for pre-screening.
+    """
+    n = centers.shape[0]
+    wall = np.minimum.reduce([centers[:, 0], centers[:, 1],
+                              1 - centers[:, 0], 1 - centers[:, 1]])
+    dist = _pair_dist(centers)
+    radii = np.minimum(wall, np.min(dist, axis=1) / 2.0)
+    radii = np.maximum(radii, 0.0)
+    for _ in range(8):
+        new = np.minimum(wall, np.min(dist - radii[None, :], axis=1))
+        new = np.maximum(new, 0.0)
+        if np.max(np.abs(new - radii)) < 1e-12:
+            radii = new
+            break
+        radii = new
+    return radii
+
+
+def _lp_radii(centers):
+    """Exact: maximize sum(r) s.t. r_i + r_j <= d_ij, r_i <= wall_i."""
+    n = centers.shape[0]
+    radii = _greedy_radii(centers)
+    try:
+        from scipy.optimize import linprog
+
+        d = np.sqrt(((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1))
+        iu, ju = np.triu_indices(n, 1)
+        m = len(iu)
+        A_ub = np.zeros((m + n, n))
+        b_ub = np.empty(m + n)
+        rows_i = np.arange(m)
+        A_ub[rows_i, iu] = 1.0
+        A_ub[rows_i, ju] = 1.0
+        b_ub[:m] = d[iu, ju]
+        wall = np.minimum.reduce([centers[:, 0], centers[:, 1],
+                                  1 - centers[:, 0], 1 - centers[:, 1]])
+        A_ub[m + np.arange(n), np.arange(n)] = 1.0
+        b_ub[m:] = wall
+        res = linprog(c=-np.ones(n), A_ub=A_ub, b_ub=b_ub,
+                      bounds=[(0, None)] * n, method="highs")
+        if res.success:
+            radii = res.x
+    except Exception:
+        pass
+    return radii
+
+
+def compute_max_radii(centers):
+    """Kept for API compatibility: greedy (valid) radii for fixed centers."""
+    return _greedy_radii(centers)
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

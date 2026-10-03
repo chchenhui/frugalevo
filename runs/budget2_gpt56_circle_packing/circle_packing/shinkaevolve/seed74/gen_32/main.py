@@ -1,0 +1,359 @@
+# EVOLVE-BLOCK-START
+"""Analytic-Jacobian portfolio constructor for 26 circles in a unit square."""
+
+import numpy as np
+
+
+class _PackingModel:
+    """Geometry and optimization support shared by all candidate layouts."""
+
+    def __init__(self, n=26):
+        self.n = n
+        self.pi, self.pj = np.triu_indices(n, 1)
+        self.m = len(self.pi)
+
+        self.lp_pairs = np.zeros((self.m, n), dtype=float)
+        rows = np.arange(self.m)
+        self.lp_pairs[rows, self.pi] = 1.0
+        self.lp_pairs[rows, self.pj] = 1.0
+
+        self.wall_jac = np.zeros((4 * n, 3 * n), dtype=float)
+        disk = np.arange(n)
+        rcol = 2 * n + disk
+        self.wall_jac[4 * disk + 0, 2 * disk] = 1.0
+        self.wall_jac[4 * disk + 0, rcol] = -1.0
+        self.wall_jac[4 * disk + 1, 2 * disk] = -1.0
+        self.wall_jac[4 * disk + 1, rcol] = -1.0
+        self.wall_jac[4 * disk + 2, 2 * disk + 1] = 1.0
+        self.wall_jac[4 * disk + 2, rcol] = -1.0
+        self.wall_jac[4 * disk + 3, 2 * disk + 1] = -1.0
+        self.wall_jac[4 * disk + 3, rcol] = -1.0
+
+    @staticmethod
+    def wall_limit(centers):
+        return np.minimum.reduce((
+            centers[:, 0], centers[:, 1],
+            1.0 - centers[:, 0], 1.0 - centers[:, 1],
+        ))
+
+    def radius_lp(self, centers):
+        """Maximum sum of feasible radii for fixed center locations."""
+        centers = np.asarray(centers, dtype=float)
+        wall = np.maximum(self.wall_limit(centers), 0.0)
+        d = centers[self.pi] - centers[self.pj]
+        dist = np.sqrt(np.einsum("ij,ij->i", d, d))
+
+        try:
+            from scipy.optimize import linprog
+            result = linprog(
+                c=-np.ones(self.n),
+                A_ub=self.lp_pairs,
+                b_ub=dist,
+                bounds=[(0.0, float(x)) for x in wall],
+                method="highs",
+            )
+            if result.success and np.all(np.isfinite(result.x)):
+                return np.maximum(result.x, 0.0)
+        except Exception:
+            pass
+
+        # Conservative dependency-free fallback.
+        radii = wall.copy()
+        for _ in range(20):
+            totals = radii[self.pi] + radii[self.pj]
+            bad = np.flatnonzero(totals > dist)
+            if len(bad) == 0:
+                break
+            for k in bad:
+                i, j = self.pi[k], self.pj[k]
+                total = radii[i] + radii[j]
+                if total > 0.0:
+                    q = dist[k] / total
+                    radii[i] *= q
+                    radii[j] *= q
+        return np.maximum(radii, 0.0)
+
+    def safe_radii(self, centers, radii):
+        """Certify feasibility with a common contraction factor."""
+        centers = np.asarray(centers, dtype=float)
+        radii = np.maximum(np.asarray(radii, dtype=float), 0.0).copy()
+        wall = self.wall_limit(centers)
+
+        factor = 1.0
+        active = radii > 0.0
+        if np.any(active):
+            factor = min(factor, float(np.min(wall[active] / radii[active])))
+
+        d = centers[self.pi] - centers[self.pj]
+        dist = np.sqrt(np.einsum("ij,ij->i", d, d))
+        totals = radii[self.pi] + radii[self.pj]
+        active = totals > 0.0
+        if np.any(active):
+            factor = min(factor, float(np.min(dist[active] / totals[active])))
+
+        return radii * max(0.0, min(1.0, factor)) * (1.0 - 2.0e-9)
+
+    def relax_centers(self, initial_centers, fixed_radii, maxiter=450):
+        """
+        With radii slightly deflated, maximize a common geometric clearance.
+        This is a center-only escape step: it can alter a locked contact graph
+        before the subsequent joint radius expansion.
+        """
+        try:
+            from scipy.optimize import minimize
+        except Exception:
+            return np.asarray(initial_centers, dtype=float).copy()
+
+        n, pi, pj, m = self.n, self.pi, self.pj, self.m
+        centers0 = np.clip(np.asarray(initial_centers, dtype=float), 1.e-6, 1.0 - 1.e-6)
+        radii = np.asarray(fixed_radii, dtype=float)
+        z0 = np.r_[centers0.ravel(), 0.0]
+
+        def constraints(z):
+            c = z[:2 * n].reshape(n, 2)
+            clearance = z[-1]
+            walls = np.empty(4 * n, dtype=float)
+            walls[0::4] = c[:, 0] - radii - clearance
+            walls[1::4] = 1.0 - c[:, 0] - radii - clearance
+            walls[2::4] = c[:, 1] - radii - clearance
+            walls[3::4] = 1.0 - c[:, 1] - radii - clearance
+            delta = c[pi] - c[pj]
+            distance = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+            return np.r_[walls, distance - radii[pi] - radii[pj] - clearance]
+
+        def jacobian(z):
+            c = z[:2 * n].reshape(n, 2)
+            jac = np.zeros((4 * n + m, 2 * n + 1), dtype=float)
+            disk = np.arange(n)
+            jac[4 * disk + 0, 2 * disk] = 1.0
+            jac[4 * disk + 1, 2 * disk] = -1.0
+            jac[4 * disk + 2, 2 * disk + 1] = 1.0
+            jac[4 * disk + 3, 2 * disk + 1] = -1.0
+            jac[:4 * n, -1] = -1.0
+
+            delta = c[pi] - c[pj]
+            distance = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+            unit = delta / np.maximum(distance[:, None], 1.e-12)
+            rows = 4 * n + np.arange(m)
+            jac[rows, 2 * pi] = unit[:, 0]
+            jac[rows, 2 * pi + 1] = unit[:, 1]
+            jac[rows, 2 * pj] = -unit[:, 0]
+            jac[rows, 2 * pj + 1] = -unit[:, 1]
+            jac[rows, -1] = -1.0
+            return jac
+
+        try:
+            result = minimize(
+                lambda z: -z[-1],
+                z0,
+                jac=lambda z: np.r_[np.zeros(2 * n), -1.0],
+                method="SLSQP",
+                bounds=[(1.e-6, 1.0 - 1.e-6)] * (2 * n) + [(0.0, 0.25)],
+                constraints={"type": "ineq", "fun": constraints, "jac": jacobian},
+                options={"maxiter": maxiter, "ftol": 2.e-11, "disp": False},
+            )
+            if result.x is not None and np.all(np.isfinite(result.x)):
+                return np.clip(result.x[:2 * n].reshape(n, 2), 1.e-7, 1.0 - 1.e-7)
+        except Exception:
+            pass
+        return centers0
+
+    def optimize(self, initial_centers, maxiter=1000):
+        """Jointly optimize positions and nonuniform radii."""
+        try:
+            from scipy.optimize import minimize
+        except Exception:
+            return np.asarray(initial_centers, dtype=float).copy()
+
+        n, pi, pj, m = self.n, self.pi, self.pj, self.m
+        centers0 = np.clip(np.asarray(initial_centers, dtype=float), 0.002, 0.998)
+        radii0 = 0.965 * self.radius_lp(centers0)
+        z0 = np.r_[centers0.ravel(), radii0]
+        objective_gradient = np.r_[np.zeros(2 * n), -np.ones(n)]
+
+        def constraints(z):
+            c = z[:2 * n].reshape(n, 2)
+            r = z[2 * n:]
+            walls = np.empty(4 * n, dtype=float)
+            walls[0::4] = c[:, 0] - r
+            walls[1::4] = 1.0 - c[:, 0] - r
+            walls[2::4] = c[:, 1] - r
+            walls[3::4] = 1.0 - c[:, 1] - r
+
+            delta = c[pi] - c[pj]
+            distance = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+            return np.r_[walls, distance - r[pi] - r[pj]]
+
+        def jacobian(z):
+            c = z[:2 * n].reshape(n, 2)
+            jac = np.zeros((4 * n + m, 3 * n), dtype=float)
+            jac[:4 * n] = self.wall_jac
+
+            delta = c[pi] - c[pj]
+            distance = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+            unit = delta / np.maximum(distance[:, None], 1.0e-12)
+            rows = 4 * n + np.arange(m)
+
+            jac[rows, 2 * pi] = unit[:, 0]
+            jac[rows, 2 * pi + 1] = unit[:, 1]
+            jac[rows, 2 * pj] = -unit[:, 0]
+            jac[rows, 2 * pj + 1] = -unit[:, 1]
+            jac[rows, 2 * n + pi] = -1.0
+            jac[rows, 2 * n + pj] = -1.0
+            return jac
+
+        try:
+            result = minimize(
+                lambda z: -float(np.sum(z[2 * n:])),
+                z0,
+                jac=lambda z: objective_gradient,
+                method="SLSQP",
+                bounds=[(1.e-6, 1.0 - 1.e-6)] * (2 * n) +
+                       [(0.0, 0.5)] * n,
+                constraints={"type": "ineq", "fun": constraints, "jac": jacobian},
+                options={"maxiter": maxiter, "ftol": 8.e-12, "disp": False},
+            )
+            if result.x is not None and np.all(np.isfinite(result.x)):
+                return np.clip(result.x[:2 * n].reshape(n, 2), 1.e-7, 1.0 - 1.e-7)
+        except Exception:
+            pass
+
+        return centers0
+
+
+def _layer_seed(counts, seed, jitter, phase=0.0):
+    """Create a boundary-aware staggered triangular layout."""
+    rng = np.random.default_rng(seed)
+    rows = len(counts)
+    points = []
+    for row, count in enumerate(counts):
+        y = (row + 0.5) / rows
+        stagger = 0.035 if ((row + int(phase)) & 1) else -0.035
+        xs = np.linspace(0.10, 0.90, count) + stagger
+        for x in xs:
+            points.append((x, y))
+    points = np.asarray(points[:26], dtype=float)
+    if jitter:
+        points += rng.normal(0.0, jitter, points.shape)
+    return np.clip(points, 0.025, 0.975)
+
+
+def _grid_interstice(cell, seed, jitter):
+    """Five-by-five wall-supported lattice plus one interstitial disk."""
+    rng = np.random.default_rng(seed)
+    grid = np.array(
+        [(0.1 + 0.2 * x, 0.1 + 0.2 * y)
+         for y in range(5) for x in range(5)],
+        dtype=float,
+    )
+    cells = np.array(
+        [(0.2 + 0.2 * x, 0.2 + 0.2 * y)
+         for y in range(4) for x in range(4)],
+        dtype=float,
+    )
+    points = np.vstack((grid, cells[cell % 16]))
+    if jitter:
+        points += rng.normal(0.0, jitter, points.shape)
+    return np.clip(points, 0.025, 0.975)
+
+
+def compute_max_radii(centers):
+    """Compatibility helper: optimal fixed-center LP radius assignment."""
+    centers = np.asarray(centers, dtype=float)
+    return _PackingModel(len(centers)).radius_lp(centers)
+
+
+def construct_packing():
+    """Construct a certified high-sum packing of 26 circles."""
+    model = _PackingModel(26)
+
+    seeds = [
+        _layer_seed((5, 5, 6, 5, 5), 2601, 0.000),
+        _layer_seed((5, 5, 6, 5, 5), 2602, 0.012),
+        _layer_seed((5, 6, 5, 5, 5), 2603, 0.015, 1),
+        _layer_seed((5, 5, 5, 6, 5), 2604, 0.018, 1),
+        _layer_seed((4, 5, 4, 5, 4, 4), 2605, 0.010),
+        _layer_seed((4, 5, 5, 4, 5, 3), 2606, 0.018),
+        _grid_interstice(0, 2607, 0.006),
+        _grid_interstice(10, 2608, 0.022),
+    ]
+
+    candidates = []
+    for seed in seeds:
+        centers = model.optimize(seed, 1050)
+        radii = model.safe_radii(centers, model.radius_lp(centers))
+        candidates.append((float(np.sum(radii)), centers, radii))
+
+    # A small second-stage portfolio explores contact exchanges around the
+    # strongest independently discovered arrangements.
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    rng = np.random.default_rng(262635)
+    for _, centers, radii0 in candidates[:4]:
+        for noise in (0.0, 0.004):
+            start = centers.copy()
+            if noise:
+                start += rng.normal(0.0, noise, start.shape)
+                start = np.clip(start, 0.015, 0.985)
+            refined = model.optimize(start, 1250)
+            radii = model.safe_radii(refined, model.radius_lp(refined))
+            candidates.append((float(np.sum(radii)), refined, radii))
+
+        # Deflation makes room for a center-only max-clearance displacement.
+        # The following full solve restores radii and exploits its new contact
+        # graph rather than merely polishing the original locked arrangement.
+        for deflation in (0.978, 0.962):
+            relaxed = model.relax_centers(centers, radii0 * deflation, 450)
+            refined = model.optimize(relaxed, 1250)
+            radii = model.safe_radii(refined, model.radius_lp(refined))
+            candidates.append((float(np.sum(radii)), refined, radii))
+
+    score, centers, radii = max(candidates, key=lambda item: item[0])
+    return centers, radii, float(score)
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

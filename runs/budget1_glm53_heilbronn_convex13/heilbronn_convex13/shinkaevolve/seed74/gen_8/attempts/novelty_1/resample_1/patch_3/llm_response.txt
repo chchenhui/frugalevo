@@ -1,0 +1,157 @@
+<NAME>
+heilbronn_13_anneal_symmetry
+</NAME>
+<DESCRIPTION>
+The previous SEARCH block didn't match the actual file contents. Region 1 contains a placeholder function with `rng = np.random.default_rng(seed=42); points = rng.random((n, 2)); return points`. I replace that placeholder body with a complete deterministic Heilbronn optimizer:
+
+1. Region: unit-area equilateral triangle (area exactly 1), so points automatically satisfy the unit-area convex region constraint.
+2. Init: 3-fold rotationally symmetric configurations (center + 4 orbits of 3 = 13 points), reducing the search to 10 parameters; known good Heilbronn configurations exhibit this symmetry.
+3. Stage 1: seeded simulated annealing over the 10 symmetry parameters maximizing min triangle area / convex hull area (the exact graded metric).
+4. Stage 2: greedy coordinate-descent polish of all 13 points with shrinking steps, projected back into the triangle via barycentric clipping.
+5. Deterministic: fixed seed, vectorized numpy objective over all C(13,3)=286 triples.
+6. Error handling: try/except with a deterministic lattice fallback.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        rng = np.random.default_rng(seed=42)
+        points = rng.random((n, 2))
+        return points
+=======
+        import math
+        rng = np.random.default_rng(seed=20240513)
+
+        # ---- Unit-area equilateral triangle as the convex region ----
+        side = math.sqrt(4.0 / math.sqrt(3.0))
+        V = np.array([[0.0, 0.0],
+                      [side, 0.0],
+                      [side * 0.5, side * math.sqrt(3.0) * 0.5]])
+        TRI_AREA = math.sqrt(3.0) / 4.0 * side * side  # == 1.0
+
+        # ---- All C(13,3) = 286 index triples ----
+        triples = [(i, j, k) for i in range(13) for j in range(i + 1, 13)
+                   for k in range(j + 1, 13)]
+        I = np.array([t[0] for t in triples])
+        J = np.array([t[1] for t in triples])
+        K = np.array([t[2] for t in triples])
+
+        def min_tri(P):
+            a, b, c = P[I], P[J], P[K]
+            cross = ((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+                     (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+            return 0.5 * float(np.min(np.abs(cross)))
+
+        def hull_area(P):
+            pts = np.unique(P, axis=0)
+            pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+            if len(pts) < 3:
+                return 1e-9
+            def half(seq):
+                h = []
+                for p in seq:
+                    while len(h) >= 2:
+                        ax, ay = h[-1]; bx, by = h[-2]
+                        if (ax - bx) * (p[1] - by) - (ay - by) * (p[0] - bx) <= 1e-12:
+                            h.pop()
+                        else:
+                            break
+                    h.append(tuple(p))
+                return h
+            lower = half(pts)
+            upper = half(pts[::-1])
+            hull = np.array(lower[:-1] + upper[:-1])
+            x, y = hull[:, 0], hull[:, 1]
+            return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+        def bary(P):
+            x1, y1 = V[0]; x2, y2 = V[1]; x3, y3 = V[2]
+            x = P[..., 0]; y = P[..., 1]
+            w1 = ((y2 - y3) * (x - x3) + (x3 - x2) * (y - y3)) / (2.0 * TRI_AREA)
+            w2 = ((y3 - y1) * (x - x3) + (x1 - x3) * (y - y3)) / (2.0 * TRI_AREA)
+            w3 = 1.0 - w1 - w2
+            return np.stack([w1, w2, w3], axis=-1)
+
+        def clip(P):
+            W = np.clip(bary(P), 0.0, None)
+            W = W / np.maximum(W.sum(axis=-1, keepdims=True), 1e-12)
+            return W @ V
+
+        def objective(P):
+            ha = hull_area(P)
+            if ha < 1e-9:
+                return 0.0
+            return min_tri(P) / ha
+
+        # ---- Symmetric builder: center + 4 orbits of 3 points (10 params) ----
+        def build(q):
+            cx, cy = q[0], q[1]
+            pts = [[cx, cy]]
+            for o in range(4):
+                r, th = q[2 + 2 * o], q[3 + 2 * o]
+                for m in range(3):
+                    ang = th + m * 2.0 * math.pi / 3.0
+                    pts.append([cx + r * math.cos(ang), cy + r * math.sin(ang)])
+            return clip(np.array(pts))
+
+        def anneal(q0, iters=5000, s0=0.08):
+            q = np.array(q0, dtype=float)
+            cur = objective(build(q))
+            best_q, best = q.copy(), cur
+            for t in range(iters):
+                step = s0 * (1.0 - t / iters) + 1e-3
+                prop = q + rng.normal(0.0, step, size=q.shape)
+                val = objective(build(prop))
+                temp = 0.002 * (1.0 - t / iters) + 1e-5
+                if val >= cur or rng.random() < math.exp((val - cur) / max(temp, 1e-12)):
+                    q, cur = prop, val
+                    if val > best:
+                        best_q, best = q.copy(), val
+            return best_q, best
+
+        def polish(P, iters=3000, s0=0.03):
+            P = P.copy()
+            cur = objective(P)
+            for t in range(iters):
+                step = s0 * (1.0 - t / iters) + 5e-4
+                i = int(rng.integers(0, 13))
+                prop = P.copy()
+                prop[i] = clip(prop[i] + rng.normal(0.0, step, size=2))
+                val = objective(prop)
+                if val >= cur:
+                    P, cur = prop, val
+            return P, cur
+
+        try:
+            cx, cy = side * 0.5, side * math.sqrt(3.0) / 6.0
+            best_P, best_val = None, -1.0
+            for fracs in ([0.10, 0.22, 0.36, 0.52],
+                          [0.14, 0.28, 0.42, 0.55],
+                          [0.08, 0.20, 0.34, 0.50]):
+                q = np.array([cx, cy] + [v for f in fracs
+                                        for v in (f * side, rng.uniform(0, 2 * math.pi))])
+                q, _ = anneal(q)
+                P = build(q)
+                P, val = polish(P)
+                if val > best_val:
+                    best_P, best_val = P, val
+            for _ in range(3):
+                best_P, best_val = polish(best_P, iters=1500, s0=0.01)
+
+            unique = []
+            for p in [tuple(p) for p in best_P]:
+                if all(math.hypot(p[0] - u[0], p[1] - u[1]) > 1e-9 for u in unique):
+                    unique.append(p)
+            while len(unique) < 13:
+                unique.append((0.1 + 0.8 * rng.random()) * side,
+                              0.05 + 0.5 * rng.random() * side)
+            return [list(p) for p in unique[:13]]
+        except Exception:
+            rows = [4, 4, 3, 2]
+            pts = []
+            for r, cnt in enumerate(rows):
+                y = 0.06 + r * 0.27 * side
+                for i in range(cnt):
+                    x = 0.10 * side + i * (0.80 * side / max(cnt - 1, 1))
+                    pts.append([x, min(y, side * math.sqrt(3.0) * 0.55)])
+            return pts[:13]
+>>>>>>> REPLACE
+</DIFF>

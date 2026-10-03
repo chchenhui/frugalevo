@@ -1,0 +1,75 @@
+<NAME>
+greedy_lpt_packing
+
+<DESCRIPTION>
+The snake/zig-zag packing currently used in `balanced_packing` is only an approximation of LPT (longest-processing-time-first) greedy. Its balance quality is limited: within each chunk it assigns items to packs in a fixed rotation, so a pack that receives a heavy item in one chunk may still receive a relatively heavy item in the next chunk (the zig-zag only partially compensates). This shows up in the low `balancedness_score_expert` (0.25) and mediocre `balancedness_score_gpu` (0.66), and the resulting load imbalance directly inflates `times_inference` (straggler GPUs).
+
+The fix: implement the true greedy LPT rule — sort all items by descending weight, then for each successive chunk of `num_packs` items (one item per pack, keeping cardinalities exact), assign the chunk's items to the packs currently having the *smallest* accumulated load. This is exactly the classic LPT heuristic, which has a tight 4/3 approximation guarantee for makespan, and is strictly stronger than the fixed zig-zag rotation. It is fully vectorized over layers: the only Python loop is over `groups_per_pack` chunks (a small number, e.g. 8–32), each iteration doing a few tensor ops (argsort of the `[layers, num_packs]` load matrix, scatter for assignment, scatter_add for load update). This keeps the algorithm as fast as the current version while measurably improving both GPU-level and expert-level balancedness, which should also reduce inference time (fewer stragglers).
+
+This improvement applies to both call sites: node packing (Step 1) and GPU packing (Step 3) of the hierarchical rebalancer.
+
+<DIFF>
+<<<<<<< SEARCH
+    # Vectorized "snake deal" (zig-zag) packing:
+    # 1) sort groups by descending weight,
+    # 2) split into `groups_per_pack` chunks of `num_packs` items, where each
+    #    chunk assigns exactly one group to every pack,
+    # 3) reverse the item order of every odd chunk so that the pack which
+    #    received the heaviest items in one chunk receives the lightest ones
+    #    in the next. This keeps pack cardinalities exact while keeping the
+    #    pack weights balanced, without any Python-level loops.
+    indices = weight.argsort(-1, descending=True)
+    indices = indices.view(num_layers, groups_per_pack, num_packs)
+    odd_chunks = torch.arange(groups_per_pack,
+                              device=weight.device) % 2 == 1
+    if odd_chunks.any():
+        indices[:, odd_chunks] = indices[:, odd_chunks].flip(-1)
+
+    flat_indices = indices.reshape(num_layers, num_groups)
+    positions = torch.arange(num_groups, device=weight.device)
+    # flat position k corresponds to (chunk = k // num_packs, slot = k % num_packs)
+    pack_vals = (positions % num_packs).expand(num_layers, -1)
+    rank_vals = torch.div(positions, num_packs,
+                          rounding_mode="floor").expand(num_layers, -1)
+
+    pack_index = torch.empty(num_layers,
+                             num_groups,
+                             dtype=torch.int64,
+                             device=weight.device)
+    rank_in_pack = torch.empty_like(pack_index)
+    pack_index.scatter_(-1, flat_indices, pack_vals)
+    rank_in_pack.scatter_(-1, flat_indices, rank_vals)
+    return pack_index, rank_in_pack
+=======
+    # Vectorized greedy LPT (longest-processing-time-first) packing:
+    # 1) sort groups by descending weight,
+    # 2) split into `groups_per_pack` chunks of `num_packs` items, where each
+    #    chunk assigns exactly one group to every pack (keeping pack
+    #    cardinalities exact),
+    # 3) for each chunk, assign its (descending) items to the packs with the
+    #    smallest accumulated load, i.e. the true greedy LPT rule. This is a
+    #    4/3-approximation for makespan balancing and strictly stronger than
+    #    a fixed zig-zag rotation. Fully vectorized over layers; the only
+    #    Python loop is over the (few) chunks.
+    indices = weight.argsort(-1, descending=True)
+    indices = indices.view(num_layers, groups_per_pack, num_packs)
+    pack_index = torch.empty(num_layers,
+                             num_groups,
+                             dtype=torch.int64,
+                             device=weight.device)
+    rank_in_pack = torch.empty_like(pack_index)
+    loads = torch.zeros(num_layers, num_packs,
+                        dtype=weight.dtype, device=weight.device)
+    for t in range(groups_per_pack):
+        chunk = indices[:, t, :]  # [num_layers, num_packs], descending
+        # packs ordered by ascending current load (stable for determinism)
+        order = loads.argsort(-1, stable=True)
+        # assign item j of the chunk to the j-th lightest pack
+        pack_index.scatter_(-1, chunk, order)
+        rank_in_pack.scatter_(
+            -1, chunk,
+            torch.full_like(order, t))
+        chunk_w = weight.gather(-1, chunk)
+        loads.scatter_add_(-1, order, chunk_w)
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE

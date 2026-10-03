@@ -1,0 +1,118 @@
+<NAME>
+relay_bundle_fallback
+</NAME>
+
+<DESCRIPTION>
+Strengthen the large-fan-out fallback where exact Steiner dynamic programming is intentionally avoided. The previous greedy method connects only one destination at a time, so it can miss a cheap relay that accepts one ingress transfer and then fans out to several destinations. This edit precomputes low-cost relay-to-destination paths and, at every iteration, evaluates both single-destination and two-destination relay bundles.
+
+Candidates are scored by incremental union-edge cost per newly served destination. Existing tree edges have zero marginal cost, so the heuristic explicitly prefers paths that overlap previously installed transfers. Pair bundles model parallel fan-out from a relay and avoid paying redundant ingress links separately for destinations that can share them. The resulting selected graph remains rooted at the source, and the existing output logic continues to assign the shared routes to every partition.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    else:
+        selected = nx.DiGraph()
+        selected.add_node(src)
+        pending = set(terminals)
+        while pending:
+            lengths, paths = nx.multi_source_dijkstra(
+                h, list(selected.nodes), weight="cost"
+            )
+            candidates = [
+                (lengths[dst], dst, paths[dst])
+                for dst in pending
+                if dst in lengths
+            ]
+            if not candidates:
+                break
+            _, _, path = min(candidates, key=lambda item: item[0])
+            for u, v in zip(path, path[1:]):
+                selected.add_edge(u, v, **G[u][v])
+            pending.difference_update(path)
+=======
+    else:
+        # For large fan-outs, use a relay-aware approximation rather than
+        # attaching destinations independently.  A relay can share one ingress
+        # path from the current tree while concurrently forwarding to several
+        # destinations, so evaluate one- and two-destination fan-out bundles.
+        selected = nx.DiGraph()
+        selected.add_node(src)
+        pending = set(terminals)
+
+        relay_routes = {}
+        for relay in nodes:
+            lengths, paths = nx.single_source_dijkstra(h, relay, weight="cost")
+            relay_routes[relay] = {
+                dst: (lengths[dst], paths[dst])
+                for dst in terminals
+                if dst in lengths
+            }
+
+        while pending:
+            ingress_lengths, ingress_paths = nx.multi_source_dijkstra(
+                h, list(selected.nodes), weight="cost"
+            )
+            best_candidate = None
+
+            for relay, routes in relay_routes.items():
+                if relay not in ingress_paths:
+                    continue
+
+                reachable = [
+                    dst for dst in pending
+                    if dst in routes
+                ]
+                if not reachable:
+                    continue
+
+                # Testing every pair is still modest for the fallback's
+                # intended graph sizes and captures the useful shared-relay
+                # structure that single-path greedy attachment misses.
+                bundles = [(dst,) for dst in reachable]
+                bundles.extend(
+                    (reachable[i], reachable[j])
+                    for i in range(len(reachable))
+                    for j in range(i + 1, len(reachable))
+                )
+
+                for bundle in bundles:
+                    candidate_edges = set(zip(
+                        ingress_paths[relay],
+                        ingress_paths[relay][1:]
+                    ))
+                    for dst in bundle:
+                        route = routes[dst][1]
+                        candidate_edges.update(zip(route, route[1:]))
+
+                    marginal_cost = sum(
+                        h[u][v]["cost"]
+                        for u, v in candidate_edges
+                        if not selected.has_edge(u, v)
+                    )
+                    score = marginal_cost / len(bundle)
+                    if (
+                        best_candidate is None
+                        or score < best_candidate[0]
+                        or (
+                            score == best_candidate[0]
+                            and len(bundle) > len(best_candidate[1])
+                        )
+                    ):
+                        best_candidate = (score, bundle, candidate_edges)
+
+            if best_candidate is None:
+                break
+
+            _, bundle, candidate_edges = best_candidate
+            for u, v in candidate_edges:
+                selected.add_edge(u, v, **G[u][v])
+
+            # A bundled route can also pass through another pending terminal;
+            # it is already served by the newly rooted transfer and should not
+            # trigger a redundant later attachment.
+            pending = {
+                dst for dst in pending
+                if not (dst in selected and nx.has_path(selected, src, dst))
+            }
+>>>>>>> REPLACE
+</DIFF>

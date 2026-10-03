@@ -1,0 +1,82 @@
+<NAME>
+hybrid_gated_lead_dual_cascade</NAME>
+
+<DESCRIPTION>
+Apply the recommended hybrid composition. The current program already implements the volatility-scheduled Kalman + RTS + percentile-blended multi-scale SG pipeline (Gen 45/46 lineage). What's missing to combine their strengths is: (1) a confidence-gated trend lead applied to the *already-SG-smoothed* slope channel (computed from the polished level, not the raw RTS slope), which reduces lag_error without injecting slope noise; (2) a short second-cascade SG pass that kills residual ripple and drives down false_reversals/slope_changes at negligible trend distortion. The sigmoid gate keeps quiet regions untouched (smoothness) while advancing statistically significant trends (responsiveness), targeting the lag/smoothness trade-off frontier that no program has broken past 0.65 on.</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    if len(halves) == 1 or n < 2 * max(halves) + 1:
+        smoothed = _sg_smooth(level, halves[0])
+    else:
+        # Soft Gaussian membership in volatility space, centered at the
+        # 20th/50th/80th percentiles -> smooth blending, no seams.
+        centers = np.percentile(v, [20.0, 50.0, 80.0])[:len(halves)]
+        spread = max(centers[-1] - centers[0], 1e-9)
+        W = np.stack([
+            np.exp(-0.5 * ((v - c) / spread) ** 2) for c in centers
+        ])
+        W = W / (W.sum(axis=0, keepdims=True) + 1e-12)
+        smoothed = np.zeros(n)
+        for j, h in enumerate(halves):
+            smoothed += W[j] * _sg_smooth(level, h)
+
+    # --- Trim to sliding-window output length, end-aligned (minimal lag) ---
+    y = smoothed[-output_length:]
+    return y
+=======
+    if len(halves) == 1 or n < 2 * max(halves) + 1:
+        smoothed = _sg_smooth(level, halves[0])
+    else:
+        # Soft Gaussian membership in volatility space, centered at the
+        # 20th/50th/80th percentiles -> smooth blending, no seams.
+        centers = np.percentile(v, [20.0, 50.0, 80.0])[:len(halves)]
+        spread = max(centers[-1] - centers[0], 1e-9)
+        W = np.stack([
+            np.exp(-0.5 * ((v - c) / spread) ** 2) for c in centers
+        ])
+        W = W / (W.sum(axis=0, keepdims=True) + 1e-12)
+        smoothed = np.zeros(n)
+        for j, h in enumerate(halves):
+            smoothed += W[j] * _sg_smooth(level, h)
+
+    # --- Stage 4: short second-cascade zero-phase SG pass ---
+    # Two cascaded short zero-phase kernels attenuate residual ripple
+    # (spurious slope reversals) far more per unit of trend distortion
+    # than one wide kernel.
+    h2 = max(1, window_size // 8)
+    if 2 * h2 + 1 <= max(3, n):
+        smoothed = _sg_smooth(smoothed, h2)
+
+    # --- Stage 5: sigmoid-gated trend lead on the polished slope ---
+    # Lag compensation applied ONLY where the denoised slope is
+    # statistically significant relative to its own robust noise scale
+    # (MAD). Quiet regions receive no lead -> no jitter; genuine trends
+    # are advanced -> low lag. Sigmoid gives a smooth, monotone gate.
+    if n >= 5:
+        slopes = np.gradient(smoothed)
+        # light 5-tap polish on the slope channel to strip residual ripple
+        c5 = np.array([-3.0, 12.0, 17.0, 12.0, -3.0]) / 35.0
+        hs = 2
+        if n > hs + 1:
+            pad_s = np.concatenate((
+                2 * slopes[0] - slopes[1:hs + 1][::-1],
+                slopes,
+                2 * slopes[-1] - slopes[n - 2:n - hs - 2:-1][::-1],
+            ))
+            sl = np.convolve(pad_s, c5, mode="valid")
+            if len(sl) == n:
+                slopes = sl
+        # Robust noise scale of the slope channel
+        med_sl = np.median(slopes)
+        mad_sl = 1.4826 * np.median(np.abs(slopes - med_sl))
+        # Smooth sigmoid gate: ~0 at noise level, ~1 for confident trends
+        gate = 1.0 / (1.0 + np.exp(-(np.abs(slopes) / (2.0 * mad_sl + 1e-12) - 2.0)))
+        lead = max(1.0, window_size / 8.0)
+        smoothed = smoothed + lead * gate * slopes
+
+    # --- Trim to sliding-window output length, end-aligned (minimal lag) ---
+    y = smoothed[-output_length:]
+    return y
+>>>>>>> REPLACE
+</DIFF>

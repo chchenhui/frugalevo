@@ -1,0 +1,500 @@
+<NAME>
+adaptive_consensus_tracker
+</NAME>
+
+<DESCRIPTION>
+This redesign separates the filter into three stages: robust multi-horizon measurement extraction, agreement-driven alpha-beta state tracking, and reversal-gated output stabilization. Short and long endpoint regressions produce responsive and stable observations, while a lightweight recent slope controls tracker gains internally. A persistent trend state suppresses noise-driven direction flips without excessively delaying confirmed reversals. The public functions, arguments, output alignment, validation behavior, and return formats are preserved.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""
+Causal adaptive consensus tracker for volatile non-stationary signals.
+
+Architecture:
+1. Robust causal endpoint regressions generate short/long horizon measurements.
+2. A recent slope agreement signal adapts alpha-beta tracker gains.
+3. A reversal gate prevents isolated measurement noise from changing direction.
+
+The output remains aligned with the newest sample in every complete window.
+"""
+import numpy as np
+from dataclasses import dataclass
+
+
+def _robust_scale(values, fallback=1e-6):
+    """Return a finite MAD-based robust scale."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+
+    if values.size == 0:
+        return float(fallback)
+
+    median = np.median(values)
+    scale = 1.4826 * np.median(np.abs(values - median))
+
+    if not np.isfinite(scale) or scale < 1e-10:
+        scale = np.std(values)
+
+    if not np.isfinite(scale) or scale < 1e-10:
+        scale = max(float(fallback), 1e-6)
+
+    return float(scale)
+
+
+def _weighted_line_fit(time, values, weights):
+    """Solve weighted local-linear regression and return endpoint intercept/slope."""
+    sw = np.sum(weights)
+    st = np.sum(weights * time)
+    stt = np.sum(weights * time * time)
+    sz = np.sum(weights * values)
+    stz = np.sum(weights * time * values)
+
+    determinant = sw * stt - st * st
+    if not np.isfinite(determinant) or determinant <= 1e-14:
+        return float(np.average(values, weights=weights)), 0.0
+
+    intercept = (stt * sz - st * stz) / determinant
+    slope = (sw * stz - st * sz) / determinant
+    return float(intercept), float(slope)
+
+
+def _robust_endpoint_fit(window, decay, fallback_scale):
+    """
+    Exponentially weighted robust causal endpoint regression.
+
+    The time origin is the newest sample, so the fitted intercept is a
+    zero-phase endpoint estimate.
+    """
+    window = np.asarray(window, dtype=float)
+    valid = np.isfinite(window)
+
+    if not np.any(valid):
+        return np.nan, 0.0, float(fallback_scale)
+
+    if np.count_nonzero(valid) == 1:
+        return float(window[valid][0]), 0.0, float(fallback_scale)
+
+    length = len(window)
+    time = np.arange(length, dtype=float) - float(length - 1)
+    time = time[valid]
+    values = window[valid]
+
+    tau = max(float(decay), 1.0)
+    weights = np.exp(time / tau)
+    weights /= max(np.sum(weights), 1e-12)
+
+    intercept, slope = _weighted_line_fit(time, values, weights)
+
+    # One robust reweighting iteration gives substantial impulse resistance
+    # without introducing substantial runtime cost.
+    residual = values - (intercept + slope * time)
+    scale = _robust_scale(residual, fallback=fallback_scale)
+    limit = max(1.65 * scale, 1e-10)
+    robust_weights = np.minimum(
+        1.0, limit / np.maximum(np.abs(residual), 1e-12)
+    )
+
+    intercept, slope = _weighted_line_fit(
+        time, values, weights * robust_weights
+    )
+    residual = values - (intercept + slope * time)
+    scale = _robust_scale(residual, fallback=fallback_scale)
+
+    return intercept, slope, scale
+
+
+def _recent_endpoint_slope(window, fallback=0.0):
+    """
+    Fast endpoint slope from the newest observations.
+
+    This slope is intentionally used only for tracker gain adaptation, not
+    directly blended into the visible output.
+    """
+    window = np.asarray(window, dtype=float)
+    valid = np.isfinite(window)
+
+    if np.count_nonzero(valid) < 2:
+        return float(fallback)
+
+    time = np.arange(len(window), dtype=float) - float(len(window) - 1)
+    time = time[valid]
+    values = window[valid]
+
+    time_centered = time - np.mean(time)
+    denominator = np.dot(time_centered, time_centered)
+    if denominator <= 1e-12:
+        return float(fallback)
+
+    return float(np.dot(time_centered, values - np.mean(values)) / denominator)
+
+
+@dataclass
+class _TrackerState:
+    """Persistent state for the causal alpha-beta and reversal controller."""
+    level: float = np.nan
+    velocity: float = 0.0
+    direction: float = 0.0
+    pending_direction: float = 0.0
+    pending_count: int = 0
+
+
+class _ConsensusTracker:
+    """
+    Adaptive alpha-beta tracker with confirmation-based direction changes.
+
+    Measurements always update internal state.  Only the externally emitted
+    level is direction-gated, which preserves estimator continuity while
+    specifically reducing visible false reversals.
+    """
+
+    def __init__(self, base_noise):
+        self.noise = max(float(base_noise), 1e-6)
+        self.state = _TrackerState()
+
+    def update(self, measurement, slope, recent_slope, local_scale, agreement):
+        state = self.state
+        local_scale = max(float(local_scale), 0.20 * self.noise, 1e-8)
+
+        if not np.isfinite(measurement):
+            if np.isfinite(state.level):
+                state.level += state.velocity
+                return state.level
+            return np.nan
+
+        if not np.isfinite(state.level):
+            state.level = float(measurement)
+            state.velocity = float(slope) if np.isfinite(slope) else 0.0
+            return state.level
+
+        predicted_level = state.level + state.velocity
+        innovation = float(measurement - predicted_level)
+
+        slope_scale = max(0.13 * self.noise, 0.24 * local_scale, 1e-8)
+        normalized_motion = abs(slope) / slope_scale
+
+        slope_sign_agreement = (
+            np.sign(slope) != 0.0
+            and np.sign(recent_slope) != 0.0
+            and np.sign(slope) == np.sign(recent_slope)
+        )
+
+        # Agreement raises responsiveness. Disagreement preferentially lowers
+        # beta, preserving trend velocity instead of reacting to local jitter.
+        if slope_sign_agreement:
+            alpha = 0.39 + 0.08 * min(normalized_motion / 2.0, 1.0)
+            beta = 0.085 + 0.035 * min(normalized_motion / 2.0, 1.0)
+        elif agreement > 0.30:
+            alpha = 0.35
+            beta = 0.065
+        else:
+            alpha = 0.25
+            beta = 0.028
+
+        innovation_limit = max(3.8 * local_scale, 2.3 * self.noise)
+        clipped_innovation = float(
+            np.clip(innovation, -innovation_limit, innovation_limit)
+        )
+
+        proposed_level = predicted_level + alpha * clipped_innovation
+        proposed_velocity = state.velocity + beta * clipped_innovation
+
+        delta = proposed_level - state.level
+        delta_sign = np.sign(delta)
+        threshold = max(0.10 * local_scale, 0.026 * self.noise)
+
+        trend_evidence = (
+            np.sign(slope) == delta_sign
+            and np.sign(recent_slope) in (0.0, delta_sign)
+        )
+        strong_move = abs(delta) >= 1.65 * threshold
+        opposite_move = (
+            state.direction != 0.0
+            and delta_sign != 0.0
+            and delta_sign != state.direction
+        )
+
+        if opposite_move and not (trend_evidence and strong_move):
+            # Continue updating velocity gently, but hold displayed level until
+            # a direction change persists across consecutive causal windows.
+            if state.pending_direction == delta_sign:
+                state.pending_count += 1
+            else:
+                state.pending_direction = delta_sign
+                state.pending_count = 1
+
+            required_count = 2 if abs(delta) >= 2.5 * threshold else 3
+
+            if state.pending_count < required_count:
+                state.velocity = 0.82 * state.velocity + 0.18 * proposed_velocity
+                return state.level
+        else:
+            state.pending_direction = 0.0
+            state.pending_count = 0
+
+        state.level = proposed_level
+        state.velocity = proposed_velocity
+
+        actual_delta = state.level - predicted_level + state.velocity * 0.0
+        if abs(delta) >= threshold:
+            state.direction = np.sign(delta)
+
+        return state.level
+
+
+def _global_noise_level(x):
+    """Estimate observation noise from finite first differences."""
+    finite_x = x[np.isfinite(x)]
+
+    if finite_x.size > 2:
+        noise = _robust_scale(
+            np.diff(finite_x), fallback=1e-5
+        ) / np.sqrt(2.0)
+    else:
+        noise = _robust_scale(finite_x, fallback=1e-5)
+
+    return max(float(noise), 1e-6)
+
+
+def _fuse_horizon_measurements(short_fit, long_fit, noise):
+    """Fuse two robust endpoint models according to slope agreement."""
+    short_level, short_slope, short_scale = short_fit
+    long_level, long_slope, long_scale = long_fit
+
+    if not np.isfinite(long_level):
+        return short_level, short_slope, short_scale, 0.0
+    if not np.isfinite(short_level):
+        return long_level, long_slope, long_scale, 0.0
+
+    reference = max(
+        0.30 * (abs(short_slope) + abs(long_slope)),
+        0.12 * noise,
+        1e-9,
+    )
+    agreement = np.tanh(
+        (short_slope * long_slope) / (reference * reference)
+    )
+
+    # Favor short-horizon endpoint response only when independent scales agree.
+    short_weight = float(np.clip(0.50 + 0.19 * agreement, 0.31, 0.69))
+    level = short_weight * short_level + (1.0 - short_weight) * long_level
+    slope = short_weight * short_slope + (1.0 - short_weight) * long_slope
+    scale = max(0.5 * (short_scale + long_scale), 0.25 * noise)
+
+    # A small causal extrapolation compensates regression attenuation.
+    level += 0.09 * slope
+    return level, slope, scale, float(agreement)
+
+
+def adaptive_filter(x, window_size=20):
+    """
+    Causal robust adaptive consensus filter.
+
+    Args:
+        x: Input one-dimensional real-valued signal.
+        window_size: Required history before emitting the first output.
+
+    Returns:
+        Filtered endpoint estimates of length len(x) - window_size + 1.
+    """
+    x = np.asarray(x, dtype=float)
+
+    if x.ndim != 1:
+        raise ValueError("Input signal must be a 1D array")
+    if window_size < 1:
+        raise ValueError("window_size must be >= 1")
+    if len(x) < window_size:
+        raise ValueError(
+            f"Input signal length ({len(x)}) must be >= window_size ({window_size})"
+        )
+
+    output_length = len(x) - window_size + 1
+
+    if not np.any(np.isfinite(x)):
+        return np.full(output_length, np.nan)
+
+    if window_size == 1:
+        return x.copy()
+
+    noise = _global_noise_level(x)
+
+    short_size = max(4, min(window_size, int(np.ceil(0.52 * window_size))))
+    recent_size = max(3, min(short_size, 6))
+    short_decay = max(1.5, 0.34 * short_size)
+    long_decay = max(2.0, 0.42 * window_size)
+
+    output = np.empty(output_length, dtype=float)
+    tracker = _ConsensusTracker(noise)
+
+    for output_index, endpoint in enumerate(range(window_size - 1, len(x))):
+        long_window = x[endpoint - window_size + 1:endpoint + 1]
+        short_window = x[endpoint - short_size + 1:endpoint + 1]
+        recent_window = x[endpoint - recent_size + 1:endpoint + 1]
+
+        short_fit = _robust_endpoint_fit(short_window, short_decay, noise)
+        long_fit = _robust_endpoint_fit(long_window, long_decay, noise)
+
+        measurement, slope, local_scale, agreement = _fuse_horizon_measurements(
+            short_fit, long_fit, noise
+        )
+        recent_slope = _recent_endpoint_slope(recent_window, fallback=slope)
+
+        output[output_index] = tracker.update(
+            measurement=measurement,
+            slope=slope,
+            recent_slope=recent_slope,
+            local_scale=local_scale,
+            agreement=agreement,
+        )
+
+    return output
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """Backward-compatible trend-preserving public entry point."""
+    return adaptive_filter(x, window_size)
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """
+    Apply the selected signal-processing algorithm.
+
+    Args:
+        input_signal: Input time series data.
+        window_size: Sliding history size.
+        algorithm_type: "basic" or "enhanced".
+
+    Returns:
+        Filtered signal with length len(input_signal) - window_size + 1.
+    """
+    if algorithm_type == "enhanced":
+        return enhanced_filter_with_trend_preservation(input_signal, window_size)
+    return adaptive_filter(input_signal, window_size)
+
+
+# EVOLVE-BLOCK-END
+
+
+def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+    """
+    Generate synthetic test signal with known characteristics.
+
+    Args:
+        length: Length of the signal
+        noise_level: Standard deviation of noise to add
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (noisy_signal, clean_signal)
+    """
+    np.random.seed(seed)
+    t = np.linspace(0, 10, length)
+
+    clean_signal = (
+        2 * np.sin(2 * np.pi * 0.5 * t)
+        + 1.5 * np.sin(2 * np.pi * 2 * t)
+        + 0.5 * np.sin(2 * np.pi * 5 * t)
+        + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)
+    )
+
+    trend = 0.1 * t * np.sin(0.2 * t)
+    clean_signal += trend
+
+    random_walk = np.cumsum(np.random.randn(length) * 0.05)
+    clean_signal += random_walk
+
+    noise = np.random.normal(0, noise_level, length)
+    noisy_signal = clean_signal + noise
+
+    return noisy_signal, clean_signal
+
+
+def run_signal_processing(
+    noisy_signal=None,
+    signal_length=1000,
+    noise_level=0.3,
+    window_size=20,
+):
+    """
+    Run the signal processing algorithm on a test signal.
+
+    Args:
+        noisy_signal: Input signal to filter, if provided.
+        signal_length: Generated signal length.
+        noise_level: Generated observation noise standard deviation.
+        window_size: Sliding history size.
+
+    Returns:
+        Dictionary containing output signal and available evaluation metrics.
+    """
+    if noisy_signal is not None:
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+        clean_signal = None
+    else:
+        noisy_signal, clean_signal = generate_test_signal(
+            signal_length, noise_level
+        )
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+
+    if len(filtered_signal) > 0 and clean_signal is not None:
+        delay = window_size - 1
+        aligned_clean = clean_signal[delay:]
+        aligned_noisy = noisy_signal[delay:]
+
+        min_length = min(len(filtered_signal), len(aligned_clean))
+        filtered_signal = filtered_signal[:min_length]
+        aligned_clean = aligned_clean[:min_length]
+        aligned_noisy = aligned_noisy[:min_length]
+
+        correlation = (
+            np.corrcoef(filtered_signal, aligned_clean)[0, 1]
+            if min_length > 1
+            else 0
+        )
+
+        noise_before = np.var(aligned_noisy - aligned_clean)
+        noise_after = np.var(filtered_signal - aligned_clean)
+        noise_reduction = (
+            (noise_before - noise_after) / noise_before
+            if noise_before > 0
+            else 0
+        )
+
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": aligned_clean,
+            "noisy_signal": aligned_noisy,
+            "correlation": correlation,
+            "noise_reduction": noise_reduction,
+            "signal_length": min_length,
+        }
+
+    if len(filtered_signal) > 0:
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": None,
+            "noisy_signal": None,
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": len(filtered_signal),
+        }
+
+    return {
+        "filtered_signal": [],
+        "clean_signal": [],
+        "noisy_signal": [],
+        "correlation": 0,
+        "noise_reduction": 0,
+        "signal_length": 0,
+    }
+
+
+if __name__ == "__main__":
+    results = run_signal_processing()
+    print("Signal processing completed!")
+    print(f"Correlation with clean signal: {results['correlation']:.3f}")
+    print(f"Noise reduction: {results['noise_reduction']:.3f}")
+    print(f"Processed signal length: {results['signal_length']}")
+```
+</CODE>

@@ -1,0 +1,262 @@
+{
+  "version": 24,
+  "curve": {
+    "unit": "usd",
+    "budget": 2.0,
+    "spent": 0.3793528,
+    "final_incumbent": 0.6097079707323921,
+    "ba_auc": 1.1880508727812131,
+    "ba_auc_normalized": 0.5940254363906066,
+    "num_points": 6,
+    "points": [
+      {
+        "cost": 0.0,
+        "score": 0.49825364225419244,
+        "incumbent": 0.49825364225419244,
+        "iteration": 0,
+        "candidates": 0
+      },
+      {
+        "cost": 0.06566280000000001,
+        "score": 0.5171139722685482,
+        "incumbent": 0.5171139722685482,
+        "iteration": 1,
+        "candidates": 3
+      },
+      {
+        "cost": 0.0967408,
+        "score": 0.5217285574166116,
+        "incumbent": 0.5217285574166116,
+        "iteration": 2,
+        "candidates": 1
+      },
+      {
+        "cost": 0.1291128,
+        "score": 0.5364944175376392,
+        "incumbent": 0.5364944175376392,
+        "iteration": 3,
+        "candidates": 1
+      },
+      {
+        "cost": 0.1664368,
+        "score": 0.5303308178855627,
+        "incumbent": 0.5364944175376392,
+        "iteration": 4,
+        "candidates": 1
+      },
+      {
+        "cost": 0.3793528,
+        "score": 0.6097079707323921,
+        "incumbent": 0.6097079707323921,
+        "iteration": 5,
+        "candidates": 4
+      }
+    ]
+  },
+  "strategy_objective_guidance": "- **Complete input is available at once:** `run_signal_processing(noisy_signal, window_size)` receives the entire noisy array, not a stream. The evaluator does **not** enforce causality, true sliding-window-only computation, real-time latency, or phase delay. Offline/batch, bidirectional, zero-phase, whole-record adaptive, and future-looking methods are permitted, provided they return the required output length.\n- **Hard validity constraints:**\n  - Export `run_signal_processing`.\n  - Return a `dict` containing `\"filtered_signal\"`.\n  - For every input, return exactly `len(noisy_signal) - window_size + 1` outputs: for full evaluation, `N - 19`; Stage 1 uses another window size, so the length must depend on the supplied `window_size`.\n  - Finish within 5 seconds in Stage 1 and 10 seconds per full-evaluation signal. An invalid length immediately produces total score `0`.\n  - Reliable completion matters: `success_rate` contributes directly to the final score.\n- **Primary selection metric is `combined_score` / `overall_score`:**\n  - `0.4 * avg_composite_score`\n  - `0.2 * smoothness_score = 0.2 / (1 + avg_slope_changes / 20)`\n  - `0.2 * accuracy_score = 0.2 * max(0, mean Pearson correlation(filtered, clean))`\n  - `0.1 * avg_noise_reduction`, where reduction is clipped below at zero\n  - `0.1 * success_rate`\n  - There is a hard gate: if average correlation with the hidden clean signal is below `0.1`, the entire overall score is zero.\n- **The nested composite term is itself a reciprocal penalty:**\n  - `avg_composite_score = mean[1 / (1 + penalty)]`, then weighted by **0.4** in the final score.\n  - Per signal, `penalty = 0.3*S_norm + 0.2*L_recent_norm + 0.2*L_avg_norm + 0.3*R_norm`.\n  - `S_norm = min(slope_changes / 50, 2)`; therefore slope changes stop getting worse after 100.\n  - `L_recent_norm = min(recent MAE versus delayed noisy input, 2)`.\n  - `L_avg_norm = min(full-output MAE versus delayed noisy input, 2)`.\n  - `R_norm = min(false_reversals / 25, 2)`; false reversals stop getting worse after 50.\n- **What each term actually rewards:**\n  - Slope-related terms reward an output with very few sign reversals, not necessarily accurate turning points.\n  - `L_recent` and `L_avg` reward closeness to the **noisy input shifted by `window_size - 1`**, not closeness to the clean signal.\n  - Correlation and noise reduction reward agreement with the hidden clean signal.\n  - The false-reversal term penalizes output reversals that are absent from the clean signal, but does **not** penalize missing genuine clean reversals.\n- **Important objective mismatch:** the nominal goal is responsive, low-lag adaptive filtering, but the evaluator rewards a potentially noncausal, aggressively smoothed offline reconstruction. In particular, a method can improve score by suppressing or delaying real turning points because missed clean reversals have no direct penalty. Likewise, copying the noisy input minimizes both lag-error terms but is heavily harmful to slope count, false reversals, and noise reduction.\n- **Terms near their maximum versus remaining room:** `success_rate` is usually the easiest term to bring and keep at its maximum `1.0`; it should be treated as a constraint, not an optimization target. Execution time is reported through `efficiency_score` but is **not included** in `combined_score`, so speed beyond avoiding timeouts is unscored. For unsmoothed noisy signals, slope changes and false reversals are likely large and may be at their normalization caps, making reversal suppression a large initial lever. Once reversal counts are low, correlation with clean signal and positive noise reduction become the larger remaining levers; excessive flattening can make these fall.\n- **Main conflicts:**\n  - Stronger smoothing lowers `S`, `R`, and often improves noise reduction, but worsens both noisy-input MAE terms and can lower correlation by attenuating legitimate high-frequency clean components.\n  - Tracking the noisy input improves `L_recent` and `L_avg`, but worsens reversal counts and usually noise reduction.\n  - Piecewise-constant or monotone output can nearly maximize smoothness and reduce false reversals, but risks poor correlation, weak noise reduction on steps/trends, and failure of the `correlation >= 0.1` gate.\n  - Zero-phase/bidirectional filtering is evaluator-legal and improves alignment/correlation relative to causal filtering, even though it violates the stated real-time premise.\n- **Largest remaining lever:** after guaranteed validity, the most valuable evaluator-visible tradeoff is a batch denoiser that substantially reduces spurious reversals while retaining enough waveform variation for high clean correlation and positive noise reduction. Pure latency optimization is not a lever because neither latency nor phase delay is scored.",
+  "strategy_diverge_guidance": "EXAMPLES OF DIFFERENT approaches:\n- **Zero-phase low-pass family:** design adaptive low-pass candidates with `scipy.signal.butter`, apply `scipy.signal.sosfiltfilt`; tune cutoff from robust local/global noise estimates. This is batch-legal, preserves output alignment with samples `window_size - 1:` and can reduce `S`, `R`, and residual-noise variance without causal phase lag.\n- **Local polynomial trend family:** use `scipy.signal.savgol_filter` with several odd window lengths and polynomial orders. Its shape-preserving smoothing can retain sinusoidal curvature and clean turning points better than a simple low-pass, improving correlation while reducing reversal penalties.\n- **Robust impulsive-noise family:** use `scipy.signal.medfilt` or `scipy.ndimage.median_filter`, optionally followed by a light `scipy.signal.savgol_filter`. Median-based suppression is especially relevant to noisy step and random-walk cases, where narrow spikes create false reversals but broad level changes should remain.\n- **Wavelet shrinkage family:** use `pywt.wavedec`, `pywt.threshold`, and `pywt.waverec` with soft thresholding; estimate threshold scale from detail coefficients using robust MAD. Multiresolution shrinkage can remove high-frequency noise while retaining steps and frequency-changing content, directly targeting clean correlation and noise reduction rather than merely minimizing slopes.\n- **Frequency-domain Wiener-style family:** use `scipy.signal.wiener` as a baseline local adaptive denoiser, or estimate a smooth spectral attenuation profile with `scipy.signal.welch` and apply it through `scipy.signal.sosfiltfilt`-style low-pass candidates. This offers locally varying smoothing strength for the changing noise levels across test cases.\n- **Global trend-plus-residual family:** estimate a smooth global component with `scipy.signal.detrend` plus low-pass reconstruction, then selectively restore low-amplitude residual structure only when it improves local trend consistency. This explicitly exploits that missed reversals are cheaper than false ones, while maintaining enough waveform dynamics for Pearson correlation.\n- **Offline model-selection family:** generate a small bank of outputs from distinct denoisers and select per signal using observable proxies: residual variance reduction, retained variance, reversal count, and agreement with a broad reference smoother. Since the full record is available, choose one whole-record candidate rather than committing to an online filter state.\n- **State-space/predictive family:** implement a lightweight constant-velocity or local-linear Kalman-style smoother and include a backward smoothing pass. No dedicated Kalman package is available, so this is only worth exploring if the mature `scipy.signal` and PyWavelets families plateau; its evaluator-visible advantage is smooth trajectory estimation with fewer false reversals, not real-time behavior.",
+  "strategy_refine_guidance": "EXAMPLES OF REFINEMENT approaches:\n- **Honor alignment exactly:** produce one estimate per terminal window position and compare design outputs conceptually to `noisy_signal[window_size - 1:]`; trim any batch-filter result to exactly `N - window_size + 1`, using the supplied window size rather than assuming 20.\n- **Tune reversal versus fidelity jointly:** search Savitzky\u2013Golay window length, polynomial order, Butterworth order, and normalized cutoff against a proxy combining reversal count, output-to-input MAE, retained variance, and residual variance. Do not optimize only denoising strength.\n- **Use zero-phase filtering where stable:** prefer `scipy.signal.sosfiltfilt` over `scipy.signal.sosfilt` for batch low-pass variants; test padding-sensitive short inputs and fall back safely when filter padding requirements are not met.\n- **Calibrate wavelet thresholds:** refine wavelet family, decomposition level, soft versus hard `pywt.threshold`, and threshold multiplier. Favor soft thresholds when hard thresholding introduces staircase artifacts and additional sign changes.\n- **Preserve steps deliberately:** for median/wavelet candidates, reduce smoothing around large robust first-difference excursions so the two clean step transitions are retained; this protects correlation and noise reduction while avoiding ringing-induced false reversals.\n- **Add hysteresis only if it improves correlation:** suppress tiny derivative sign flips using a scale tied to robust residual noise, but avoid broad deadbands that turn sinusoidal sections into plateaus and reduce Pearson correlation.\n- **Adapt strength by estimated noise:** derive a robust noise scale from median absolute first differences and use stronger smoothing for high-noise records, weaker smoothing for low-noise records. The evaluator varies noise level from `0.2` to `0.6`, so one fixed aggressive setting is unlikely to dominate.\n- **Keep candidate bank small and deterministic:** test a bounded number of mature-filter candidates and select deterministically; execution time has no score bonus, but timeouts and failures lower `success_rate`, which costs a direct `0.1`.\n- **Validate degenerate behavior:** ensure finite numeric output, stable handling of short Stage-1 inputs, and no constant-output fallback except as a last-resort error guard, because constant output risks undefined/zero Pearson correlation and triggers the overall-score gate.",
+  "strategy_guidance_attempted": true,
+  "strategy_guidance_cost": 0.046296000000000004,
+  "strategies": [
+    {
+      "index": 1,
+      "title": "[zero-phase-local-polynomial] Offline adaptive Savitzky\u2013Golay endpoint-aligned s",
+      "plan": "Mechanism family: zero-phase-local-polynomial  \nReplacement scope: Replace the entire body of `enhanced_filter_with_trend_preservation`; retain `adaptive_filter`, `process_signal`, and output trimming behavior.  \nCompute budget: none; one `scipy.signal.savgol_filter` pass over the complete input, with expected evaluation-time reduction relative to the incumbent\u2019s two robust weighted least-squares solves per output sample.  \nGain mechanism: Replace the incumbent\u2019s causal, recursively lagged alpha-beta state tracker with a symmetric batch local-polynomial projection. The new degree of freedom is future-sample support around every evaluated sample, which removes phase lag while the polynomial basis preserves local curvature better than an ordinary moving average. Estimate noise using robust second differences, choose exactly one odd smoothing span from `{11, 15, 19, 23}`, use polynomial order 3, filter the full record, then return `filtered[window_size - 1:]`. The robust noise estimate is `sigma = median(abs(diff(x, 2) - median(diff(x, 2)))) / (0.67449 * sqrt(6))`; select spans 11, 15, 19, and 23 for sigma below 0.20, 0.35, 0.50, and above 0.50 respectively, clipped to the largest valid odd span. This suppresses high-frequency reversal noise without the incumbent\u2019s trend-state overshoot and without endpoint delay. For short records where the selected span is invalid, use the largest valid odd span at least 5; if unavailable, return the aligned raw suffix.\nExpected-gain check: this construction can realize zero-phase symmetric polynomial projection, which the incumbent\u2019s strictly causal regression-plus-recursion cannot realize, and it should be accepted only if evaluation reports `combined_score > 0.536494417538` with correlation remaining at least `0.90`.",
+      "cost": 0.022832,
+      "best_score": 0.5805962126470811,
+      "baseline_score": 0.5364944175376392,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 1,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.032707999999999994,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 5,
+      "failure_feedback": []
+    },
+    {
+      "index": 2,
+      "title": "[multiresolution-wavelet-shrinkage] Robust wavelet-detail attenuation with low-f",
+      "plan": "Mechanism family: multiresolution-wavelet-shrinkage  \nReplacement scope: Replace the entire body of `enhanced_filter_with_trend_preservation`, including its weighted quadratic fitting and alpha-beta tracker.  \nCompute budget: none; one `pywt.wavedec` decomposition and one `pywt.waverec` reconstruction, maximum decomposition level `min(5, pywt.dwt_max_level(len(x), wavelet.dec_len))`; expected evaluation time is linear in input length and materially below repeated matrix solves for normal evaluator sizes.  \nGain mechanism: Use a `sym4` wavelet representation, which changes the representation from overlapping time-domain endpoint fits to scale-separated approximation and detail coefficients. Compute the finest-detail robust scale as `sigma = median(abs(cD1 - median(cD1))) / 0.67449`. Soft-threshold each detail band with `threshold_j = sigma * sqrt(2*log(N)) * 0.70 * 2**(-0.18*j)`, where `j=1` is the finest retained detail level; leave the approximation coefficients untouched. Reconstruct, crop to exactly `len(x)`, and return the endpoint-aligned suffix beginning at `window_size - 1`. Use `mode=\"symmetric\"` to avoid boundary ringing. If PyWavelets is unavailable or reconstruction has an unexpected length, deterministically fall back to the local-polynomial smoother described above. This selectively removes small noise coefficients while retaining broad trend transitions and transient components that a single fixed smoother attenuates.\nExpected-gain check: the incumbent has no independently controllable scale-domain detail suppression, whereas this method can eliminate fine-scale noise without forcing equal attenuation of the trend bands, and the falsifiable acceptance threshold is `combined_score > 0.536494417538` while retaining positive mean noise reduction.",
+      "cost": 0.022832,
+      "best_score": 0.6097079707323921,
+      "baseline_score": 0.5364944175376392,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 1,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.07321355319475298,
+      "cumulative_relative_gain": 0.1200797048902076,
+      "productive_rounds": 1,
+      "barren_rounds": 0,
+      "implementation_spend": 0.032707999999999994,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 5,
+      "failure_feedback": []
+    },
+    {
+      "index": 3,
+      "title": "Mechanism family: total-variation-trajectory  \nReplacement scope: Replace `enhan",
+      "plan": "Mechanism family: total-variation-trajectory  \nReplacement scope: Replace `enhanced_filter_with_trend_preservation` with a whole-record one-dimensional ROF total-variation denoiser followed by one light symmetric polynomial reconstruction pass.  \nCompute budget: one deterministic dual projected-gradient solve of exactly 80 iterations, no optimizer starts, followed by one Savitzky\u2013Golay pass of span 7 and order 2; expected evaluation time is `O(80*N)` and safely below the stated timeout for evaluator-scale signals.  \nGain mechanism: Change the topology from independent sliding regressions plus a velocity recursion to a globally coupled adjacent-sample chain. Solve `min_y 0.5*sum((y-x)^2) + lambda*sum(abs(diff(y)))` using Chambolle\u2019s 1-D dual update, with `lambda = clip(1.35*sigma, 0.12, 0.90)` and `sigma` obtained from robust second differences. The dual variable is projected elementwise to `[-lambda, lambda]` each iteration, and the primal reconstruction is `y = x - D^T p`; this makes the construction fully specified and deterministic. Then apply only a span-7/order-2 zero-phase Savitzky\u2013Golay pass to remove staircase corners while retaining the globally selected monotone segments. Return exactly `y[window_size - 1:]`; for records shorter than 7, skip the final polynomial pass. This directly targets the evaluator\u2019s heavily weighted slope-change and false-reversal penalties because a reversal requires a globally supported change in the fused trajectory rather than a local noisy innovation.\nExpected-gain check: unlike the incumbent, whose state update can reverse on each successive endpoint innovation, the fused-chain penalty explicitly charges every total directional excursion; the falsifiable evaluator threshold is `combined_score > 0.536494417538` and average `slope_changes < 114.8` without correlation below `0.1`.",
+      "cost": 0.022832,
+      "best_score": 0.5767946999942752,
+      "baseline_score": 0.5364944175376392,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 1,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.032707999999999994,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 5,
+      "failure_feedback": []
+    }
+  ],
+  "active_strategy": null,
+  "strategy_queue": [],
+  "ordered_portfolio_roots": [
+    1,
+    2,
+    3
+  ],
+  "ordered_exploitation_queue": [
+    2,
+    1,
+    3
+  ],
+  "ordered_active_root": null,
+  "ordered_pilot_scores": {
+    "1": 0.5805962126470811,
+    "2": 0.6097079707323921,
+    "3": 0.5767946999942752
+  },
+  "ordered_phase": "exploit",
+  "ordered_reference_feedback": [
+    "portfolio reference scored 0.580596212647 and promoted to shared pilot parent"
+  ],
+  "strategy_reference_failure_streak": 0,
+  "strategy_reference_disabled": false,
+  "strategy_costs": [
+    0.068496
+  ],
+  "implementation_costs": [
+    0.021887600000000004,
+    0.031077999999999995,
+    0.032372,
+    0.037323999999999996,
+    0.032707999999999994
+  ],
+  "guide_implementation_costs": [],
+  "guide_implementation_due": false,
+  "guide_implementation_due_reason": null,
+  "guide_implementation_unguided": false,
+  "strategy_call_count": 1,
+  "anchor_next_cheap_to_incumbent": false,
+  "opening_cheap_probe_done": true,
+  "opening_failure_retries_used": 0,
+  "opening_guide_hedge_done": false,
+  "success_achieved": false,
+  "barren_rounds": 0,
+  "stagnation": 0,
+  "next_strategy_escalation": 32,
+  "strategy_escalation_gap": 32,
+  "seen_solutions": [
+    "04dcf76833db9509e44396a3f5f3ed133399dba9",
+    "25ad73f0b06fec7c1e8dc810dad05570dc16830d",
+    "3b0bb5e1cbca7c33d7a9f798d515cc971dacf71b",
+    "4fba41bc94d524cec9fccd497ddbc1b677379014",
+    "50efe7ce1977b75ad1b3292da64ac05ac39e0aea",
+    "7aa2e9a3c67c100119f4b66c39bb99fb9668e334",
+    "890bf04b3f37a0830a98eef51416daa52b06bed7",
+    "a02db3c267788357e477e40c494e2de8c1628b95",
+    "e3079badaa648265b4d25ece9295c07f031d1f3f",
+    "f9b7eced77c877f5e06d669e9e7e2efe91b85618"
+  ],
+  "score_ledger": [
+    [
+      0.500076694,
+      1
+    ],
+    [
+      0.500716759,
+      1
+    ],
+    [
+      0.517113972,
+      1
+    ],
+    [
+      0.521728557,
+      1
+    ],
+    [
+      0.536494418,
+      1
+    ],
+    [
+      0.530330818,
+      1
+    ],
+    [
+      0.580596213,
+      2
+    ],
+    [
+      0.609707971,
+      1
+    ],
+    [
+      0.5767947,
+      1
+    ]
+  ],
+  "cost_samples": [
+    [
+      3,
+      0.06566280000000001
+    ],
+    [
+      1,
+      0.031077999999999995
+    ],
+    [
+      1,
+      0.032372
+    ],
+    [
+      1,
+      0.037323999999999996
+    ],
+    [
+      3,
+      0.212916
+    ]
+  ],
+  "exploring": false
+}

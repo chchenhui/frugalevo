@@ -1,0 +1,138 @@
+<NAME>
+iterated_local_perturbation
+</NAME>
+
+<DESCRIPTION>
+Add a deterministic iterated-local-search phase after the existing beam-seeded descent.
+
+The current code performs strong strict-improvement local search, but once every beam seed reaches an insertion/swap/reversal local optimum it cannot cross a makespan barrier requiring one temporary non-improving move. Transaction conflict landscapes commonly have these barriers: a group of mutually conflicting transactions may need to be reordered together before any individual move reduces the critical-path delay.
+
+This edit generates several deterministic, structurally different perturbations of the best schedule, including interval reversals, distant exchanges, and short block relocations. Each perturbed schedule is then reoptimized using the same actual simulator makespan objective and the same insertion/swap/reversal neighborhoods. The schedule is replaced only if the complete reoptimization produces a strictly better makespan, preserving validity and never sacrificing an already-found solution.
+
+The phase is bounded to avoid excessive simulator calls while allowing the search to escape local optima that the ordinary descent cannot improve directly.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        if current_cost < best_cost:
+            best_cost = current_cost
+            best_schedule = current
+
+    return best_cost, best_schedule
+=======
+        if current_cost < best_cost:
+            best_cost = current_cost
+            best_schedule = current
+
+    # A strict local optimum can still be separated from a better conflict
+    # ordering by a small uphill move.  Perturb the best known ordering in a
+    # few deterministic ways, then apply the same objective-driven descent.
+    # This is deliberately deterministic so repeated scheduling of a workload
+    # produces the same result and so all comparisons remain reproducible.
+    perturbations = []
+    seen_perturbations = {tuple(best_schedule)}
+    perturb_count = min(6, max(3, num_txns // 3))
+
+    for perturbation_index in range(perturb_count):
+        candidate = best_schedule.copy()
+        mode = perturbation_index % 3
+
+        if mode == 0:
+            # Reverse a medium interval, changing many conflict directions at
+            # once while retaining the transactions on either side.
+            left = (perturbation_index * 3) % max(1, num_txns - 1)
+            width = min(
+                num_txns - left,
+                max(3, num_txns // 3 + (perturbation_index % 3)),
+            )
+            right = left + width
+            candidate[left:right] = candidate[left:right][::-1]
+        elif mode == 1:
+            # Exchange distant transactions.  Such a move is useful when two
+            # critical chains are interleaved in an insertion-local optimum.
+            left = perturbation_index % max(1, num_txns // 2)
+            right = num_txns - 1 - (
+                perturbation_index % max(1, num_txns // 3)
+            )
+            if left != right:
+                candidate[left], candidate[right] = candidate[right], candidate[left]
+        else:
+            # Relocate a short consecutive block across the ordering.  Moving
+            # the block together preserves useful internal ordering while
+            # changing its relationship with many other transactions.
+            block_start = (perturbation_index * 2) % max(1, num_txns - 1)
+            block_size = min(3, num_txns - block_start)
+            block = candidate[block_start:block_start + block_size]
+            remainder = (
+                candidate[:block_start] + candidate[block_start + block_size:]
+            )
+            destination = (num_txns - 1 - perturbation_index * 2) % (
+                len(remainder) + 1
+            )
+            candidate = remainder[:destination] + block + remainder[destination:]
+
+        candidate_key = tuple(candidate)
+        if candidate_key not in seen_perturbations:
+            seen_perturbations.add(candidate_key)
+            perturbations.append(candidate)
+
+    for perturbed_schedule in perturbations:
+        current = perturbed_schedule
+        current_cost = evaluate(current)
+
+        # Use a bounded best-improvement descent after each perturbation.  The
+        # normal phase has already optimized the easy moves, so a few rounds
+        # are sufficient to determine whether this basin is more promising.
+        for _round in range(min(num_txns, 8)):
+            round_best_cost = current_cost
+            round_best_schedule = current
+
+            for source in range(num_txns):
+                stripped = current[:source] + current[source + 1:]
+                moved_txn = current[source]
+                for destination in range(num_txns):
+                    if destination == source:
+                        continue
+                    candidate = (
+                        stripped[:destination]
+                        + [moved_txn]
+                        + stripped[destination:]
+                    )
+                    candidate_cost = evaluate(candidate)
+                    if candidate_cost < round_best_cost:
+                        round_best_cost = candidate_cost
+                        round_best_schedule = candidate
+
+            for left in range(num_txns):
+                for right in range(left + 1, num_txns):
+                    candidate = current.copy()
+                    candidate[left], candidate[right] = candidate[right], candidate[left]
+                    candidate_cost = evaluate(candidate)
+                    if candidate_cost < round_best_cost:
+                        round_best_cost = candidate_cost
+                        round_best_schedule = candidate
+
+            for left in range(num_txns):
+                for right in range(left + 2, num_txns):
+                    candidate = (
+                        current[:left]
+                        + current[left:right + 1][::-1]
+                        + current[right + 1:]
+                    )
+                    candidate_cost = evaluate(candidate)
+                    if candidate_cost < round_best_cost:
+                        round_best_cost = candidate_cost
+                        round_best_schedule = candidate
+
+            if round_best_cost >= current_cost:
+                break
+            current = round_best_schedule
+            current_cost = round_best_cost
+
+        if current_cost < best_cost:
+            best_cost = current_cost
+            best_schedule = current
+
+    return best_cost, best_schedule
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,67 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct 14 points by deterministic direct maximin refinement.
+
+    The symmetric cube/axis packing provides a strong feasible initial
+    point.  A fixed-seed batched evolution strategy then searches nearby
+    nonsymmetric configurations using exactly the evaluator's squared
+    minimum-distance over maximum-distance objective.
+    """
+    a = (1.0 + np.sqrt(10.0)) / 3.0
+    cube = np.array(
+        [
+            [-1.0, -1.0, -1.0], [-1.0, -1.0,  1.0],
+            [-1.0,  1.0, -1.0], [-1.0,  1.0,  1.0],
+            [ 1.0, -1.0, -1.0], [ 1.0, -1.0,  1.0],
+            [ 1.0,  1.0, -1.0], [ 1.0,  1.0,  1.0],
+        ],
+        dtype=float,
+    )
+    axes = np.array(
+        [
+            [ a, 0.0, 0.0], [-a, 0.0, 0.0],
+            [0.0,  a, 0.0], [0.0, -a, 0.0],
+            [0.0, 0.0,  a], [0.0, 0.0, -a],
+        ],
+        dtype=float,
+    )
+    best = np.vstack((cube, axes))
+
+    def ratios(configurations: np.ndarray) -> np.ndarray:
+        differences = configurations[:, :, None, :] - configurations[:, None, :, :]
+        squared = np.einsum("...k,...k->...", differences, differences)
+        diagonal = np.arange(14)
+        squared[:, diagonal, diagonal] = np.inf
+        minimum = squared.min(axis=(1, 2))
+        squared[:, diagonal, diagonal] = 0.0
+        maximum = squared.max(axis=(1, 2))
+        return minimum / maximum
+
+    best_score = ratios(best[None, :, :])[0]
+    rng = np.random.default_rng(148731)
+    scale = 0.22
+    batch_size = 28
+
+    for iteration in range(5200):
+        candidates = best + scale * rng.standard_normal((batch_size, 14, 3))
+        candidate_scores = ratios(candidates)
+        winner = int(np.argmax(candidate_scores))
+
+        if candidate_scores[winner] > best_score:
+            best = candidates[winner]
+            best_score = candidate_scores[winner]
+            scale = min(0.32, scale * 1.035)
+        else:
+            scale *= 0.997
+
+        if iteration % 900 == 899:
+            scale = max(scale, 0.055)
+
+    return best
+
+
+# EVOLVE-BLOCK-END

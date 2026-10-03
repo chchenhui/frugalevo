@@ -1,0 +1,104 @@
+<NAME>
+optimize_edgecount_size
+</NAME>
+
+<DESCRIPTION>
+Replace the fixed separation heuristic for the edge-count strategy with a direct search over all possible graph sizes.
+
+The current `K_SEP=2.5` formula targets one fixed spacing regardless of the scoring function. However, the score trades prediction reliability against the explicit `1/N` penalty, so the best graph size is not necessarily the first size reaching that spacing. For every `N` from 4 to 100, this edit estimates the expected classification error from the exact edge-count codebook layout using a normal approximation to the noisy edge count. It then selects the `N` maximizing the estimated score factor `0.9^(100 * expected_errors) / N`.
+
+The decoder remains unchanged and is already maximum-likelihood for this code family: it chooses the closest expected noisy edge count. The legacy `L_ideal` computation is retained for debug output, while `N_candidate_EC` becomes the score-aware selection.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    int N_candidate_EC = 4; 
+    if (L_ideal > 1e-9) { 
+         double discriminant = 1.0 + 8.0 * L_ideal; 
+         if (discriminant >=0) { 
+            N_candidate_EC = static_cast<int>(std::ceil((1.0 + std::sqrt(discriminant)) / 2.0));
+         } else { 
+            N_candidate_EC = 100; 
+         }
+    }
+    N_candidate_EC = std::max(4, N_candidate_EC); 
+    N_candidate_EC = std::min(100, N_candidate_EC); 
+
+    if (epsilon_noise_rate < 0.01) {
+        current_strategy = Strategy::GED; N_ACTUAL = N_for_GED_strat;
+    } else { 
+        if (N_candidate_EC > N_for_GED_strat) { 
+             current_strategy = Strategy::EDGE_COUNT; N_ACTUAL = N_candidate_EC;
+        } else { 
+            current_strategy = Strategy::GED; N_ACTUAL = N_for_GED_strat;
+        }
+    }
+=======
+    // For the edge-count code, evaluate the actual score trade-off instead of
+    // using a fixed target separation.  A transmitted graph with m edges has
+    // observed mean eps*L + (1-2eps)*m and variance L*eps*(1-eps).
+    // Consecutive codewords are decoded at the midpoint of those means.
+    int N_candidate_EC = 4;
+    double best_ec_estimated_score = -1.0;
+    const double edge_variance_factor = epsilon_noise_rate * (1.0 - epsilon_noise_rate);
+    const double mean_slope = 1.0 - 2.0 * epsilon_noise_rate;
+    const double sqrt_two = std::sqrt(2.0);
+
+    for (int candidate_n = 4; candidate_n <= 100; ++candidate_n) {
+        int candidate_l = candidate_n * (candidate_n - 1) / 2;
+        // Distinct edge counts are required; otherwise several messages are
+        // intrinsically indistinguishable by this decoder.
+        if (candidate_l < M_graphs - 1) continue;
+
+        std::vector<int> counts(M_graphs);
+        for (int k = 0; k < M_graphs; ++k) {
+            counts[k] = static_cast<int>(std::round(
+                static_cast<double>(k) * candidate_l / (M_graphs - 1.0)));
+        }
+
+        double estimated_error = 0.0;
+        if (edge_variance_factor < 1e-15) {
+            estimated_error = 0.0;
+        } else {
+            double sigma = std::sqrt(candidate_l * edge_variance_factor);
+            for (int k = 0; k < M_graphs; ++k) {
+                double mu = epsilon_noise_rate * candidate_l + mean_slope * counts[k];
+                double lower_z = -std::numeric_limits<double>::infinity();
+                double upper_z = std::numeric_limits<double>::infinity();
+
+                if (k > 0) {
+                    double prev_mu = epsilon_noise_rate * candidate_l + mean_slope * counts[k - 1];
+                    lower_z = ((prev_mu + mu) * 0.5 - mu) / sigma;
+                }
+                if (k + 1 < M_graphs) {
+                    double next_mu = epsilon_noise_rate * candidate_l + mean_slope * counts[k + 1];
+                    upper_z = ((mu + next_mu) * 0.5 - mu) / sigma;
+                }
+
+                double correct_probability =
+                    0.5 * (std::erf(upper_z / sqrt_two) - std::erf(lower_z / sqrt_two));
+                correct_probability = std::max(0.0, std::min(1.0, correct_probability));
+                estimated_error += 1.0 - correct_probability;
+            }
+            estimated_error /= M_graphs;
+        }
+
+        double estimated_score =
+            std::pow(0.9, 100.0 * estimated_error) / candidate_n;
+        if (estimated_score > best_ec_estimated_score) {
+            best_ec_estimated_score = estimated_score;
+            N_candidate_EC = candidate_n;
+        }
+    }
+
+    if (epsilon_noise_rate < 0.01) {
+        current_strategy = Strategy::GED; N_ACTUAL = N_for_GED_strat;
+    } else {
+        if (N_candidate_EC > N_for_GED_strat) {
+             current_strategy = Strategy::EDGE_COUNT; N_ACTUAL = N_candidate_EC;
+        } else {
+            current_strategy = Strategy::GED; N_ACTUAL = N_for_GED_strat;
+        }
+    }
+>>>>>>> REPLACE
+</DIFF>

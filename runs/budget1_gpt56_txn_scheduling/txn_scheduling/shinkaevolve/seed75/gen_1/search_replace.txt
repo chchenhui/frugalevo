@@ -1,0 +1,167 @@
+<NAME>
+beam_local_schedule_search
+</NAME>
+
+<DESCRIPTION>
+Replace sampled single-path greedy construction with a deterministic beam search followed by insertion-based local optimization.
+
+1. The prior method evaluates only a random subset of next transactions and commits immediately to one choice. A poor early commitment can create long read/write-conflict chains that cannot be repaired later.
+2. The new beam search keeps several promising partial transaction orders. Every retained prefix is extended by every remaining transaction and scored through `workload.get_opt_seq_cost`, which directly measures the conflict-aware scheduling objective rather than proxy properties such as transaction length.
+3. Retaining up to `num_seqs` prefixes allows the search to preserve alternatives when several early choices appear similar but lead to different downstream dependency delays.
+4. Each completed beam candidate is refined with best-improvement insertion local search. Moving one transaction across several others can remove conflict-critical ordering delays that adjacent swaps or fixed greedy construction miss.
+5. Costs are cached by sequence tuple, avoiding repeated simulator calls for identical prefixes or candidate schedules.
+
+This remains valid because every generated candidate is a permutation of every transaction exactly once, while substantially broadening the search over transaction orders that determine makespan.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using greedy cost sampling strategy.
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    def get_greedy_cost_sampled(num_samples, sample_rate):
+        # greedy with random starting point
+        start_txn = random.randint(0, workload.num_txns - 1)
+        txn_seq = [start_txn]
+        remaining_txns = [x for x in range(0, workload.num_txns)]
+        remaining_txns.remove(start_txn)
+        running_cost = workload.txns[start_txn][0][3]
+        # min_costs = []
+        # key_map, total_cost = workload.get_incremental_seq_cost(start_txn, {}, 0)
+        for i in range(0, workload.num_txns - 1):
+            min_cost = 100000 # MAX
+            min_relative_cost = 10
+            min_txn = -1
+            # min_index = 0
+            holdout_txns = []
+            done = False
+            key_maps = []
+
+            sample = random.random()
+            if sample > sample_rate:
+                idx = random.randint(0, len(remaining_txns) - 1)
+                t = remaining_txns[idx]
+                txn_seq.append(t)
+                remaining_txns.pop(idx)
+                continue
+
+            for j in range(0, num_samples):
+                idx = 0
+                if len(remaining_txns) > 1:
+                    idx = random.randint(0, len(remaining_txns) - 1)
+                else:
+                    done = True
+                t = remaining_txns[idx]
+                holdout_txns.append(remaining_txns.pop(idx))
+                if workload.debug:
+                    print(remaining_txns, holdout_txns)
+                txn_len = workload.txns[t][0][3]
+                test_seq = txn_seq.copy()
+                test_seq.append(t)
+                cost = 0
+                cost = workload.get_opt_seq_cost(test_seq)
+                if cost < min_cost:
+                # if relative_cost < min_relative_cost:
+                    min_cost = cost
+                    min_txn = t
+                    # min_relative_cost = relative_cost
+                    # min_index = j
+                if done:
+                    break
+            assert(min_txn != -1)
+            running_cost = min_cost
+            txn_seq.append(min_txn)
+            holdout_txns.remove(min_txn)
+            remaining_txns.extend(holdout_txns)
+
+            if workload.debug:
+                print("min: ", min_txn, remaining_txns, holdout_txns, txn_seq)
+        if workload.debug:
+            print(txn_seq)
+            print(len(set(txn_seq)))
+        assert len(set(txn_seq)) == workload.num_txns
+        # print(txn_seq)
+
+        overall_cost = workload.get_opt_seq_cost(txn_seq)
+
+        return overall_cost, txn_seq
+
+    return get_greedy_cost_sampled(10, 1.0)
+=======
+def get_best_schedule(workload, num_seqs):
+    """
+    Search transaction permutations using conflict-aware beam construction and
+    insertion local search.
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    transactions = list(range(workload.num_txns))
+    if not transactions:
+        return 0, []
+
+    # Prefix costs are repeatedly encountered while expanding the beam and
+    # during local improvement, so avoid re-running the simulator for them.
+    cost_cache = {}
+
+    def sequence_cost(sequence):
+        key = tuple(sequence)
+        if key not in cost_cache:
+            cost_cache[key] = workload.get_opt_seq_cost(list(sequence))
+        return cost_cache[key]
+
+    # Keep several low-cost alternatives instead of committing to one sampled
+    # greedy choice.  Prefixes are scored by the actual conflict scheduler.
+    beam_width = max(1, min(num_seqs, workload.num_txns))
+    beam = [()]
+    for _ in range(workload.num_txns):
+        expanded = []
+        seen = set()
+        for prefix in beam:
+            used = set(prefix)
+            for txn in transactions:
+                if txn not in used:
+                    candidate = prefix + (txn,)
+                    if candidate not in seen:
+                        seen.add(candidate)
+                        expanded.append((sequence_cost(candidate), candidate))
+        expanded.sort(key=lambda entry: (entry[0], entry[1]))
+        beam = [candidate for _, candidate in expanded[:beam_width]]
+
+    def improve_by_insertion(schedule):
+        """Apply best improving transaction moves until locally optimal."""
+        current = list(schedule)
+        current_cost = sequence_cost(current)
+        while True:
+            best_cost = current_cost
+            best_schedule = None
+            for source in range(len(current)):
+                reduced = current[:source] + current[source + 1:]
+                for destination in range(len(current)):
+                    candidate = reduced[:destination] + [current[source]] + reduced[destination:]
+                    candidate_cost = sequence_cost(candidate)
+                    if candidate_cost < best_cost:
+                        best_cost = candidate_cost
+                        best_schedule = candidate
+
+            if best_schedule is None:
+                return current_cost, current
+            current, current_cost = best_schedule, best_cost
+
+    best_cost = float("inf")
+    best_schedule = None
+    for candidate in beam:
+        candidate_cost, candidate_schedule = improve_by_insertion(candidate)
+        if candidate_cost < best_cost:
+            best_cost = candidate_cost
+            best_schedule = candidate_schedule
+
+    if workload.debug:
+        print("best schedule:", best_schedule, "cost:", best_cost)
+    return best_cost, best_schedule
+>>>>>>> REPLACE
+</DIFF>

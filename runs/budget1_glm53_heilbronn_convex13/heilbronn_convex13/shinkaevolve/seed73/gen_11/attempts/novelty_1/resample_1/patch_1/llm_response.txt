@@ -1,0 +1,124 @@
+<NAME>
+multistart_hardmin_optimizer
+</NAME>
+<DESCRIPTION>
+Two key issues limit the current solution: (1) the soft-min gradient spreads the update over all triangles weighted by proximity to the minimum, diluting the effort on the actual bottleneck triangles, and (2) a single initialization risks a poor local optimum. Heilbronn-type max-min problems are highly multi-modal, so a multi-start strategy over several ring geometries and seeds is the standard remedy. The new optimizer uses a *hard-min* vertex-repulsion scheme: at each iteration only the ~8 smallest triangles are enlarged by pushing their vertices along the gradient of their (signed) area, with an adaptive backtracking step (accept a move only if the new min does not decrease, otherwise shrink the step). This monotonically improves the true objective, avoids the ill-conditioned softmax, and converges robustly. Determinism is preserved via fixed seeds, and the best configuration across all restarts is returned.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Small deterministic jitter to break degeneracies (collinear triples with center).
+    pts += 0.02 * R * rng.standard_normal((n, 2))
+    pts = clip(pts)
+
+    idx = np.array([(i, j, k) for i in range(n) for j in range(i + 1, n) for k in range(j + 1, n)])
+
+    def min_tri(p):
+        a = p[idx[:, 0]]
+        b = p[idx[:, 1]]
+        c = p[idx[:, 2]]
+        areas = 0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+                             (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+        return areas
+
+    # Subgradient ascent on the minimum triangle area.
+    step = 0.02 * R
+    best_pts = pts.copy()
+    best_val = min_tri(pts).min()
+    for it in range(600):
+        areas = min_tri(pts)
+        m = areas.min()
+        if m > best_val:
+            best_val = m
+            best_pts = pts.copy()
+        # soft-min gradient: weight triangles near the minimum
+        w = np.exp(-(areas - m) / max(1e-6, 0.02 * m + 1e-9))
+        w /= w.sum()
+        grads = np.zeros_like(pts)
+        a = pts[idx[:, 0]]
+        b = pts[idx[:, 1]]
+        c = pts[idx[:, 2]]
+        s = np.sign((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+                    (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+        ga = 0.5 * s[:, None] * np.stack([c[:, 1] - b[:, 1], b[:, 0] - c[:, 0]], axis=1)
+        gb = 0.5 * s[:, None] * np.stack([a[:, 1] - c[:, 1], c[:, 0] - a[:, 0]], axis=1)
+        gc = 0.5 * s[:, None] * np.stack([b[:, 1] - a[:, 1], a[:, 0] - b[:, 0]], axis=1)
+        np.add.at(grads, idx[:, 0], w[:, None] * ga)
+        np.add.at(grads, idx[:, 1], w[:, None] * gb)
+        np.add.at(grads, idx[:, 2], w[:, None] * gc)
+        # normalize gradient scale
+        gn = np.linalg.norm(grads, axis=1, keepdims=True)
+        gn[gn < 1e-12] = 1.0
+        grads /= gn
+        pts = clip(pts + step * grads)
+        step *= 0.995
+
+    pts = clip(best_pts)
+=======
+    idx = np.array([(i, j, k) for i in range(n) for j in range(i + 1, n) for k in range(j + 1, n)])
+
+    def min_tri(p):
+        a = p[idx[:, 0]]
+        b = p[idx[:, 1]]
+        c = p[idx[:, 2]]
+        areas = 0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+                             (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+        return areas
+
+    def optimize(p0):
+        # Hard-min vertex repulsion: enlarge only the few smallest triangles,
+        # with backtracking so the true minimum never decreases.
+        p = clip(p0.copy())
+        bv = min_tri(p).min()
+        bp = p.copy()
+        step = 0.05 * R
+        for it in range(2500):
+            areas = min_tri(p)
+            order = np.argsort(areas)
+            m = areas[order[0]]
+            if m > bv:
+                bv = m
+                bp = p.copy()
+            grads = np.zeros_like(p)
+            for t in order[:8]:
+                i, j, l = idx[t]
+                a, b, c = p[i], p[j], p[l]
+                s = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+                s = 1.0 if s >= 0 else -1.0
+                grads[i] += 0.5 * s * np.array([c[1] - b[1], b[0] - c[0]])
+                grads[j] += 0.5 * s * np.array([a[1] - c[1], c[0] - a[0]])
+                grads[l] += 0.5 * s * np.array([b[1] - a[1], a[0] - b[0]])
+            gn = np.linalg.norm(grads, axis=1, keepdims=True)
+            gn[gn < 1e-12] = 1.0
+            grads /= gn
+            cand = clip(p + step * grads)
+            if min_tri(cand).min() >= m - 1e-12:
+                p = cand
+                step *= 0.999
+            else:
+                step *= 0.6
+                if step < 1e-5 * R:
+                    break
+        return clip(bp), bv
+
+    # Multi-start over ring geometries and deterministic seeds; keep global best.
+    best_pts = None
+    best_val = -1.0
+    for r1f, r2f, jig in [(0.55, 0.95, 0.02), (0.40, 0.90, 0.05),
+                          (0.60, 1.00, 0.03), (0.30, 0.85, 0.06),
+                          (0.50, 1.00, 0.00)]:
+        for seed in (42, 123, 7):
+            rr = np.random.default_rng(seed=seed)
+            p0 = np.zeros((n, 2))
+            for i in range(6):
+                a1 = np.pi / 3 * i
+                a2 = np.pi / 3 * i + np.pi / 6
+                p0[1 + i] = r1f * R * np.array([np.cos(a1), np.sin(a1)])
+                p0[7 + i] = r2f * R * np.array([np.cos(a2), np.sin(a2)])
+            p0 += jig * R * rr.standard_normal((n, 2))
+            bp, bv = optimize(p0)
+            if bv > best_val:
+                best_val = bv
+                best_pts = bp
+    pts = clip(best_pts)
+>>>>>>> REPLACE
+</DIFF>

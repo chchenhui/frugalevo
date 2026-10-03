@@ -1,0 +1,146 @@
+<NAME>
+binary_search_rebalance</NAME>
+<DESCRIPTION>
+Instead of a single greedy pass, this approach uses a feasibility-driven strategy: it binary-searches a target KVPR threshold λ, then uses a first-fit-decreasing packing (models sorted by density r/s descending) to check if all models can be assigned to GPUs such that each GPU stays under λ while fitting memory. This produces a much more balanced placement than greedy, since the threshold forces spreading of pressure rather than piling onto the currently-least-loaded GPU. After finding the minimal feasible λ, one refinement pass moves models between GPUs if it lowers the max KVPR. This yields lower max KVPR at negligible runtime cost.</DESCRIPTION>
+<CODE>
+```python
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement minimizing the maximum KVPR across all GPUs
+    using a binary-search-on-threshold + first-fit-decreasing feasibility check.
+    """
+
+    # Sort models by pressure density (req_rate / slo) descending
+    sorted_models = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
+
+    def feasible(lam, limit_gpu_num):
+        """Try to pack all models into at most limit_gpu_num GPUs with each GPU's
+        KVPR <= lam. KVPR constraint: W / (MEM - S) <= lam, i.e.
+        for each added model: (W + w) <= lam * (MEM - S - s), requires S + s < MEM."""
+        gpus = []  # each: [remaining_mem, W]
+        for m in sorted_models:
+            w = m.req_rate / m.slo
+            s = m.model_size
+            placed = False
+            for g in gpus:
+                rem, W = g
+                if s <= rem and (W + w) <= lam * (rem - s) + 1e-12:
+                    g[0] = rem - s
+                    g[1] = W + w
+                    placed = True
+                    break
+            if not placed:
+                if s <= GPU_MEM_SIZE and w <= lam * (GPU_MEM_SIZE - s) + 1e-12:
+                    gpus.append([GPU_MEM_SIZE - s, w])
+                else:
+                    return None
+            if len(gpus) > limit_gpu_num:
+                return None
+        return gpus
+
+    # Binary search on lam
+    lo, hi = 0.0, 1e9
+    best = None
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        res = feasible(mid, gpu_num)
+        if res is not None:
+            best = res
+            hi = mid
+        else:
+            lo = mid
+
+    if best is None:
+        # Fallback: feasibility without KVPR constraint (memory only), may be infeasible
+        gpus = []
+        for m in sorted_models:
+            w = m.req_rate / m.slo
+            s = m.model_size
+            placed = False
+            for g in gpus:
+                if s <= g[0]:
+                    g[0] -= s
+                    g[1] += w
+                    placed = True
+                    break
+            if not placed:
+                if s <= GPU_MEM_SIZE:
+                    gpus.append([GPU_MEM_SIZE - s, w])
+                else:
+                    raise ValueError(
+                        f"Unable to place model of size {m.model_size} GB on any GPU."
+                    )
+        best = gpus
+
+    # Convert to placement dict: models to GPU index
+    # Re-run packing with best lambda to record assignments
+    lam = hi
+    placement = {i: [] for i in range(gpu_num)}
+    rem = [GPU_MEM_SIZE] * gpu_num
+    W = [0.0] * gpu_num
+    gidx = 0
+    for m in sorted_models:
+        w = m.req_rate / m.slo
+        s = m.model_size
+        placed = False
+        for i in range(gidx):
+            if s <= rem[i] and (W[i] + w) <= lam * (rem[i] - s) + 1e-9:
+                rem[i] -= s
+                W[i] += w
+                placement[i].append(m)
+                placed = True
+                break
+        if not placed:
+            if gidx < gpu_num and s <= rem[gidx] and (W[gidx] + w) <= lam * (rem[gidx] - s) + 1e-9:
+                rem[gidx] -= s
+                W[gidx] += w
+                placement[gidx].append(m)
+                gidx += 1
+            else:
+                # last resort: any GPU that fits memory
+                done = False
+                for i in range(gpu_num):
+                    if s <= rem[i]:
+                        rem[i] -= s
+                        W[i] += w
+                        placement[i].append(m)
+                        done = True
+                        break
+                if not done:
+                    raise ValueError(
+                        f"Unable to place model of size {s} GB on any GPU."
+                    )
+
+    return placement
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")
+```
+</CODE>

@@ -1,0 +1,169 @@
+<NAME>
+conservative_endpoint_blend
+</NAME>
+
+<DESCRIPTION>
+Replace the three-scale endpoint consensus with two closely related endpoint regressions: the validated exp(-3) profile and a slightly more recent exp(-4.5) profile. The recent profile is not used merely because an instantaneous slope is large; it is admitted only after both profiles agree on direction and the trend confidence has persisted across consecutive complete windows. This removes conflicting multi-scale slope estimates that can produce direction chatter, while preserving the low endpoint lag of local regression on clean, sustained trends. The residual-based confidence also makes the blend naturally conservative during volatile or noisy intervals.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Exponential state is retained for the warm-up interval.  Once a complete
+    # window is available, use a bank of causal endpoint regressions instead of
+    # a single fixed-decay average.  Gentle weighting is quiet in flat regions;
+    # stronger recency weighting removes endpoint lag during coherent trends.
+    decay = np.exp(-2.0 / max(window_size - 1, 1))
+    window_level = float(x[0])
+    regression_windows = np.lib.stride_tricks.sliding_window_view(x, window_size)
+    regression_time = np.arange(window_size, dtype=float) - (window_size - 1)
+    regression_design = np.column_stack((
+        np.ones(window_size, dtype=float), regression_time
+    ))
+    endpoint_levels = []
+    endpoint_slopes = []
+    for strength in (1.5, 3.0, 5.0):
+        regression_weights = np.exp(
+            strength * regression_time / max(window_size - 1, 1)
+        )
+        regression_map = np.linalg.solve(
+            regression_design.T @ (regression_weights[:, None] * regression_design),
+            regression_design.T * regression_weights,
+        )
+        endpoint_levels.append(regression_windows @ regression_map[0])
+        endpoint_slopes.append(regression_windows @ regression_map[1])
+
+    endpoint_levels = np.asarray(endpoint_levels)
+    endpoint_slopes = np.asarray(endpoint_slopes)
+    medium_fit = (
+        endpoint_levels[1, :, None]
+        + endpoint_slopes[1, :, None] * regression_time[None, :]
+    )
+    endpoint_noise = np.maximum(
+        1.4826 * np.median(np.abs(regression_windows - medium_fit), axis=1),
+        1e-6,
+    )
+=======
+    # Retain an exponential reference during warm-up.  Complete windows use a
+    # conservative two-profile endpoint regression: exp(-3) is the stable
+    # primary estimate, while exp(-4.5) is a modestly more recent correction
+    # that is enabled only after persistent, low-residual trend evidence.
+    decay = np.exp(-2.0 / max(window_size - 1, 1))
+    window_level = float(x[0])
+    regression_windows = np.lib.stride_tricks.sliding_window_view(x, window_size)
+    regression_time = np.arange(window_size, dtype=float) - (window_size - 1)
+    regression_design = np.column_stack((
+        np.ones(window_size, dtype=float), regression_time
+    ))
+    endpoint_levels = []
+    endpoint_slopes = []
+    endpoint_residuals = []
+    for strength in (3.0, 4.5):
+        regression_weights = np.exp(
+            strength * regression_time / max(window_size - 1, 1)
+        )
+        regression_map = np.linalg.solve(
+            regression_design.T @ (regression_weights[:, None] * regression_design),
+            regression_design.T * regression_weights,
+        )
+        coefficients = regression_windows @ regression_map.T
+        fitted = (
+            coefficients[:, :1]
+            + coefficients[:, 1:] * regression_time[None, :]
+        )
+        endpoint_levels.append(coefficients[:, 0])
+        endpoint_slopes.append(coefficients[:, 1])
+        endpoint_residuals.append(
+            1.4826 * np.median(np.abs(regression_windows - fitted), axis=1)
+        )
+
+    endpoint_levels = np.asarray(endpoint_levels)
+    endpoint_slopes = np.asarray(endpoint_slopes)
+    endpoint_residuals = np.asarray(endpoint_residuals)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    previous_step = 0.0
+    reversal_direction = 0.0
+    reversal_evidence = 0
+
+    for index, sample in enumerate(x):
+=======
+    previous_step = 0.0
+    reversal_direction = 0.0
+    reversal_evidence = 0
+    trend_direction = 0.0
+    trend_persistence = 0
+
+    for index, sample in enumerate(x):
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Use the exponential reference only before a full causal regression
+        # window exists.  Thereafter blend gentle, medium, and steep endpoint
+        # fits according to slope-to-residual confidence.  This prevents a
+        # fixed recency decay from either lagging every turn or following every
+        # noisy oscillation.
+        window_level = decay * window_level + (1.0 - decay) * sample
+        if index >= window_size - 1:
+            local_index = index - window_size + 1
+            medium_slope = endpoint_slopes[1, local_index]
+            fit_noise = endpoint_noise[local_index]
+            trend_confidence = abs(medium_slope) / (
+                abs(medium_slope) + 1.5 * fit_noise
+            )
+            gentle_weight = (1.0 - trend_confidence) ** 2
+            medium_weight = 2.0 * trend_confidence * (1.0 - trend_confidence)
+            steep_weight = trend_confidence ** 2
+            window_reference = (
+                gentle_weight * endpoint_levels[0, local_index]
+                + medium_weight * endpoint_levels[1, local_index]
+                + steep_weight * endpoint_levels[2, local_index]
+            )
+        else:
+            trend_confidence = 0.0
+            window_reference = window_level
+=======
+        # The more recent endpoint fit is admitted only after several windows
+        # of directionally coherent, residual-supported evidence.  In noisy or
+        # turning regions the stable exp(-3) fit remains the sole reference.
+        window_level = decay * window_level + (1.0 - decay) * sample
+        if index >= window_size - 1:
+            local_index = index - window_size + 1
+            primary_slope = endpoint_slopes[0, local_index]
+            recent_slope = endpoint_slopes[1, local_index]
+            fit_noise = max(endpoint_residuals[0, local_index], 1e-6)
+            trend_confidence = abs(primary_slope) / (
+                abs(primary_slope) + 1.5 * fit_noise
+            )
+            slope_direction = np.sign(primary_slope)
+            coherent = (
+                slope_direction != 0.0
+                and slope_direction == np.sign(recent_slope)
+                and trend_confidence > 0.10
+            )
+            if coherent:
+                if slope_direction == trend_direction:
+                    trend_persistence += 1
+                else:
+                    trend_direction = slope_direction
+                    trend_persistence = 1
+            else:
+                trend_direction = 0.0
+                trend_persistence = 0
+
+            recent_weight = 0.0
+            if trend_persistence >= 3:
+                recent_weight = min(0.42, 0.55 * trend_confidence)
+            window_reference = (
+                (1.0 - recent_weight) * endpoint_levels[0, local_index]
+                + recent_weight * endpoint_levels[1, local_index]
+            )
+        else:
+            trend_confidence = 0.0
+            window_reference = window_level
+>>>>>>> REPLACE
+</DIFF>

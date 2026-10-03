@@ -1,0 +1,100 @@
+--- a/original.py
++++ b/original.py
+@@ -1,24 +1,87 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def min_max_dist_dim3_14() -> np.ndarray:
+     """
+-    Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
++    Construct fourteen points by deterministic multi-start maximin relaxation.
+ 
+-    Returns
+-        points: np.ndarray of shape (14,3) containing the (x,y) coordinates of the 14 points.
++    The optimization uses a smooth approximation to the minimum and
++    maximum squared pairwise distances.  Translation and scale are removed
++    after every step, since neither changes the requested ratio.
++    """
++    n, d = 14, 3
++    pair_i, pair_j = np.triu_indices(n, 1)
++    rng = np.random.default_rng(20240517)
+ 
+-    """
++    def normalize(x: np.ndarray) -> np.ndarray:
++        x = x - x.mean(axis=0, keepdims=True)
++        return x / np.sqrt(np.mean(np.sum(x * x, axis=1)))
+ 
+-    n = 14
+-    d = 3
++    def exact_ratio(x: np.ndarray) -> float:
++        delta = x[pair_i] - x[pair_j]
++        squared = np.einsum("ij,ij->i", delta, delta)
++        return float(squared.min() / squared.max())
+ 
+-    # places points randomly
+-    np.random.seed(42)
+-    points = np.random.randn(n, d)
++    best_points = None
++    best_ratio = -np.inf
+ 
+-    return points
++    # Independent starts substantially reduce the tendency of the
++    # nonsmooth maximin problem to settle in a poor local arrangement.
++    for restart in range(16):
++        points = normalize(rng.standard_normal((n, d)))
++
++        for iteration in range(1500):
++            delta = points[pair_i] - points[pair_j]
++            squared = np.einsum("ij,ij->i", delta, delta)
++
++            # Anneal from a broad force field to an increasingly accurate
++            # approximation of the active closest and farthest pairs.
++            temperature = 0.09 * (0.025 / 0.09) ** (iteration / 1499.0)
++
++            low_shift = squared.min()
++            low_weight = np.exp(-(squared - low_shift) / temperature)
++            low_weight /= low_weight.sum()
++            smooth_min = low_shift - temperature * np.log(
++                np.exp(-(squared - low_shift) / temperature).sum()
++            )
++
++            high_shift = squared.max()
++            high_weight = np.exp((squared - high_shift) / temperature)
++            high_weight /= high_weight.sum()
++            smooth_max = high_shift + temperature * np.log(
++                np.exp((squared - high_shift) / temperature).sum()
++            )
++
++            # Gradient of log(smooth_min / smooth_max) with respect to
++            # each squared pair distance.
++            pair_weight = low_weight / smooth_min - high_weight / smooth_max
++            weights = np.zeros((n, n), dtype=float)
++            weights[pair_i, pair_j] = pair_weight
++            weights[pair_j, pair_i] = pair_weight
++
++            gradient = 2.0 * (
++                weights.sum(axis=1)[:, None] * points - weights @ points
++            )
++            gradient -= gradient.mean(axis=0, keepdims=True)
++
++            # A normalized step makes the schedule stable across starts.
++            gradient_norm = np.sqrt(np.mean(np.sum(gradient * gradient, axis=1)))
++            step = 0.045 * (1.0 - 0.55 * iteration / 1499.0)
++            points = normalize(points + step * gradient / (gradient_norm + 1e-12))
++
++            if iteration % 50 == 0:
++                ratio = exact_ratio(points)
++                if ratio > best_ratio:
++                    best_ratio = ratio
++                    best_points = points.copy()
++
++        ratio = exact_ratio(points)
++        if ratio > best_ratio:
++            best_ratio = ratio
++            best_points = points.copy()
++
++    return best_points
+ 
+ 
+ # EVOLVE-BLOCK-END

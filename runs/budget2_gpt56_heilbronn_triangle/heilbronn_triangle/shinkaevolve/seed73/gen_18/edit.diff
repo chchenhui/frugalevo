@@ -1,0 +1,191 @@
+--- a/original.py
++++ b/original.py
+@@ -1,158 +1,173 @@
+ # EVOLVE-BLOCK-START
+ import itertools
+ import numpy as np
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+     Return a deterministic 11-point configuration in the equilateral triangle
+     with vertices (0,0), (1,0), and (1/2,sqrt(3)/2).
+ 
+     Internally, points are represented by the last two barycentric coordinates.
+     For a triple of such points, the absolute determinant is exactly its area
+     normalized by the area of the containing equilateral triangle.
+     """
+     n = 11
+     fixed_count = 3
+     rng = np.random.default_rng(47311829)
+ 
+     triples = np.asarray(list(itertools.combinations(range(n), 3)), dtype=np.intp)
+     height = np.sqrt(3.0) * 0.5
+ 
+     def project(uv: np.ndarray) -> np.ndarray:
+         """Map arbitrary pairs into the closed barycentric simplex."""
+         w0 = 1.0 - uv[..., 0] - uv[..., 1]
+         weights = np.stack((w0, uv[..., 0], uv[..., 1]), axis=-1)
+         np.maximum(weights, 1.0e-9, out=weights)
+         weights /= weights.sum(axis=-1, keepdims=True)
+         return weights[..., 1:]
+ 
+     def normalized_areas(configs: np.ndarray) -> np.ndarray:
+         chosen = configs[:, triples]
+         a = chosen[:, :, 1] - chosen[:, :, 0]
+         b = chosen[:, :, 2] - chosen[:, :, 0]
+         return np.abs(a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0])
+ 
+     def rank_score(configs: np.ndarray, tail: int = 10) -> tuple[np.ndarray, np.ndarray]:
+         """
+         Score configurations using the true bottleneck plus a small support
+         term from nearby active constraints.  The first returned value is
+         always the actual min-area objective.
+         """
+         areas = normalized_areas(configs)
+         low = np.partition(areas, tail - 1, axis=1)[:, :tail]
+         minimum = low[:, 0]
+         support = low.mean(axis=1)
+         return minimum, minimum + 0.028 * support
+ 
+     def make_population(size: int) -> np.ndarray:
+         population = rng.dirichlet((0.82, 0.82, 0.82), size=(size, n))[..., 1:]
+         population[:, 0] = (0.0, 0.0)
+         population[:, 1] = (1.0, 0.0)
+         population[:, 2] = (0.0, 1.0)
+ 
+         # A few broadly distributed structured seeds improve initial coverage.
+         seed_count = min(12, size)
+         for i in range(seed_count):
+             phase = (i + 0.5) / seed_count
+             values = []
+             for j in range(n - fixed_count):
+                 u = ((j * 0.61803398875 + phase) % 1.0)
+                 v = ((j * 0.38196601125 + 0.37 * phase) % 1.0)
+                 values.append((u, v))
+             population[i, fixed_count:] = project(np.asarray(values))
+         return population
+ 
++    # The first part of the run locates geometrically distinct basins; the
++    # second, longer part is deliberately much less disruptive and polishes
++    # the nearly active determinant constraints.
+     population_size = 128
+     elite_count = 24
+-    generations = 3200
++    generations = 6000
+ 
+     population = make_population(population_size)
+     true_score, search_score = rank_score(population)
+ 
+     best_index = int(np.argmax(true_score))
+     best = population[best_index].copy()
+     best_area = float(true_score[best_index])
+ 
+     for generation in range(generations):
+         order = np.argsort(search_score)[::-1]
+         elites = population[order[:elite_count]].copy()
+ 
+         current_best = int(np.argmax(true_score))
+         if true_score[current_best] > best_area:
+             best_area = float(true_score[current_best])
+             best = population[current_best].copy()
+ 
+         offspring_count = population_size - elite_count
+         progress = generation / (generations - 1)
+         offspring = np.empty((offspring_count, n, 2), dtype=float)
+ 
+         parent_rank = rng.integers(0, elite_count, size=offspring_count)
+         offspring[:] = elites[parent_rank]
+ 
+         # Differential displacements retain useful geometric relationships.
+         ia = rng.integers(0, population_size, size=offspring_count)
+         ib = rng.integers(0, population_size, size=offspring_count)
+         differential = population[ia, fixed_count:] - population[ib, fixed_count:]
+ 
+-        differential_scale = 0.38 * (1.0 - progress) + 0.055
+-        gaussian_scale = 0.055 * (1.0 - progress) ** 1.55 + 0.0010
+-        differential_mask = rng.random((offspring_count, n - fixed_count, 1)) < 0.58
++        # Differential moves are valuable while discovering the arrangement,
++        # but must become genuinely local once the active triangles have
++        # emerged.  The quadratic decay creates that refinement phase.
++        differential_scale = 0.43 * (1.0 - progress) ** 2.0 + 0.010
++        gaussian_scale = 0.070 * (1.0 - progress) ** 1.8 + 0.00045
++        differential_mask = rng.random((offspring_count, n - fixed_count, 1)) < (
++            0.66 - 0.50 * progress
++        )
+         gaussian_mask = rng.random((offspring_count, n - fixed_count, 1)) < (
+-            0.48 - 0.22 * progress
++            0.52 - 0.32 * progress
+         )
+ 
+         offspring[:, fixed_count:] += differential_mask * differential_scale * differential
+         offspring[:, fixed_count:] += gaussian_mask * rng.normal(
+             0.0, gaussian_scale, size=(offspring_count, n - fixed_count, 2)
+         )
+         offspring[:, fixed_count:] = project(offspring[:, fixed_count:])
+ 
+         # Early random immigrants avoid a premature common ancestor.
+-        if generation < 700 and generation % 35 == 0:
++        if generation < 1200 and generation % 40 == 0:
+             immigrants = 8
+             offspring[-immigrants:] = make_population(immigrants)
+ 
+         population = np.concatenate((elites, offspring), axis=0)
+         true_score, search_score = rank_score(population)
+ 
+     current_best = int(np.argmax(true_score))
+     if true_score[current_best] > best_area:
+         best_area = float(true_score[current_best])
+         best = population[current_best].copy()
+ 
+     # Focused local maximin polishing around the strongest discovered layout.
+-    # Batches make this substantially cheaper than point-by-point evaluation.
+-    for step in range(520):
++    # Keep a separate incumbent for support-guided moves: it may move slightly
++    # sideways, but `best` always remains the globally strongest true minimum.
++    polish = best.copy()
++    polish_area = best_area
++    for step in range(700):
+         batch_size = 72
+-        scale = 0.012 * (1.0 - step / 520.0) ** 1.7 + 0.00022
+-        trials = np.repeat(best[None, :, :], batch_size, axis=0)
++        scale = 0.012 * (1.0 - step / 700.0) ** 1.8 + 0.00016
++        trials = np.repeat(polish[None, :, :], batch_size, axis=0)
+ 
+-        move_probability = 0.52 if step < 250 else 0.30
++        move_probability = 0.52 if step < 300 else 0.26
+         move = rng.random((batch_size, n - fixed_count, 1)) < move_probability
+         trials[:, fixed_count:] += move * rng.normal(
+             0.0, scale, size=(batch_size, n - fixed_count, 2)
+         )
+         trials[:, fixed_count:] = project(trials[:, fixed_count:])
+ 
+         trial_min, trial_search = rank_score(trials)
+         candidate_index = int(np.argmax(trial_search))
++        _, incumbent_search = rank_score(polish[None, :, :])
+ 
+-        _, incumbent_search = rank_score(best[None, :, :])
+         if (
+-            trial_min[candidate_index] > best_area
++            trial_min[candidate_index] > polish_area
+             or (
+-                trial_min[candidate_index] >= best_area * 0.9995
++                trial_min[candidate_index] >= polish_area * 0.9995
+                 and trial_search[candidate_index] > incumbent_search[0]
+             )
+         ):
++            polish = trials[candidate_index].copy()
++            polish_area = float(trial_min[candidate_index])
++
++        if trial_min[candidate_index] > best_area:
+             best = trials[candidate_index].copy()
+-            best_area = max(best_area, float(trial_min[candidate_index]))
++            best_area = float(trial_min[candidate_index])
+ 
+     return np.column_stack((
+         best[:, 0] + 0.5 * best[:, 1],
+         height * best[:, 1],
+     ))
+ 
+ 
+ # EVOLVE-BLOCK-END

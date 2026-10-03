@@ -1,0 +1,107 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.signal import savgol_filter
+
+
+def _adaptive_kalman_pass(y, q_scale=2.5, vol_win=5):
+    """Forward adaptive-Q Kalman (constant-velocity model, level domain only)."""
+    n = len(y)
+    x = np.zeros(n)
+    # Noise variance estimate from first differences (robust MAD)
+    d = np.diff(y)
+    sigma_n = 1.4826 * np.median(np.abs(d - np.median(d))) / np.sqrt(2.0)
+    sigma_n = max(sigma_n, 1e-8)
+    R = sigma_n ** 2
+
+    # State: [level, slope]
+    xm = np.array([y[0], 0.0])
+    P = np.eye(2) * (sigma_n ** 2 + 1.0)
+    F = np.array([[1.0, 1.0], [0.0, 1.0]])
+    H = np.array([[1.0, 0.0]])
+    I = np.eye(2)
+
+    # Local volatility for Q adaptation
+    pad = np.concatenate([[y[0]] * vol_win, y, [y[-1]] * vol_win])
+    vol = np.array([np.std(pad[i:i + 2 * vol_win + 1]) for i in range(n)])
+    vol = np.maximum(vol, sigma_n)
+
+    for k in range(n):
+        # Predict
+        xm = F @ xm
+        P = F @ P @ F.T
+        # Adaptive process noise: scale with local volatility
+        q = q_scale * (vol[k] ** 2) / max(vol_win, 1)
+        P[0, 0] += q
+        P[1, 1] += 0.25 * q
+        # Update
+        S = (H @ P @ H.T + R)[0, 0]
+        K = (P @ H.T / S).flatten()
+        innov = y[k] - (H @ xm)[0]
+        xm = xm + K * innov
+        P = (I - np.outer(K, H)) @ P
+        x[k] = xm[0]
+    return x
+
+
+def _bidirectional_kalman(y, crossover=0.25):
+    """Fuse forward and backward Kalman passes with linear crossover weighting."""
+    fwd = _adaptive_kalman_pass(y)
+    bwd = _adaptive_kalman_pass(y[::-1])[::-1]
+    n = len(y)
+    t = np.linspace(0.0, 1.0, n)
+    # Weight on forward pass: 1 near start, 0 near end, linear in transition zones
+    w = np.ones(n)
+    lo = crossover
+    hi = 1.0 - crossover
+    mask = (t > lo) & (t < hi)
+    w[mask] = 0.5 + 0.5 * np.cos(np.pi * (t[mask] - lo) / (hi - lo))
+    w[t >= hi] = 0.0
+    return w * fwd + (1.0 - w) * bwd
+
+
+def _robust_sg(x, window=9, poly=2, iters=2):
+    """Robust Savitzky-Golay with residual-based outlier downweighting."""
+    x = savgol_filter(x, window, poly, mode="interp")
+    for _ in range(iters):
+        resid = np.abs(x - savgol_filter(x, window, poly, mode="interp"))
+        s = 1.4826 * np.median(np.abs(resid - np.median(resid))) + 1e-8
+        w = np.clip(1.0 - (resid / (3.0 * s)) ** 2, 0.05, 1.0)
+        xs = savgol_filter(x * w, window, poly, mode="interp")
+        norm = savgol_filter(w, window, poly, mode="interp") + 1e-8
+        x = xs / norm
+    return x
+
+
+def _recency_convolution(x, half_life=12):
+    """Causal convolution with exponentially decaying kernel (mild lag, high recency weight)."""
+    n = len(x)
+    L = min(n, 4 * half_life)
+    k = np.exp(-np.arange(L) / half_life)
+    k /= k.sum()
+    out = np.convolve(x, k, mode="full")[:n]
+    # Zero-phase correction for the interior (leave endpoints causal)
+    return out
+
+
+def _median_snap(x, y, window=5, thresh=2.5):
+    """Level-domain median snap: pull output toward local input median when drifted."""
+    n = len(x)
+    pad = np.concatenate([[y[0]] * window, y, [y[-1]] * window])
+    med = np.array([np.median(pad[i:i + 2 * window + 1]) for i in range(n)])
+    dev = x - med
+    s = 1.4826 * np.median(np.abs(dev - np.median(dev))) + 1e-8
+    corr = np.where(np.abs(dev) > thresh * s, 0.5 * (med - x), 0.0)
+    return x + corr
+
+
+def filter_signal(y):
+    """Full cascade: bidirectional adaptive-Q Kalman -> robust SG -> recency conv -> median snap."""
+    y = np.asarray(y, dtype=float)
+    if len(y) < 8:
+        return y.copy()
+    x = _bidirectional_kalman(y, crossover=0.25)
+    x = _robust_sg(x, window=9, poly=2, iters=2)
+    x = _recency_convolution(x, half_life=12)
+    x = _median_snap(x, y, window=5, thresh=2.5)
+    return x
+# EVOLVE-BLOCK-END

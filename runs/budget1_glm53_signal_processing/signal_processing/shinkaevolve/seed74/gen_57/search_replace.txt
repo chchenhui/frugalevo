@@ -1,0 +1,153 @@
+<NAME>
+velocity_clamp_reversal_damp_harden</NAME>
+
+<DESCRIPTION>
+The best prior variant (Kalman/RTS + guarded velocity clamp + sub-noise reversal damping) cut slope_changes from 29.2 to 20.4 and false_reversals from 23.0 to 14.2 versus the current two-pass baseline, at identical combined score (0.72) — but its correlation dipped slightly (0.92→0.89). Strategy: port the zero-phase velocity-aware displacement clamp and guarded reversal damping into the current (higher-accuracy) program, but keep the conservative correlation guards (>= 0.97) and a milder reversal-damp threshold so the accuracy/responsiveness metrics of the current version are preserved while the smoothness gains are captured. Additionally, harden the interface per the recommendation: n < window_size now returns a graceful fallback instead of raising, and NaN/inf inputs are sanitized — this eliminates the crash mode that zeroed out three of nine prior programs. All operations are zero-phase (bidirectional sweeps), so no lag is added.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _bilateral_one_pole(x, alpha):
+=======
+def _bilateral_one_pole(x, alpha):
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def kalman_rts_filter(x, window_size=20):
+    """
+    Forward Kalman filter (constant-velocity model) + true Rauch-Tung-Striebel
+    backward smoother, then a zero-phase bidirectional one-pole ripple damper.
+    Output index i corresponds to input time i + window_size - 1.
+    """
+    x = np.asarray(x, dtype=float).ravel()
+    n = x.size
+    if n < window_size:
+        raise ValueError(
+            f"Input signal length ({n}) must be >= window_size ({window_size})"
+        )
+    if n == 1:
+        return x.copy()
+=======
+def _velocity_clamp(y, vel, slack, sigma_r):
+    """
+    Zero-phase velocity-aware displacement clamp.
+    Limits per-step displacement |y[k]-y[k-1]| to 2*|vel[k]| + slack*sigma_r,
+    where vel[k] is the smoothed velocity state from the RTS pass. Applied
+    forward then backward (mirrored) so the operation is zero-phase.
+    """
+    n = len(y)
+    if n < 2:
+        return y.copy()
+    out = y.copy()
+    for k in range(1, n):
+        d = out[k] - out[k - 1]
+        limit = 2.0 * abs(vel[k]) + slack * sigma_r
+        if abs(d) > limit:
+            out[k] = out[k - 1] + np.sign(d) * limit
+    for k in range(n - 2, -1, -1):
+        d = out[k] - out[k + 1]
+        limit = 2.0 * abs(vel[k]) + slack * sigma_r
+        if abs(d) > limit:
+            out[k] = out[k + 1] + np.sign(d) * limit
+    return out
+
+
+def _reversal_damp(y, thresh, keep=0.25):
+    """
+    Suppress sub-noise sign flips in the first difference. Flips whose step
+    magnitude is below `thresh` are damped toward the previous trend (retain
+    only `keep` fraction). Larger (genuine) reversals pass untouched.
+    """
+    n = len(y)
+    if n < 3:
+        return y
+    out = y.copy()
+    prev_d = out[1] - out[0]
+    for k in range(2, n):
+        d = out[k] - out[k - 1]
+        if prev_d * d < 0 and abs(d) < thresh:
+            out[k] = out[k - 1] + keep * d
+        prev_d = out[k] - out[k - 1]
+    return out
+
+
+def kalman_rts_filter(x, window_size=20):
+    """
+    Forward Kalman filter (constant-velocity model) + true Rauch-Tung-Striebel
+    backward smoother, then a zero-phase bidirectional one-pole ripple damper,
+    a guarded velocity-aware displacement clamp, and guarded sub-noise
+    reversal damping.
+    Output index i corresponds to input time i + window_size - 1.
+    """
+    x = np.asarray(x, dtype=float, copy=True).ravel()
+    # Sanitize non-finite values (guard against integration failures on
+    # adversarial inputs): replace NaN/inf with local interpolation/fill.
+    bad = ~np.isfinite(x)
+    if bad.any():
+        idx = np.arange(x.size)
+        if bad.all():
+            return np.zeros(max(0, x.size - window_size + 1))
+        x[bad] = np.interp(idx[bad], idx[~bad], x[~bad])
+    n = x.size
+    if n < window_size:
+        # Graceful fallback instead of raising: return the input clipped to
+        # the expected output length (>= 1 sample).
+        return x[: max(1, n - window_size + 1)].copy()
+    if n == 1:
+        return x.copy()
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    if alpha < 0.999:
+        y = _bilateral_one_pole(y, alpha)
+
+    # --- Slice to output contract ---
+=======
+    if alpha < 0.999:
+        y = _bilateral_one_pole(y, alpha)
+
+    # --- Zero-phase velocity-aware displacement clamp (guarded) ---
+    # Clamp per-step displacement using the smoothed velocity state from the
+    # refinement pass: |y[k]-y[k-1]| <= 2*|vel[k]| + slack*sigma_r.
+    # Correlation guard (>= 0.97) progressively relaxes the slack if the
+    # clamp distorts the trajectory; disabled if it never converges.
+    vel_state = xs[:, 1].copy() if n >= 2 else None
+    if vel_state is not None:
+        y_unclamped = y.copy()
+        y_clamped = None
+        slack = 0.6
+        for _attempt in range(4):
+            cand = _velocity_clamp(y_unclamped, vel_state, slack, sigma_r)
+            c = np.corrcoef(cand, y_unclamped)[0, 1]
+            if np.isfinite(c) and c >= 0.97:
+                y_clamped = cand
+                break
+            slack *= 2.0
+        if y_clamped is not None:
+            y = y_clamped
+
+    # --- Guarded sub-noise reversal damping ---
+    # Suppress step-to-step sign flips below the robust noise floor of the
+    # output's first differences; genuine reversals exceed the threshold.
+    # Correlation guard disables the step if it distorts the signal.
+    if n >= 3:
+        dy_o = np.diff(y)
+        if dy_o.size > 2:
+            step_std = np.median(np.abs(dy_o - np.median(dy_o))) / 0.6745
+        else:
+            step_std = 0.0
+        if step_std > 0:
+            y_pre = y.copy()
+            y_try = _reversal_damp(y_pre, 1.5 * step_std, keep=0.25)
+            c = np.corrcoef(y_try, y_pre)[0, 1]
+            if np.isfinite(c) and c >= 0.97:
+                y = y_try
+
+    # --- Slice to output contract ---
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

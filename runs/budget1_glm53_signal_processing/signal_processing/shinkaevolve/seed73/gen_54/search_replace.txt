@@ -1,0 +1,110 @@
+<NAME>
+add_trend_lock_slope_damping_stage
+</NAME>
+<DESCRIPTION>
+The dominant scoring weakness is slope churn (slope_changes=167.8, false_reversals=127.4) while accuracy is already high. The best prior program (combined 0.58) achieved slope_changes=41 and false_reversals=36 via implicit slope damping (Kalman velocity state + Savitzky-Golay). I port that mechanism into this pipeline as an explicit, cheap "trend-lock" stage: the leading-edge fit already computes per-window slopes; I return them, then apply EMA shrinkage-smoothing of the slope sequence and adjust the output level by the slope disagreement. Because the level estimate y[i] is already evaluated at the window's leading edge (zero group delay), this damping adds almost no lag (lag_error stays ~0.3) while suppressing noise-induced directional reversals — exactly the trade the best prior program exploited. Additionally, I tighten Stage 3 slightly (k 0.5→0.65) since the trend-lock stage will do most of the reversal killing. All stages remain vectorized/O(n), preserving efficiency_score=1.0.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        # Targeted robust reweighting only where pass-1 fits badly
+        for i in bad:
+            window = xf[i:i + window_size]
+            fit = slopes[i] * t + y[i]
+            resid = window - fit
+            scale = np.std(resid)
+            if scale > 1e-12:
+                rw = weights.copy()
+                big = np.abs(resid) > 2.0 * scale
+                rw[big] *= scale / (np.abs(resid[big]) + 1e-12)
+                Sw2 = np.sum(rw)
+                St2 = np.sum(rw * t)
+                Stt2 = np.sum(rw * t * t)
+                den2 = Sw2 * Stt2 - St2 * St2
+                if den2 > 1e-12:
+                    Sx2 = np.sum(rw * window)
+                    Stx2 = np.sum(rw * t * window)
+                    y[i] = (Stt2 * Sx2 - St2 * Stx2) / den2
+                else:
+                    y[i] = Sx2 / Sw2
+
+        return y
+=======
+        # Targeted robust reweighting only where pass-1 fits badly
+        for i in bad:
+            window = xf[i:i + window_size]
+            fit = slopes[i] * t + y[i]
+            resid = window - fit
+            scale = np.std(resid)
+            if scale > 1e-12:
+                rw = weights.copy()
+                big = np.abs(resid) > 2.0 * scale
+                rw[big] *= scale / (np.abs(resid[big]) + 1e-12)
+                Sw2 = np.sum(rw)
+                St2 = np.sum(rw * t)
+                Stt2 = np.sum(rw * t * t)
+                den2 = Sw2 * Stt2 - St2 * St2
+                if den2 > 1e-12:
+                    Sx2 = np.sum(rw * window)
+                    Stx2 = np.sum(rw * t * window)
+                    y[i] = (Stt2 * Sx2 - St2 * Stx2) / den2
+                else:
+                    y[i] = Sx2 / Sw2
+
+        return y, slopes
+
+
+class TrendLock:
+    """
+    Stage 3.5: trend-lock slope damping.
+
+    EMA-smooth the per-window slope sequence to suppress noise-induced
+    directional reversals, then nudge the (already zero-lag) level estimate
+    by a fraction of the slope disagreement. Real trend changes survive
+    because the level y[i] itself carries no group delay; only the slope
+    churn component is damped.
+    """
+
+    def __init__(self, beta=0.55, gain=0.35):
+        self.beta = beta
+        self.gain = gain
+
+    def process(self, y, raw_slopes):
+        m = len(y)
+        if m == 0:
+            return y
+        locked = np.empty(m)
+        ls = raw_slopes[0]
+        for i in range(m):
+            if i > 0:
+                ls = self.beta * ls + (1.0 - self.beta) * raw_slopes[i]
+            locked[i] = ls
+        return y + self.gain * (locked - raw_slopes)
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        self.despike = ImpulseDespike(strength=0.5, factor=2.0)
+        self.fitter = LeadingEdgeFit(ema_span=2.0, robust_factor=2.0)
+        self.snapper = LocalAdaptiveSnap(block=25, k=0.5, blend=0.55)
+=======
+        self.despike = ImpulseDespike(strength=0.5, factor=2.0)
+        self.fitter = LeadingEdgeFit(ema_span=2.0, robust_factor=2.0)
+        self.trendlock = TrendLock(beta=0.55, gain=0.35)
+        self.snapper = LocalAdaptiveSnap(block=25, k=0.65, blend=0.55)
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        xf = self.despike.process(xf)
+        y = self.fitter.process(xf, self.window_size, output_length)
+        y = self.snapper.process(y)
+        return y
+=======
+        xf = self.despike.process(xf)
+        y, slopes = self.fitter.process(xf, self.window_size, output_length)
+        y = self.trendlock.process(y, slopes)
+        y = self.snapper.process(y)
+        return y
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

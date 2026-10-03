@@ -1,0 +1,165 @@
+# INDIVIDUAL PROGRAM SUMMARIES
+
+The following are summaries of individual programs evaluated since the last meta update:
+
+**Program Name: GGR Recursive Value-Grouping Table Reordering Algorithm**
+- **Implementation**: Recursively splits DataFrames (halves down to 2000 rows via ThreadPoolExecutor), finds the max weighted group value (value length² × count), reorders columns to group matching values together, then falls back to fixed column-stat sorting on early stop or depth limits; discards highly-distinct columns (>80% unique) and merges them back via an "original_index" join.
+- **Performance**: Combined score 0.00 — program fails to run successfully and passes no validation tests.
+- **Feedback**: Crashes with `TypeError: Invalid value ... for dtype 'int64'` when a mixed-type (string/int) reordered column is assigned back into an int64-typed DataFrame column, indicating unsafe dtype handling when column permutations move heterogeneous values into typed columns. Needs dtype-safe assignment (e.g., casting to object/concatenation instead of positional `loc`/`update` writes) before correctness can even be evaluated.
+**Program Identifier:** Generation 0 - Patch Name initial_program - Correct Program: False
+
+**Program Name: Row-wise column reordering via prefix-reuse scoring and partition tree**
+- **Implementation**: Generates three candidate per-row column orderings (original order, global frequency-weighted order, and a conditional partition tree capped at 8 candidate columns per node), scores each by the sum of adjacent LCPs of sorted serialized row strings, and returns the best along with per-row column orderings.
+- **Performance**: Failed completely — combined score 0.00 with a ValueError ("0 columns passed, passed data had 6 columns") and zero successful runs.
+- **Feedback**: The output DataFrame construction is broken; it builds positional columns renamed to `__col_{k}` instead of preserving expected column labels, causing the evaluator to reject it. The core reordering logic is likely sound but the return-value contract (DataFrame column schema matching evaluator expectations) must be fixed before any scoring can occur.
+**Program Identifier:** Generation 1 - Patch Name serial_trie_rowwise_reorder_fix - Correct Program: False
+
+**Program Name: Character-Trie Prefix Caching Column Reorderer**
+- **Implementation**: Produces per-row column permutations via three candidates (global frequency-ranked units, conditional partition tree, original order), scored with an exact serial Trie reuse objective (sum of adjacent LCPs over sorted serialized rows), handling column merges and one-way dependencies as contiguous units.
+- **Performance**: Combined score 0.58 with 100% success rate; hit rates vary widely from 0.09 to 0.82 across the five evaluation scenarios; total runtime 18.66s.
+- **Feedback**: The multi-candidate selection with exact scoring works robustly but performance is inconsistent—very strong on some datasets (0.82, 0.77) while nearly failing on one (0.09), suggesting the candidate constructions don't cover the column-ordering patterns needed for that scenario, and the per-row Python loops likely contribute to the slow runtime.
+**Program Identifier:** Generation 2 - Patch Name rewrite_trie_prefix_reorder - Correct Program: True
+
+**Program Name: Trie-Prefix Reuse with Conditional Column Ordering**
+- **Implementation**: Builds a small set of candidate per-row column orderings (global score-ranked, identity, and a recursive conditional splitter capped at depth 8 that groups rows by shared column values), then selects the best candidate by exact serial-Trie reuse (sum of LCPs of sorted adjacent row strings) and sorts rows lexicographically.
+- **Performance**: Achieved a combined score of 0.09 with 100% run success, hit rates ranging 0.004–0.146, and fast 1.86s total runtime.
+- **Feedback**: The exact Trie-objective candidate selection is correct and efficient but yields modest hit rates, suggesting the scoring objective aligns imperfectly with the underlying evaluator; the conditional recursion and character-level LCP machinery may be over-engineered relative to gains achieved.
+**Program Identifier:** Generation 3 - Patch Name trie_reuse_permutations - Correct Program: True
+
+**Program Name: Trie-Scored Column Candidate Reordering Algorithm**
+- **Implementation**: Builds a small set of candidate column orderings ranked by length-weighted, count-weighted, and sqrt-weighted pair-repetition scores, then exhaustively scores each with an exact serial-Trie objective (sum of adjacent LCPs over sorted serialized rows) and returns the best; cell values are never modified.
+- **Performance**: Combined score of 0.70 with 100% successful runs, per-dataset hit rates ranging from 0.44 to 0.83, and total runtime of 2.37.
+- **Feedback**: The cheap candidate generation plus exact scoring approach is effective on some datasets (hit rates ~0.83) but struggles on others (~0.44), suggesting the fixed heuristic candidate pool is too narrow; exploring more diverse orderings or local search could improve worst-case performance.
+**Program Identifier:** Generation 4 - Patch Name prefix_trie_column_reorder - Correct Program: True
+
+**Program Name: Trie-Reuse Optimized Per-Row Column Reordering**
+- **Implementation**: Serializes rows as concatenated cell strings, factorizes columns to compute length-weighted pair-repetition stats, and generates three candidate orderings (global frequency rank, conditional partition tree with per-row orders, length-first) scored by exact sorted-adjacent LCP (Trie reuse) to pick the best.
+- **Performance**: Combined score 0.00 — the program fails with `TypeError: unhashable type: 'list'` and does not run successfully.
+- **Feedback**: The crash stems from list-typed values being used in hash-based operations (e.g., `pd.factorize` on serialized cells or unit tuples containing lists treated as dict keys/sort keys), so no candidate ever gets evaluated; unit-based `col_merge` handling and hashable key construction need hardening before scoring logic can matter.
+**Program Identifier:** Generation 5 - Patch Name trie_prefix_reuse_reorder_fix - Correct Program: False
+
+**Program Name: Prefix-cache friendly column reordering via trie scoring**
+- **Implementation**: Generates up to 3 candidate column orderings (length-weighted value repetition, fewest-distinct-values-first, original), scores each by sum of adjacent LCPs of sorted serialized rows, and returns the best; also handles `col_merge` by concatenating grouped columns.
+- **Performance**: Score 0.00; failed with UFuncTypeError from `np.char.str_len` on object-dtype array; program does not run.
+- **Feedback**: The crash is in Candidate 2's heuristic where `np.char.str_len` is applied to an object-dtype array — needs explicit casting to a string dtype (e.g., `<U` via `.astype(str)`). The core trie-scoring approach is sound but never gets exercised due to this preventable type error.
+**Program Identifier:** Generation 6 - Patch Name rewrite_with_lcp_scored_global_ordering - Correct Program: False
+
+**Program Name: LCP/Trie-Aware Candidate Column Reordering Algorithm**
+- **Implementation**: Serializes cells exactly as the scorer does (NaN→""), builds three candidate orderings—original order, global frequency-ranked order (length-weighted pair repetition), and a conditional partition-tree per-row order—then scores each via exact serial trie reuse (sum of adjacent LCPs over sorted serialized rows) and returns the best. Enforces one-way column dependencies by inserting dependents after sources, and attempts col_merge via parent `merging_columns` API with a safe fallback.
+- **Performance**: Combined score of 0.35 with 100% successful runs and 12.42s total runtime; hit rates varied widely across the five datasets (0.057 to 0.826).
+- **Feedback**: The partition-tree candidate's gain computation has dead code (representative length loop contributes 0) and falls back to a mean-length approximation, weakening its quality; scoring only three cheap candidates leaves headroom. The very high hit rate on one dataset (0.83) versus near-zero on others suggests the approach generalizes well to structured/repetitive data but poorly to sparse or low-redundancy datasets.
+**Program Identifier:** Generation 7 - Patch Name rewrite_lcp_trie_reorder - Correct Program: True
+
+**Program Name: Character-Trie Prefix-Caching Column Order Optimizer**
+- **Implementation**: Builds three candidate per-row column orderings (frequency-weighted global order, a conditional partition tree over factorized integer codes with depth caps of 5–12, and a classic cardinality/char-count heuristic), then scores each via exact serial-Trie reuse (sum of adjacent LCPs of sorted serialized rows) and materializes the best, preserving all values and sorting rows deterministically by serialized string.
+- **Performance**: Achieves a combined score of 0.71 with a perfect 1.00 success rate, hit rates ranging from 0.44 to 0.84 across five tasks, and a total runtime of 5.01s.
+- **Feedback**: The exact-LCP scoring of candidates is effective but the heuristic candidates (A/C) plus depth-limited tree (B) may not capture optimal orderings, as evidenced by the weak 0.44 hit rate on one task; exploring more diverse candidate orderings or deeper search could improve the lowest-performing cases.
+**Program Identifier:** Generation 8 - Patch Name rewrite_trie_lcp_candidates - Correct Program: True
+
+**Program Name: Trie Prefix-Cache Row Reordering with Conditional Partitioning**
+- **Implementation**: Precomputes per-column serialized cell strings and factorized integer codes, builds three candidate orderings (original, global frequency-ranked, and a depth-8 conditional partition tree), scores each with an exact adjacent-LCP Trie-reuse proxy, and returns per-row column permutations as a reordered DataFrame.
+- **Performance**: Score 0.00 — the program crashed with `ValueError: invalid literal for int() with base 10: '"It is, in more ways than one, ...'` and failed all validation tests.
+- **Feedback**: The crash stems from swapped `pd.factorize` return values (`uniq, cd` reverses the codes/uniques tuple), so `int()` was called on string uniques instead of integer codes; fixing the tuple unpacking would make the candidate-building logic executable. The defensive try/except around the tree build could not catch this because the error occurs earlier in the precomputation loop.
+**Program Identifier:** Generation 9 - Patch Name lcp_trie_candidate_reorder_fix - Correct Program: False
+
+**Program Name: Trie-Aware Candidate Column Reordering with Conditional Partition Tree**
+- **Implementation**: Serializes each column once, then evaluates three candidate orderings — a global ordering by duplicate-pair score (len × count × count−1), a per-row conditional partition tree (greedy split on highest-gain columns, max depth 12, up to 8 candidate split columns), and a length-weighted ordering — scoring each with exact serial Trie reuse (sum of adjacent LCPs of sorted joined row strings) and picking the best.
+- **Performance**: Combined score 0.72 with 100% successful runs and total runtime 3.73s; hit rates vary widely across datasets (0.44–0.84), with the weakest performance on dataset 4 (0.44) and strongest on dataset 5 (0.84).
+- **Feedback**: The candidate-scoring approach is reliable but the near-unique column skipping and small candidate limits (8 split columns, depth 12) may cap gains on harder datasets like dataset 4; runtime is cheap, suggesting room to add more diverse candidates or deeper trees for higher compression hit rates.
+**Program Identifier:** Generation 10 - Patch Name rewrite_trie_lcp_candidate_selection - Correct Program: True
+
+**Program Name: Trie-aware character-LCP column reordering with partition candidates**
+- **Implementation**: Builds three candidate orderings (global frequency-ranked, recursive conditional partition tree with per-row orders, count-ranked), then exactly scores each via sorted-string adjacent-LCP sums under a 40M-character budget. A buggy line references undefined `order_b` (`orders_b` was intended), which crashes before any candidate evaluation.
+- **Performance**: Combined score 0.00; run fails with `ValueError: 'list' argument must have no negative elements` and does not pass validation.
+- **Feedback**: The NameError-free path is never reached because the candidate dict references an undefined variable `order_b`, indicating the code was never run end-to-end before submission; the per-row variable column-ordering scheme also risks invalid outputs if the evaluator expects a consistent column layout.
+**Program Identifier:** Generation 11 - Patch Name rewrite_serial_trie_reorder - Correct Program: False
+
+**Program Name: Candidate-Based Per-Row Column Reordering with Serial-Trie Scoring**
+- **Implementation**: Serializes each cell once, builds merged units from col_merge groups, then constructs three candidate per-row orderings (global frequency-ranked, bounded recursive conditional grouping tree with max_depth=10, and alphabetical) and selects the best via the true objective—sum of adjacent LCPs over sorted serialized rows—falling back to the frequency order when data is too large (>8M chars or >60k rows).
+- **Performance**: Achieved combined score 0.72 with hit rates ranging from 0.44 to 0.83 across five datasets, 100% successful runs, and total runtime of 11.66s.
+- **Feedback**: The multi-candidate scoring approach correctly optimizes the actual evaluation objective, but the candidate pool is small and the LCP scoring via repeated string slicing (binary search on slice equality) is costly at scale, forcing conservative size guards; the weak dataset (~0.44 hit rate) suggests the candidate constructions don't capture that data's structural dependencies.
+**Program Identifier:** Generation 12 - Patch Name rewrite_serial_trie_reorder - Correct Program: True
+
+**Program Name: Prefix-Cache Trie-Optimized Column Reordering**
+- **Implementation**: Generates three candidate per-row column orderings — global frequency order, a length-weighted variant, and a recursive conditional partition tree (depth ≤6, group ≥8, ≤64 splits) — then selects the best by exact serial Trie reuse score (sum of adjacent LCPs of sorted serialized rows, computed via binary-search LCP). Values and shape are fully preserved; output uses object dtype with per-row permutations reconstructed via `df.iat`.
+- **Performance**: Combined score 0.70 with 100% successful runs, hit rates ranging 0.44–0.83 across five tasks, total runtime 12.87s.
+- **Feedback**: The multi-candidate selection by exact objective is robust but the conditional partitioning variant only moderately helps weaker tasks (e.g., 0.44 hit rate), suggesting per-row adaptive ordering has limited headroom or the heuristics for candidate construction don't fully exploit remaining task structure; runtime is modest but candidate scoring is O(n·m) per candidate and could be a bottleneck at scale.
+**Program Identifier:** Generation 13 - Patch Name trie_prefix_caching_reorder_rewrite - Correct Program: True
+
+**Program Name: Candidate-Scoring Column Reordering for Trie Prefix Caching**
+- **Implementation**: Builds 4 cheap global column-order candidates (value-frequency-weighted rankings, duplicate-pair counts, and original order), then scores each with the true objective—sum of LCPs over lexicographically adjacent serialized rows—picking the best; handles NaNs, duplicate columns, and col_merge adjacency constraints with bounded-cost guards for large tables.
+- **Performance**: Combined score 0.72 with perfect correctness (1.00) and fast runtime (1.95s); hit rates range from 0.44 to 0.84 across the five test datasets.
+- **Feedback**: The candidate-scoring approach is reliable but plateaus since only ~4 heuristic orders are evaluated, leaving search diversity limited; datasets with low hit rates (~0.44) suggest per-row or local-search reordering beyond a single global order could substantially improve compression.
+**Program Identifier:** Generation 14 - Patch Name rewrite_valid_rowwise_col_ordering - Correct Program: True
+
+**Program Name: Character-Trie Prefix-Reuse Row/Column Reordering**
+- **Implementation**: Builds a few bounded candidate orderings (global repetition-scored, length-ranked, and a depth-limited conditional partition tree selecting columns by length-weighted pair-repetition gain), then scores each exactly via sum of adjacent LCPs of sorted serialized rows; supports col_merge by concatenating grouped columns before reordering.
+- **Performance**: Failed with combined score 0.00 — crashes with `IndexError: loc must be an integer between -7 and 7` rather than running successfully.
+- **Feedback**: The bug likely stems from pandas positional indexing misuse (e.g., `work.iloc`/column-location handling after `insert`/`drop` in the col_merge path, or `codes[j][rows]` fancy-indexing edge cases); extensive defensive try/except blocks masked the true failure point, so validation should target the merge/reindex logic and ensure integer loc values stay in bounds.
+**Program Identifier:** Generation 15 - Patch Name rewrite_trie_prefix_reorder - Correct Program: False
+
+**Program Name: Prefix-Cache Column Reordering via Trie Reuse Scoring**
+- **Implementation**: Builds three candidate per-row column orderings (baseline, global frequency-ranked, and a recursive conditional partition tree over column units honoring col_merge groups), serializes each row via fillna("")+str(), and selects the candidate maximizing exact trie reuse (sum of LCPs of lexicographically adjacent serialized rows).
+- **Performance**: Achieved a combined score of 0.72 with per-dataset hit rates ranging from 0.44 to 0.84 and a fast total runtime of 2.39s.
+- **Feedback**: Scoring with the true trie objective and precomputing cell serializations keeps runtime low while the multi-candidate approach captures diverse structures; the weaker hit rate on one dataset (0.44) suggests the candidate pool (only 3 strategies) may be too limited for that data's structure.
+**Program Identifier:** Generation 16 - Patch Name trie_reuse_row_orders_fix - Correct Program: True
+
+**Program Name: Duplicate-Weighted Column Ordering for Trie Prefix Reuse**
+- **Implementation**: Serializes cells to strings (NaN→''), scores columns by sum of `len(v)*count*(count-1)` over duplicate values to prioritize columns with many repeated long values first, then optionally evaluates a few candidate orders via sorted-string adjacent-LCP ("ideal trie reuse") under an 8M-char compute budget, returning a global column permutation.
+- **Performance**: Combined score 0.72 with 100% successful runs and total runtime 1.74s; hit rates ranged from 0.44 to 0.83 across the five benchmarks.
+- **Feedback**: The duplicate-weighted heuristic is effective on string-heavy datasets (hit rates 0.79–0.83) but weak on others (0.44, 0.62), suggesting row-level per-row column ordering (rather than a single global order) and exploiting early_stop/one_way_dep constraints could improve weaker cases. The budget-bounded LCP evaluation and defensive exception handling keep runtime low and correctness robust.
+**Program Identifier:** Generation 17 - Patch Name rewrite_simple_correct_trie_reorder - Correct Program: True
+
+**Program Name: Prefix-Cache-Friendly Trie-Reuse Column Reordering**
+- **Implementation**: Generates up to three candidate per-row column orderings (global frequency-ranked, original, and a recursive conditional-partition order that splits rows by their most-reusable column values up to depth 8 with top-12 column candidates), scores each exactly via a binary-search adjacent-LCP sum over sorted serialized row strings, and honors col_merge (merged-cell serialization) and one-way dependency position adjustments while leaving data values unaltered.
+- **Performance**: Achieved a combined score of 0.71 with a 100% success rate, hit rates ranging from 0.44 to 0.84 across five test cases (mean ~0.70), and a fast total runtime of 3.39 seconds; candidate evaluation is guarded by a 60M-character cap and 500K-row limit to control cost.
+- **Feedback**: The wide hit-rate variance (0.44 minimum vs 0.84 maximum) suggests the heuristic candidate set works well on datasets matching its frequency-reuse assumptions but leaves headroom on others; the exact serial LCP objective and cheap candidate enumeration deliver a strong speed/quality balance, and future gains likely require richer or dataset-adaptive candidate generation beyond the three current orderings.
+**Program Identifier:** Generation 18 - Patch Name rewrite_trie_prefix_candidates - Correct Program: True
+
+**Program Name: Character-Trie Candidate Reordering with Conditional Partition Tree**
+- **Implementation**: Builds three candidate column orderings (frequency-ranked, length/frequency tradeoff, and a recursive conditional partition tree that splits rows by best-saving column), scores each with the true objective (sum of adjacent LCPs of sorted serialized row strings), and returns the best while preserving raw cell objects in an object-dtype output frame.
+- **Performance**: Failed evaluation with combined score 0.00 due to a ValueError ("operands could not be broadcast together with shapes (23,) (22,)"), producing a malformed output frame.
+- **Feedback**: The recursion removes a merged unit by identity (`u is not prefix_unit`), which can drop or duplicate columns after list copies, yielding per-row permutations of inconsistent length and a shape mismatch (23 vs 22 columns). Unit removal and permutation assembly must guarantee every column appears exactly once per row.
+**Program Identifier:** Generation 19 - Patch Name serial_trie_construction_selection_rewrite - Correct Program: False
+
+# GLOBAL INSIGHTS SCRATCHPAD
+
+The following are global insights about optimization approaches and their effectiveness:
+
+## Successful Algorithmic Patterns
+- **Multi-candidate ordering + exact Trie-LCP scoring remains the dominant pattern**, now confirmed across Gen 8 (0.71), Gen 10/current best (0.72, 3.73s), Gens 12–14, 16–18 (all 0.70–0.72). The current best uses exactly 3 candidates (pair-score global, conditional partition tree, length-weighted) scored by sum of adjacent LCPs of sorted serialized rows — same quality ceiling as 4 candidates (Gen 14, 0.72 at 1.95s).
+- **Cheap candidate enumeration is the differentiator**: Gen 10 wins on runtime (3.73s) vs Gen 12 (11.66s, same 0.72) and Gen 13 (12.87s, 0.70) because it serializes each column once and reuses the serializations across all candidates, avoiding repeated string slicing/binary search LCP costs that forced Gen 12's conservative >8M-char fallbacks.
+- **Conditional partition tree (depth ≤12, ≤8 split columns, skipping near-unique columns via `distinct_value_threshold`)** delivers the per-row adaptive orderings that fixed global orders miss, driving 0.83–0.84 hit rates on repetitive datasets (Gen 10, 16, 18).
+- **Duplicate-pair scoring `len(v) × count × (count−1)`** as the primary ranking heuristic is consistently effective (Gen 10, Gen 17, Gen 18), fast via `Counter`, and aligned with prefix reuse.
+
+## Ineffective Approaches
+- **Never-run-end-to-end code and identity-based unit removal are the top crash modes**: Gen 11 (0.00, undefined `order_b`), Gen 15 (0.00, pandas `.loc` integer bounds after insert/drop in col_merge path, masked by try/except), Gen 19 (0.00, `u is not prefix_unit` identity removal dropped a column causing (23,) vs (22,) broadcast error). All 0.00 scores are correctness crashes, not algorithmic failures.
+- **Defensive try/except masking bugs**: Gen 15's extensive exception handling hid the true failure point; Gen 19's recursion removed merged units by identity after list copies. Permutation assembly must guarantee every column appears exactly once per row.
+- **Per-row variable ordering risks shape/schema violations** (Gen 11, 19 feedback) — must return per-row permutations with consistent total length; the current best handles this correctly with `col_pos` mapping and an explicit shape assert.
+- **Bigger/over-engineered candidate machinery doesn't pay**: Gens 12/13 with more elaborate scoring cost 3–4× runtime (11.66s, 12.87s) for equal or lower scores than Gen 10's lean 3-candidate approach.
+
+## Implementation Insights
+- **Serialize once, reuse everywhere**: Gen 10's `ser_cols` dict (fillna("")→astype(str)→tolist) feeds candidates, scoring, and per-row joins simultaneously — the key runtime edge (3.73s) over Gens 12/13 (11–13s) at equal 0.72/0.70 quality.
+- **Integer factorization for the tree**: Gen 10 maps serialized values to sorted-int codes for grouping (`codes[c]`), avoiding string hashing in partitioning — consistent with Gen 8's lesson about factorize codes vs uniques (Gen 9's fatal tuple-unpack bug).
+- **Object-dtype output with explicit column-position mapping**: `raw = work.to_numpy(dtype=object)`, `np.empty(dtype=object)`, per-row `row[col_pos[c]]` assembly, plus `assert out_df.shape == (n, ncols)` — eliminates the dtype/crash classes that killed Gens 0/5/6/9 and the shape-mismatch class that killed Gen 19.
+- **Graceful col_merge degradation**: wrap the base-class `calculate_col_stats`/`merging_columns` calls in try/except falling back to the raw df — preserved 100% run success (also Gen 8's pattern).
+
+## Performance Analysis
+- **Trajectory (Gens 10–19)**: 0.72 → 0.00 → 0.72 → 0.70 → 0.72 → 0.00 → 0.72 → 0.72 → 0.71 → 0.00. Every correct implementation lands at 0.70–0.72 — a hard plateau; all 0.00s are crashes (Gen 11 undefined var, Gen 15 pandas indexing, Gen 19 shape mismatch).
+- **The persistent 0.44-dataset bottleneck**: the same dataset scores ~0.444 in Gens 10, 12, 13, 14, 16, 17, 18 while others reach 0.79–0.84. Neither more candidates (Gen 14's 4), deeper trees (Gen 10's depth 12), nor per-row orders crack it — indicating structural limits of the current heuristic candidate pool on low-redundancy data.
+- **Runtime vs score tradeoff is settled**: at equal 0.72, Gen 10 (3.73s) and Gen 14 (1.95s, single global order) beat Gen 12 (11.66s); the extra partition-tree candidate mainly buys the 0.83–0.84 peak datasets, so candidate cost should stay cheap (Gen 17's budget-bounded single-order at 1.74s also hit 0.72).
+- **Current best (Gen 10, 0.72, 3.73s)** combines Gen 8's algorithmic recipe with leaner serialization reuse, matching the quality ceiling of all peers while keeping runtime among the fastest correct full-candidate implementations.
+
+# META RECOMMENDATIONS
+
+The following are actionable recommendations for the next program generations:
+
+1. **Add a 4th candidate: "unique-first" ordering to attack the 0.44 hard dataset.** All three current candidates (pair-score, partition tree, length-weighted) are biased toward repetition-heavy columns; the persistent 0.44 dataset likely has low redundancy where distinguishing columns first helps. Add a candidate sorted by descending `nunique/n` ratio (computed from the already-built `codes[c]` lengths — free, no new serialization), score it with the same `_trie_score`, and let the scorer pick it only when it wins. This is the cheapest possible diversity increase given the settled quality plateau of 0.70–0.72.
+
+2. **Vectorize `rows_for` and `_trie_score` to double candidate budget.** Replace the per-row Python `"".join` loop with a numpy object-matrix assembled once (`raw_sorted = [[ser_cols[c][i] for c in order] for ...]`) and use `np.char.add` / array-based concatenation, keeping the exact LCP-by-sort evaluation. Gen 10's runtime edge (3.73s vs Gen 12's 11.66s) came exactly from serialization reuse; halving scoring cost again allows 5–6 candidates at the same wall time, which is the most direct lever on the hard dataset.
+
+3. **Refine the winning candidate with bounded adjacent-swap hill climbing.** After the 3-candidate (or 4-candidate) selection, run ≤30 adjacent column swaps on the winning global order (or per-row for small trees), keeping a swap only if the exact `_trie_score` improves, under a ~1s time budget. This exploits the observed imperfect alignment between heuristics and the Trie objective while keeping the diversified multi-candidate pool intact.
+
+4. **Exploit `one_way_dep` as tie-breaking constraints in candidate A and the tree.** The current program ignores these inputs entirely. When generating `order1`, enforce that determiner column `a` precedes determined column `b` for each `(a, b)` pair (stable insertion, not a re-sort that would break the pair-score ranking); in `_tree_orders`, prefer splitting on determiner columns before their dependents. These are free structural hints about evaluator data with no new machinery.
+
+5. **Add a guarded duplicate-row-first candidate that orders by exact duplicate-row density.** Compute full-row duplicates via a Counter over joined strings from the existing `ser_cols` (cheap: one join pass), and build an ordering that places columns with the most row-wise duplicate overlap (measured with pairwise `sum((cnt_a[v]==cnt_b[v]))` on codes) adjacent to each other — a chain-assembly heuristic for the sorted-row LCP objective. Wrap any failure with a fallback to `order1` (Gen 8/Gen 10's graceful-degradation pattern) so run success stays 1.00; the strict shape assert and `col_pos` per-row assembly must remain untouched to avoid the Gen 11/15/19 crash classes.

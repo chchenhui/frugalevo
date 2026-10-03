@@ -1,0 +1,98 @@
+<NAME>
+multi_path_load_balanced_broadcast
+
+<DESCRIPTION>
+The current algorithm sends every partition of the data along the same single Dijkstra shortest path per destination, wasting the opportunity to use multiple parallel network paths and to share (deduplicate) transfer edges across destinations. I improve it by: (1) computing k-shortest simple paths per destination and spreading partitions across them to balance load and exploit cheaper parallel links, (2) adding a shared-cost component so edges already used by other partitions/destinations are preferred (since broadcast data on a shared edge can be reused, reducing redundant transfers), and (3) building a Steiner-tree-like overlay using shortest-path trees with shared-edge discounting so overlapping route segments get merged. This reduces total transfer cost by avoiding redundant transfers and leveraging multi-network topologies.
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    # Ensure every edge has a valid cost (fallback to a large but finite cost)
+    for u, v, data in h.edges(data=True):
+        if data.get("cost") is None:
+            h[u][v]["cost"] = 1e6
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Shared-edge bookkeeping: edges already used are cheaper to reuse for
+    # broadcast because data can be replicated downstream without re-transfer
+    # from the source.
+    shared_edges = set()
+
+    def adjusted_weight(u, v, data):
+        base = data["cost"]
+        if (u, v) in shared_edges:
+            # Strong discount for reusing an edge already carrying the data
+            return base * 0.25
+        return base
+
+    for dst in sorted(dsts, key=lambda d: nx.shortest_path_length(h, src, d, weight="cost")):
+        # Compute multiple candidate paths to spread partitions and
+        # balance load across networks.
+        try:
+            candidates = list(
+                nx.shortest_simple_paths(h, src, dst, weight="cost")
+            )
+        except nx.NetworkXNoPath:
+            candidates = []
+        # Cap the number of candidate paths examined
+        max_candidates = min(len(candidates), max(4, num_partitions))
+
+        # Build a working graph copy with adjusted weights so shared edges
+        # are reused instead of duplicated.
+        wg = h.copy()
+        for u, v, data in wg.edges(data=True):
+            wg[u][v]["adjusted"] = adjusted_weight(u, v, data)
+
+        selected_paths = []
+        for k in range(max_candidates):
+            try:
+                path = nx.dijkstra_path(wg, src, dst, weight="adjusted")
+            except nx.NetworkXNoPath:
+                break
+            if path not in selected_paths:
+                selected_paths.append(path)
+                # Mark edges as shared so subsequent partitions/destinations
+                # prefer reusing the same trunk edges.
+                for i in range(len(path) - 1):
+                    shared_edges.add((path[i], path[i + 1]))
+                    # Update adjusted weights incrementally
+                    wg[path[i]][path[i + 1]]["adjusted"] = (
+                        h[path[i]][path[i + 1]]["cost"] * 0.25
+                    )
+
+        if not selected_paths:
+            # Fallback: original single path approach
+            try:
+                selected_paths = [nx.dijkstra_path(h, src, dst, weight="cost")]
+            except nx.NetworkXNoPath:
+                continue
+
+        # Assign partitions round-robin across the selected paths to balance
+        # load across networks while benefiting from shared trunk discounts.
+        for j in range(bc_topology.num_partitions):
+            path = selected_paths[j % len(selected_paths)]
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,289 @@
+# EVOLVE-BLOCK-START
+import heapq
+from collections import Counter, defaultdict
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+from solver import Algorithm
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-cache-oriented column reordering.
+
+    The returned dataframe contains each source row's values in the positional
+    order recorded in column_orderings.  This is important for row-specific
+    orders: dataframe column labels remain the source labels while the matching
+    ordering entry identifies the source column represented at each position.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    @staticmethod
+    def _string_value(value) -> str:
+        """Match evaluator normalization without modifying the source value."""
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            # Non-scalar objects are uncommon in dataframes, but str() is the
+            # closest safe equivalent to pandas' astype(str) behavior.
+            pass
+        return str(value)
+
+    @staticmethod
+    def _lcp(left: str, right: str) -> int:
+        if left == right:
+            return len(left)
+        limit = min(len(left), len(right))
+        lo, hi = 0, limit
+        # Slice comparisons are performed in C and avoid Python character loops.
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if left[:mid] == right[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_reuse(self, strings: List[str]) -> int:
+        if len(strings) < 2:
+            return 0
+        strings = sorted(strings)
+        return sum(self._lcp(strings[i - 1], strings[i]) for i in range(1, len(strings)))
+
+    @staticmethod
+    def _resolve_column(name, columns: List) -> int:
+        """Resolve API constraint names conservatively and deterministically."""
+        for i, column in enumerate(columns):
+            if column == name:
+                return i
+        matches = [i for i, column in enumerate(columns) if str(name) in str(column)]
+        return matches[0] if len(matches) == 1 else -1
+
+    def _constrained_order(
+        self,
+        preferred: List[int],
+        columns: List,
+        col_merge: List[List[str]],
+        one_way_dep: List[Tuple[str, str]],
+    ) -> List[int]:
+        """
+        Make merge groups consecutive and satisfy dependency precedence where
+        possible.  A deterministic stable order is retained for cyclic input.
+        """
+        ncols = len(columns)
+        rank = {col: pos for pos, col in enumerate(preferred)}
+
+        # Union overlapping merge groups into indivisible ordering units.
+        parent = list(range(ncols))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            a, b = find(a), find(b)
+            if a != b:
+                parent[b] = a
+
+        for group in col_merge or []:
+            ids = [self._resolve_column(name, columns) for name in group]
+            ids = [i for i in ids if i >= 0]
+            for i in ids[1:]:
+                union(ids[0], i)
+
+        groups = defaultdict(list)
+        for col in range(ncols):
+            groups[find(col)].append(col)
+
+        # Preserve the candidate's preference inside each merged unit.
+        units = list(groups.values())
+        for unit in units:
+            unit.sort(key=lambda c: rank[c])
+        unit_for_col = {}
+        for unit_id, unit in enumerate(units):
+            for col in unit:
+                unit_for_col[col] = unit_id
+
+        edges = defaultdict(set)
+        indegree = [0] * len(units)
+        for before_name, after_name in one_way_dep or []:
+            before = self._resolve_column(before_name, columns)
+            after = self._resolve_column(after_name, columns)
+            if before < 0 or after < 0:
+                continue
+            source, target = unit_for_col[before], unit_for_col[after]
+            if source != target and target not in edges[source]:
+                edges[source].add(target)
+                indegree[target] += 1
+
+        unit_rank = [min(rank[col] for col in unit) for unit in units]
+        ready = [(unit_rank[i], i) for i in range(len(units)) if indegree[i] == 0]
+        heapq.heapify(ready)
+        result_units = []
+        while ready:
+            _, unit = heapq.heappop(ready)
+            result_units.append(unit)
+            for target in sorted(edges[unit], key=lambda x: unit_rank[x]):
+                indegree[target] -= 1
+                if indegree[target] == 0:
+                    heapq.heappush(ready, (unit_rank[target], target))
+
+        # Contradictory dependency constraints cannot all be satisfied; keep a
+        # deterministic order for the unresolved cycle rather than dropping data.
+        if len(result_units) != len(units):
+            used = set(result_units)
+            result_units.extend(
+                sorted((u for u in range(len(units)) if u not in used), key=lambda u: unit_rank[u])
+            )
+
+        return [col for unit in result_units for col in units[unit]]
+
+    def _global_orders(self, text: List[List[str]]) -> Tuple[List[int], List[int]]:
+        nrows = len(text)
+        ncols = len(text[0]) if nrows else 0
+        repeated = []
+        coverage = []
+        for col in range(ncols):
+            counts = Counter(text[row][col] for row in range(nrows))
+            repeated.append(sum(len(value) * count * (count - 1) for value, count in counts.items()))
+            coverage.append(sum(len(value) * count for value, count in counts.items()))
+        primary = sorted(range(ncols), key=lambda c: (-repeated[c], -coverage[c], c))
+        # A distinct, cheap alternative that does not merely reverse primary.
+        secondary = sorted(
+            range(ncols),
+            key=lambda c: (
+                -sum(len(value) * count for value, count in Counter(row[c] for row in text).items()),
+                -repeated[c],
+                c,
+            ),
+        )
+        return primary, secondary
+
+    def _conditional_orders(
+        self,
+        text: List[List[str]],
+        global_tail: List[int],
+        early_stop: int,
+        col_stop: int,
+        distinct_value_threshold: float,
+    ) -> List[List[int]]:
+        """Bounded conditional prefix partitioning with a deterministic tail."""
+        nrows = len(text)
+        ncols = len(global_tail)
+        orders = [[] for _ in range(nrows)]
+        if not nrows or not ncols:
+            return [list(global_tail) for _ in range(nrows)]
+
+        max_depth = min(ncols, 8 if col_stop is None else max(0, col_stop))
+        candidate_limit = min(ncols, 32)
+        usable = global_tail[:candidate_limit]
+        stack = [(list(range(nrows)), [], usable)]
+
+        while stack:
+            rows, prefix, remaining = stack.pop()
+            if not rows:
+                continue
+            if len(prefix) >= max_depth or not remaining or len(rows) < 2:
+                for row in rows:
+                    orders[row] = prefix + [c for c in global_tail if c not in prefix]
+                continue
+
+            best_col, best_score, best_counts = None, 0, None
+            for col in remaining:
+                counts = Counter(text[row][col] for row in rows)
+                if len(counts) > len(rows) * distinct_value_threshold:
+                    continue
+                score = sum(len(value) * count * (count - 1) for value, count in counts.items())
+                if score > best_score or (score == best_score and best_col is not None and col < best_col):
+                    best_col, best_score, best_counts = col, score, counts
+
+            if best_col is None or best_score <= early_stop:
+                for row in rows:
+                    orders[row] = prefix + [c for c in global_tail if c not in prefix]
+                continue
+
+            partitions = defaultdict(list)
+            for row in rows:
+                partitions[text[row][best_col]].append(row)
+            # No useful split means there is no conditional information left.
+            if len(partitions) == 1:
+                for row in rows:
+                    orders[row] = prefix + [c for c in global_tail if c not in prefix]
+                continue
+
+            remainder = [c for c in remaining if c != best_col]
+            for value in sorted(partitions):
+                stack.append((partitions[value], prefix + [best_col], remainder))
+
+        for row in range(nrows):
+            if not orders[row]:
+                orders[row] = list(global_tail)
+        return orders
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        self.df = df
+        nrows, ncols = df.shape
+        columns = list(df.columns)
+
+        if nrows == 0 or ncols == 0:
+            return df.copy(), [[] for _ in range(nrows)]
+
+        # Cache evaluator-equivalent serial representations once.
+        source = df.to_numpy(dtype=object, copy=False)
+        text = [[self._string_value(source[row, col]) for col in range(ncols)] for row in range(nrows)]
+
+        primary, secondary = self._global_orders(text)
+        candidates = [
+            [self._constrained_order(primary, columns, col_merge, one_way_dep) for _ in range(nrows)],
+            [self._constrained_order(secondary, columns, col_merge, one_way_dep) for _ in range(nrows)],
+        ]
+
+        conditional = self._conditional_orders(
+            text,
+            primary,
+            max(0, early_stop),
+            col_stop,
+            max(0.0, min(1.0, distinct_value_threshold)),
+        )
+        candidates.append(
+            [self._constrained_order(order, columns, col_merge, one_way_dep) for order in conditional]
+        )
+
+        best_orders = candidates[0]
+        best_score = -1
+        for candidate in candidates:
+            serialized = ["".join(text[row][col] for col in candidate[row]) for row in range(nrows)]
+            score = self._trie_reuse(serialized)
+            if score > best_score:
+                best_score = score
+                best_orders = candidate
+
+        # Object storage preserves mixed source values exactly, including None,
+        # pd.NA, timestamps, decimals, and user objects.
+        output = np.empty((nrows, ncols), dtype=object)
+        for row, order in enumerate(best_orders):
+            for position, source_col in enumerate(order):
+                output[row, position] = source[row, source_col]
+
+        reordered = pd.DataFrame(output, index=df.index.copy(), columns=df.columns.copy())
+        column_orderings = [[columns[col] for col in order] for order in best_orders]
+        return reordered, column_orderings
+
+
+# EVOLVE-BLOCK-END

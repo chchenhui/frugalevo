@@ -1,0 +1,289 @@
+<NAME>
+robust_multiscale_regression
+</NAME>
+
+<DESCRIPTION>
+This replaces recursive Kalman state updates with a causal multi-scale robust local-polynomial regression filter. At every endpoint it fits both short- and long-horizon weighted local linear models, using Huber reweighting to reject impulsive noise. The short model supplies low-lag dynamics while the long model suppresses volatility; their blend is selected from local model agreement and estimated noise. A directional hysteresis controller requires persistent evidence before committing weak reversals, substantially reducing noise-induced slope changes without delaying large genuine turns. Output alignment and all public function inputs/outputs remain unchanged.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""
+Causal robust multi-scale local-regression filtering for volatile,
+non-stationary time series.
+
+The enhanced path performs endpoint-aligned robust regression over two trailing
+time scales.  It combines a responsive short-horizon estimate with a smoother
+long-horizon estimate, then applies an amplitude-aware directional hysteresis
+gate to prevent isolated noisy movements from becoming reported reversals.
+"""
+import numpy as np
+
+
+def _validate_signal(x, window_size):
+    """Return a validated finite one-dimensional floating-point signal."""
+    signal = np.asarray(x, dtype=float)
+
+    if signal.ndim != 1:
+        raise ValueError("Input signal must be a 1D array")
+    if int(window_size) != window_size or window_size <= 0:
+        raise ValueError("window_size must be a positive integer")
+
+    window_size = int(window_size)
+    if signal.size < window_size:
+        raise ValueError(
+            f"Input signal length ({signal.size}) must be >= "
+            f"window_size ({window_size})"
+        )
+    if not np.all(np.isfinite(signal)):
+        raise ValueError("Input signal must contain only finite values")
+
+    return signal, window_size
+
+
+def _regression_design(length):
+    """
+    Build a centered endpoint-local linear design.
+
+    Time runs from -(length - 1) through zero, so the fitted intercept is the
+    estimate at the newest sample with no additional alignment delay.
+    """
+    time = np.arange(-(length - 1), 1, dtype=float)
+    scale = max(float(length - 1), 1.0)
+    normalized_time = time / scale
+    return np.column_stack((np.ones(length), normalized_time))
+
+
+def _tricube_weights(length):
+    """Endpoint-local tricube weights, emphasizing recent samples smoothly."""
+    if length <= 1:
+        return np.ones(1, dtype=float)
+
+    age = np.linspace(1.0, 0.0, length)
+    weights = (1.0 - age ** 3) ** 3
+    return np.maximum(weights, 1e-4)
+
+
+class _RobustEndpointRegressor:
+    """
+    Fixed-horizon causal local-linear estimator with two Huber IRLS passes.
+
+    The matrix inversions are only 2x2 and use precomputed base geometry.
+    Runtime cost is O(N * window_size), suitable for short real-time windows.
+    """
+
+    def __init__(self, horizon):
+        self.horizon = int(max(2, horizon))
+        self.design = _regression_design(self.horizon)
+        self.base_weights = _tricube_weights(self.horizon)
+
+    @staticmethod
+    def _solve(design, weights, values):
+        weighted_design = design * weights[:, None]
+        normal = design.T @ weighted_design
+        rhs = weighted_design.T @ values
+        normal[0, 0] += 1e-10
+        normal[1, 1] += 1e-10
+        return np.linalg.solve(normal, rhs)
+
+    def estimate(self, values):
+        """
+        Return endpoint level, per-sample slope, and robust residual scale.
+        """
+        coefficients = self._solve(self.design, self.base_weights, values)
+        residual = values - self.design @ coefficients
+
+        median_residual = np.median(residual)
+        scale = max(
+            np.median(np.abs(residual - median_residual)) / 0.6745,
+            1e-6,
+        )
+
+        # Huber residual weighting removes spike leverage without flattening
+        # coherent ramps or waveform extrema.
+        standardized = np.abs(residual) / (1.8 * scale)
+        huber = np.ones_like(standardized)
+        mask = standardized > 1.0
+        huber[mask] = 1.0 / standardized[mask]
+
+        coefficients = self._solve(
+            self.design,
+            self.base_weights * huber,
+            values,
+        )
+        residual = values - self.design @ coefficients
+        median_residual = np.median(residual)
+        scale = max(
+            np.median(np.abs(residual - median_residual)) / 0.6745,
+            1e-6,
+        )
+
+        # normalized-time coefficient converted to level change per sample
+        slope = coefficients[1] / max(float(self.horizon - 1), 1.0)
+        return float(coefficients[0]), float(slope), float(scale)
+
+
+class _ReversalGate:
+    """
+    Hysteretic output controller.
+
+    Very small local changes are softly integrated. Counter-trend changes must
+    persist for two samples unless their magnitude clearly exceeds local noise.
+    This retains prompt response to genuine sharp turns while suppressing
+    one-sample false reversals.
+    """
+
+    def __init__(self):
+        self.value = None
+        self.direction = 0
+        self.pending_direction = 0
+        self.pending_count = 0
+
+    def update(self, candidate, slope, noise_scale):
+        if self.value is None:
+            self.value = candidate
+            return candidate
+
+        # Small bounded slope lead compensates local-regression attenuation.
+        lead_limit = max(0.8 * noise_scale, 1e-6)
+        candidate += float(np.clip(0.35 * slope, -lead_limit, lead_limit))
+
+        delta = candidate - self.value
+        deadband = max(0.14 * noise_scale, 1e-6)
+
+        if abs(delta) <= deadband:
+            self.value += 0.20 * delta
+            return self.value
+
+        direction = 1 if delta > 0.0 else -1
+
+        if self.direction == 0 or direction == self.direction:
+            self.value = candidate
+            self.direction = direction
+            self.pending_direction = 0
+            self.pending_count = 0
+            return self.value
+
+        strong_turn = abs(delta) > max(0.75 * noise_scale, 2.5 * deadband)
+
+        if strong_turn:
+            self.value = candidate
+            self.direction = direction
+            self.pending_direction = 0
+            self.pending_count = 0
+            return self.value
+
+        if direction == self.pending_direction:
+            self.pending_count += 1
+        else:
+            self.pending_direction = direction
+            self.pending_count = 1
+
+        if self.pending_count >= 2:
+            self.value = candidate
+            self.direction = direction
+            self.pending_direction = 0
+            self.pending_count = 0
+        else:
+            # Preserve continuity during unconfirmed opposing noise.
+            self.value += 0.05 * delta
+
+        return self.value
+
+
+def adaptive_filter(x, window_size=20):
+    """
+    Basic trailing moving-average filter.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window (W samples)
+
+    Returns:
+        Filtered output signal with length = len(x) - window_size + 1
+    """
+    signal, window_size = _validate_signal(x, window_size)
+    cumulative = np.concatenate(([0.0], np.cumsum(signal, dtype=float)))
+    return (cumulative[window_size:] - cumulative[:-window_size]) / window_size
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Robust causal multi-scale endpoint-regression filter.
+
+    Every returned output corresponds to the newest sample in its original
+    trailing window, preserving the prior API's length and alignment.
+    """
+    signal, window_size = _validate_signal(x, window_size)
+    count = signal.size
+
+    long_horizon = max(3, window_size)
+    short_horizon = max(3, min(long_horizon, int(round(np.sqrt(long_horizon) * 1.8))))
+
+    long_model = _RobustEndpointRegressor(long_horizon)
+    short_model = _RobustEndpointRegressor(short_horizon)
+    estimates = np.empty(count, dtype=float)
+    gate = _ReversalGate()
+
+    for index in range(count):
+        available = index + 1
+
+        if available < short_horizon:
+            candidate = signal[index]
+            slope = signal[index] - signal[index - 1] if index else 0.0
+            scale = max(abs(slope), 1e-6)
+        else:
+            short_values = signal[index - short_horizon + 1:index + 1]
+            short_level, short_slope, short_scale = short_model.estimate(short_values)
+
+            if available < long_horizon:
+                candidate = short_level
+                slope = short_slope
+                scale = short_scale
+            else:
+                long_values = signal[index - long_horizon + 1:index + 1]
+                long_level, long_slope, long_scale = long_model.estimate(long_values)
+
+                # Agreement indicates stable motion and favors the smoother
+                # long-scale fit. Meaningful model separation favors the fast
+                # fit, but the response is bounded to avoid noise chasing.
+                local_scale = max(short_scale, long_scale, 1e-6)
+                disagreement = abs(short_level - long_level) / local_scale
+                fast_weight = 0.28 + 0.42 * (
+                    disagreement / (disagreement + 1.8)
+                )
+
+                # A coherent short-term slope is stronger evidence of a real
+                # evolving trend than a single noisy endpoint deviation.
+                if short_slope * long_slope > 0.0:
+                    fast_weight = min(0.76, fast_weight + 0.10)
+
+                candidate = fast_weight * short_level + (1.0 - fast_weight) * long_level
+                slope = fast_weight * short_slope + (1.0 - fast_weight) * long_slope
+                scale = local_scale
+
+        estimates[index] = gate.update(candidate, slope, scale)
+
+    return estimates[window_size - 1:]
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """
+    Main signal-processing entry point.
+
+    Args:
+        input_signal: Input time series data
+        window_size: Size of the sliding window
+        algorithm_type: Type of algorithm ("basic" or "enhanced")
+
+    Returns:
+        Filtered signal
+    """
+    if algorithm_type == "enhanced":
+        return enhanced_filter_with_trend_preservation(input_signal, window_size)
+    return adaptive_filter(input_signal, window_size)
+
+
+# EVOLVE-BLOCK-END
+```

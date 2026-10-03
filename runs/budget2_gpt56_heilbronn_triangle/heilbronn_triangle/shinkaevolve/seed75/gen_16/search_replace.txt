@@ -1,0 +1,111 @@
+<NAME>
+active_triple_ascent
+</NAME>
+
+<DESCRIPTION>
+Add constraint-gradient-informed proposals to the local polishing phase. The current polish relies on isotropic random perturbations, which are inefficient near a maximin optimum because only a small set of near-minimum triangles controls the objective. For the currently smallest signed determinants, this edit computes their determinant gradients with respect to each free point, aggregates ascent directions, and evaluates projected steps at several magnitudes. Random trials remain available afterward for escaping nonsmooth local configurations, while the directed trials deliberately increase active triangle areas.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _polish_layout(layout: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Deterministically improve a layout with batched maximin point moves."""
+    current = layout.copy()
+    current_area = float(np.min(_normalized_triangle_areas(current[None, ...])))
+
+    # A sequence of increasingly fine moves is more effective than applying
+    # late evolutionary mutations to all eight points simultaneously.
+    for scale, rounds in (
+        (0.030, 90),
+        (0.015, 110),
+        (0.007, 130),
+        (0.003, 150),
+        (0.0012, 170),
+    ):
+        batch_size = 48
+        for _ in range(rounds):
+            trials = np.broadcast_to(current, (batch_size, 8, 2)).copy()
+=======
+def _polish_layout(layout: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Deterministically improve a layout with batched maximin point moves."""
+    current = layout.copy()
+    current_area = float(np.min(_normalized_triangle_areas(current[None, ...])))
+
+    def active_gradient_trials(candidate: np.ndarray, scale: float) -> np.ndarray:
+        """
+        Form projected ascent proposals from the tightest determinant constraints.
+
+        For a signed triangle determinant D(a,b,c), its gradients are linear
+        in the other two vertices.  Summing sign(D) times these gradients for
+        active triangles gives a useful maximin ascent direction without
+        needing a costly general-purpose constrained optimizer.
+        """
+        all_points = np.vstack((_FIXED_CORNERS, candidate))
+        a = all_points[_TRIPLES[:, 0]]
+        b = all_points[_TRIPLES[:, 1]]
+        c = all_points[_TRIPLES[:, 2]]
+        determinants = (
+            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+        )
+        order = np.argsort(np.abs(determinants))[:18]
+        gradients = np.zeros((len(order), 8, 2), dtype=float)
+
+        for row, triple_index in enumerate(order):
+            ia, ib, ic = _TRIPLES[triple_index]
+            sign = 1.0 if determinants[triple_index] >= 0.0 else -1.0
+            triangle = (ia, ib, ic)
+            triangle_gradients = (
+                (b[triple_index, 1] - c[triple_index, 1],
+                 c[triple_index, 0] - b[triple_index, 0]),
+                (c[triple_index, 1] - a[triple_index, 1],
+                 a[triple_index, 0] - c[triple_index, 0]),
+                (a[triple_index, 1] - b[triple_index, 1],
+                 b[triple_index, 0] - a[triple_index, 0]),
+            )
+            for point_index, gradient in zip(triangle, triangle_gradients):
+                if point_index >= 3:
+                    gradients[row, point_index - 3] = sign * gradient
+
+        proposals = []
+        # Different prefixes prevent a single almost-degenerate constraint
+        # from overwhelming the other active constraints.
+        for count in (3, 5, 8, 12, 18):
+            direction = np.sum(gradients[:count], axis=0)
+            norm = float(np.linalg.norm(direction))
+            if norm > 1.0e-14:
+                direction /= norm
+                for multiplier in (0.45, 0.8, 1.2, 1.7):
+                    proposals.append(candidate + scale * multiplier * direction)
+
+        # Individual active gradients are useful when the aggregate direction
+        # is cancelled by competing tight triangles.
+        for row in range(4):
+            direction = gradients[row]
+            norm = float(np.linalg.norm(direction))
+            if norm > 1.0e-14:
+                proposals.append(candidate + scale * 0.8 * direction / norm)
+
+        return _project_to_simplex(np.asarray(proposals, dtype=float))
+
+    # A sequence of increasingly fine moves is more effective than applying
+    # late evolutionary mutations to all eight points simultaneously.
+    for scale, rounds in (
+        (0.030, 90),
+        (0.015, 110),
+        (0.007, 130),
+        (0.003, 150),
+        (0.0012, 170),
+    ):
+        batch_size = 48
+        for _ in range(rounds):
+            guided_trials = active_gradient_trials(current, scale)
+            guided_areas = np.min(_normalized_triangle_areas(guided_trials), axis=1)
+            guided_winner = int(np.argmax(guided_areas))
+            if guided_areas[guided_winner] > current_area + 1.0e-12:
+                current = guided_trials[guided_winner]
+                current_area = float(guided_areas[guided_winner])
+
+            trials = np.broadcast_to(current, (batch_size, 8, 2)).copy()
+>>>>>>> REPLACE
+</DIFF>

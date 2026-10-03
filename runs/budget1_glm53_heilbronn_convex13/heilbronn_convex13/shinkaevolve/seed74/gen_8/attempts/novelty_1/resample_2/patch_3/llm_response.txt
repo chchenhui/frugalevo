@@ -1,0 +1,128 @@
+<NAME>
+heilbronn_13pt_optimization
+</NAME>
+
+<DESCRIPTION>
+Replace the naive random point generation with a deterministic Heilbronn optimizer for 13 points: 3-fold symmetric ring+center initialization, annealed soft-min (LogSumExp) maximization via L-BFGS-B to get smooth gradients, projection into the unit square, then greedy coordinate-perturbation refinement on the exact minimum triangle area. Multi-start over 4 deterministic seeds keeps results reproducible.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        rng = np.random.default_rng(seed=42)
+        points = rng.random((n, 2))
+        return points
+=======
+        rng = np.random.default_rng(seed=42)
+        points = _heilbronn_optimize(n, seed=rng)
+        return points
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+import numpy as np
+=======
+import itertools
+
+import numpy as np
+from scipy.optimize import minimize
+
+
+def _combos(n):
+    return np.array(list(itertools.combinations(range(n), 3)))
+
+
+def _exact_min_area(pts):
+    """Exact minimum triangle area among all C(n,3) triples (vectorized)."""
+    i, j, k = _combos(pts.shape[0]).T
+    cross = (
+        (pts[j, 0] - pts[i, 0]) * (pts[k, 1] - pts[i, 1])
+        - (pts[j, 1] - pts[i, 1]) * (pts[k, 0] - pts[i, 0])
+    )
+    return float(np.abs(cross).min() / 2.0)
+
+
+def _soft_min_area(pts, beta):
+    """Smooth soft-min of squared doubled-areas via LogSumExp (differentiable)."""
+    i, j, k = _combos(pts.shape[0]).T
+    cross = (
+        (pts[j, 0] - pts[i, 0]) * (pts[k, 1] - pts[i, 1])
+        - (pts[j, 1] - pts[i, 1]) * (pts[k, 0] - pts[i, 0])
+    )
+    a2 = cross * cross
+    m = beta * a2.min()
+    return float(-(m + np.log(np.exp(-beta * a2 + m).sum())) / beta)
+
+
+def _project(pts):
+    eps = 1e-9
+    return np.clip(pts, eps, 1.0 - eps)
+
+
+def _init_config(seed, n):
+    """3-fold symmetric ring of n-1 points plus center, jittered deterministically."""
+    rng = np.random.default_rng(seed)
+    pts = []
+    m = n - 1
+    for t in range(m):
+        ang = 2.0 * np.pi * t / m + 0.06 * np.sin(6.0 * np.pi * t / m)
+        rad = 0.42 + 0.03 * rng.standard_normal()
+        pts.append((0.5 + rad * np.cos(ang), 0.5 + rad * np.sin(ang)))
+    pts.append((0.5, 0.5))
+    return _project(np.asarray(pts))
+
+
+def _heilbronn_optimize(n, seed=42):
+    """Deterministic multi-start annealed soft-min maximization + greedy polish."""
+    if n < 3:
+        rng = np.random.default_rng(seed)
+        return _project(rng.random((max(n, 1), 2)))
+
+    best_pts = None
+    best_score = -np.inf
+
+    for s in range(4):
+        pts = _init_config(s + int(seed) % 1000, n)
+        for beta in (30.0, 100.0, 300.0, 1000.0):
+            try:
+                res = minimize(
+                    lambda flat: -_soft_min_area(_project(flat.reshape(n, 2)), beta),
+                    pts.ravel(),
+                    method="L-BFGS-B",
+                    bounds=[(0.0, 1.0)] * (2 * n),
+                    options={"maxiter": 200, "eps": 1e-7},
+                )
+                if res.x is not None and np.all(np.isfinite(res.x)):
+                    pts = _project(res.x.reshape(n, 2))
+            except Exception:
+                pass
+        score = _exact_min_area(pts)
+        if score > best_score:
+            best_score = score
+            best_pts = pts.copy()
+
+    # Greedy coordinate polish on the exact objective
+    step = 0.004
+    while step > 1e-5:
+        improved = False
+        base = _exact_min_area(best_pts)
+        for idx in range(n):
+            for axis in (0, 1):
+                for sgn in (+1, -1):
+                    cand = best_pts.copy()
+                    cand[idx, axis] += sgn * step
+                    cand = _project(cand)
+                    if _exact_min_area(cand) > base + 1e-12:
+                        best_pts = cand
+                        improved = True
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+        if not improved:
+            step *= 0.5
+
+    return best_pts
+>>>>>>> REPLACE
+</DIFF>

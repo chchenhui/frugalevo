@@ -1,0 +1,353 @@
+# EVOLVE-BLOCK-START
+#include <iostream>
+#include <vector>
+#include <string>
+#include <array>
+#include <algorithm>
+#include <unordered_map>
+#include <chrono>
+#include <random>
+#include <cmath>
+#include <cstdint>
+
+using namespace std;
+
+static constexpr int MAXN = 10;
+static constexpr int MAXV = 100;
+static constexpr int DR[4] = {-1, 1, 0, 0};
+static constexpr int DC[4] = {0, 0, -1, 1};
+static constexpr char MC[4] = {'U', 'D', 'L', 'R'};
+
+int N, T, V;
+uint64_t zob[MAXV][16];
+
+static inline int hexval(char c) {
+    return c <= '9' ? c - '0' : c - 'a' + 10;
+}
+
+struct Board {
+    array<unsigned char, MAXV> a{};
+    int empty = 0;
+    uint64_t hash = 0;
+
+    inline bool move(int d) {
+        int r = empty / N, c = empty % N;
+        int nr = r + DR[d], nc = c + DC[d];
+        if ((unsigned)nr >= (unsigned)N || (unsigned)nc >= (unsigned)N) return false;
+        int to = nr * N + nc;
+        unsigned char x = a[to];
+
+        hash ^= zob[empty][0] ^ zob[to][x] ^ zob[empty][x] ^ zob[to][0];
+        a[empty] = x;
+        a[to] = 0;
+        empty = to;
+        return true;
+    }
+
+    inline void move_known(int d) {
+        int r = empty / N, c = empty % N;
+        int to = (r + DR[d]) * N + c + DC[d];
+        unsigned char x = a[to];
+        hash ^= zob[empty][0] ^ zob[to][x] ^ zob[empty][x] ^ zob[to][0];
+        a[empty] = x;
+        a[to] = 0;
+        empty = to;
+    }
+};
+
+struct Score {
+    unsigned char tree;
+    unsigned char components;
+};
+
+unordered_map<uint64_t, Score> score_cache;
+
+struct DSU {
+    int p[MAXV], sz[MAXV], ed[MAXV];
+
+    inline void init() {
+        for (int i = 0; i < V; ++i) {
+            p[i] = i;
+            sz[i] = 1;
+            ed[i] = 0;
+        }
+    }
+
+    inline int find(int x) {
+        while (p[x] != x) {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        return x;
+    }
+
+    inline void edge(int x, int y) {
+        x = find(x);
+        y = find(y);
+        if (x == y) {
+            ++ed[x];
+            return;
+        }
+        if (sz[x] < sz[y]) swap(x, y);
+        p[y] = x;
+        sz[x] += sz[y];
+        ed[x] += ed[y] + 1;
+    }
+};
+
+static inline Score evaluate(const Board& b) {
+    auto it = score_cache.find(b.hash);
+    if (it != score_cache.end()) return it->second;
+
+    DSU d;
+    d.init();
+
+    for (int r = 0; r < N; ++r) {
+        int base = r * N;
+        for (int c = 0; c + 1 < N; ++c) {
+            int x = base + c, y = x + 1;
+            if ((b.a[x] & 4) && (b.a[y] & 1)) d.edge(x, y);
+        }
+    }
+
+    for (int r = 0; r + 1 < N; ++r) {
+        int base = r * N;
+        for (int c = 0; c < N; ++c) {
+            int x = base + c, y = x + N;
+            if ((b.a[x] & 8) && (b.a[y] & 2)) d.edge(x, y);
+        }
+    }
+
+    int best = 0, comps = 0;
+    for (int i = 0; i < V; ++i) {
+        if (i == b.empty) continue;
+        if (d.find(i) == i) {
+            ++comps;
+            if (d.ed[i] == d.sz[i] - 1) best = max(best, d.sz[i]);
+        }
+    }
+
+    Score res{(unsigned char)best, (unsigned char)comps};
+    if (score_cache.size() < 2000000) score_cache.emplace(b.hash, res);
+    return res;
+}
+
+static inline long long beam_score(const Score& s, int moves, int empty) {
+    if (s.tree == V - 1) return (long long)4e18 - moves;
+
+    long long ret = (long long)s.tree * 1000000000LL;
+    ret -= (long long)(max(0, (int)s.components - 1)) * 800000000LL;
+
+    if (s.components == 1 && s.tree >= V - 3) ret += 500000000LL;
+
+    int r = empty / N, c = empty % N;
+    ret -= moves;
+    ret -= abs(r - (N - 1)) + abs(c - (N - 1));
+    return ret;
+}
+
+static inline int official_score(const Score& s, int moves) {
+    if (s.tree == V - 1) {
+        return (int)llround(500000.0 * (2.0 - (double)moves / T));
+    }
+    return (int)llround(500000.0 * (double)s.tree / (V - 1));
+}
+
+struct Hist {
+    int parent;
+    char move;
+};
+
+struct State {
+    Board b;
+    long long value;
+    int depth;
+    int hist;
+    signed char prev;
+
+    bool operator<(const State& other) const {
+        return value > other.value;
+    }
+};
+
+static vector<Hist> history;
+
+static string restore_path(int h) {
+    string s;
+    while (h > 0) {
+        s.push_back(history[h].move);
+        h = history[h].parent;
+    }
+    reverse(s.begin(), s.end());
+    return s;
+}
+
+static string move_empty_to_corner(Board& b) {
+    string path;
+    int target = V - 1;
+    while (b.empty / N < target / N) {
+        path.push_back('D');
+        b.move_known(1);
+    }
+    while (b.empty % N < target % N) {
+        path.push_back('R');
+        b.move_known(3);
+    }
+    return path;
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    cin >> N >> T;
+    V = N * N;
+
+    mt19937_64 zrng(123456789);
+    for (int i = 0; i < V; ++i) {
+        for (int x = 0; x < 16; ++x) zob[i][x] = zrng();
+    }
+
+    Board initial;
+    for (int r = 0; r < N; ++r) {
+        string row;
+        cin >> row;
+        for (int c = 0; c < N; ++c) {
+            int id = r * N + c;
+            initial.a[id] = (unsigned char)hexval(row[c]);
+            if (initial.a[id] == 0) initial.empty = id;
+            initial.hash ^= zob[id][initial.a[id]];
+        }
+    }
+
+    string prefix;
+    if (initial.empty != V - 1) prefix = move_empty_to_corner(initial);
+    int prefix_len = (int)prefix.size();
+
+    score_cache.reserve(2000000);
+    score_cache.max_load_factor(0.75f);
+
+    unordered_map<uint64_t, int> visited;
+    visited.reserve(2000000);
+    visited.max_load_factor(0.75f);
+
+    history.reserve(3000000);
+    history.push_back({-1, ' '});
+
+    Score init_score = evaluate(initial);
+    vector<State> beam;
+    beam.push_back({initial, beam_score(init_score, prefix_len, initial.empty), 0, 0, -1});
+    visited[initial.hash] = prefix_len;
+
+    int best_score = official_score(init_score, prefix_len);
+    string answer = prefix;
+
+    int width;
+    if (N == 6) width = 1350;
+    else if (N == 7) width = 1100;
+    else if (N == 8) width = 780;
+    else if (N == 9) width = 480;
+    else width = 300;
+
+    mt19937 rng((unsigned)chrono::steady_clock::now().time_since_epoch().count());
+    vector<State> cand;
+    vector<State> next;
+    vector<int> ids;
+    cand.reserve(width * 4 + 32);
+    next.reserve(width + 8);
+    ids.reserve(width * 3 + 16);
+
+    auto start = chrono::steady_clock::now();
+    const int TIME_MS = 2520;
+
+    for (int turn = 0; prefix_len + turn < T; ++turn) {
+        if ((turn & 7) == 0) {
+            auto now = chrono::steady_clock::now();
+            if (chrono::duration_cast<chrono::milliseconds>(now - start).count() >= TIME_MS) break;
+        }
+        if (history.size() + width * 4 + 10 >= 3000000) break;
+
+        cand.clear();
+
+        for (const State& cur : beam) {
+            int er = cur.b.empty / N, ec = cur.b.empty % N;
+            for (int d = 0; d < 4; ++d) {
+                if (cur.prev >= 0 && ((cur.prev ^ 1) == d)) continue;
+                int nr = er + DR[d], nc = ec + DC[d];
+                if ((unsigned)nr >= (unsigned)N || (unsigned)nc >= (unsigned)N) continue;
+
+                State nx = cur;
+                nx.b.move_known(d);
+                nx.depth = cur.depth + 1;
+                nx.prev = (signed char)d;
+
+                int total_moves = prefix_len + nx.depth;
+                auto it = visited.find(nx.b.hash);
+                if (it != visited.end()) {
+                    if (it->second <= total_moves) continue;
+                    it->second = total_moves;
+                } else if (visited.size() < 2000000) {
+                    visited.emplace(nx.b.hash, total_moves);
+                }
+
+                Score sc = evaluate(nx.b);
+                nx.value = beam_score(sc, total_moves, nx.b.empty);
+                history.push_back({cur.hist, MC[d]});
+                nx.hist = (int)history.size() - 1;
+                cand.push_back(nx);
+
+                int real = official_score(sc, total_moves);
+                if (real > best_score) {
+                    best_score = real;
+                    answer = prefix + restore_path(nx.hist);
+                }
+            }
+        }
+
+        if (cand.empty()) break;
+
+        int elite = max(1, width / 5);
+        int useful = min((int)cand.size(), elite + width * 3);
+        if (useful < (int)cand.size()) {
+            nth_element(cand.begin(), cand.begin() + useful, cand.end());
+            cand.resize(useful);
+        }
+        sort(cand.begin(), cand.end());
+
+        next.clear();
+        int take_elite = min(elite, (int)cand.size());
+        for (int i = 0; i < take_elite; ++i) next.push_back(cand[i]);
+
+        // Keep elites unchanged, then diversify the rest over rank bands.
+        // This prevents the beam from collapsing into nearly identical
+        // near-elite paths while still favoring strong candidates.
+        int pool_begin = take_elite;
+        int pool_count = (int)cand.size() - pool_begin;
+        int need = min(width - (int)next.size(), pool_count);
+        int first_end = pool_begin + pool_count / 2;
+        int second_end = pool_begin + (pool_count * 4) / 5;
+        int first_take = (need * 5) / 10;
+        int second_take = (need * 3) / 10;
+        int third_take = need - first_take - second_take;
+
+        auto take_random_from_band = [&](int begin, int end, int count) {
+            ids.clear();
+            for (int i = begin; i < end; ++i) ids.push_back(i);
+            shuffle(ids.begin(), ids.end(), rng);
+            for (int i = 0; i < count && i < (int)ids.size(); ++i) {
+                next.push_back(cand[ids[i]]);
+            }
+        };
+
+        take_random_from_band(pool_begin, first_end, first_take);
+        take_random_from_band(first_end, second_end, second_take);
+        take_random_from_band(second_end, (int)cand.size(), third_take);
+
+        beam.swap(next);
+        if (beam.empty()) break;
+    }
+
+    cout << answer << '\n';
+    return 0;
+}
+# EVOLVE-BLOCK-END

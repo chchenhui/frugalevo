@@ -1,0 +1,334 @@
+--- a/original.py
++++ b/original.py
+@@ -1,187 +1,253 @@
+ # EVOLVE-BLOCK-START
+ """Constructor-based circle packing for n=26 circles.
+ 
+-Approach: generate diverse hexagonal-lattice candidate layouts, then refine
+-each with SLSQP nonlinear constrained optimization over centers and radii
+-jointly, directly maximizing sum of radii. Best result is returned.
++Approach: hexagonal-lattice seeds -> exact radius growth -> SLSQP joint
++(center, radius) optimization with analytic Jacobians, repeated restart
++("polish") passes from repaired endpoints until improvement stalls.
+ """
+ import numpy as np
+ from scipy.optimize import minimize
+ 
+ SQRT3 = np.sqrt(3.0)
++N = 26
+ EPS = 1e-9
+ 
+ 
+ def _lattice_candidates():
+-    """Generate diverse initial center layouts on clipped hex lattices."""
+     cands = []
+     row_sets = [
+         [5, 4, 5, 4, 5, 3], [5, 4, 5, 4, 4, 4], [4, 5, 4, 5, 4, 4],
+         [3, 5, 4, 5, 4, 5], [4, 4, 5, 5, 4, 4], [5, 5, 4, 4, 5, 3],
+         [3, 4, 5, 5, 4, 5], [4, 5, 5, 4, 5, 3], [5, 4, 4, 5, 4, 4],
+     ]
++    r = min(1.0 / 10.0, 1.0 / (2.0 + 5.0 * SQRT3))
+     for counts in row_sets:
+-        if sum(counts) != 26:
++        if sum(counts) != N:
+             continue
+-        r = min(1.0 / 10.0, 1.0 / (2.0 + 5.0 * SQRT3))
+         for sf in (1.0, 1.05):
+             rr = r * sf
+-            dx = 2.0 * rr
+-            dy = SQRT3 * rr
++            dx, dy = 2.0 * rr, SQRT3 * rr
+             pts = []
+             for row, c in enumerate(counts):
+                 y = rr + row * dy
+                 span = 2.0 * rr + (c - 1) * dx
+                 start = (1.0 - span) / 2.0 + rr
+                 for k in range(c):
+                     pts.append([start + k * dx, y])
+-            pts = np.clip(np.array(pts), 0.005, 0.995)
+-            cands.append(pts)
+-    # Deterministic jittered variants for layout diversity
++            cands.append(np.clip(np.array(pts), 0.005, 0.995))
+     rng = np.random.default_rng(12345)
+-    base = cands[0]
+-    for _ in range(4):
+-        jit = rng.normal(0.0, 0.015, size=base.shape)
+-        cands.append(np.clip(base + jit, 0.005, 0.995))
++    for base in list(cands[:3]):
++        for _ in range(3):
++            jit = rng.normal(0.0, 0.015, size=base.shape)
++            cands.append(np.clip(base + jit, 0.005, 0.995))
+     return cands
+ 
+ 
+-def _cons_all(z):
+-    """All constraint values (>= 0 means feasible): walls + pairwise gaps."""
+-    n = 26
+-    x = z[0:n]
+-    y = z[n:2 * n]
+-    r = z[2 * n:3 * n]
+-    walls = np.concatenate([
+-        x - r, (1.0 - x) - r, y - r, (1.0 - y) - r
+-    ])
+-    dx = x[:, None] - x[None, :]
+-    dy = y[:, None] - y[None, :]
+-    d = np.sqrt(dx * dx + dy * dy)
+-    gaps = []
+-    for i in range(n):
+-        for j in range(i + 1, n):
+-            gaps.append(d[i, j] - r[i] - r[j] - EPS)
+-    return np.concatenate([walls, np.array(gaps)])
+-
+-
+-def _refine(centers, r_init):
+-    """SLSQP optimization of centers + radii maximizing sum of radii."""
+-    n = 26
+-    # initial radii: small feasible values
++def grow_radii(centers, iters=400):
++    """Exact Gauss-Seidel growth: r_i = min(wall_i, min_j (d_ij - r_j))."""
++    n = centers.shape[0]
++    b = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
++                   np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+     d = np.sqrt(((centers[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2))
++    np.fill_diagonal(d, np.inf)
++    radii = np.zeros(n)
++    for _ in range(iters):
++        grew = False
++        for i in range(n):
++            cand = min(b[i], float(np.min(d[i, :] - radii)))
++            cand = max(cand, 1e-9)
++            if cand > radii[i] + 1e-12:
++                radii[i] = cand
++                grew = True
++        if not grew:
++            break
++    return radii
++
++
++def _slsqp_once(centers, max_iters):
++    """One SLSQP pass with analytic Jacobians. Returns (z, ok)."""
++    n = N
++    centers = np.clip(centers, 0.002, 0.998)
++    # Feasible start: exact growth shrunk slightly
++    r = grow_radii(centers)
++    d = np.sqrt(((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1))
+     np.fill_diagonal(d, np.inf)
+     wall = np.minimum(np.minimum(centers[:, 0], 1 - centers[:, 0]),
+                       np.minimum(centers[:, 1], 1 - centers[:, 1]))
+-    r = np.full(n, 0.5 * r_init)
+-    for _ in range(50):
++    r = np.minimum(r * 0.98, np.maximum(wall * 0.98, 1e-9))
++    for i in range(n):
++        r[i] = max(min(r[i], float(np.min(d[i] - r)) - 1e-9), 1e-9)
++
++    z0 = np.concatenate([centers[:, 0], centers[:, 1], r])
++    m2 = 2 * n
++    ii, jj = np.triu_indices(n, k=1)
++
++    def obj(z):
++        return -float(np.sum(z[m2:]))
++
++    def obj_grad(z):
++        g = np.zeros_like(z)
++        g[m2:] = -1.0
++        return g
++
++    def pair_fun(z):
++        x, y, rr = z[:n], z[n:m2], z[m2:]
++        dvec = np.sqrt((x[ii] - x[jj]) ** 2 + (y[ii] - y[jj]) ** 2)
++        return dvec - rr[ii] - rr[jj]
++
++    def pair_jac(z):
++        x, y, rr = z[:n], z[n:m2], z[m2:]
++        dvec = np.sqrt((x[ii] - x[jj]) ** 2 + (y[ii] - y[jj]) ** 2)
++        dvec = np.maximum(dvec, 1e-12)
++        J = np.zeros((ii.size, z0.size))
++        rows = np.arange(ii.size)
++        J[rows, ii] = (x[ii] - x[jj]) / dvec
++        J[rows, jj] = -(x[ii] - x[jj]) / dvec
++        J[rows, n + ii] = (y[ii] - y[jj]) / dvec
++        J[rows, n + jj] = -(y[ii] - y[jj]) / dvec
++        J[rows, m2 + ii] = -1.0
++        J[rows, m2 + jj] = -1.0
++        return J
++
++    def wall_fun(z):
++        x, y, rr = z[:n], z[n:m2], z[m2:]
++        return np.concatenate([x - rr, 1 - x - rr, y - rr, 1 - y - rr])
++
++    def wall_jac(z):
++        J = np.zeros((4 * n, z0.size))
+         for i in range(n):
+-            r[i] = min(wall[i], np.min(d[i, :] - r) - 2 * EPS)
+-            r[i] = max(r[i], 0.005)
+-
+-    z0 = np.concatenate([centers[:, 0], centers[:, 1], r])
+-    bounds = [(0.002, 0.998)] * (2 * n) + [(0.001, 0.5)] * n
+-
+-    cons = [{'type': 'ineq', 'fun': _cons_all}]
+-    res = minimize(lambda z: -np.sum(z[2 * n:3 * n]), z0,
+-                   method='SLSQP', bounds=bounds, constraints=cons,
+-                   options={'maxiter': 250, 'ftol': 1e-12})
+-
+-    z = res.x if res.x is not None else z0
+-    return _repair(z)
++            J[i, i] = 1.0
++            J[i, m2 + i] = -1.0
++            J[n + i, i] = -1.0
++            J[n + i, m2 + i] = -1.0
++            J[2 * n + i, n + i] = 1.0
++            J[2 * n + i, m2 + i] = -1.0
++            J[3 * n + i, n + i] = -1.0
++            J[3 * n + i, m2 + i] = -1.0
++        return J
++
++    cons = [{'type': 'ineq', 'fun': pair_fun, 'jac': pair_jac},
++            {'type': 'ineq', 'fun': wall_fun, 'jac': wall_jac}]
++    bounds = [(0.001, 0.999)] * m2 + [(1e-6, 0.5)] * n
++    try:
++        res = minimize(obj, z0, jac=obj_grad, bounds=bounds, constraints=cons,
++                       method='SLSQP',
++                       options={'maxiter': max_iters, 'ftol': 1e-14})
++        return (res.x if res.x is not None else z0), True
++    except Exception:
++        return z0, False
+ 
+ 
+ def _repair(z):
+-    """Ensure strict feasibility by shrinking radii as needed."""
+-    n = 26
+-    x = np.clip(z[0:n], 0.001, 0.999)
++    """Clip centers and exactly grow radii => always-valid packing."""
++    n = N
++    x = np.clip(z[:n], 0.001, 0.999)
+     y = np.clip(z[n:2 * n], 0.001, 0.999)
+-    r = np.clip(z[2 * n:3 * n], 0.001, 0.5)
+-    wall = np.minimum(np.minimum(x, 1 - x), np.minimum(y, 1 - y))
+-    r = np.minimum(r, wall)
+-    d = np.sqrt(((x[:, None] - x[None, :]) ** 2 + (y[:, None] - y[None, :]) ** 2))
+-    np.fill_diagonal(d, np.inf)
+-    # iterative shrink until feasible
+-    for _ in range(200):
+-        gap = d - r[:, None] - r[None, :]
+-        np.fill_diagonal(gap, np.inf)
+-        violation = -gap.min(axis=1)
+-        if violation.max() <= -1e-12:
++    centers = np.stack([x, y], axis=1)
++    r = grow_radii(centers)
++    return centers, r, float(np.sum(r))
++
++
++def _refine(centers, passes=4, max_iters=500):
++    """SLSQP with iterative restart passes from repaired endpoints."""
++    best = None
++    cur = np.asarray(centers, dtype=float)
++    prev_sum = -np.inf
++    for _ in range(passes):
++        z, ok = _slsqp_once(cur, max_iters)
++        c, r, s = _repair(z)
++        if best is None or s > best[2]:
++            best = (c, r, s)
++        if s < prev_sum + 1e-6:
+             break
+-        for i in np.where(violation > -1e-12)[0]:
+-            j = np.argmin(gap[i])
+-            need = d[i, j] - r[j] - 1e-8
+-            r[i] = min(r[i], max(need, 0.001))
+-    r = np.minimum(r, wall - 1e-9)
+-    r = np.maximum(r, 0.0005)
+-    centers = np.stack([x, y], axis=1)
+-    return centers, r, float(np.sum(r))
++        prev_sum = s
++        cur = c  # restart from repaired endpoint
++    return best
+ 
+ 
+ def construct_packing():
+     """
+     Construct an arrangement of 26 circles in a unit square maximizing
+-    the sum of radii via multi-start SLSQP constrained optimization.
++    the sum of radii via multi-start SLSQP with restart polish passes.
+ 
+     Returns:
+         Tuple of (centers, radii, sum_of_radii)
+     """
+     best = None
+     for cand in _lattice_candidates():
+         try:
+-            centers, radii, s = _refine(cand, 0.05)
++            centers, radii, s = _refine(cand)
+         except Exception:
+             continue
+         if best is None or s > best[2]:
+             best = (centers, radii, s)
+-
++    # Extra deep polish of the overall best configuration
++    try:
++        centers, radii, s = _refine(best[0], passes=5, max_iters=600)
++        if s > best[2]:
++            best = (centers, radii, s)
++    except Exception:
++        pass
+     centers, radii, sum_radii = best
+     return centers, radii, sum_radii
++
++
++def compute_max_radii(centers):
++    n = centers.shape[0]
++    radii = np.array([min(c[0], c[1], 1 - c[0], 1 - c[1]) for c in centers])
++    for i in range(n):
++        for j in range(i + 1, n):
++            dist = np.linalg.norm(centers[i] - centers[j])
++            if radii[i] + radii[j] > dist:
++                sc = dist / (radii[i] + radii[j])
++                radii[i] *= sc
++                radii[j] *= sc
++    return radii
+ 
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ # This part remains fixed (not evolved)
+ def run_packing():
+     """Run the circle packing constructor for n=26"""
+     centers, radii, sum_radii = construct_packing()
+     return centers, radii, sum_radii
+ 
+ 
+ def visualize(centers, radii):
+     """
+     Visualize the circle packing
+ 
+     Args:
+         centers: np.array of shape (n, 2) with (x, y) coordinates
+         radii: np.array of shape (n) with radius of each circle
+     """
+     import matplotlib.pyplot as plt
+     from matplotlib.patches import Circle
+ 
+     fig, ax = plt.subplots(figsize=(8, 8))
+ 
+     # Draw unit square
+     ax.set_xlim(0, 1)
+     ax.set_ylim(0, 1)
+     ax.set_aspect("equal")
+     ax.grid(True)
+ 
+     # Draw circles
+     for i, (center, radius) in enumerate(zip(centers, radii)):
+         circle = Circle(center, radius, alpha=0.5)
+         ax.add_patch(circle)
+         ax.text(center[0], center[1], str(i), ha="center", va="center")
+ 
+     plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+     plt.show()
+ 
+ 
+ if __name__ == "__main__":
+     centers, radii, sum_radii = run_packing()
+     print(f"Sum of radii: {sum_radii}")
+     # AlphaEvolve improved this to 2.635
+ 
+     # Uncomment to visualize:
+     visualize(centers, radii)

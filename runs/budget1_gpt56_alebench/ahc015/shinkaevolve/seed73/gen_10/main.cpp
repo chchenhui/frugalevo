@@ -1,0 +1,261 @@
+# EVOLVE-BLOCK-START
+#include <bits/stdc++.h>
+using namespace std;
+
+static constexpr int N = 10;
+static constexpr int CELLS = 100;
+
+struct RNG {
+    uint64_t x;
+    explicit RNG(uint64_t seed = 88172645463325252ULL) : x(seed) {}
+    uint64_t next() {
+        x ^= x << 7;
+        x ^= x >> 9;
+        return x;
+    }
+    int range(int n) {
+        return n <= 1 ? 0 : int(next() % (uint64_t)n);
+    }
+};
+
+struct Board {
+    array<unsigned char, CELLS> a{};
+    int used = 0;
+
+    int empty_at_rank(int rank1) const {
+        int cnt = 0;
+        for (int i = 0; i < CELLS; ++i) {
+            if (a[i] == 0 && ++cnt == rank1) return i;
+        }
+        return -1;
+    }
+
+    void put_rank(int rank1, int flavor) {
+        int p = empty_at_rank(rank1);
+        a[p] = (unsigned char)flavor;
+        ++used;
+    }
+
+    void put_random(RNG& rng, int flavor) {
+        int empty = CELLS - used;
+        put_rank(rng.range(empty) + 1, flavor);
+    }
+
+    void tilt(int d) {
+        array<unsigned char, CELLS> b{};
+        if (d == 0 || d == 1) {
+            for (int c = 0; c < N; ++c) {
+                int w = (d == 0 ? 0 : 9);
+                if (d == 0) {
+                    for (int r = 0; r < N; ++r) {
+                        unsigned char v = a[r * N + c];
+                        if (v) b[(w++) * N + c] = v;
+                    }
+                } else {
+                    for (int r = 9; r >= 0; --r) {
+                        unsigned char v = a[r * N + c];
+                        if (v) b[(w--) * N + c] = v;
+                    }
+                }
+            }
+        } else {
+            for (int r = 0; r < N; ++r) {
+                int w = (d == 2 ? 0 : 9);
+                if (d == 2) {
+                    for (int c = 0; c < N; ++c) {
+                        unsigned char v = a[r * N + c];
+                        if (v) b[r * N + (w++)] = v;
+                    }
+                } else {
+                    for (int c = 9; c >= 0; --c) {
+                        unsigned char v = a[r * N + c];
+                        if (v) b[r * N + (w--)] = v;
+                    }
+                }
+            }
+        }
+        a = b;
+    }
+};
+
+array<int, 100> flavor;
+array<int, 4> total_count{};
+array<int, 4> left_col{}, right_col{};
+uint64_t flavor_hash = 0;
+
+double evaluate(const Board& b, int turn) {
+    bool seen[CELLS] = {};
+    int que[CELLS];
+    long long sum_sq = 0;
+    int adjacent_same = 0;
+
+    int cnt[4] = {};
+    int sr[4] = {}, sc[4] = {};
+
+    for (int p = 0; p < CELLS; ++p) {
+        int f = b.a[p];
+        if (!f) continue;
+        int r = p / N, c = p % N;
+        ++cnt[f];
+        sr[f] += r;
+        sc[f] += c;
+
+        if (r + 1 < N && b.a[p + N] == f) ++adjacent_same;
+        if (c + 1 < N && b.a[p + 1] == f) ++adjacent_same;
+
+        if (seen[p]) continue;
+        seen[p] = true;
+        int head = 0, tail = 0;
+        que[tail++] = p;
+        int sz = 0;
+        while (head < tail) {
+            int v = que[head++];
+            ++sz;
+            int vr = v / N, vc = v % N;
+            const int nb[4] = {v - N, v + N, v - 1, v + 1};
+            if (vr > 0 && !seen[nb[0]] && b.a[nb[0]] == f) {
+                seen[nb[0]] = true; que[tail++] = nb[0];
+            }
+            if (vr < 9 && !seen[nb[1]] && b.a[nb[1]] == f) {
+                seen[nb[1]] = true; que[tail++] = nb[1];
+            }
+            if (vc > 0 && !seen[nb[2]] && b.a[nb[2]] == f) {
+                seen[nb[2]] = true; que[tail++] = nb[2];
+            }
+            if (vc < 9 && !seen[nb[3]] && b.a[nb[3]] == f) {
+                seen[nb[3]] = true; que[tail++] = nb[3];
+            }
+        }
+        sum_sq += 1LL * sz * sz;
+    }
+
+    double spread = 0.0;
+    double strip_bad = 0.0;
+    for (int p = 0; p < CELLS; ++p) {
+        int f = b.a[p];
+        if (!f) continue;
+        int r = p / N, c = p % N;
+        if (cnt[f]) {
+            spread += abs(r - double(sr[f]) / cnt[f]);
+            spread += abs(c - double(sc[f]) / cnt[f]);
+        }
+        if (c < left_col[f]) strip_bad += left_col[f] - c;
+        if (c > right_col[f]) strip_bad += c - right_col[f];
+    }
+
+    double rem = double(100 - turn) / 100.0;
+    double connectivity_weight = 24.0 + 1.65 * turn;
+    double adjacency_weight = 8.0 + 0.18 * turn;
+
+    return connectivity_weight * sum_sq
+         + adjacency_weight * adjacent_same
+         - rem * 34.0 * spread
+         - rem * 48.0 * strip_bad;
+}
+
+int greedy_future_tilt(const Board& placed, int turn) {
+    double best = -1e100;
+    int best_d = 0;
+    for (int d = 0; d < 4; ++d) {
+        Board q = placed;
+        q.tilt(d);
+        double v = evaluate(q, turn);
+        if (v > best) {
+            best = v;
+            best_d = d;
+        }
+    }
+    return best_d;
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    for (int i = 0; i < 100; ++i) {
+        cin >> flavor[i];
+        ++total_count[flavor[i]];
+        flavor_hash = flavor_hash * 1000003ULL + flavor[i] + 17;
+    }
+
+    vector<pair<int,int>> order;
+    for (int f = 1; f <= 3; ++f) order.push_back({-total_count[f], f});
+    sort(order.begin(), order.end());
+
+    int width[4] = {};
+    int assigned = 0;
+    for (auto [neg, f] : order) {
+        width[f] = total_count[f] / 10;
+        assigned += width[f];
+    }
+    int remain = 10 - assigned;
+    for (int i = 0; i < remain; ++i) width[order[i % 3].second]++;
+
+    int at = 0;
+    for (auto [neg, f] : order) {
+        left_col[f] = at;
+        right_col[f] = at + width[f] - 1;
+        at += width[f];
+    }
+
+    Board current;
+    static const char out[4] = {'F', 'B', 'L', 'R'};
+
+    for (int t = 0; t < 100; ++t) {
+        int p;
+        cin >> p;
+        current.put_rank(p, flavor[t]);
+        int turn = t + 1;
+
+        int horizon;
+        int particles;
+        if (turn < 30) {
+            horizon = 7;
+            particles = 10;
+        } else if (turn < 70) {
+            horizon = 10;
+            particles = 12;
+        } else {
+            horizon = 18;
+            particles = 16;
+        }
+        horizon = min(horizon, 100 - turn);
+
+        double best_value = -1e100;
+        int best_dir = 0;
+
+        for (int first_d = 0; first_d < 4; ++first_d) {
+            Board initial = current;
+            initial.tilt(first_d);
+
+            double value_sum = 0.18 * evaluate(initial, turn) * particles;
+
+            for (int s = 0; s < particles; ++s) {
+                uint64_t seed = flavor_hash
+                    ^ (uint64_t(turn) * 0x9e3779b97f4a7c15ULL)
+                    ^ (uint64_t(s + 1) * 0xbf58476d1ce4e5b9ULL);
+                RNG rng(seed);
+
+                Board sim = initial;
+                for (int h = 0; h < horizon; ++h) {
+                    int nt = t + 1 + h;
+                    sim.put_random(rng, flavor[nt]);
+                    int d = greedy_future_tilt(sim, nt + 1);
+                    sim.tilt(d);
+                }
+                value_sum += evaluate(sim, turn + horizon);
+            }
+
+            double value = value_sum / particles;
+            if (value > best_value) {
+                best_value = value;
+                best_dir = first_d;
+            }
+        }
+
+        cout << out[best_dir] << endl;
+        current.tilt(best_dir);
+    }
+    return 0;
+}
+# EVOLVE-BLOCK-END

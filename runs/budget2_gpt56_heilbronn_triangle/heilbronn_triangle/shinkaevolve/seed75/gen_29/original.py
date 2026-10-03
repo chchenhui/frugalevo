@@ -1,0 +1,273 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+_N = 11
+_FREE = 8
+_DIM = 16
+_HEIGHT = np.sqrt(3.0) * 0.5
+_CORNERS = np.array(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)), dtype=np.float64)
+_TRIPLES = np.array(
+    [
+        (i, j, k)
+        for i in range(_N - 2)
+        for j in range(i + 1, _N - 1)
+        for k in range(j + 1, _N)
+    ],
+    dtype=np.intp,
+)
+
+
+def _project_simplex_batch(points: np.ndarray) -> np.ndarray:
+    """Map affine coordinates into u >= 0, v >= 0, u + v <= 1."""
+    result = np.abs(np.asarray(points, dtype=np.float64)).copy()
+    total = result[..., 0] + result[..., 1]
+    outside = total > 1.0
+    if np.any(outside):
+        result[outside] /= total[outside, None]
+    return result
+
+
+def _all_areas(population: np.ndarray) -> np.ndarray:
+    """
+    Areas normalized by the enclosing triangle area.
+
+    In affine simplex coordinates this is simply the absolute determinant.
+    """
+    count = population.shape[0]
+    corners = np.broadcast_to(_CORNERS, (count, 3, 2))
+    points = np.concatenate((corners, population), axis=1)
+
+    a = points[:, _TRIPLES[:, 0]]
+    b = points[:, _TRIPLES[:, 1]]
+    c = points[:, _TRIPLES[:, 2]]
+
+    return np.abs(
+        (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
+        - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
+    )
+
+
+def _rank_values(population: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Return strict min areas and a lexicographic-style selection value.
+
+    The lower-tail statistic is deliberately scaled far below meaningful
+    min-area changes, so it stabilizes the evolutionary search without
+    sacrificing the primary objective.
+    """
+    areas = _all_areas(population)
+    tail = np.partition(areas, 13, axis=1)[:, :14]
+    minimum = tail[:, 0]
+    support = np.mean(tail[:, 1:], axis=1)
+    return minimum, minimum + 2.0e-5 * support
+
+
+def _random_simplex(rng: np.random.Generator, count: int) -> np.ndarray:
+    values = rng.random((count, _FREE, 2))
+    over = values.sum(axis=2) > 1.0
+    values[over] = 1.0 - values[over]
+    return values
+
+
+def _template_population(rng: np.random.Generator, count: int) -> np.ndarray:
+    """
+    Start from both a separated triangular pattern and unbiased simplex draws.
+    Keeping a fixed point ordering is important for covariance adaptation.
+    """
+    template = np.array(
+        [
+            [0.13, 0.075],
+            [0.43, 0.060],
+            [0.75, 0.075],
+            [0.075, 0.335],
+            [0.350, 0.255],
+            [0.640, 0.240],
+            [0.145, 0.610],
+            [0.405, 0.445],
+        ],
+        dtype=np.float64,
+    )
+
+    population = _random_simplex(rng, count)
+    seeded = count * 3 // 4
+    population[:seeded] = _project_simplex_batch(
+        template[None, :, :] + rng.normal(0.0, 0.105, (seeded, _FREE, 2))
+    )
+    return population
+
+
+def _elite_island(
+    rng: np.random.Generator,
+    population_size: int = 176,
+    generations: int = 255,
+) -> np.ndarray:
+    """
+    Covariance-adapting cross-entropy search in the full 16-dimensional
+    configuration space.  It proposes coordinated displacement vectors rather
+    than the independent single-point moves used by annealing.
+    """
+    population = _template_population(rng, population_size)
+    minimum, score = _rank_values(population)
+
+    elite_count = 28
+    keep_count = 12
+    mean = population[0].reshape(_DIM).copy()
+    covariance = np.eye(_DIM, dtype=np.float64) * 0.030
+
+    best = population[int(np.argmax(minimum))].copy()
+    best_area = float(np.max(minimum))
+
+    for generation in range(generations):
+        order = np.argsort(score)[::-1]
+        elite = population[order[:elite_count]]
+        elite_vectors = elite.reshape(elite_count, _DIM)
+
+        # Rank weighting reduces sensitivity to a single fortunate candidate.
+        weights = np.log(elite_count + 0.75) - np.log(
+            np.arange(1, elite_count + 1, dtype=np.float64)
+        )
+        weights /= weights.sum()
+
+        new_mean = np.sum(elite_vectors * weights[:, None], axis=0)
+        centered = elite_vectors - new_mean
+        empirical = (centered * weights[:, None]).T @ centered
+
+        # A smoothed covariance retains exploratory directions while adapting
+        # to the active geometric constraints.
+        covariance = 0.62 * covariance + 0.38 * empirical
+        covariance += np.eye(_DIM) * (2.0e-6 + 2.0e-5 * (1.0 - generation / generations))
+        mean = 0.58 * mean + 0.42 * new_mean
+
+        try:
+            samples = rng.multivariate_normal(
+                mean, covariance, size=population_size - keep_count,
+                method="cholesky",
+            )
+        except (np.linalg.LinAlgError, ValueError):
+            covariance = np.eye(_DIM) * 0.008
+            samples = rng.normal(0.0, 0.09, (population_size - keep_count, _DIM)) + mean
+
+        # Occasional broad samples keep an island from covariance collapse.
+        broad = rng.random(samples.shape[0]) < 0.10
+        if np.any(broad):
+            samples[broad] += rng.normal(0.0, 0.075, (np.sum(broad), _DIM))
+
+        offspring = _project_simplex_batch(samples.reshape(-1, _FREE, 2))
+        population = np.concatenate((elite[:keep_count], offspring), axis=0)
+
+        minimum, score = _rank_values(population)
+        index = int(np.argmax(minimum))
+        if minimum[index] > best_area:
+            best_area = float(minimum[index])
+            best = population[index].copy()
+
+    return best
+
+
+def _active_polish(
+    rng: np.random.Generator,
+    seed: np.ndarray,
+    rounds: int = 440,
+    batch_size: int = 192,
+) -> np.ndarray:
+    """
+    Batch local search driven by currently binding triangle constraints.
+    """
+    best = seed.copy()
+    best_minimum, best_score = _rank_values(best[None, ...])
+    best_minimum = float(best_minimum[0])
+    best_score = float(best_score[0])
+
+    for iteration in range(rounds):
+        fraction = iteration / max(1, rounds - 1)
+        scale = 0.030 * (1.0 - fraction) ** 1.65 + 0.00055
+
+        current_areas = _all_areas(best[None, ...])[0]
+        active_ids = np.argpartition(current_areas, 15)[:16]
+        active_triangles = _TRIPLES[active_ids]
+
+        candidates = np.broadcast_to(best, (batch_size, _FREE, 2)).copy()
+
+        # Most proposals move an incident point from a currently restrictive
+        # triangle; some coordinated two-point proposals cross narrow barriers.
+        for row in range(batch_size):
+            triangle = active_triangles[int(rng.integers(len(active_triangles)))]
+            movable = triangle[triangle >= 3] - 3
+            if len(movable):
+                point = int(movable[rng.integers(len(movable))])
+            else:
+                point = int(rng.integers(_FREE))
+
+            candidates[row, point] += rng.normal(0.0, scale, 2)
+
+            if rng.random() < 0.30:
+                other = int(rng.integers(_FREE))
+                if other != point:
+                    candidates[row, other] += rng.normal(0.0, 0.62 * scale, 2)
+
+        candidates = _project_simplex_batch(candidates)
+        minimum, scores = _rank_values(candidates)
+
+        # Strict minimum remains primary; the support score resolves only
+        # essentially equal numerical minima.
+        winner = int(np.argmax(scores))
+        improves_minimum = minimum[winner] > best_minimum + 1.0e-12
+        tied_better = (
+            abs(minimum[winner] - best_minimum) <= 1.0e-12
+            and scores[winner] > best_score
+        )
+
+        if improves_minimum or tied_better:
+            best = candidates[winner]
+            best_minimum = float(minimum[winner])
+            best_score = float(scores[winner])
+
+    return best
+
+
+def _fallback() -> np.ndarray:
+    affine = np.vstack(
+        (
+            _CORNERS,
+            np.array(
+                [
+                    [0.13, 0.075], [0.43, 0.060], [0.75, 0.075],
+                    [0.075, 0.335], [0.350, 0.255], [0.640, 0.240],
+                    [0.145, 0.610], [0.405, 0.445],
+                ],
+                dtype=np.float64,
+            ),
+        )
+    )
+    result = np.empty_like(affine)
+    result[:, 0] = affine[:, 0] + 0.5 * affine[:, 1]
+    result[:, 1] = _HEIGHT * affine[:, 1]
+    return result
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Return eleven deterministic points in or on the prescribed triangle.
+    """
+    try:
+        rng = np.random.default_rng(11031991)
+        finalists = [_elite_island(rng) for _ in range(5)]
+
+        finalist_array = np.asarray(finalists)
+        finalist_minimum, _ = _rank_values(finalist_array)
+        seed = finalist_array[int(np.argmax(finalist_minimum))]
+
+        affine = np.vstack((_CORNERS, _active_polish(rng, seed)))
+        result = np.empty_like(affine)
+        result[:, 0] = affine[:, 0] + 0.5 * affine[:, 1]
+        result[:, 1] = _HEIGHT * affine[:, 1]
+
+        if result.shape != (11, 2) or not np.all(np.isfinite(result)):
+            return _fallback()
+        return result
+    except Exception:
+        return _fallback()
+
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,701 @@
+--- a/original.py
++++ b/original.py
+@@ -1,414 +1,468 @@
+ # EVOLVE-BLOCK-START
+ """
+-Real-Time Adaptive Signal Processing Algorithm for Non-Stationary Time Series
+-
+-This algorithm implements a sliding window approach to filter volatile, non-stationary
+-time series data while minimizing noise and preserving signal dynamics.
++Hysteretic real-time adaptive filter for volatile, non-stationary time series.
++
++The enhanced implementation is organized as a three-stage causal pipeline:
++
++1. Multiscale window feature extraction:
++   robust endpoint regressions estimate local level, slope, and residual noise.
++2. Robust predictive state tracker:
++   a bounded-innovation constant-velocity tracker limits outlier influence.
++3. Hysteretic trend controller:
++   discrete flat/trend modes and reversal confirmation suppress noise-driven
++   directional changes without continuously jittering adaptive filter gains.
+ """
+ import numpy as np
+ 
+ 
+-def adaptive_filter(x, window_size=20):
+-    """
+-    Efficient sliding-window moving average baseline.
+-
+-    Args:
+-        x: Input signal (1D array of real-valued samples)
+-        window_size: Size of the sliding window (W samples)
+-
+-    Returns:
+-        y: Filtered output signal with length = len(x) - window_size + 1
+-    """
++def _validate_signal(x, window_size):
++    """Convert and validate a one-dimensional signal."""
+     x = np.asarray(x, dtype=float)
+     if x.ndim != 1:
+         raise ValueError("Input signal must be a 1D array")
+     if window_size < 1:
+         raise ValueError("window_size must be >= 1")
+     if len(x) < window_size:
+-        raise ValueError(f"Input signal length ({len(x)}) must be >= window_size ({window_size})")
+-
++        raise ValueError(
++            f"Input signal length ({len(x)}) must be >= window_size ({window_size})"
++        )
++    return x
++
++
++def adaptive_filter(x, window_size=20):
++    """
++    Efficient sliding-window moving average baseline.
++
++    Args:
++        x: Input signal (1D array of real-valued samples)
++        window_size: Size of the sliding window.
++
++    Returns:
++        Moving-average output aligned to x[window_size - 1:].
++    """
++    x = _validate_signal(x, window_size)
+     cumulative = np.concatenate(([0.0], np.cumsum(x, dtype=float)))
+     return (cumulative[window_size:] - cumulative[:-window_size]) / float(window_size)
+ 
+ 
++def _endpoint_regression_bank(x, window_size):
++    """
++    Compute causal multiscale endpoint regression features.
++
++    Each local line is evaluated at the newest sample of its window.  The
++    returned confidence is dimensionless: slope is scaled by window span before
++    comparison with residual noise.
++    """
++    windows = np.lib.stride_tricks.sliding_window_view(x, window_size)
++    span = max(window_size - 1, 1)
++    t = np.arange(window_size, dtype=float) - span
++    design = np.column_stack((np.ones(window_size), t))
++
++    levels = []
++    slopes = []
++
++    # Gentle regression rejects local noise; steep regression reduces delay at
++    # coherent turns.  The medium fit supplies the robust noise estimate.
++    for strength in (1.2, 3.0, 5.5):
++        weights = np.exp(strength * t / span)
++        normal = design.T @ (weights[:, None] * design)
++        mapping = np.linalg.solve(normal, design.T * weights)
++        levels.append(windows @ mapping[0])
++        slopes.append(windows @ mapping[1])
++
++    levels = np.asarray(levels)
++    slopes = np.asarray(slopes)
++
++    medium_fit = levels[1, :, None] + slopes[1, :, None] * t[None, :]
++    residual = windows - medium_fit
++    residual_center = np.median(residual, axis=1, keepdims=True)
++    noise = 1.4826 * np.median(np.abs(residual - residual_center), axis=1)
++    noise = np.maximum(noise, 1e-6)
++
++    # A slope is meaningful only if its total movement over the window exceeds
++    # fitted residual variation.  This avoids interpreting sample-scale slope
++    # values directly as amplitudes.
++    movement = np.abs(slopes[1]) * span
++    confidence = movement / (movement + 1.35 * noise)
++
++    # Blend scales using confidence, but leave final discrete gain decisions to
++    # the streaming controller. This gives a stable target without requiring
++    # discontinuous regression selection.
++    quiet_weight = (1.0 - confidence) ** 2
++    medium_weight = 2.0 * confidence * (1.0 - confidence)
++    fast_weight = confidence ** 2
++    reference = (
++        quiet_weight * levels[0]
++        + medium_weight * levels[1]
++        + fast_weight * levels[2]
++    )
++
++    return reference, slopes[1], noise, confidence
++
++
++def _initial_noise_scale(x, window_size):
++    """Robust initial measurement-noise estimate from first differences."""
++    differences = np.diff(x[:window_size])
++    if differences.size == 0:
++        return 1e-4
++
++    median_difference = np.median(differences)
++    scale = np.median(np.abs(differences - median_difference)) / 0.6745
++    return max(float(scale), 1e-4)
++
++
+ def enhanced_filter_with_trend_preservation(x, window_size=20):
+     """
+-    Robust adaptive Kalman/window consensus filter.
+-
+-    A constant-velocity Kalman tracker supplies a low-lag level estimate.  A
+-    causal exponentially weighted local estimate is used as a second, smoother
+-    consensus signal.  The final alpha-beta stage follows persistent trends
+-    predictively while damping short alternating deviations that cause false
+-    directional reversals.
++    Causal robust tracker with hysteretic discrete trend modes.
++
++    The output remains aligned with x[window_size - 1:].  Unlike continuously
++    adaptive alpha filters, mode-specific gains are retained for multiple
++    windows.  This reduces gain jitter, slope changes, and noise-induced trend
++    reversals while preserving high gain during confirmed motion.
+ 
+     Args:
+-        x: Input signal (1D array of real-valued samples)
+-        window_size: Sliding-window length used for local context and output
+-            alignment.
++        x: Input signal (1D array of real-valued samples).
++        window_size: Causal sliding-window size.
+ 
+     Returns:
+-        Filtered signal aligned with x[window_size - 1:].
+-    """
+-    x = np.asarray(x, dtype=float)
+-    if x.ndim != 1:
+-        raise ValueError("Input signal must be a 1D array")
+-    if window_size < 1:
+-        raise ValueError("window_size must be >= 1")
+-    if len(x) < window_size:
+-        raise ValueError(f"Input signal length ({len(x)}) must be >= window_size ({window_size})")
+-
++        Filtered signal of length len(x) - window_size + 1.
++    """
++    x = _validate_signal(x, window_size)
+     n = len(x)
+-    initial = x[:window_size]
+-    differences = np.diff(initial)
+-
+-    if differences.size:
+-        diff_median = np.median(differences)
+-        diff_scale = np.median(np.abs(differences - diff_median)) / 0.6745
+-    else:
+-        diff_scale = 0.0
+-
+-    measurement_var = max(0.5 * diff_scale * diff_scale, 1e-8)
++    output_length = n - window_size + 1
++
++    if window_size == 1:
++        return x.copy()
++
++    references, local_slopes, local_noise, confidences = _endpoint_regression_bank(
++        x, window_size
++    )
++
++    initial_noise = _initial_noise_scale(x, window_size)
++    measurement_var = initial_noise * initial_noise
+     innovation_var = measurement_var
+-    process_var = max(0.05 * measurement_var, 1e-10)
+-
+-    # Robust initial slope avoids allowing one endpoint outlier to establish a
+-    # spurious initial direction.
+-    if window_size > 1:
+-        half = max(1, window_size // 2)
+-        initial_slope = (
+-            np.median(initial[half:] if half < window_size else initial[-1:])
+-            - np.median(initial[:half])
+-        ) / max(window_size - half, 1)
+-    else:
+-        initial_slope = 0.0
+-
++    process_var = max(0.04 * measurement_var, 1e-9)
++
++    # Predictive tracker state and covariance.
+     level = float(x[0])
+-    velocity = float(initial_slope)
+-    p00 = measurement_var * 4.0
++    velocity = 0.0
++    p00 = 4.0 * measurement_var
+     p01 = 0.0
+     p11 = measurement_var
+ 
+-    # Exponential state is retained for the warm-up interval.  Once a complete
+-    # window is available, use a bank of causal endpoint regressions instead of
+-    # a single fixed-decay average.  Gentle weighting is quiet in flat regions;
+-    # stronger recency weighting removes endpoint lag during coherent trends.
+-    decay = np.exp(-2.0 / max(window_size - 1, 1))
+-    window_level = float(x[0])
+-    regression_windows = np.lib.stride_tricks.sliding_window_view(x, window_size)
+-    regression_time = np.arange(window_size, dtype=float) - (window_size - 1)
+-    regression_design = np.column_stack((
+-        np.ones(window_size, dtype=float), regression_time
+-    ))
+-    endpoint_levels = []
+-    endpoint_slopes = []
+-    for strength in (1.5, 3.0, 5.0):
+-        regression_weights = np.exp(
+-            strength * regression_time / max(window_size - 1, 1)
+-        )
+-        regression_map = np.linalg.solve(
+-            regression_design.T @ (regression_weights[:, None] * regression_design),
+-            regression_design.T * regression_weights,
+-        )
+-        endpoint_levels.append(regression_windows @ regression_map[0])
+-        endpoint_slopes.append(regression_windows @ regression_map[1])
+-
+-    endpoint_levels = np.asarray(endpoint_levels)
+-    endpoint_slopes = np.asarray(endpoint_slopes)
+-    medium_fit = (
+-        endpoint_levels[1, :, None]
+-        + endpoint_slopes[1, :, None] * regression_time[None, :]
+-    )
+-    endpoint_noise = np.maximum(
+-        1.4826 * np.median(np.abs(regression_windows - medium_fit), axis=1),
+-        1e-6,
+-    )
+-
+-    output = np.empty(n - window_size + 1, dtype=float)
+-    consensus_level = float(x[0])
+-    consensus_velocity = 0.0
+-
+-    # Direction-aware reversal hysteresis prevents isolated target crossings
+-    # from becoming output reversals.  Evidence is tracked independently of
+-    # the Kalman sign because a real turn can begin before its velocity state
+-    # has crossed zero.
+-    previous_step = 0.0
+-    reversal_direction = 0.0
+-    reversal_evidence = 0
++    # Output smoothing state.
++    filtered_level = float(x[0])
++    filtered_velocity = 0.0
++    previous_direction = 0
++
++    # Stable discrete gain mode.  Entry takes two coherent feature windows;
++    # exit requires four weak windows, preventing mode chatter.
++    trend_mode = False
++    high_confidence_count = 0
++    low_confidence_count = 0
++
++    # Separate reversal evidence permits a real turn after persistence while
++    # holding isolated countertrend samples at the previous level.
++    pending_direction = 0
++    pending_count = 0
++
++    output = np.empty(output_length, dtype=float)
++    exponential_reference = float(x[0])
++    warm_decay = np.exp(-2.0 / max(window_size - 1, 1))
+ 
+     for index, sample in enumerate(x):
+-        # Constant-velocity Kalman prediction with white acceleration noise.
++        # ----- Stage 1: bounded-innovation constant-velocity tracker -----
+         predicted_level = level + velocity
+         predicted_velocity = velocity
+-        q = process_var
+-
+-        pp00 = p00 + 2.0 * p01 + p11 + 0.25 * q
+-        pp01 = p01 + p11 + 0.5 * q
+-        pp11 = p11 + q
++
++        pp00 = p00 + 2.0 * p01 + p11 + 0.25 * process_var
++        pp01 = p01 + p11 + 0.5 * process_var
++        pp11 = p11 + process_var
+ 
+         innovation = sample - predicted_level
+-        residual_var = max(pp00 + measurement_var, 1e-12)
+-        innovation_limit = 3.0 * np.sqrt(residual_var)
+-        bounded_innovation = np.clip(innovation, -innovation_limit, innovation_limit)
+-
+-        k0 = pp00 / residual_var
+-        k1 = pp01 / residual_var
+-        level = predicted_level + k0 * bounded_innovation
+-        velocity = predicted_velocity + k1 * bounded_innovation
+-
+-        # Scalar Joseph-equivalent covariance update, kept symmetric.
++        residual_variance = max(pp00 + measurement_var, 1e-12)
++        innovation_limit = 3.2 * np.sqrt(residual_variance)
++        innovation = np.clip(innovation, -innovation_limit, innovation_limit)
++
++        k0 = pp00 / residual_variance
++        k1 = pp01 / residual_variance
++        level = predicted_level + k0 * innovation
++        velocity = predicted_velocity + k1 * innovation
++
+         p00 = max(pp00 - k0 * pp00, 1e-12)
+         p01 = pp01 - k0 * pp01
+         p11 = max(pp11 - k1 * pp01, 1e-12)
+ 
+-        innovation_var = 0.95 * innovation_var + 0.05 * bounded_innovation * bounded_innovation
+-        measurement_var = max(0.985 * measurement_var + 0.015 * innovation_var, 1e-8)
+-        process_var = max(0.99 * process_var + 0.01 * innovation_var * 0.05, 1e-10)
+-
+-        # Use the exponential reference only before a full causal regression
+-        # window exists.  Thereafter blend gentle, medium, and steep endpoint
+-        # fits according to slope-to-residual confidence.  This prevents a
+-        # fixed recency decay from either lagging every turn or following every
+-        # noisy oscillation.
+-        window_level = decay * window_level + (1.0 - decay) * sample
++        innovation_var = 0.96 * innovation_var + 0.04 * innovation * innovation
++        measurement_var = max(
++            0.99 * measurement_var + 0.01 * innovation_var, 1e-9
++        )
++        process_var = max(
++            0.992 * process_var + 0.008 * innovation_var * 0.045, 1e-10
++        )
++
++        # ----- Stage 2: local feature fusion and mode update -----
++        exponential_reference = (
++            warm_decay * exponential_reference + (1.0 - warm_decay) * sample
++        )
++
+         if index >= window_size - 1:
+-            local_index = index - window_size + 1
+-            medium_slope = endpoint_slopes[1, local_index]
+-            fit_noise = endpoint_noise[local_index]
+-            trend_confidence = abs(medium_slope) / (
+-                abs(medium_slope) + 1.5 * fit_noise
+-            )
+-            gentle_weight = (1.0 - trend_confidence) ** 2
+-            medium_weight = 2.0 * trend_confidence * (1.0 - trend_confidence)
+-            steep_weight = trend_confidence ** 2
+-            window_reference = (
+-                gentle_weight * endpoint_levels[0, local_index]
+-                + medium_weight * endpoint_levels[1, local_index]
+-                + steep_weight * endpoint_levels[2, local_index]
+-            )
++            feature_index = index - window_size + 1
++            local_reference = references[feature_index]
++            slope = local_slopes[feature_index]
++            feature_noise = local_noise[feature_index]
++            confidence = confidences[feature_index]
+         else:
+-            trend_confidence = 0.0
+-            window_reference = window_level
+-
+-        # When the endpoint estimate and Kalman tracker agree, the local
+-        # estimate is a useful noise suppressor.  During a coherent trend its
+-        # confidence also raises its contribution, reducing lag without giving
+-        # isolated samples direct control of the output.
+-        disagreement = abs(level - window_reference)
+-        scale = np.sqrt(max(innovation_var, 1e-10))
+-        agreement_weight = 1.0 / (1.0 + (disagreement / (1.75 * scale)) ** 2)
+-        local_weight = (0.18 + 0.24 * trend_confidence) * agreement_weight
+-        target = (1.0 - local_weight) * level + local_weight * window_reference
+-
+-        # Predictive post-stage: smoothing is performed around a velocity
+-        # prediction instead of a stationary average, minimizing phase delay.
+-        # Update its velocity from both the Kalman trend estimate and the
+-        # realized consensus step.  Bounding acceleration prevents one noisy
+-        # residual from creating a sequence of false directional reversals.
+-        previous_consensus = consensus_level
+-        predicted_consensus = consensus_level + consensus_velocity
+-        residual = target - predicted_consensus
+-        alpha = 0.70 + 0.16 * min(1.0, disagreement / (2.5 * scale + 1e-12))
+-        candidate_level = predicted_consensus + alpha * residual
+-        step = candidate_level - previous_consensus
+-
+-        # A reversal needs volatility-scaled persistence.  Unlike a gate that
+-        # waits exclusively for the Kalman slope sign, this can release a true
+-        # turn on its second coherent endpoint movement while the velocity
+-        # tracker is still decelerating from the old trend.
+-        prior_direction = np.sign(previous_step)
+-        step_direction = np.sign(step)
+-        is_opposing = (
+-            prior_direction != 0.0 and step_direction == -prior_direction
+-        )
+-        supports_turn = (
+-            np.sign(velocity) == step_direction
+-            and abs(velocity) >= 0.035 * scale
+-        )
+-        evidence_floor = 0.14 * scale
+-        strong_evidence = abs(step) >= evidence_floor
+-        decisive_turn = abs(step) >= 0.32 * scale and supports_turn
+-
+-        if is_opposing and not decisive_turn:
+-            if strong_evidence:
+-                if step_direction == reversal_direction:
+-                    reversal_evidence += 1
+-                else:
+-                    reversal_direction = step_direction
+-                    reversal_evidence = 1
++            local_reference = exponential_reference
++            slope = 0.0
++            feature_noise = initial_noise
++            confidence = 0.0
++
++        tracker_scale = np.sqrt(max(innovation_var, 1e-10))
++        scale = max(tracker_scale, feature_noise)
++        disagreement = abs(level - local_reference)
++
++        # A high-confidence local trend must persist before trend mode is
++        # entered. Exit is deliberately slower, preserving responsiveness
++        # through a sustained but temporarily weakening trend.
++        high_confidence = confidence > 0.52 and abs(slope) * max(window_size - 1, 1) > 0.65 * scale
++        low_confidence = confidence < 0.32
++
++        if high_confidence:
++            high_confidence_count += 1
++            low_confidence_count = 0
++        elif low_confidence:
++            low_confidence_count += 1
++            high_confidence_count = 0
++        else:
++            high_confidence_count = max(0, high_confidence_count - 1)
++            low_confidence_count = max(0, low_confidence_count - 1)
++
++        if not trend_mode and high_confidence_count >= 2:
++            trend_mode = True
++            low_confidence_count = 0
++        elif trend_mode and low_confidence_count >= 4:
++            trend_mode = False
++            high_confidence_count = 0
++
++        agreement = 1.0 / (1.0 + (disagreement / (1.8 * scale + 1e-12)) ** 2)
++        if trend_mode:
++            local_weight = (0.30 + 0.16 * confidence) * agreement
++            alpha = 0.77
++            velocity_mix = 0.58
++            required_reversal_count = 2
++        else:
++            local_weight = 0.28 * agreement
++            alpha = 0.50
++            velocity_mix = 0.34
++            required_reversal_count = 3
++
++        target = (1.0 - local_weight) * level + local_weight * local_reference
++
++        # ----- Stage 3: predictive output and reversal hysteresis -----
++        predicted_output = filtered_level + filtered_velocity
++        candidate = predicted_output + alpha * (target - predicted_output)
++        proposed_step = candidate - filtered_level
++
++        step_band = 0.10 * scale
++        proposed_direction = (
++            1 if proposed_step > step_band else -1 if proposed_step < -step_band else 0
++        )
++
++        opposite = (
++            previous_direction != 0
++            and proposed_direction != 0
++            and proposed_direction != previous_direction
++        )
++        slope_support = (
++            proposed_direction != 0
++            and np.sign(slope) == proposed_direction
++            and abs(slope) * max(window_size - 1, 1) > 0.45 * scale
++        )
++        decisive_turn = (
++            slope_support
++            and abs(proposed_step) > (0.24 if trend_mode else 0.34) * scale
++        )
++
++        accepted_step = proposed_step
++        if opposite and not decisive_turn:
++            if proposed_direction == pending_direction:
++                pending_count += 1
+             else:
+-                reversal_direction = 0.0
+-                reversal_evidence = 0
+-
+-            if reversal_evidence < 2:
+-                consensus_level = previous_consensus
+-                step = 0.0
++                pending_direction = proposed_direction
++                pending_count = 1
++
++            if pending_count < required_reversal_count:
++                candidate = filtered_level
++                accepted_step = 0.0
+             else:
+-                consensus_level = candidate_level
+-                reversal_direction = 0.0
+-                reversal_evidence = 0
++                pending_direction = 0
++                pending_count = 0
+         else:
+-            consensus_level = candidate_level
+-            reversal_direction = 0.0
+-            reversal_evidence = 0
+-
+-        if step != 0.0:
+-            previous_step = step
+-
+-        velocity_target = 0.55 * velocity + 0.45 * step
+-        acceleration_limit = 0.10 * scale + 0.025 * abs(velocity)
+-        velocity_change = np.clip(
+-            velocity_target - consensus_velocity,
++            pending_direction = 0
++            pending_count = 0
++
++        filtered_level = candidate
++
++        if abs(accepted_step) > step_band:
++            previous_direction = 1 if accepted_step > 0.0 else -1
++
++        velocity_target = velocity_mix * velocity + (1.0 - velocity_mix) * accepted_step
++        acceleration_limit = (
++            (0.15 if trend_mode else 0.08) * scale + 0.04 * abs(filtered_velocity)
++        )
++        velocity_delta = np.clip(
++            velocity_target - filtered_velocity,
+             -acceleration_limit,
+             acceleration_limit,
+         )
+-        consensus_velocity += 0.48 * velocity_change
+-
+-        velocity_deadband = 0.025 * scale
+-        if abs(consensus_velocity) < velocity_deadband:
+-            consensus_velocity = 0.0
++        filtered_velocity += (0.52 if trend_mode else 0.34) * velocity_delta
++
++        deadband = (0.018 if trend_mode else 0.040) * scale
++        if abs(filtered_velocity) < deadband:
++            filtered_velocity = 0.0
+ 
+         if index >= window_size - 1:
+-            output[index - window_size + 1] = consensus_level
++            output[index - window_size + 1] = filtered_level
+ 
+     return output
+ 
+ 
+ def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+     """
+-    Main signal processing function that applies the selected algorithm.
++    Apply the requested filtering algorithm.
+ 
+     Args:
+-        input_signal: Input time series data
+-        window_size: Window size for processing
+-        algorithm_type: Type of algorithm to use ("basic" or "enhanced")
++        input_signal: Input time series data.
++        window_size: Sliding-window length.
++        algorithm_type: "basic" or "enhanced".
+ 
+     Returns:
+-        Filtered signal
++        Filtered signal.
+     """
+     if algorithm_type == "enhanced":
+         return enhanced_filter_with_trend_preservation(input_signal, window_size)
+-    else:
+-        return adaptive_filter(input_signal, window_size)
++    return adaptive_filter(input_signal, window_size)
+ 
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+     """
+     Generate synthetic test signal with known characteristics.
+ 
+     Args:
+         length: Length of the signal
+         noise_level: Standard deviation of noise to add
+         seed: Random seed for reproducibility
+ 
+     Returns:
+         Tuple of (noisy_signal, clean_signal)
+     """
+     np.random.seed(seed)
+     t = np.linspace(0, 10, length)
+ 
+     # Create a complex signal with multiple components
+     clean_signal = (
+         2 * np.sin(2 * np.pi * 0.5 * t)  # Low frequency component
+         + 1.5 * np.sin(2 * np.pi * 2 * t)  # Medium frequency component
+         + 0.5 * np.sin(2 * np.pi * 5 * t)  # Higher frequency component
+         + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)  # Decaying oscillation
+     )
+ 
+     # Add non-stationary behavior
+     trend = 0.1 * t * np.sin(0.2 * t)  # Slowly varying trend
+     clean_signal += trend
+ 
+     # Add random walk component for non-stationarity
+     random_walk = np.cumsum(np.random.randn(length) * 0.05)
+     clean_signal += random_walk
+ 
+     # Add noise
+     noise = np.random.normal(0, noise_level, length)
+     noisy_signal = clean_signal + noise
+ 
+     return noisy_signal, clean_signal
+ 
+ 
+ def run_signal_processing(noisy_signal=None, signal_length=1000, noise_level=0.3, window_size=20):
+     """
+     Run the signal processing algorithm on a test signal.
+ 
+     Args:
+         noisy_signal: Input signal to filter (if provided, use this; otherwise generate)
+         signal_length: Length if generating signal (for backward compatibility)
+         noise_level: Noise level if generating signal (for backward compatibility)
+         window_size: Window size for processing
+ 
+     Returns:
+         Dictionary containing results and metrics
+     """
+     # Use provided signal or generate test signal (for backward compatibility)
+     if noisy_signal is not None:
+         # Filter the provided signal
+         filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+         clean_signal = None  # Not available when using provided signal
+     else:
+         # Generate test signal (for __main__ and backward compatibility)
+         noisy_signal, clean_signal = generate_test_signal(signal_length, noise_level)
+         filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+ 
+     # Calculate basic metrics (only if we have clean_signal from generation)
+     if len(filtered_signal) > 0 and clean_signal is not None:
+         # Align signals for comparison (account for processing delay)
+         delay = window_size - 1
+         aligned_clean = clean_signal[delay:]
+         aligned_noisy = noisy_signal[delay:]
+ 
+         # Ensure same length
+         min_length = min(len(filtered_signal), len(aligned_clean))
+         filtered_signal = filtered_signal[:min_length]
+         aligned_clean = aligned_clean[:min_length]
+         aligned_noisy = aligned_noisy[:min_length]
+ 
+         # Calculate correlation with clean signal
+         correlation = np.corrcoef(filtered_signal, aligned_clean)[0, 1] if min_length > 1 else 0
+ 
+         # Calculate noise reduction
+         noise_before = np.var(aligned_noisy - aligned_clean)
+         noise_after = np.var(filtered_signal - aligned_clean)
+         noise_reduction = (noise_before - noise_after) / noise_before if noise_before > 0 else 0
+ 
+         return {
+             "filtered_signal": filtered_signal,
+             "clean_signal": aligned_clean,
+             "noisy_signal": aligned_noisy,
+             "correlation": correlation,
+             "noise_reduction": noise_reduction,
+             "signal_length": min_length,
+         }
+     elif len(filtered_signal) > 0:
+         # When using provided signal (no clean_signal available), just return filtered signal
+         return {
+             "filtered_signal": filtered_signal,
+             "clean_signal": None,
+             "noisy_signal": None,
+             "correlation": 0,
+             "noise_reduction": 0,
+             "signal_length": len(filtered_signal),
+         }
+     else:
+         return {
+             "filtered_signal": [],
+             "clean_signal": [],
+             "noisy_signal": [],
+             "correlation": 0,
+             "noise_reduction": 0,
+             "signal_length": 0,
+         }
+ 
+ 
+ if __name__ == "__main__":
+     # Test the algorithm
+     results = run_signal_processing()
+     print("Signal processing completed!")
+     print(f"Correlation with clean signal: {results['correlation']:.3f}")
+     print(f"Noise reduction: {results['noise_reduction']:.3f}")
+     print(f"Processed signal length: {results['signal_length']}")

@@ -1,0 +1,211 @@
+<NAME>
+successive_halving_contact_search
+</NAME>
+
+<DESCRIPTION>
+The prior program uses 10 equal 4,600-step Adam searches, followed by three SLSQP polish attempts and stochastic exact-ratio moves. Its main parameters are the beta continuation `8→528`, Adam coefficients `(0.89, 0.995)`, initial learning rate `0.026`, 10 restarts, and 1,100 SLSQP iterations.
+
+This version replaces equal-budget restarts with successive halving: 18 diverse starts receive a shorter broad search (`2,000` iterations, beta `6→190`), are ranked using the exact squared min/max ratio, and only the best 5 receive a longer sharp contact-graph phase (`3,100` iterations, beta `170→950`). This allocates late optimization effort to promising basins while increasing initial contact-graph diversity. The final constrained fixed-minimum-distance SLSQP formulation is applied to the strongest 5 candidates with tighter explicit feasibility polishing. The returned value remains exactly a finite `(14, 3)` NumPy array.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Deterministically search for a fourteen-point diameter packing in R^3.
+
+    The objective is the exact minimum squared pair distance divided by the
+    exact maximum squared pair distance.  Centering and RMS normalization
+    remove translation and uniform-scale null directions during the search.
+    """
+    n, dim = 14, 3
+    iu, ju = np.triu_indices(n, 1)
+    pairs = len(iu)
+    rng = np.random.default_rng(246813579)
+
+    def distances_squared(p: np.ndarray) -> np.ndarray:
+        delta = p[iu] - p[ju]
+        return np.einsum("ij,ij->i", delta, delta)
+
+    def normalize(p: np.ndarray) -> np.ndarray:
+        p = np.asarray(p, dtype=float).copy()
+        p -= p.mean(axis=0, keepdims=True)
+        s = np.sqrt(np.mean(p * p))
+        if np.isfinite(s) and s > 1.0e-14:
+            p /= s
+        return p
+
+    def exact_ratio(p: np.ndarray) -> float:
+        q = distances_squared(p)
+        return float(q.min() / q.max())
+
+    def soft_gradient(p: np.ndarray, beta: float) -> np.ndarray:
+        delta = p[iu] - p[ju]
+        q = np.einsum("ij,ij->i", delta, delta)
+        logd = 0.5 * np.log(q + 1.0e-18)
+
+        lo = -beta * logd
+        lo -= lo.max()
+        wlo = np.exp(lo)
+        wlo /= wlo.sum()
+
+        hi = beta * logd
+        hi -= hi.max()
+        whi = np.exp(hi)
+        whi /= whi.sum()
+
+        pg = (wlo - whi)[:, None] * delta / (q[:, None] + 1.0e-18)
+        g = np.zeros_like(p)
+        np.add.at(g, iu, pg)
+        np.add.at(g, ju, -pg)
+        return g
+
+    def adam_phase(
+        p: np.ndarray,
+        steps: int,
+        beta0: float,
+        beta1: float,
+        lr0: float,
+        lr1: float,
+        power: float,
+    ) -> np.ndarray:
+        """A scale-normalized Adam continuation over soft contact objectives."""
+        m = np.zeros_like(p)
+        v = np.zeros_like(p)
+        b1, b2 = 0.90, 0.996
+
+        for step in range(steps):
+            f = step / max(steps - 1, 1)
+            beta = beta0 + (beta1 - beta0) * (f ** power)
+            g = soft_gradient(p, beta)
+
+            m = b1 * m + (1.0 - b1) * g
+            v = b2 * v + (1.0 - b2) * (g * g)
+            mh = m / (1.0 - b1 ** (step + 1))
+            vh = v / (1.0 - b2 ** (step + 1))
+            lr = lr0 + (lr1 - lr0) * f
+            p = normalize(p + lr * mh / (np.sqrt(vh) + 1.0e-9))
+
+        return p
+
+    # Broad basin discovery.  More starts than the previous equal-budget
+    # strategy expose substantially more potential short/diameter contact
+    # graphs before expensive sharpening is performed.
+    candidates = []
+    for _ in range(18):
+        p = normalize(rng.normal(size=(n, dim)))
+        p = adam_phase(
+            p,
+            steps=2000,
+            beta0=6.0,
+            beta1=190.0,
+            lr0=0.031,
+            lr1=0.0065,
+            power=1.55,
+        )
+        candidates.append((exact_ratio(p), p))
+
+    # Successive halving: sharpen only basins which already have a strong
+    # exact objective, resetting Adam moments between continuation stages.
+    candidates.sort(key=lambda z: z[0], reverse=True)
+    refined = []
+    for _, seed in candidates[:5]:
+        p = adam_phase(
+            seed.copy(),
+            steps=3100,
+            beta0=170.0,
+            beta1=950.0,
+            lr0=0.0080,
+            lr1=0.00115,
+            power=1.30,
+        )
+        refined.append((exact_ratio(p), p))
+
+    refined.sort(key=lambda z: z[0], reverse=True)
+    best_ratio, best = refined[0][0], refined[0][1].copy()
+
+    # The final problem fixes the shortest squared distance to one and
+    # minimizes the diameter squared.  Its reciprocal is exactly the score.
+    try:
+        from scipy.optimize import minimize
+
+        def polish(seed: np.ndarray) -> np.ndarray:
+            q0 = distances_squared(seed)
+            p0 = seed / np.sqrt(q0.min())
+            d0 = float(distances_squared(p0).max()) * (1.0 + 2.0e-10)
+            x0 = np.concatenate((p0.ravel(), [d0]))
+
+            def objective(x: np.ndarray) -> float:
+                return float(x[-1])
+
+            def objective_jac(x: np.ndarray) -> np.ndarray:
+                g = np.zeros_like(x)
+                g[-1] = 1.0
+                return g
+
+            def inequalities(x: np.ndarray) -> np.ndarray:
+                p = x[:-1].reshape(n, dim)
+                q = distances_squared(p)
+                return np.concatenate((q - 1.0, x[-1] - q))
+
+            def inequalities_jac(x: np.ndarray) -> np.ndarray:
+                p = x[:-1].reshape(n, dim)
+                delta = p[iu] - p[ju]
+                out = np.zeros((2 * pairs, n * dim + 1))
+                grad = 2.0 * delta
+                for k in range(pairs):
+                    a, b = iu[k], ju[k]
+                    aa, bb = 3 * a, 3 * b
+                    out[k, aa:aa + 3] = grad[k]
+                    out[k, bb:bb + 3] = -grad[k]
+                    out[pairs + k, aa:aa + 3] = -grad[k]
+                    out[pairs + k, bb:bb + 3] = grad[k]
+                    out[pairs + k, -1] = 1.0
+                return out
+
+            def centroid(x: np.ndarray) -> np.ndarray:
+                return x[:-1].reshape(n, dim).sum(axis=0)
+
+            def centroid_jac(x: np.ndarray) -> np.ndarray:
+                out = np.zeros((dim, n * dim + 1))
+                for k in range(n):
+                    out[:, 3 * k:3 * k + 3] = np.eye(dim)
+                return out
+
+            result = minimize(
+                objective,
+                x0,
+                jac=objective_jac,
+                method="SLSQP",
+                constraints=(
+                    {"type": "ineq", "fun": inequalities, "jac": inequalities_jac},
+                    {"type": "eq", "fun": centroid, "jac": centroid_jac},
+                ),
+                options={"maxiter": 850, "ftol": 1.0e-13, "disp": False},
+            )
+
+            if result.x is not None and np.all(np.isfinite(result.x)):
+                return normalize(result.x[:-1].reshape(n, dim))
+            return normalize(seed)
+
+        for _, seed in refined:
+            p = polish(seed)
+            value = exact_ratio(p)
+            if value > best_ratio:
+                best_ratio, best = value, p.copy()
+
+    except Exception:
+        # The NumPy successive-halving construction remains a valid result
+        # when SciPy is unavailable or an optimizer backend fails.
+        pass
+
+    return np.asarray(normalize(best), dtype=float)
+
+
+# EVOLVE-BLOCK-END
+``` 
+</CODE>

@@ -1,0 +1,308 @@
+# EVOLVE-BLOCK-START
+#include <bits/stdc++.h>
+using namespace std;
+
+static const long long BASE_WEIGHT = 100000;
+static int N, D, Q, used_queries;
+static signed char cmp_cache[105][105];
+static signed char sum_cache[105][105][105];
+static mt19937 rng;
+
+static inline char invert_cmp(char c) {
+    return c == '<' ? '>' : (c == '>' ? '<' : '=');
+}
+
+static char query(const vector<int>& L, const vector<int>& R) {
+    ++used_queries;
+    cout << L.size() << ' ' << R.size();
+    for (int x : L) cout << ' ' << x;
+    for (int x : R) cout << ' ' << x;
+    cout << endl;
+    char ret;
+    cin >> ret;
+    return ret;
+}
+
+static char compare_one(int a, int b) {
+    if (a == b) return '=';
+    if (cmp_cache[a][b]) return (char)cmp_cache[a][b];
+    if (used_queries >= Q) return '=';
+
+    char res = query(vector<int>{a}, vector<int>{b});
+    cmp_cache[a][b] = res;
+    cmp_cache[b][a] = invert_cmp(res);
+    return res;
+}
+
+static char compare_one_two(int x, int a, int b) {
+    if (a > b) swap(a, b);
+    if (sum_cache[x][a][b]) return (char)sum_cache[x][a][b];
+    if (used_queries >= Q) return '=';
+    char res = query(vector<int>{x}, vector<int>{a, b});
+    sum_cache[x][a][b] = res;
+    return res;
+}
+
+static int query_cost(int n, int k) {
+    if (k <= 1) return n - 1;
+    auto lgceil = [](int x) {
+        int r = 0;
+        while ((1 << r) < x) ++r;
+        return r;
+    };
+    int c = k * lgceil(k);
+    for (int j = 2; j < k; ++j) c += lgceil(j - 1);
+    c += (n - k) * lgceil(k);
+    return c;
+}
+
+static void merge_sort_items(vector<int>& a) {
+    int n = (int)a.size();
+    vector<int> tmp(n);
+    for (int width = 1; width < n; width <<= 1) {
+        for (int l = 0; l < n; l += width << 1) {
+            int m = min(n, l + width);
+            int r = min(n, l + (width << 1));
+            int i = l, j = m, p = l;
+            while (i < m && j < r) {
+                char c = compare_one(a[i], a[j]);
+                if (c == '<' || c == '=') tmp[p++] = a[i++];
+                else tmp[p++] = a[j++];
+            }
+            while (i < m) tmp[p++] = a[i++];
+            while (j < r) tmp[p++] = a[j++];
+        }
+        a.swap(tmp);
+    }
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    cin >> N >> D >> Q;
+    rng.seed((uint32_t)chrono::steady_clock::now().time_since_epoch().count());
+
+    vector<long long> est(N, BASE_WEIGHT);
+
+    int k = 1;
+    for (int cand = N; cand >= 1; --cand) {
+        if (query_cost(N, cand) <= Q) {
+            k = cand;
+            break;
+        }
+    }
+
+    vector<int> all(N);
+    iota(all.begin(), all.end(), 0);
+    shuffle(all.begin(), all.end(), rng);
+    vector<int> piv(all.begin(), all.begin() + k);
+    merge_sort_items(piv);
+
+    vector<char> is_pivot(N, 0);
+    for (int x : piv) is_pivot[x] = 1;
+
+    est[piv[0]] = BASE_WEIGHT;
+    if (k >= 2) {
+        char c = compare_one(piv[1], piv[0]);
+        if (c == '=') est[piv[1]] = est[piv[0]];
+        else est[piv[1]] = 2 * est[piv[0]];
+    }
+
+    const long long max_gap = BASE_WEIGHT * (N / max(1, D) + 10LL);
+
+    for (int j = 2; j < k; ++j) {
+        int cur = piv[j];
+        int prev = piv[j - 1];
+        char adjacent = compare_one(cur, prev);
+
+        if (adjacent == '=') {
+            est[cur] = est[prev];
+            continue;
+        }
+
+        long long lo = 1, hi = max_gap;
+        bool has_lo = false, has_hi = false;
+        int left = 0, right = j - 2;
+        int iterations = 0;
+        int count = j - 1;
+        while ((1 << iterations) < count) ++iterations;
+        if (count == 1) iterations = 1;
+
+        for (int it = 0; it < iterations && left <= right && used_queries < Q; ++it) {
+            int mid = (left + right) >> 1;
+            int aux = piv[mid];
+            char c = compare_one_two(cur, prev, aux);
+
+            if (c == '=') {
+                lo = hi = est[aux];
+                has_lo = has_hi = true;
+                break;
+            } else if (c == '<') {
+                hi = est[aux];
+                has_hi = true;
+                right = mid - 1;
+            } else {
+                lo = est[aux];
+                has_lo = true;
+                left = mid + 1;
+            }
+        }
+
+        long long gap;
+        if (has_lo && has_hi) gap = (lo + hi) / 2;
+        else if (has_lo) gap = max(1LL, lo * 2);
+        else if (has_hi) gap = max(1LL, hi / 2);
+        else gap = max(1LL, est[prev]);
+
+        est[cur] = est[prev] + gap;
+    }
+
+    for (int x = 0; x < N; ++x) {
+        if (is_pivot[x]) continue;
+
+        int lo = 0, hi = k - 1;
+        int eq = -1;
+        while (lo <= hi && used_queries < Q) {
+            int mid = (lo + hi) >> 1;
+            char c = compare_one(x, piv[mid]);
+            if (c == '=') {
+                eq = mid;
+                break;
+            }
+            if (c == '<') hi = mid - 1;
+            else lo = mid + 1;
+        }
+
+        if (eq >= 0) {
+            est[x] = est[piv[eq]];
+        } else if (lo <= 0) {
+            long long a = est[piv[0]];
+            long long b = est[piv[min(1, k - 1)]];
+            est[x] = (b > a ? max(1LL, a * a / b) : max(1LL, a / 2));
+        } else if (lo >= k) {
+            long long a = est[piv[k - 1]];
+            long long b = est[piv[max(0, k - 2)]];
+            est[x] = (a > b ? max(1LL, a * a / b) : max(1LL, a * 2));
+        } else {
+            long long a = est[piv[lo - 1]];
+            long long b = est[piv[lo]];
+            est[x] = max(a, min(b, (long long)sqrt((long double)a * b)));
+        }
+    }
+
+    while (used_queries < Q) {
+        int b = 1 + (used_queries % (N - 1));
+        query(vector<int>{0}, vector<int>{b});
+    }
+
+    vector<int> order(N);
+    iota(order.begin(), order.end(), 0);
+    sort(order.begin(), order.end(), [&](int a, int b) {
+        return est[a] != est[b] ? est[a] > est[b] : a < b;
+    });
+
+    vector<int> assign(N), pos(N);
+    vector<long long> sums(D, 0);
+    vector<vector<int>> members(D);
+
+    for (int x : order) {
+        int g = 0;
+        for (int h = 1; h < D; ++h) {
+            if (sums[h] < sums[g]) g = h;
+        }
+        assign[x] = g;
+        pos[x] = (int)members[g].size();
+        members[g].push_back(x);
+        sums[g] += est[x];
+    }
+
+    long double sum_sq = 0;
+    for (long long s : sums) sum_sq += (long double)s * s;
+    long long total = accumulate(est.begin(), est.end(), 0LL);
+
+    auto remove_item = [&](int g, int x) {
+        int p = pos[x];
+        int y = members[g].back();
+        members[g][p] = y;
+        pos[y] = p;
+        members[g].pop_back();
+    };
+    auto add_item = [&](int g, int x) {
+        pos[x] = (int)members[g].size();
+        members[g].push_back(x);
+    };
+
+    const auto start = chrono::steady_clock::now();
+    const auto limit = chrono::milliseconds(1850);
+    long double temperature = max((long double)1.0, sum_sq / max(1, D) * 0.25L);
+    uniform_real_distribution<long double> uni(0.0L, 1.0L);
+
+    long long iter = 0;
+    while (true) {
+        if ((++iter & 255) == 0) {
+            if (chrono::steady_clock::now() - start >= limit) break;
+            temperature *= 0.9999L;
+            if (temperature < 1e-9L) temperature = 1e-9L;
+        }
+
+        bool do_swap = (rng() % 3 == 0);
+        if (!do_swap) {
+            int x = (int)(rng() % N);
+            int a = assign[x];
+            int b = (int)(rng() % D);
+            if (a == b) continue;
+
+            long long w = est[x];
+            long long sa = sums[a], sb = sums[b];
+            long long na = sa - w, nb = sb + w;
+            long double next_sq = sum_sq - (long double)sa * sa - (long double)sb * sb
+                                + (long double)na * na + (long double)nb * nb;
+            long double delta = next_sq - sum_sq;
+
+            if (delta < 0 || uni(rng) < expl(-delta / temperature)) {
+                sums[a] = na;
+                sums[b] = nb;
+                sum_sq = next_sq;
+                remove_item(a, x);
+                add_item(b, x);
+                assign[x] = b;
+            }
+        } else {
+            int a = (int)(rng() % D);
+            int b = (int)(rng() % D);
+            if (a == b || members[a].empty() || members[b].empty()) continue;
+
+            int x = members[a][rng() % members[a].size()];
+            int y = members[b][rng() % members[b].size()];
+            long long wx = est[x], wy = est[y];
+            long long sa = sums[a], sb = sums[b];
+            long long na = sa - wx + wy;
+            long long nb = sb - wy + wx;
+            long double next_sq = sum_sq - (long double)sa * sa - (long double)sb * sb
+                                + (long double)na * na + (long double)nb * nb;
+            long double delta = next_sq - sum_sq;
+
+            if (delta < 0 || uni(rng) < expl(-delta / temperature)) {
+                sums[a] = na;
+                sums[b] = nb;
+                sum_sq = next_sq;
+
+                remove_item(a, x);
+                remove_item(b, y);
+                add_item(a, y);
+                add_item(b, x);
+                assign[x] = b;
+                assign[y] = a;
+            }
+        }
+    }
+
+    for (int i = 0; i < N; ++i) {
+        if (i) cout << ' ';
+        cout << assign[i];
+    }
+    cout << endl;
+    return 0;
+}
+# EVOLVE-BLOCK-END

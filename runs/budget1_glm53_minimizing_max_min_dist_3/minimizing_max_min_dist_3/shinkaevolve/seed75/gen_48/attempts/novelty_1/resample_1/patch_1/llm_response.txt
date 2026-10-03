@@ -1,0 +1,92 @@
+<NAME>
+add_soft_ratio_polish_stage</NAME>
+<DESCRIPTION>
+The current program relies only on a repulsion-style relaxation, which converges to configurations where the min distance is "locally pushed" but is not a true local optimum of the ratio dmin/dmax. A complementary, well-proven technique (used in the higher-scoring variants) is an annealed smooth surrogate: replace dmin and dmax by soft-min/soft-max over squared distances via logsumexp, and minimize that surrogate with L-BFGS while annealing tau to zero. This gradient-based method makes coordinated, simultaneous moves of all 14 points (unlike the greedy pairwise repulsion), and since the objective is built from squared distances it is smooth and well-conditioned for the optimizer. Adding this as a final polish stage applied to the best relaxed configuration, plus a few jittered polish restarts, should refine the ratio beyond what relaxation alone reaches, matching or beating the ~0.94 score of the best prior program while staying well within the time budget (the polish takes ~1s). The polish re-centers and re-normalizes (scale-invariant surrogate on d^2), so the returned points remain valid and normalized to unit diameter.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+import numpy as np
+
+N = 14
+D = 3
+IU = np.triu_indices(N, 1)
+=======
+import numpy as np
+from scipy.optimize import minimize
+from scipy.special import logsumexp
+
+N = 14
+D = 3
+IU = np.triu_indices(N, 1)
+_IJ = np.array([(i, j) for i in range(N) for j in range(i + 1, N)])
+_IJ0 = _IJ[:, 0]
+_IJ1 = _IJ[:, 1]
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+def perturb(P, rng, scale):
+    return normalize(P + rng.normal(scale=scale, size=P.shape))
+=======
+def polish(P0, taus=(0.02, 0.008, 0.003, 0.001, 0.0004, 0.00015)):
+    """Annealed soft-min/soft-max L-BFGS polish on squared distances.
+
+    The surrogate tau*(logsumexp(-d2/tau) + logsumexp(d2/tau)) is smooth,
+    scale-aware, and converges to -(dmin^2 - dmax^2) as tau -> 0, so
+    maximizing it drives the true ratio toward a local optimum with
+    coordinated moves of all points.
+    """
+    P = normalize(P0)
+    x = P.ravel()
+
+    def obj(z, tau):
+        X = z.reshape(N, D)
+        d2 = np.sum((X[_IJ0] - X[_IJ1]) ** 2, axis=1)
+        return tau * (logsumexp(-d2 / tau) + logsumexp(d2 / tau))
+
+    for tau in taus:
+        try:
+            res = minimize(lambda z, t=tau: obj(z, t), x, method="L-BFGS-B",
+                           options={"maxiter": 400, "ftol": 1e-15,
+                                    "gtol": 1e-13})
+            if np.isfinite(res.x).all():
+                x = res.x
+        except Exception:
+            break
+    X = normalize(x.reshape(N, D))
+    return X
+
+
+def perturb(P, rng, scale):
+    return normalize(P + rng.normal(scale=scale, size=P.shape))
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # final polish: tight relaxation restarts around best
+    for k in range(8):
+        Q, s = relax(perturb(best, rng, 0.02), iters=400)
+        if s > best_s:
+            best_s, best = s, Q
+=======
+    # final polish: tight relaxation restarts around best
+    for k in range(8):
+        Q, s = relax(perturb(best, rng, 0.02), iters=400)
+        if s > best_s:
+            best_s, best = s, Q
+
+    # gradient-based soft-ratio polish of the current best
+    Q = polish(best)
+    q = score(Q)
+    if q > best_s:
+        best_s, best = q, Q
+    # jittered polish restarts (coordinated moves can escape relax plateaus)
+    for k in range(6):
+        Q = polish(best + 0.03 * (0.7 ** k) * rng.normal(size=best.shape))
+        q = score(Q)
+        if q > best_s + 1e-12:
+            best_s, best = q, Q
+        # alternate: jitter then relax then polish
+        Qr, _ = relax(perturb(best, rng, 0.02), iters=200)
+        Qp = polish(Qr)
+        q = score(Qp)
+        if q > best_s + 1e-12:
+            best_s, best = q, Qp
+>>>>>>> REPLACE
+</DIFF>

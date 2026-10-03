@@ -1,0 +1,331 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+from solver import Algorithm
+from typing import Tuple, List, Dict, Any
+from collections import Counter, defaultdict
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-cache-aware dataframe reordering.
+
+    Values are never normalized in the returned dataframe.  Normalization to
+    strings is used only for estimating the evaluator's serialization.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    @staticmethod
+    def _serialized_value(value: Any) -> str:
+        """Match the evaluator's fillna('').astype(str) representation."""
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, bool) and missing:
+                return ""
+        except Exception:
+            pass
+        return str(value)
+
+    @staticmethod
+    def _lcp(left: str, right: str) -> int:
+        """Bounded binary-search LCP; slicing comparisons execute in C."""
+        if left == right:
+            return len(left)
+        high = min(len(left), len(right))
+        low = 0
+        while low < high:
+            mid = (low + high + 1) // 2
+            if left[:mid] == right[:mid]:
+                low = mid
+            else:
+                high = mid - 1
+        return low
+
+    def _trie_reuse_score(self, rows: List[str]) -> int:
+        if len(rows) < 2:
+            return 0
+        ordered = sorted(rows)
+        return sum(self._lcp(ordered[i - 1], ordered[i])
+                   for i in range(1, len(ordered)))
+
+    @staticmethod
+    def _flatten(unit_order: List[int], units: List[List[int]]) -> List[int]:
+        return [column for unit in unit_order for column in units[unit]]
+
+    def _make_units(self, columns: List[Any], col_merge: List[List[str]]) -> List[List[int]]:
+        """
+        col_merge is treated as a contiguous ordering requirement.  It must not
+        physically merge or remove columns, since that would alter the data.
+        """
+        positions_by_name = defaultdict(list)
+        for pos, name in enumerate(columns):
+            positions_by_name[name].append(pos)
+
+        used = set()
+        units = []
+        for requested_group in col_merge or []:
+            group = []
+            for name in requested_group:
+                for pos in positions_by_name.get(name, []):
+                    if pos not in used:
+                        group.append(pos)
+                        used.add(pos)
+            if group:
+                units.append(group)
+
+        for pos in range(len(columns)):
+            if pos not in used:
+                units.append([pos])
+        return units
+
+    def _dependency_edges(
+        self,
+        columns: List[Any],
+        units: List[List[int]],
+        one_way_dep: List[Tuple[str, str]],
+    ) -> List[Tuple[int, int]]:
+        """Resolve the historical substring dependency API conservatively."""
+        if not one_way_dep:
+            return []
+
+        unit_for_column = {}
+        for unit_id, unit in enumerate(units):
+            for pos in unit:
+                unit_for_column[pos] = unit_id
+
+        edges = set()
+        names = [str(name) for name in columns]
+        for before, after in one_way_dep:
+            left = [i for i, name in enumerate(names) if str(before) in name]
+            right = [i for i, name in enumerate(names) if str(after) in name]
+            # The old implementation required exactly one match.  Ignoring an
+            # ambiguous request is safer than dropping or corrupting columns.
+            if len(left) == 1 and len(right) == 1:
+                source = unit_for_column[left[0]]
+                target = unit_for_column[right[0]]
+                if source != target:
+                    edges.add((source, target))
+        return sorted(edges)
+
+    @staticmethod
+    def _respect_dependencies(
+        preferred: List[int], edges: List[Tuple[int, int]]
+    ) -> List[int]:
+        """Stable topological ordering using the candidate order as priority."""
+        if not edges:
+            return preferred[:]
+
+        rank = {value: i for i, value in enumerate(preferred)}
+        outgoing = defaultdict(list)
+        indegree = {value: 0 for value in preferred}
+        for source, target in edges:
+            outgoing[source].append(target)
+            indegree[target] += 1
+
+        ready = sorted((value for value in preferred if indegree[value] == 0),
+                       key=rank.get)
+        result = []
+        while ready:
+            current = ready.pop(0)
+            result.append(current)
+            for target in outgoing[current]:
+                indegree[target] -= 1
+                if indegree[target] == 0:
+                    ready.append(target)
+                    ready.sort(key=rank.get)
+
+        # A dependency cycle cannot be fully satisfied.  Retain deterministic
+        # candidate order for the remaining units instead of changing data.
+        if len(result) != len(preferred):
+            present = set(result)
+            result.extend(value for value in preferred if value not in present)
+        return result
+
+    def _global_orders(
+        self, cell_strings: List[List[str]], units: List[List[int]]
+    ) -> Tuple[List[int], List[int]]:
+        """Two cheap global frequency/length order hypotheses."""
+        metrics = []
+        for unit_id, unit in enumerate(units):
+            values = ["".join(row[pos] for pos in unit) for row in cell_strings]
+            counts = Counter(values)
+            pair_weight = sum(
+                len(value) * count * (count - 1)
+                for value, count in counts.items()
+            )
+            repeated_length = sum(
+                len(value) * (count - 1)
+                for value, count in counts.items()
+            )
+            metrics.append((pair_weight, repeated_length, unit_id))
+
+        # Required global hypothesis: len(v) * count(v) * (count(v)-1).
+        frequency_order = [
+            unit_id for _, _, unit_id in
+            sorted(metrics, key=lambda item: (-item[0], -item[1], item[2]))
+        ]
+        # A distinct, less pair-heavy global alternative.
+        repetition_order = [
+            unit_id for _, _, unit_id in
+            sorted(metrics, key=lambda item: (-item[1], -item[0], item[2]))
+        ]
+        return frequency_order, repetition_order
+
+    def _conditional_orders(
+        self,
+        cell_strings: List[List[str]],
+        units: List[List[int]],
+        tail_order: List[int],
+        early_stop: int,
+        col_stop: int,
+    ) -> List[List[int]]:
+        """
+        Build a bounded conditional prefix partition tree.  Every leaf receives
+        a complete unit order, so row-specific output orderings remain valid.
+        """
+        row_count = len(cell_strings)
+        unit_count = len(units)
+        orders = [None] * row_count
+        unit_values = [
+            ["".join(row[pos] for pos in unit) for row in cell_strings]
+            for unit in units
+        ]
+
+        # Avoid a wide-table combinatorial search.  The tail is deterministic.
+        candidate_units = tail_order[:min(32, unit_count)]
+        max_depth = min(12, unit_count)
+        if col_stop is not None and col_stop > 0:
+            max_depth = min(max_depth, col_stop)
+
+        def visit(rows: List[int], selected: List[int], remaining: List[int], depth: int):
+            if len(rows) < 2 or not remaining or depth >= max_depth:
+                final = selected + [u for u in tail_order if u not in selected]
+                for row in rows:
+                    orders[row] = final
+                return
+
+            best_unit = None
+            best_score = 0
+            for unit in remaining:
+                counts = Counter(unit_values[unit][row] for row in rows)
+                score = sum(
+                    len(value) * count * (count - 1)
+                    for value, count in counts.items()
+                )
+                if score > best_score or (
+                    score == best_score and best_unit is not None and unit < best_unit
+                ):
+                    best_score = score
+                    best_unit = unit
+
+            if best_unit is None or best_score <= early_stop:
+                final = selected + [u for u in tail_order if u not in selected]
+                for row in rows:
+                    orders[row] = final
+                return
+
+            partitions = defaultdict(list)
+            for row in rows:
+                partitions[unit_values[best_unit][row]].append(row)
+
+            # A non-partitioning field cannot improve conditional suffix choice.
+            if len(partitions) <= 1:
+                final = selected + [u for u in tail_order if u not in selected]
+                for row in rows:
+                    orders[row] = final
+                return
+
+            next_remaining = [u for u in remaining if u != best_unit]
+            for value in sorted(partitions):
+                visit(partitions[value], selected + [best_unit],
+                      next_remaining, depth + 1)
+
+        visit(list(range(row_count)), [], candidate_units, 0)
+        fallback = tail_order[:]
+        return [order if order is not None else fallback for order in orders]
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        # row_stop, distinct_value_threshold and parallel are retained for API
+        # compatibility.  This bounded implementation does not need threads.
+        del row_stop, distinct_value_threshold, parallel
+
+        n_rows, n_cols = df.shape
+        if n_rows == 0:
+            return df.copy(), []
+        if n_cols == 0:
+            return df.copy(), [[] for _ in range(n_rows)]
+
+        columns = list(df.columns)
+        raw_values = df.to_numpy(dtype=object, copy=False)
+        cell_strings = [
+            [self._serialized_value(raw_values[row, col]) for col in range(n_cols)]
+            for row in range(n_rows)
+        ]
+
+        units = self._make_units(columns, col_merge)
+        edges = self._dependency_edges(columns, units, one_way_dep)
+        global_frequency, global_repetition = self._global_orders(cell_strings, units)
+        global_frequency = self._respect_dependencies(global_frequency, edges)
+        global_repetition = self._respect_dependencies(global_repetition, edges)
+
+        conditional = self._conditional_orders(
+            cell_strings, units, global_frequency, max(0, early_stop), col_stop
+        )
+        conditional = [
+            self._respect_dependencies(order, edges) for order in conditional
+        ]
+
+        candidates = [
+            [global_frequency] * n_rows,
+            [global_repetition] * n_rows,
+            conditional,
+        ]
+
+        best_score = -1
+        best_orders = candidates[0]
+        best_serialized = None
+        for candidate_orders in candidates:
+            serialized = [
+                "".join(cell_strings[row][col]
+                        for col in self._flatten(candidate_orders[row], units))
+                for row in range(n_rows)
+            ]
+            score = self._trie_reuse_score(serialized)
+            if score > best_score:
+                best_score = score
+                best_orders = candidate_orders
+                best_serialized = serialized
+
+        # Sorting does not change ideal Trie reuse, but gives deterministic
+        # insertion order and improves real prefix-cache locality.
+        source_order = sorted(range(n_rows), key=lambda row: (best_serialized[row], row))
+        output = [[None] * n_cols for _ in range(n_rows)]
+        output_orders = []
+
+        for destination, source in enumerate(source_order):
+            source_columns = self._flatten(best_orders[source], units)
+            output[destination] = [raw_values[source, col] for col in source_columns]
+            output_orders.append([columns[col] for col in source_columns])
+
+        # Object dtype preserves mixed values rather than coercing them while
+        # rebuilding a dataframe after row-specific permutations.
+        result = pd.DataFrame(
+            output,
+            columns=columns,
+            index=df.index.take(source_order),
+            dtype=object,
+        )
+        return result, output_orders
+
+# EVOLVE-BLOCK-END

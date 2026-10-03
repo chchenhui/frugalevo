@@ -1,0 +1,135 @@
+<NAME>
+restore_slsqp_polish_top_k</NAME>
+<DESCRIPTION>
+The best previous program (score 0.99, sum 2.61) combined the multi-seed constructor with an SLSQP continuous refinement of the joint (centers, radii) variables. The current program dropped SLSQP entirely and regressed to 0.92. Restore the SLSQP polishing stage, and improve on it by polishing the top-k constructor candidates (not just the single best), since SLSQP is basin-sensitive: different starting layouts converge to different local optima. The SLSQP result is always re-validated/repaired via grow_radii, so validity stays 1.0.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    best = None
+    for cand in candidates:
+        centers, radii, s = refine_layout(cand, r0)
+        if best is None or s > best[2]:
+            best = (centers, radii, s)
+
+    centers, radii, sum_radii = best
+    return centers, radii, sum_radii
+=======
+    results = []
+    for cand in candidates:
+        centers, radii, s = refine_layout(cand, r0)
+        results.append((s, centers, radii))
+    results.sort(key=lambda t: -t[0])
+
+    # SLSQP continuous polish of the top-k basins: refine the joint
+    # (centers, radii) variables for the best few starting layouts and
+    # keep the overall best result.
+    best = (results[0][1], results[0][2], results[0][0])
+    for s0, c0, r0v in results[:5]:
+        out = slsqp_refine(c0, max_iters=300)
+        if out is not None and out[2] > best[2]:
+            best = out
+
+    centers, radii, sum_radii = best
+    return centers, radii, sum_radii
+
+
+def slsqp_refine(centers, max_iters=200):
+    """
+    Continuous refinement of (centers, radii) with SLSQP.
+    Variables: 3n = [x_i, y_i, r_i]. Maximize sum(r) subject to
+    r_i + r_j <= |c_i - c_j| and r_i <= wall distance. The final result
+    is re-validated via grow_radii so it is always a valid packing.
+    Returns (centers, radii, sum).
+    """
+    try:
+        from scipy.optimize import minimize
+    except Exception:
+        return None
+    n = centers.shape[0]
+    r = grow_radii(centers)
+    d = np.sqrt(((centers[:, None] - centers[None, :]) ** 2).sum(-1))
+    np.fill_diagonal(d, np.inf)
+    wall = np.minimum(np.minimum(centers[:, 0], 1 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1 - centers[:, 1]))
+    r = np.minimum(r * 0.98, np.maximum(wall * 0.98, 1e-9))
+    for i in range(n):
+        r[i] = min(r[i], float(np.min(d[i] - r)) - 1e-9)
+        r[i] = max(r[i], 1e-9)
+
+    x0 = np.concatenate([centers.ravel(), r])
+
+    def unpack(z):
+        c = z[:2 * n].reshape(n, 2)
+        rr = z[2 * n:]
+        return c, rr
+
+    def obj(z):
+        return -float(np.sum(z[2 * n:]))
+
+    def obj_grad(z):
+        g = np.zeros_like(z)
+        g[2 * n:] = -1.0
+        return g
+
+    cons = []
+    ii, jj = np.triu_indices(n, k=1)
+
+    def pair_fun(z):
+        c, rr = unpack(z)
+        dvec = np.sqrt(((c[ii] - c[jj]) ** 2).sum(axis=1))
+        return dvec - rr[ii] - rr[jj]
+
+    def pair_jac(z):
+        c, rr = unpack(z)
+        dvec = np.sqrt(((c[ii] - c[jj]) ** 2).sum(axis=1))
+        dvec = np.maximum(dvec, 1e-12)
+        J = np.zeros((ii.size, x0.size))
+        diff = (c[ii] - c[jj]) / dvec[:, None]
+        rows = np.arange(ii.size)
+        J[rows, 2 * ii] = diff[:, 0]
+        J[rows, 2 * jj] = -diff[:, 0]
+        J[rows, 2 * ii + 1] = diff[:, 1]
+        J[rows, 2 * jj + 1] = -diff[:, 1]
+        J[rows, 2 * n + ii] = -1.0
+        J[rows, 2 * n + jj] = -1.0
+        return J
+
+    cons.append({"type": "ineq", "fun": pair_fun, "jac": pair_jac})
+
+    def wall_fun(z):
+        c, rr = unpack(z)
+        return np.concatenate([
+            c[:, 0] - rr, 1 - c[:, 0] - rr,
+            c[:, 1] - rr, 1 - c[:, 1] - rr,
+        ])
+
+    def wall_jac(z):
+        c, rr = unpack(z)
+        m = 4 * n
+        J = np.zeros((m, x0.size))
+        for i in range(n):
+            J[i, 2 * i] = 1.0
+            J[i, 2 * n + i] = -1.0
+            J[n + i, 2 * i] = -1.0
+            J[n + i, 2 * n + i] = -1.0
+            J[2 * n + i, 2 * i + 1] = 1.0
+            J[2 * n + i, 2 * n + i] = -1.0
+            J[3 * n + i, 2 * i + 1] = -1.0
+            J[3 * n + i, 2 * n + i] = -1.0
+        return J
+
+    cons.append({"type": "ineq", "fun": wall_fun, "jac": wall_jac})
+
+    bounds = [(0.001, 0.999)] * (2 * n) + [(1e-6, 0.5)] * n
+
+    try:
+        res = minimize(obj, x0, jac=obj_grad, bounds=bounds, constraints=cons,
+                       method="SLSQP", options={"maxiter": max_iters,
+                                                "ftol": 1e-10})
+        c, rr = unpack(res.x)
+    except Exception:
+        return None
+    c = np.clip(c, 0.001, 0.999)
+    rr = grow_radii(c)
+    return c, rr, float(np.sum(rr))
+>>>>>>> REPLACE
+</DIFF>

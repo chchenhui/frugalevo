@@ -1,0 +1,326 @@
+<NAME>
+kalman_quad_adaptive_mediansnap</NAME>
+<DESCRIPTION>
+The best prior variant (combined 0.54) was the innovation-adaptive Kalman prefilter followed by robust exponentially-weighted local quadratic regression evaluated at the window end — it achieved correlation 0.93-0.94 and noise_reduction 0.50-0.57, far better than the current trend-lock design (0.34 noise reduction, 0.53 combined). The current trend-lock hysteresis over-suppresses dynamics, hurting responsiveness and noise reduction. This edit replaces the trend-lock core with that proven pipeline, then adds a NEW final stage: a locally adaptive median-snap on output differences. Small point-to-point differences that deviate little from a rolling median of diffs are snapped to the median, which removes residual jitter (slope churn / false reversals) without a global threshold — noisy non-stationary segments get aggressive snapping via a rolling MAD-of-diffs, clean segments keep their dynamics. This directly targets slope_changes and false_reversals (the multi-objective smoothness terms) while the quadratic fit's t=0 evaluation keeps phase lag near zero, and the Kalman slope state preserves responsiveness.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+class CappedKalmanTrendLock:
+    """Constant-velocity Kalman filter with capped Q adaptation and trend lock."""
+
+    def __init__(self, meas_var, q_base, q_slope, vel_shrink=0.35,
+                 trend_lock_factor=1.0):
+        self.x = np.zeros(2)              # [level, slope]
+        self.P = np.eye(2) * max(meas_var, 1.0)
+        self.R = max(meas_var, 1e-8)
+        self.q_level = q_level = q_base
+        self.q_slope = q_slope
+        # online slope estimate stats
+        self.slope_ema = 0.0
+        self.slope_var = max(q_slope, 1e-12)   # running var of slope estimates
+        self.forget = 0.95
+        self.vel_shrink = vel_shrink
+        self.lock_factor = trend_lock_factor
+        self.initialized = False
+
+    def _ensure_init(self, z):
+        if not self.initialized:
+            self.x[0] = z
+            self.x[1] = 0.0
+            self.P = np.eye(2) * max(self.R, 1.0)
+            self.initialized = True
+
+    def step(self, z):
+        self._ensure_init(z)
+
+        # ---- predict ----
+        self.x[0] += self.x[1]
+        # P = F P F^T for F = [[1,1],[0,1]]
+        p00, p01, p11 = self.P[0, 0], self.P[0, 1], self.P[1, 1]
+        p00_new = p00 + 2.0 * p01 + p11
+        p01_new = p01 + p11
+        self.P[0, 0] = p00_new
+        self.P[0, 1] = p01_new
+        self.P[1, 0] = p01_new
+
+        # ---- innovation-based adaptive Q (CAPPED) ----
+        innov = z - self.x[0]
+        S = self.P[0, 0] + self.R
+        nis = innov * innov / max(S, 1e-12)
+        # cap the multiplier at 4x so noise cannot flood the velocity state
+        mult = 1.0 + 3.0 * min(nis, 6.0) / 6.0          # in [1, 4]
+        self.P[0, 0] += self.q_level * mult
+        self.P[1, 1] += self.q_slope * mult
+        self.P[0, 1] += 0.5 * self.q_slope * mult
+        self.P[1, 0] = self.P[0, 1]
+
+        # ---- update ----
+        S = self.P[0, 0] + self.R
+        k0 = self.P[0, 0] / S
+        k1 = self.P[1, 0] / S
+        self.x[0] += k0 * innov
+        self.x[1] += k1 * innov
+
+        # covariance update (I - K H) P
+        p00, p01, p11 = self.P[0, 0], self.P[0, 1], self.P[1, 1]
+        new_p00 = (1.0 - k0) * p00
+        new_p01 = (1.0 - k0) * p01
+        new_p10 = p01 - k1 * p00
+        new_p11 = p11 - k1 * p01
+        self.P[0, 0] = max(new_p00, 1e-12)
+        self.P[0, 1] = new_p01
+        self.P[1, 0] = new_p10
+        self.P[1, 1] = max(new_p11, 1e-12)
+
+        # ---- quiet-regime velocity shrinkage (denoise slope) ----
+        if nis < 2.0:
+            self.x[1] = (1.0 - self.vel_shrink) * self.x[1] + \
+                        self.vel_shrink * self.slope_ema
+
+        # ---- trend-lock hysteresis on slope sign ----
+        d = self.x[1] - self.slope_ema
+        self.slope_var = (self.forget * self.slope_var
+                          + (1.0 - self.forget) * d * d)
+        slope_sigma = np.sqrt(max(self.slope_var, 1e-12))
+        threshold = self.lock_factor * slope_sigma
+        if self.slope_ema * self.x[1] < 0.0:  # sign flip proposed
+            if abs(self.x[1]) < threshold:
+                # not significant: keep previous trend direction, scaled
+                self.x[1] = np.sign(self.slope_ema) * \
+                            max(abs(self.x[1]), threshold * 0.5)
+        self.slope_ema = (self.forget * self.slope_ema
+                          + (1.0 - self.forget) * self.x[1])
+
+        return self.x[0]
+=======
+def _adaptive_kalman_prefilter(x):
+    """
+    Constant-velocity (level + slope) Kalman filter with innovation-adaptive
+    process noise. When the normalized innovation is consistent with
+    measurement noise, Q stays small (heavy smoothing, no spurious reversals);
+    when it grows (genuine dynamics), Q expands instantly (responsive
+    tracking, minimal lag). The slope state extrapolates trends, so this
+    stage adds near-zero phase delay.
+    """
+    n = len(x)
+    if n < 3:
+        return np.asarray(x, dtype=float).copy()
+
+    # Robust measurement-noise variance from first differences (MAD-based)
+    d = np.diff(x)
+    med = np.median(d)
+    mad = np.median(np.abs(d - med)) / 0.6745
+    r = max((mad * mad) / 2.0, 1e-8)
+
+    x_state = np.array([x[0], 0.0])
+    P = np.eye(2) * r
+    I = np.eye(2)
+    y = np.empty(n)
+
+    q_base = 1e-3 * r + 1e-9
+    for k in range(n):
+        # Predict (constant velocity)
+        x_state[0] += x_state[1]
+        P[0, 0] += P[0, 1] + P[1, 0] + P[1, 1]
+        P[0, 1] += P[1, 1]
+        P[1, 0] = P[0, 1]
+        # baseline process noise
+        P[0, 0] += q_base
+        P[1, 1] += 0.25 * q_base
+
+        # Innovation-adaptive process noise
+        z = x[k]
+        innov = z - x_state[0]
+        S = P[0, 0] + r
+        nis = innov * innov / max(S, 1e-12)
+        if nis > 1.0:
+            q_dyn = r * min(nis - 1.0, 50.0)
+            P[0, 0] += q_dyn
+            P[1, 1] += 0.25 * q_dyn
+
+        # Update
+        S = P[0, 0] + r
+        K = P[:, 0] / S
+        x_state = x_state + K * innov
+        P = (I - np.outer(K, [1.0, 0.0])) @ P
+        P += np.eye(2) * 1e-9
+
+        y[k] = x_state[0]
+
+    return y
+
+
+def _adaptive_median_snap(y, block=25, snap_thresh=0.6, blend=0.5):
+    """
+    Locally adaptive median-snap on output differences: small point-to-point
+    differences that deviate little from the rolling median of diffs are
+    snapped toward the median, suppressing residual jitter (spurious slope
+    changes / false reversals) without a global threshold. The local MAD of
+    diffs makes the snap aggressive in noisy non-stationary segments and
+    gentle in clean segments, preserving genuine dynamics.
+    """
+    n = len(y)
+    if n < 3:
+        return y
+
+    d = np.diff(y)
+
+    # rolling median and rolling MAD of diffs over +/- block/2 neighborhood
+    half = block // 2
+    d_pad = np.pad(d, half, mode="edge")
+    win = np.lib.stride_tricks.sliding_window_view(d_pad, block)
+    med = np.median(win, axis=1)
+
+    # rolling MAD (robust local noise scale of the diffs)
+    absdev = np.abs(win - med[:, None])
+    mad = np.median(absdev, axis=1) / 0.6745 + 1e-12
+
+    # snap: where the diff is within snap_thresh * local MAD of the local
+    # median diff, pull it toward the median by `blend`.
+    dev = np.abs(d - med)
+    snap_mask = dev < snap_thresh * mad
+    d_new = np.where(snap_mask, med + (1.0 - blend) * (d - med), d)
+
+    # reintegrate from the (unchanged) first level
+    y_out = np.empty_like(y)
+    y_out[0] = y[0]
+    y_out[1:] = y[0] + np.cumsum(d_new)
+
+    # anchor to levels via convex blend so snapped segments do not drift
+    return blend * y_out + (1.0 - blend) * y
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def kalman_trendlock_signal(x, window_size=20):
+    """
+    Capped-Q adaptive Kalman filter with trend-lock hysteresis.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window (W samples)
+
+    Returns:
+        y: Filtered output signal with length = len(x) - window_size + 1
+    """
+    x = np.asarray(x, dtype=float)
+    if len(x) < window_size:
+        raise ValueError(
+            f"Input signal length ({len(x)}) must be >= window_size ({window_size})"
+        )
+
+    r = _estimate_meas_var(x)
+    # slightly raised q_base so genuine dynamics still track under the cap
+    q_level = 4e-3 * r + 1e-7
+    q_slope = 8e-5 * r + 1e-9
+    kf = CappedKalmanTrendLock(r, q_level, q_slope,
+                               vel_shrink=0.35, trend_lock_factor=1.2)
+
+    warmup = window_size - 1
+    for i in range(warmup):
+        kf.step(x[i])
+
+    n_out = len(x) - window_size + 1
+    y = np.empty(n_out)
+    for j in range(n_out):
+        y[j] = kf.step(x[warmup + j])
+
+    # light 3-tap post-smoothing: suppresses residual spurious reversals
+    # with negligible phase delay (symmetric kernel)
+    if n_out >= 3:
+        y[1:-1] = 0.25 * y[:-2] + 0.5 * y[1:-1] + 0.25 * y[2:]
+
+    return y
+=======
+def kalman_trendlock_signal(x, window_size=20):
+    """
+    Adaptive Kalman pre-filter + robust weighted local quadratic regression
+    evaluated at the window end (zero trend lag), finalized by a locally
+    adaptive median-snap to suppress residual slope churn.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window (W samples)
+
+    Returns:
+        y: Filtered output signal with length = len(x) - window_size + 1
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < window_size:
+        raise ValueError(
+            f"Input signal length ({n}) must be >= window_size ({window_size})"
+        )
+
+    output_length = n - window_size + 1
+    y = np.zeros(output_length)
+
+    # Stage 0: adaptive Kalman pre-filter (noise reduction with no phase lag;
+    # slope state extrapolates trends so genuine dynamics are preserved).
+    xs = _adaptive_kalman_prefilter(x)
+
+    # Exponential weights emphasizing recent samples (adaptive to
+    # non-stationarity)
+    weights = np.exp(np.linspace(-2, 0, window_size))
+    weights = weights / np.sum(weights)
+
+    # Time axis anchored so the LAST sample in the window is t = 0:
+    # evaluating the fitted quadratic at t=0 gives zero trend-lag output.
+    t = np.arange(window_size, dtype=float) - (window_size - 1)
+    t2 = t * t
+    ones = np.ones(window_size)
+
+    def _fit(w, win):
+        """Solve weighted normal equations for [a, b, c] of a*t^2 + b*t + c."""
+        S1 = np.dot(w, ones)        # sum w
+        St = np.dot(w, t)           # sum w*t
+        St2 = np.dot(w, t2)         # sum w*t^2
+        St3 = np.dot(w, t2 * t)     # sum w*t^3
+        St4 = np.dot(w, t2 * t2)    # sum w*t^4
+        Sx = np.dot(w, win)         # sum w*x
+        Stx = np.dot(w * t, win)    # sum w*t*x
+        Sttx = np.dot(w * t2, win)  # sum w*t^2*x
+
+        A = np.array([[St4, St3, St2],
+                      [St3, St2, St],
+                      [St2, St, S1]])
+        rhs = np.array([Sttx, Stx, Sx])
+        try:
+            sol = np.linalg.solve(A, rhs)
+        except np.linalg.LinAlgError:
+            # Degenerate: fall back to weighted mean
+            sol = np.array([0.0, 0.0, Sx / S1 if S1 > 1e-12 else np.mean(win)])
+        return sol  # value at t=0 is sol[2]
+
+    for i in range(output_length):
+        win = xs[i : i + window_size]
+
+        # --- Pass 1: weighted local quadratic fit, evaluated at window end ---
+        sol = _fit(weights, win)
+        a, b, c0 = sol
+        fit = a * t2 + b * t + c0
+
+        # --- Pass 2: Huber-style robust reweighting to suppress outliers ---
+        resid = win - fit
+        scale = np.std(resid)
+        if scale > 1e-12:
+            rw = weights.copy()
+            big = np.abs(resid) > 2.0 * scale
+            rw[big] *= scale / (np.abs(resid[big]) + 1e-12)
+            sol2 = _fit(rw, win)
+            y[i] = sol2[2]
+        else:
+            y[i] = c0
+
+    # Stage 2: locally adaptive median-snap on diffs (removes residual slope
+    # churn / false reversals; local MAD adapts snapping to local noise level)
+    y = _adaptive_median_snap(y, block=25, snap_thresh=0.6, blend=0.5)
+
+    # Stage 3: light 3-tap post-smoothing (symmetric kernel, negligible delay)
+    if output_length >= 3:
+        y[1:-1] = 0.25 * y[:-2] + 0.5 * y[1:-1] + 0.25 * y[2:]
+
+    return y
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

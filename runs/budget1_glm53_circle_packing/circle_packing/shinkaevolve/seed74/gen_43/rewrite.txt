@@ -1,0 +1,216 @@
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles (vectorized LP + local search)."""
+import numpy as np
+from scipy.optimize import linprog
+from scipy.sparse import coo_matrix
+
+
+class LPSolver:
+    """Precomputes static LP structure; per-call only recomputes distances."""
+
+    def __init__(self, n):
+        self.n = n
+        iu, ju = np.triu_indices(n, 1)
+        self.iu, self.ju = iu, ju
+        self.n_pairs = len(iu)
+        m = self.n_pairs + n
+        # static row indices for COO assembly
+        self.rows_i = np.concatenate([np.arange(self.n_pairs), np.arange(self.n_pairs, m)])
+        self.cols = np.concatenate([iu, ju, np.arange(n)])
+        self.data_ones = np.ones(m)
+        self.wall_rows = np.arange(self.n_pairs, m)
+        self.c = -np.ones(n)
+
+    def solve(self, centers):
+        n = self.n
+        d = np.sqrt(((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1))
+        b_ub = np.empty(self.n_pairs + n)
+        b_ub[:self.n_pairs] = d[self.iu, self.ju]
+        b_ub[self.n_pairs:] = np.minimum.reduce(
+            [centers[:, 0], centers[:, 1], 1 - centers[:, 0], 1 - centers[:, 1]])
+        A_ub = coo_matrix(
+            (self.data_ones, (self.rows_i, self.cols)),
+            shape=(self.n_pairs + n, n)).tocsr()
+        res = linprog(c=self.c, A_ub=A_ub, b_ub=b_ub,
+                      bounds=[(0, None)] * n, method="highs")
+        if res.success:
+            return res.x
+        return _fallback_radii(centers)
+
+
+def _fallback_radii(centers):
+    n = centers.shape[0]
+    radii = np.minimum.reduce([centers[:, 0], centers[:, 1],
+                               1 - centers[:, 0], 1 - centers[:, 1]])
+    dist = np.sqrt(((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1))
+    np.fill_diagonal(dist, np.inf)
+    for _ in range(200):
+        cap = np.min(dist - radii[None, :], axis=1)
+        new_r = np.maximum(np.minimum(radii, cap), 0.0)
+        new_r = np.minimum(new_r, np.minimum.reduce(
+            [centers[:, 0], centers[:, 1], 1 - centers[:, 0], 1 - centers[:, 1]]))
+        if np.max(np.abs(radii - new_r)) < 1e-12:
+            break
+        radii = new_r
+    return radii
+
+
+def _gen_rows(prefix, remaining_rows, remaining, lo, hi, out):
+    if remaining_rows == 0:
+        if remaining == 0:
+            out.append(list(prefix))
+        return
+    for c in range(lo, hi + 1):
+        if c <= remaining - lo * (remaining_rows - 1):
+            _gen_rows(prefix + [c], remaining_rows - 1,
+                     remaining - c, lo, hi, out)
+
+
+def _build_layout(rows, vscale=1.0):
+    n_rows = len(rows)
+    dy = (1.0 / (n_rows + 1)) * vscale
+    y0 = 0.5 - (n_rows - 1) * dy / 2.0
+    centers = []
+    for r, count in enumerate(rows):
+        y = y0 + r * dy
+        dx = 1.0 / (count + 1)
+        offset = 0.5 * dx if (r % 2 == 1) else 0.0
+        for c in range(count):
+            x = (c + 1) * dx + offset
+            centers.append([x, y])
+    arr = np.array(centers)
+    np.clip(arr, 0.005, 0.995, out=arr)
+    return arr
+
+
+def construct_packing():
+    n = 26
+    solver = LPSolver(n)
+
+    layouts = []
+    for n_rows in (4, 5, 6, 7):
+        _gen_rows([], n_rows, n, 3, 7, layouts)
+
+    # Stage 1: score all compositions with several vertical scalings
+    scored = []
+    for rows in layouts:
+        for vscale in (0.94, 1.0, 1.06):
+            c = _build_layout(rows, vscale=vscale)
+            r = solver.solve(c)
+            s = float(np.sum(r))
+            scored.append((s, rows, vscale))
+    scored.sort(key=lambda t: -t[0])
+
+    best_centers = best_radii = None
+    best_s = -1.0
+
+    # Stage 2: local search on top basins
+    for _, rows, vscale in scored[:10]:
+        centers = _build_layout(rows, vscale=vscale)
+        cur_s = float(np.sum(solver.solve(centers)))
+
+        boundaries = []
+        idx0 = 0
+        for cnt in rows:
+            boundaries.append((idx0, idx0 + cnt))
+            idx0 += cnt
+
+        def try_accept(trial):
+            nonlocal centers, cur_s
+            r = solver.solve(trial)
+            s = float(np.sum(r))
+            if s > cur_s + 1e-9:
+                centers, cur_s = trial, s
+                return True
+            return False
+
+        for _sweep in range(4):
+            improved = False
+            # row x-shifts
+            for (a, b) in boundaries:
+                for d in (-0.02, -0.008, -0.003, 0.003, 0.008, 0.02):
+                    trial = centers.copy()
+                    trial[a:b, 0] += d
+                    np.clip(trial, 0.005, 0.995, out=trial)
+                    improved |= try_accept(trial)
+            # row y-shifts
+            for (a, b) in boundaries:
+                for d in (-0.01, -0.004, 0.004, 0.01):
+                    trial = centers.copy()
+                    trial[a:b, 1] += d
+                    np.clip(trial, 0.005, 0.995, out=trial)
+                    improved |= try_accept(trial)
+            # vertical scaling about center
+            for vy in (0.985, 1.015):
+                trial = centers.copy()
+                trial[:, 1] = 0.5 + (trial[:, 1] - 0.5) * vy
+                improved |= try_accept(trial)
+            if not improved:
+                break
+
+        # Stage 3: fine per-circle jitter
+        for _sweep in range(3):
+            improved = False
+            for i in range(n):
+                for dxy in ((0.004, 0), (-0.004, 0), (0, 0.004), (0, -0.004)):
+                    trial = centers.copy()
+                    trial[i] += dxy
+                    np.clip(trial, 0.005, 0.995, out=trial)
+                    improved |= try_accept(trial)
+            if not improved:
+                break
+
+        if cur_s > best_s:
+            best_centers, best_s = centers, cur_s
+
+    radii = solver.solve(best_centers)
+    # ensure validity via fallback if LP slightly off
+    if radii is None:
+        radii = _fallback_radii(best_centers)
+    return best_centers, radii, float(np.sum(radii))
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

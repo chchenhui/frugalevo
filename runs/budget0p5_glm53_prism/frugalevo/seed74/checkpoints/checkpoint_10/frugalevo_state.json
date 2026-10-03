@@ -1,0 +1,426 @@
+{
+  "version": 24,
+  "curve": {
+    "unit": "usd",
+    "budget": 0.5,
+    "spent": 0.031539225,
+    "final_incumbent": 26.19581260467673,
+    "ba_auc": 13.083108135420254,
+    "ba_auc_normalized": 26.166216270840508,
+    "num_points": 11,
+    "points": [
+      {
+        "cost": 0.0,
+        "score": 21.891622105209393,
+        "incumbent": 21.891622105209393,
+        "iteration": 0,
+        "candidates": 0
+      },
+      {
+        "cost": 0.00101835,
+        "score": 22.338544725203036,
+        "incumbent": 22.338544725203036,
+        "iteration": 1,
+        "candidates": 2
+      },
+      {
+        "cost": 0.001528375,
+        "score": 25.80596345447857,
+        "incumbent": 25.80596345447857,
+        "iteration": 2,
+        "candidates": 1
+      },
+      {
+        "cost": 0.002054975,
+        "score": 0.0,
+        "incumbent": 25.80596345447857,
+        "iteration": 3,
+        "candidates": 1
+      },
+      {
+        "cost": 0.018708469999999998,
+        "score": 25.80596345447857,
+        "incumbent": 25.80596345447857,
+        "iteration": 4,
+        "candidates": 3
+      },
+      {
+        "cost": 0.022354149999999996,
+        "score": 25.798905210735487,
+        "incumbent": 25.80596345447857,
+        "iteration": 5,
+        "candidates": 3
+      },
+      {
+        "cost": 0.023129375,
+        "score": 26.18074097351008,
+        "incumbent": 26.18074097351008,
+        "iteration": 6,
+        "candidates": 1
+      },
+      {
+        "cost": 0.023587575,
+        "score": 26.189145997510494,
+        "incumbent": 26.189145997510494,
+        "iteration": 7,
+        "candidates": 1
+      },
+      {
+        "cost": 0.026535724999999996,
+        "score": 26.19581260467673,
+        "incumbent": 26.19581260467673,
+        "iteration": 8,
+        "candidates": 3
+      },
+      {
+        "cost": 0.028416865,
+        "score": 26.19581260467673,
+        "incumbent": 26.19581260467673,
+        "iteration": 9,
+        "candidates": 3
+      },
+      {
+        "cost": 0.031539225,
+        "score": 26.19581260467673,
+        "incumbent": 26.19581260467673,
+        "iteration": 10,
+        "candidates": 3
+      }
+    ]
+  },
+  "strategy_objective_guidance": "- The evaluator delegates to a hidden `evaluator.py`; its internal scoring function is not visible here. What is visible is the task statement, so I base the analysis on the nominal objective it almost certainly rewards: **minimize the maximum KVPR across all GPUs**, subject to hard feasibility constraints (every model assigned, every GPU's memory capacity respected, no crashes).\n- Hard validity constraints (likely gates on score): every model must be placed; `sum(model_size) <= GPU_MEM_SIZE` per GPU; no division by zero (denominator `GPU_MEM_SIZE - sum(model_size)` must stay > 0, ideally comfortably so); the code must execute without exceptions. Any violation likely scores zero, so feasibility dominates any optimization gain.\n- The scored objective is a **min-max** quantity: max over GPUs of `(\u03a3 req_rate/slo) / (GPU_MEM_SIZE - \u03a3 model_size)`. Lowering the *worst* GPU is the only lever; improving a non-bottleneck GPU is unscored.\n- Structural tradeoff inside the objective: the numerator (traffic density \u03a3 req_rate/slo) and the denominator (free memory after loading models) pull in the same direction \u2014 you want to spread load *and* keep memory slack on the loaded GPUs. A GPU with small models but heavy traffic can still dominate; a near-full GPU with huge models but low traffic can also dominate. Placement is a balance of two per-GPU costs.\n- The program is given the full model list and GPU list at once (batch/offline); no streaming requirement \u2014 global combinatorial optimization is legitimate.\n- Likely secondary scored/reported term: simplicity of the generated code (\"as simple as possible\") \u2014 a compact, readable implementation may itself be part of the score or at least reduces failure risk. Do not over-engineer.",
+  "strategy_diverge_guidance": "- Greedy best-fit by marginal max-KVPR: place models one at a time (sorted by req_rate/slo or model_size descending) onto the GPU that yields the smallest resulting KVPR while remaining memory-feasible. Simple, pure Python, no dependencies; strong baseline.\n- Local search / swap improvement: start from any feasible assignment, repeatedly move or swap a single model between GPUs if it lowers the max KVPR; stop at local optimum. scipy.optimize or hand-rolled hill climbing; deterministic and cheap.\n- Global assignment via metaheuristic: scipy.optimize.differential_evolution or a simulated-annealing loop over assignment vectors; use the seed initial program's placement as initialization. Worth it only if greedy stalls above an unknown threshold.\n- Balanced partitioning view: treat it as a multiway partition problem \u2014 networkx/graph partition heuristics or a linear relaxation with rounding (scipy.optimize.linprog) over fractional assignment followed by rounding plus repair. Higher complexity; only if simpler families fail.\n- Linear-programming lower bound: use linprog to compute the theoretical best max-KVPR (relaxed); useful as a stopping criterion and to bound how much refinement remains.",
+  "strategy_refine_guidance": "- Order models by decreasing `req_rate/slo` before greedy placement (largest-load-first reduces max-KVPR in min-max problems); re-seed greedy with several sort keys (size, load, load/size) and keep the best.\n- After greedy, run pairwise swap + single-model-move local search until no move lowers max KVPR; this directly attacks the bottleneck GPU only \u2014 target moves involving the argmax GPU for efficiency.\n- Guard feasibility numerically: leave a safety margin on memory (e.g., cap utilization at 99% of GPU_MEM_SIZE) and raise a fallback (split largest model to emptiest GPU) if any denominator is near zero \u2014 prevents hard-zero crashes.\n- Multiple restarts (e.g., 10\u201320 randomized greedy orders with numpy.random) taking the best max-KVPR; deterministic tie-break for reproducibility.\n- Complexity control: if a metaheuristic branch is added, keep it behind a small iteration budget (e.g., a few hundred evaluations) so runtime stays modest and the code stays \"as simple as possible.\"",
+  "strategy_guidance_attempted": true,
+  "strategy_guidance_cost": 0.0044122,
+  "strategies": [
+    {
+      "index": 1,
+      "title": "[multistart-portfolio-greedy] Multi-seed greedy with distinct deterministic sort",
+      "plan": "Mechanism family: deterministic multistart greedy (portfolio of initial constructions)\nReplacement scope: The initial greedy construction loop inside `compute_model_placement` (the `sorted_models` ordering and single greedy pass), keeping the existing local search as a shared post-refinement.\nCompute budget: at most 5 greedy constructions (sort keys: req_rate/slo desc, model_size desc, req_rate/slo per GB desc, model_size*req_rate/slo desc, and the reverse-size-then-load key), each followed by the incumbent move/swap local search; ~5x current evaluation time (still well under 10ms for typical instance sizes).\nGain mechanism: The incumbent's outcome is determined by a single load-ordered greedy seed; the local search is a hill climber that cannot cross reordering barriers. Different seeds place qualitatively different models first (e.g., large-low-traffic models), producing placements in different basins that the move/swap local search cannot reach from the single incumbent seed. Taking the min over finished seeds strictly dominates the single seed (the incumbent seed is included in the portfolio as one of the starts, so the result is never worse).\nHard-validity preserved: every construction is the same feasible greedy with the existing memory check `< GPU_MEM_SIZE`, so no placement can violate capacity; the fallback of keeping the incumbent seed guarantees no regression.\nExpected-gain check: since one portfolio start is exactly the incumbent seed plus the same local search, the returned max KVPR is \u2264 the incumbent's 24.805963-metric placement by construction, and typically strictly lower because size-first seeds avoid near-full bottleneck GPUs the load-first seed creates \u2014 a falsifiable threshold is any strict drop in `max_kvpr` on the same test battery.",
+      "cost": 0.0031377166666666655,
+      "best_score": null,
+      "baseline_score": 25.80596345447857,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 0,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.0009427150000000002,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 4,
+      "failure_feedback": [
+        "Missing compute_model_placement function"
+      ]
+    },
+    {
+      "index": 2,
+      "title": "[bottleneck-ejection-chain] Targeted ejection chains on the argmax GPU",
+      "plan": "Mechanism family: local search escape via ejection chains (depth-2/3 relocation from the bottleneck GPU)\nReplacement scope: The local-search phase of `compute_model_placement` (both the move loop and the swap loop) is replaced by a bottleneck-targeted ejection search; the greedy construction stays.\nCompute budget: one ejection pass per improvement: for the single argmax GPU, try all (model_i \u2192 other GPU) moves, all (model_i \u2194 model_j) swaps with any other GPU, and all depth-2 chains (model_i from bottleneck to GPU g2, plus one model k from any GPU to the bottleneck or a third GPU), capping total candidate evaluations at ~models \u00d7 gpus \u00d7 3 per round and stopping after no improvement; expected runtime of the same order as the incumbent (\u2264 a few ms).\nGain mechanism: The incumbent's local search only accepts single moves or direct pairwise swaps that strictly reduce the global max KVPR. It cannot realize chains like \"move model A off the bottleneck, which makes room for model B to move onto it, lowering the max\" \u2014 a two-step sequence where the intermediate state is worse or equal. Ejection chains add this degree of freedom: after removing model i from the bottleneck GPU (which may raise some other GPU's KVPR), re-optimize the displaced load among the remaining GPUs, including backfilling the now-relieved bottleneck with a smaller-ratio model. This is a genuinely different escape direction than a 1-move/1-swap hill climber.\nHard-validity preserved: every candidate intermediate state still satisfies `sum(model_size) < GPU_MEM_SIZE` per GPU via the same explicit checks; only feasible final chains are committed, so the placement never becomes infeasible or empty.\nExpected-gain check: the incumbent is a strict subset of the incumbent's own move set (depth-1 moves/swaps are depth-1 chains), so the final max KVPR is \u2264 the incumbent's on the same metric, and the new depth-2/3 chains provide transitions the incumbent provably cannot take \u2014 the falsifiable threshold is a strict `max_kvpr` reduction on at least one test case where the greedy+1-swap search stalls.",
+      "cost": 0.0031377166666666655,
+      "best_score": 25.80596345447857,
+      "baseline_score": 25.80596345447857,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 1,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.0009427150000000002,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 4,
+      "failure_feedback": []
+    },
+    {
+      "index": 3,
+      "title": "[lp-relaxation-rounding] Fractional LP lower bound with ratio-guided rounding an",
+      "plan": "Mechanism family: global continuous relaxation + constructive rounding (different representation: fractional assignment variables)\nReplacement scope: Replaces the entire `compute_model_placement` body with (a) a bisection on the target KVPR T with an LP-style per-GPU capacity check, and (b) a deterministic rounding-and-repair assignment; keep the incumbent greedy+local search as fallback if rounding fails to beat it.\nCompute budget: bisection to ~1e-4 relative tolerance (\u2264 40 iterations, each a linear pass over models \u00d7 GPUs) plus one rounding pass with repair; total runtime bounded by ~50 \u00d7 models \u00d7 gpus operations, comparable to or below the incumbent's local search; no external solver required if implemented as the closed-form check below.\nGain mechanism: Rewrite the constraint `KVPR_g \u2264 T` for GPU g as a single linear packing constraint: `\u03a3_i x_{i,g} \u00b7 (r_i/s_i + T\u00b7m_i) \u2264 T\u00b7GPU_MEM_SIZE` over assignment variables x_{i,g} \u2208 [0,1] with `\u03a3_g x_{i,g} = 1`. For a candidate T this is a generalized-assignment feasibility check solvable by LP relaxation; the smallest feasible T is a true lower bound and the LP's fractional solution is a load-balanced starting point the greedy never sees \u2014 greedy makes irrevocable myopic choices, while the relaxation spreads every model fractionally across all GPUs proportionally to its combined cost `r_i/s_i + T\u00b7m_i`. Rounding assigns each model to the GPU holding its largest fractional mass, then repairs overflow by moving the smallest-cost model to the emptiest feasible GPU, followed by the incumbent's local search for final polish. This is a structural exploration: it can escape both the greedy's myopia and the 1-move local optimum because the rounded solution lives in a different basin.\nHard-validity preserved: the repair step guarantees every GPU satisfies `\u03a3 model_size < GPU_MEM_SIZE` before returning; if no feasible rounding is found (e.g., LP infeasible even at large T), return the incumbent greedy+local-search result, so the function never raises and never returns an infeasible placement.\nExpected-gain check: the LP lower bound on max KVPR can be printed during development to verify the incumbent's 24.805963-metric placement has slack; the new degree of freedom is the fractional assignment (models split proportionally across GPUs before rounding), which no greedy order can express, and the falsifiable threshold is a returned `max_kvpr` strictly below the incumbent's on the same test battery, with the LP bound certifying how much headroom remains.",
+      "cost": 0.0031377166666666655,
+      "best_score": null,
+      "baseline_score": 25.80596345447857,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 0,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.0009427150000000002,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 4,
+      "failure_feedback": [
+        "Diff SEARCH blocks did not match parent solution - no changes applied: I'll implement the LP-relaxation bisection with ratio-guided rounding, repair, and keep the incumbent greedy+local-search as a fallback (returning whichever is better). **Reasoning:** - Rewrite `KVPR_g \u2264 T` as `\u03a3 (r_i/s_i + T\u00b7m_i) \u2264 T\u00b7GPU_MEM_SIZE` per GPU \u2014 a linear packing constraint. - Bisect on T: for each candidat"
+      ]
+    },
+    {
+      "index": 4,
+      "title": "ordered attempt [bottleneck-ejection-chain] Targeted ejection chains on the argmax GPU",
+      "plan": "Mechanism family: local search escape via ejection chains (depth-2/3 relocation from the bottleneck GPU)\nReplacement scope: The local-search phase of `compute_model_placement` (both the move loop and the swap loop) is replaced by a bottleneck-targeted ejection search; the greedy construction stays.\nCompute budget: one ejection pass per improvement: for the single argmax GPU, try all (model_i \u2192 other GPU) moves, all (model_i \u2194 model_j) swaps with any other GPU, and all depth-2 chains (model_i from bottleneck to GPU g2, plus one model k from any GPU to the bottleneck or a third GPU), capping total candidate evaluations at ~models \u00d7 gpus \u00d7 3 per round and stopping after no improvement; expected runtime of the same order as the incumbent (\u2264 a few ms).\nGain mechanism: The incumbent's local search only accepts single moves or direct pairwise swaps that strictly reduce the global max KVPR. It cannot realize chains like \"move model A off the bottleneck, which makes room for model B to move onto it, lowering the max\" \u2014 a two-step sequence where the intermediate state is worse or equal. Ejection chains add this degree of freedom: after removing model i from the bottleneck GPU (which may raise some other GPU's KVPR), re-optimize the displaced load among the remaining GPUs, including backfilling the now-relieved bottleneck with a smaller-ratio model. This is a genuinely different escape direction than a 1-move/1-swap hill climber.\nHard-validity preserved: every candidate intermediate state still satisfies `sum(model_size) < GPU_MEM_SIZE` per GPU via the same explicit checks; only feasible final chains are committed, so the placement never becomes infeasible or empty.\nExpected-gain check: the incumbent is a strict subset of the incumbent's own move set (depth-1 moves/swaps are depth-1 chains), so the final max KVPR is \u2264 the incumbent's on the same metric, and the new depth-2/3 chains provide transitions the incumbent provably cannot take \u2014 the falsifiable threshold is a strict `max_kvpr` reduction on at least one test case where the greedy+1-swap search stalls.",
+      "cost": 0.0,
+      "best_score": 25.798905210735487,
+      "baseline_score": 25.80596345447857,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 3,
+      "implementations": 3,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": 2,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 1,
+      "implementation_spend": 0.0036456799999999984,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 5,
+      "failure_feedback": []
+    },
+    {
+      "index": 5,
+      "title": "ordered attempt [multistart-portfolio-greedy] Multi-seed greedy with distinct deterministic sort",
+      "plan": "Mechanism family: deterministic multistart greedy (portfolio of initial constructions)\nReplacement scope: The initial greedy construction loop inside `compute_model_placement` (the `sorted_models` ordering and single greedy pass), keeping the existing local search as a shared post-refinement.\nCompute budget: at most 5 greedy constructions (sort keys: req_rate/slo desc, model_size desc, req_rate/slo per GB desc, model_size*req_rate/slo desc, and the reverse-size-then-load key), each followed by the incumbent move/swap local search; ~5x current evaluation time (still well under 10ms for typical instance sizes).\nGain mechanism: The incumbent's outcome is determined by a single load-ordered greedy seed; the local search is a hill climber that cannot cross reordering barriers. Different seeds place qualitatively different models first (e.g., large-low-traffic models), producing placements in different basins that the move/swap local search cannot reach from the single incumbent seed. Taking the min over finished seeds strictly dominates the single seed (the incumbent seed is included in the portfolio as one of the starts, so the result is never worse).\nHard-validity preserved: every construction is the same feasible greedy with the existing memory check `< GPU_MEM_SIZE`, so no placement can violate capacity; the fallback of keeping the incumbent seed guarantees no regression.\nExpected-gain check: since one portfolio start is exactly the incumbent seed plus the same local search, the returned max KVPR is \u2264 the incumbent's 24.805963-metric placement by construction, and typically strictly lower because size-first seeds avoid near-full bottleneck GPUs the load-first seed creates \u2014 a falsifiable threshold is any strict drop in `max_kvpr` on the same test battery.",
+      "cost": 0.0,
+      "best_score": 26.19581260467673,
+      "baseline_score": 25.80596345447857,
+      "improvement_epsilon": 1e-07,
+      "rounds": 4,
+      "attempts": 8,
+      "implementations": 7,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": 1,
+      "cumulative_gain": 0.3898491501981596,
+      "cumulative_relative_gain": 0.014890434824722267,
+      "productive_rounds": 3,
+      "barren_rounds": 1,
+      "implementation_spend": 0.006062715000000003,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 9,
+      "failure_feedback": [
+        "Missing compute_model_placement function",
+        "Placement 0: Error - list.remove(x): x not in list"
+      ]
+    },
+    {
+      "index": 6,
+      "title": "ordered attempt [lp-relaxation-rounding] Fractional LP lower bound with ratio-guided rounding an",
+      "plan": "Mechanism family: global continuous relaxation + constructive rounding (different representation: fractional assignment variables)\nReplacement scope: Replaces the entire `compute_model_placement` body with (a) a bisection on the target KVPR T with an LP-style per-GPU capacity check, and (b) a deterministic rounding-and-repair assignment; keep the incumbent greedy+local search as fallback if rounding fails to beat it.\nCompute budget: bisection to ~1e-4 relative tolerance (\u2264 40 iterations, each a linear pass over models \u00d7 GPUs) plus one rounding pass with repair; total runtime bounded by ~50 \u00d7 models \u00d7 gpus operations, comparable to or below the incumbent's local search; no external solver required if implemented as the closed-form check below.\nGain mechanism: Rewrite the constraint `KVPR_g \u2264 T` for GPU g as a single linear packing constraint: `\u03a3_i x_{i,g} \u00b7 (r_i/s_i + T\u00b7m_i) \u2264 T\u00b7GPU_MEM_SIZE` over assignment variables x_{i,g} \u2208 [0,1] with `\u03a3_g x_{i,g} = 1`. For a candidate T this is a generalized-assignment feasibility check solvable by LP relaxation; the smallest feasible T is a true lower bound and the LP's fractional solution is a load-balanced starting point the greedy never sees \u2014 greedy makes irrevocable myopic choices, while the relaxation spreads every model fractionally across all GPUs proportionally to its combined cost `r_i/s_i + T\u00b7m_i`. Rounding assigns each model to the GPU holding its largest fractional mass, then repairs overflow by moving the smallest-cost model to the emptiest feasible GPU, followed by the incumbent's local search for final polish. This is a structural exploration: it can escape both the greedy's myopia and the 1-move local optimum because the rounded solution lives in a different basin.\nHard-validity preserved: the repair step guarantees every GPU satisfies `\u03a3 model_size < GPU_MEM_SIZE` before returning; if no feasible rounding is found (e.g., LP infeasible even at large T), return the incumbent greedy+local-search result, so the function never raises and never returns an infeasible placement.\nExpected-gain check: the LP lower bound on max KVPR can be printed during development to verify the incumbent's 24.805963-metric placement has slack; the new degree of freedom is the fractional assignment (models split proportionally across GPUs before rounding), which no greedy order can express, and the falsifiable threshold is a returned `max_kvpr` strictly below the incumbent's on the same test battery, with the LP bound certifying how much headroom remains.",
+      "cost": 0.0,
+      "best_score": 26.19581260467673,
+      "baseline_score": 26.19581260467673,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 3,
+      "implementations": 2,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": 3,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 1,
+      "implementation_spend": 0.0031223599999999976,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 10,
+      "failure_feedback": [
+        "Diff SEARCH blocks did not match parent solution - no changes applied: I'll implement the LP-relaxation bisection with ratio-guided rounding, repair, and keep the incumbent greedy+local-search as a fallback (returning whichever is better). **Reasoning:** - Rewrite `KVPR_g \u2264 T` as `\u03a3 (r_i/s_i + T\u00b7m_i) \u2264 T\u00b7GPU_MEM_SIZE` per GPU \u2014 a linear packing constraint. - Bisect on T: for each candidat",
+        "unexpected indent (tmpx1cpm5co.py, line 146)"
+      ]
+    }
+  ],
+  "active_strategy": 6,
+  "strategy_queue": [],
+  "ordered_portfolio_roots": [
+    1,
+    2,
+    3
+  ],
+  "ordered_exploitation_queue": [],
+  "ordered_active_root": null,
+  "ordered_pilot_scores": {
+    "1": null,
+    "2": 25.80596345447857,
+    "3": null
+  },
+  "ordered_phase": "exploit",
+  "ordered_reference_feedback": [],
+  "strategy_reference_failure_streak": 0,
+  "strategy_reference_disabled": false,
+  "strategy_costs": [
+    0.009413149999999997
+  ],
+  "implementation_costs": [
+    0.000509175,
+    0.0005100250000000001,
+    0.0005266000000000001,
+    0.0009427150000000002,
+    0.0012152266666666661,
+    0.0007752250000000044,
+    0.0004581999999999989,
+    0.0009827166666666655,
+    0.0006270466666666678,
+    0.0010407866666666658
+  ],
+  "guide_implementation_costs": [],
+  "guide_implementation_due": false,
+  "guide_implementation_due_reason": null,
+  "guide_implementation_unguided": false,
+  "strategy_call_count": 1,
+  "anchor_next_cheap_to_incumbent": false,
+  "opening_cheap_probe_done": true,
+  "opening_failure_retries_used": 0,
+  "opening_guide_hedge_done": false,
+  "success_achieved": false,
+  "barren_rounds": 1,
+  "stagnation": 2,
+  "next_strategy_escalation": 32,
+  "strategy_escalation_gap": 32,
+  "seen_solutions": [
+    "03d8bbfe64653014cd0a0ab3b4f2d8fc6ec34066",
+    "0795d3981aa44077d2bd50cb738f3979c6d45c06",
+    "0a767b03ddffe09b9732cd246f881c7f934c1feb",
+    "161f6cb4e84322bd02ffb978055e7638da2d74e8",
+    "46a42868fa82bb7a511b35ce772d7119effc6bde",
+    "485a3c88fa4a9c8d99fc3dfb899c4743853152b7",
+    "4906fa40a09bd54f78621676c03b789e090e5bc7",
+    "747bf6325921a20b34604bf5da07741faa863e38",
+    "a406e3a663656230ce9ae32f3ee71af2ae679996",
+    "ba094a7cf04fcc90c5d746f22dd06d2e11ed4f93",
+    "c00a319ef611ae8b3cbf15f7e796ca092d579624",
+    "d31ce1251c881b6a0f5ae1350f68722c11867cf0",
+    "e0b247731aeb568cd3d29a3da1ba73b5efbe8b71",
+    "ec1c61e6654d526b53c532e080a40bf1d38317fe",
+    "faa5afea7afa5d5b5170ace8518e03f842b895be",
+    "fb4a2685f1c8a6e6cd2ac81f825da41ddb04c65b"
+  ],
+  "score_ledger": [
+    [
+      19.974605869,
+      1
+    ],
+    [
+      22.338544725,
+      1
+    ],
+    [
+      25.805963454,
+      2
+    ],
+    [
+      21.525162125,
+      1
+    ],
+    [
+      25.792446959,
+      1
+    ],
+    [
+      25.798905211,
+      1
+    ],
+    [
+      26.180740974,
+      1
+    ],
+    [
+      26.189145998,
+      1
+    ],
+    [
+      25.960187383,
+      1
+    ],
+    [
+      26.177450105,
+      1
+    ],
+    [
+      25.990896303,
+      1
+    ],
+    [
+      25.951319976,
+      1
+    ],
+    [
+      26.195812605,
+      3
+    ]
+  ],
+  "cost_samples": [
+    [
+      2,
+      0.00101835
+    ],
+    [
+      1,
+      0.0005100250000000001
+    ],
+    [
+      1,
+      0.0005266000000000001
+    ],
+    [
+      3,
+      0.016653494999999997
+    ],
+    [
+      3,
+      0.0036456799999999984
+    ],
+    [
+      1,
+      0.0007752250000000044
+    ],
+    [
+      1,
+      0.0004581999999999989
+    ],
+    [
+      3,
+      0.0029481499999999966
+    ],
+    [
+      3,
+      0.0018811400000000034
+    ],
+    [
+      3,
+      0.0031223599999999976
+    ]
+  ],
+  "exploring": true
+}

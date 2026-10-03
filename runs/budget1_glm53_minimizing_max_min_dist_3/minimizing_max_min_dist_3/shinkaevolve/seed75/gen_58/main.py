@@ -1,0 +1,222 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
+
+    Returns
+        points: np.ndarray of shape (14,3) containing the (x,y,z) coordinates of the 14 points.
+
+    """
+
+    from scipy.optimize import minimize
+    from scipy.special import logsumexp
+
+    n = 14
+    d = 3
+    iu = np.triu_indices(n, 1)
+
+    def dists(p):
+        diff = p[:, None, :] - p[None, :, :]
+        D2 = (diff * diff).sum(-1)
+        return np.sqrt(np.maximum(D2[iu], 1e-12))
+
+    def ratio(p):
+        D = dists(p)
+        return D.min() / D.max()
+
+    def norm_cfg(pts):
+        pts = pts - pts.mean(axis=0)
+        return pts / max(np.linalg.norm(pts, axis=1).max(), 1e-12)
+
+    rng = np.random.default_rng(0)
+    best_pts = None
+    best_r = -1.0
+
+    def make_loss(T):
+        def loss(x):
+            p = x.reshape(n, d)
+            p = p - p.mean(axis=0)
+            D = dists(p)
+            D = D / max(D.max(), 1e-9)
+            smin = -T * logsumexp(-D / T)
+            smax = T * logsumexp(D / T)
+            return -(smin / smax)
+        return loss
+
+    def anneal(pts, taus, maxiter, maxfun, ftol=1e-12, gtol=1e-10):
+        for T in taus:
+            res = minimize(make_loss(T), pts.ravel(), method="L-BFGS-B",
+                           options={"maxiter": maxiter, "maxfun": maxfun,
+                                    "ftol": ftol, "gtol": gtol})
+            q = res.x.reshape(n, d)
+            if np.isfinite(q).all():
+                pts = norm_cfg(q)
+        return pts
+
+    # --- Seed library ---
+    def d6_seed(p, h, r):
+        t = 2 * np.pi * np.arange(6) / 6.0
+        ring1 = np.stack([r * np.cos(t), r * np.sin(t), np.full(6, h)], axis=1)
+        ring2 = np.stack([r * np.cos(t + np.pi / 6), r * np.sin(t + np.pi / 6),
+                          np.full(6, -h)], axis=1)
+        poles = np.array([[0.0, 0.0, p], [0.0, 0.0, -p]])
+        return np.vstack([ring1, ring2, poles])
+
+    seeds = [d6_seed(1.0, 0.35, 1.0), d6_seed(1.1, 0.4, 1.05),
+             d6_seed(0.9, 0.3, 0.9), d6_seed(1.2, 0.45, 1.0)]
+    phi = (1 + np.sqrt(5)) / 2
+    ico = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    ], dtype=float)
+    ico /= np.linalg.norm(ico, axis=1, keepdims=True)
+    for pz in (1.0, 1.1):
+        seeds.append(np.vstack([ico, [[0.0, 0.0, pz], [0.0, 0.0, -pz]]]))
+    # twisted heptagon double rings
+    for twist in (0.0, np.pi / 7):
+        t = 2 * np.pi * np.arange(7) / 7
+        ring1 = np.stack([np.cos(t), np.sin(t), np.full(7, -0.5)], axis=1)
+        ring2 = np.stack([np.cos(t + twist), np.sin(t + twist), np.full(7, 0.5)], axis=1)
+        seeds.append(np.vstack([ring1, ring2]))
+    # random sphere starts
+    for _ in range(5):
+        p = rng.normal(size=(n, d))
+        seeds.append(p / np.linalg.norm(p, axis=1, keepdims=True))
+
+    # --- Phase 1: seed sweep (shorter ladder to save time) ---
+    for P0 in seeds:
+        pts = norm_cfg(np.asarray(P0, dtype=float).copy())
+        pts = anneal(pts, (0.06, 0.02, 0.008, 0.003), 400, 1500)
+        r = ratio(pts)
+        if r > best_r:
+            best_r = r
+            best_pts = pts.copy()
+
+    # --- Phase 2: strong perturb-and-reanneal around incumbent (key upgrade) ---
+    for trial in range(4):
+        scale = 0.05 + 0.012 * trial
+        P0 = best_pts + scale * rng.normal(size=(n, d)) / np.sqrt(3)
+        pts = norm_cfg(P0)
+        pts = anneal(pts, (0.06, 0.02, 0.01, 0.005, 0.002), 400, 1200)
+        r = ratio(pts)
+        if r > best_r:
+            best_r = r
+            best_pts = pts.copy()
+
+    # --- Phase 3: low-temperature polish with tiny kicks ---
+    for trial in range(2):
+        scale = 0.004 + 0.003 * trial
+        P0 = best_pts + scale * rng.normal(size=(n, d)) / np.sqrt(3)
+        pts = norm_cfg(P0)
+        pts = anneal(pts, (0.002, 0.001, 0.0005, 0.0002), 600, 2500,
+                     ftol=1e-14, gtol=1e-12)
+        r = ratio(pts)
+        if r > best_r:
+            best_r = r
+            best_pts = pts.copy()
+
+    # --- Phase 4: targeted pair-move hill-climb on binding constraints ---
+    # Push the closest pair apart and pull the farthest pair together,
+    # along their connecting directions, with an adaptive shrinking step.
+    def full_ratio(P):
+        D = dists(P)
+        return D.min() / D.max()
+
+    def pair_moves(P, step, tol=0.05):
+        """Yield candidate configurations from targeted pair moves over
+        all near-binding (near-min and near-max) pairs."""
+        D = dists(P)
+        iu2 = np.triu_indices(n, 1)
+        ii, jj = iu2
+        dmin, dmax = D.min(), D.max()
+        # all pairs within `tol` of the extremes are treated as binding
+        near_min = np.where(D <= dmin * (1 + tol))[0]
+        near_max = np.where(D >= dmax * (1 - tol))[0]
+        cands = []
+        for idx in near_min:
+            i, j = ii[idx], jj[idx]
+            u = P[j] - P[i]
+            nu = np.linalg.norm(u)
+            if nu > 1e-12:
+                u = u / nu
+                Q = P.copy(); Q[i] -= step * u; Q[j] += step * u
+                cands.append(Q)
+        for idx in near_max:
+            k, l = ii[idx], jj[idx]
+            v = P[l] - P[k]
+            nv = np.linalg.norm(v)
+            if nv > 1e-12:
+                v = v / nv
+                Q = P.copy(); Q[k] += step * v; Q[l] -= step * v
+                cands.append(Q)
+        # combined moves: separate a binding min pair AND pull in a
+        # binding max pair simultaneously
+        for a in range(min(len(near_min), 3)):
+            i, j = ii[near_min[a]], jj[near_min[a]]
+            u = P[j] - P[i]
+            nu = np.linalg.norm(u)
+            if nu <= 1e-12:
+                continue
+            u = u / nu
+            for b in range(min(len(near_max), 3)):
+                k, l = ii[near_max[b]], jj[near_max[b]]
+                v = P[l] - P[k]
+                nv = np.linalg.norm(v)
+                if nv <= 1e-12:
+                    continue
+                v = v / nv
+                Q = P.copy()
+                Q[i] -= step * u; Q[j] += step * u
+                Q[k] += step * v; Q[l] -= step * v
+                cands.append(Q)
+        return cands
+
+    # Staged tolerance schedule: broad band early to improve many
+    # near-binding constraints, tight band at the end for precision.
+    for _round, tol in enumerate((0.10, 0.05, 0.02)):
+        cur = norm_cfg(best_pts.copy())
+        cur_r = full_ratio(cur)
+        step = 0.02
+        while step > 1e-6:
+            improved = False
+            for Q in pair_moves(cur, step, tol):
+                Qn = norm_cfg(Q)
+                if np.isfinite(Qn).all():
+                    r = full_ratio(Qn)
+                    if r > cur_r:
+                        cur_r = r
+                        cur = Qn
+                        improved = True
+            if not improved:
+                step *= 0.5
+        if cur_r > best_r:
+            best_r = cur_r
+            best_pts = cur.copy()
+        # re-anneal the hill-climb output: pair moves alone are not a
+        # local optimum of the smooth objective; let L-BFGS-B relax all
+        # coordinates at low temperature, then hill-climb again.
+        re = anneal(norm_cfg(best_pts.copy()),
+                    (0.003, 0.001, 0.0003), 500, 2000,
+                    ftol=1e-14, gtol=1e-12)
+        r = full_ratio(re)
+        if r > best_r:
+            best_r = r
+            best_pts = re.copy()
+
+    # --- Normalize and guard ---
+    points = np.asarray(best_pts, dtype=float)
+    points = points - points.mean(axis=0)
+    Dm = dists(points).max()
+    if (not np.isfinite(points).all()) or points.shape != (n, d) or Dm <= 0:
+        points = rng.normal(size=(n, d))
+    else:
+        points = points / Dm
+
+    return points
+
+
+# EVOLVE-BLOCK-END

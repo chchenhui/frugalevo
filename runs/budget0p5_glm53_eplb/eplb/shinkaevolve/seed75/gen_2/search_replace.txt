@@ -1,0 +1,63 @@
+<NAME>
+vectorize_balanced_packing_hot_loop
+</NAME>
+<DESCRIPTION>
+The dominant cost of the algorithm is `balanced_packing`, which runs an O(num_layers × num_groups) Python loop where each iteration does `min(...)` over generator packs AND indexes into a torch tensor (`indices[i]` iterates over 0-d tensors — each access is a slow tensor-to-Python conversion). Converting the sorted indices and weights to plain Python lists once per call removes all tensor overhead from the hot loop. Additionally, we only need `min` over packs that aren't full — tracking the pack candidates in a small list and using `min(candidates, key=...)` on a plain list is dramatically faster than a generator over all packs with a conditional. Since `num_groups` is at most a few hundred, pure-Python lists are far faster than tensor ops per element. This cuts algorithm execution time substantially (improving `times_algorithm` and the speed score) while producing identical packing results, so balancedness is preserved. We also vectorize `replicate_experts`'s per-iteration division (weight/logcnt each iteration recomputes a full tensor division on all experts; we can update only the changed entry) — actually simpler: keep it but compute on the smaller per-node slice which it already is; the main win is balanced_packing.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    indices = weight.float().sort(-1, descending=True).indices.cpu().tolist()
+    weights = weight.cpu().tolist()
+    pack_index = torch.full((num_layers, num_groups),
+                            fill_value=-1,
+                            dtype=torch.int64,
+                            device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    pack_index_rows = pack_index.tolist()
+    rank_in_pack_rows = rank_in_pack.tolist()
+    for i in range(num_layers):
+        w = weights[i]
+        idx = indices[i]
+        pi = pack_index_rows[i]
+        ri = rank_in_pack_rows[i]
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        # packs that still have capacity
+        candidates = list(range(num_packs))
+        for group in idx:
+            pack = min(candidates, key=pack_weights.__getitem__)
+            pi[group] = pack
+            ri[group] = pack_items[pack]
+            pack_weights[pack] += w[group]
+            pack_items[pack] += 1
+            if pack_items[pack] == groups_per_pack:
+                candidates.remove(pack)
+    pack_index.copy_(torch.as_tensor(pack_index_rows,
+                                     dtype=torch.int64))
+    rank_in_pack.copy_(torch.as_tensor(rank_in_pack_rows,
+                                       dtype=torch.int64))
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

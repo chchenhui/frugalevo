@@ -1,0 +1,87 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+N = 14
+D = 3
+
+
+def pair_data(P):
+    diff = P[:, None, :] - P[None, :, :]
+    dist = np.sqrt((diff ** 2).sum(-1))
+    np.fill_diagonal(dist, np.inf)
+    iu = np.triu_indices(N, 1)
+    return diff, dist, iu
+
+
+def evaluate(P):
+    _, dist, iu = pair_data(P)
+    dm = dist[iu]
+    dmin, dmax = dm.min(), dm.max()
+    if dmax <= 0:
+        return -1.0
+    return (dmin / dmax) ** 2
+
+
+def project_sphere(P):
+    return P / np.linalg.norm(P, axis=1, keepdims=True)
+
+
+from scipy.optimize import minimize
+
+
+def smooth_objective(P, beta):
+    diff = P[:, None, :] - P[None, :, :]
+    dist = np.sqrt((diff ** 2).sum(-1) + 1e-12)
+    iu = np.triu_indices(N, 1)
+    dm = dist[iu]
+    wmin = np.exp(-beta * (dm - dm.min()))
+    dmin_s = (dm * wmin).sum() / wmin.sum()
+    wmax = np.exp(beta * (dm - dm.max()))
+    dmax_s = (dm * wmax).sum() / wmax.sum()
+    return -(dmin_s / dmax_s)
+
+
+def optimize(P0, beta, maxiter):
+    res = minimize(lambda x: smooth_objective(x.reshape(N, D), beta),
+                   P0.ravel(), method="L-BFGS-B",
+                   options={"maxiter": maxiter, "maxfun": 10 * maxiter, "ftol": 1e-14})
+    return res.x.reshape(N, D)
+
+
+def initializers():
+    seeds = []
+    cube = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], dtype=float)
+    seeds.append(project_sphere(np.vstack([cube[:7], -cube[:7]])))
+    # icosahedron vertices + centers
+    phi = (1 + 5 ** 0.5) / 2
+    ico = []
+    for a in (-1, 1):
+        for b in (-phi, phi):
+            ico += [[0, a, b], [a, b, 0], [b, 0, a]]
+    ico = np.array(ico, dtype=float)
+    c = ico.mean(0)
+    ico = project_sphere(ico - c)
+    seeds.append(np.vstack([ico, -ico[:2]]))
+    for s in range(10):
+        rng = np.random.RandomState(100 + s)
+        seeds.append(project_sphere(rng.randn(N, D)))
+    return seeds
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    best_s, best_P = -1.0, None
+    for idx, P0 in enumerate(initializers()):
+        # phase 1: soft objective to find a good basin
+        P = optimize(P0, beta=12.0, maxiter=250)
+        # phase 2: anneal beta upward so smooth min/max track the true extrema
+        for beta in (25.0, 60.0):
+            P = optimize(P, beta=beta, maxiter=200)
+        s = evaluate(P)
+        if s > best_s:
+            best_s, best_P = s, P.copy()
+    best_P = best_P - best_P.mean(0)
+    best_P = best_P / np.abs(best_P).max()
+    return best_P
+
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,105 @@
+<NAME>
+shared_multicast_tree
+</NAME>
+
+<DESCRIPTION>
+Replace independent source-to-destination shortest paths with a cost-aware directed multicast tree. The new search first removes unusable, unpriced links and then repeatedly attaches the remaining destination with the cheapest path from any node already reached by the broadcast tree. This allows destinations to reuse previously selected transit trunks, reducing redundant inter-cloud transfer charges while retaining valid per-destination ordered paths for every partition. The deterministic tie-breaker prefers higher-throughput branches when branch costs are equal, improving the ability to overlap transfers without sacrificing billing cost.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Build a shared directed broadcast tree.  A link selected for an earlier
+    receiver becomes a zero-copy trunk for later receivers, so only newly
+    attached tree branches add transfer cost.
+    """
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    if src not in G:
+        return bc_topology
+
+    # Dijkstra cannot safely optimize missing prices.  Exclude those links,
+    # source ingress links, and loops which cannot improve a broadcast route.
+    h = nx.DiGraph()
+    for u, v, data in G.edges(data=True):
+        cost = data.get("cost")
+        try:
+            cost = float(cost)
+        except (TypeError, ValueError):
+            continue
+        if u == v or v == src or cost < 0:
+            continue
+        h.add_edge(u, v, **dict(data))
+
+    if src not in h:
+        return bc_topology
+
+    tree = nx.DiGraph()
+    tree.add_node(src)
+    remaining = set(dsts)
+
+    def branch_weight(u, v, data):
+        # Cost is primary; the tiny throughput term is only a deterministic
+        # tie-breaker that favors branches capable of parallel transfer.
+        throughput = data.get("throughput", 0.0)
+        try:
+            throughput = float(throughput)
+        except (TypeError, ValueError):
+            throughput = 0.0
+        return float(data["cost"]) + 1e-12 / max(throughput, 1e-12)
+
+    # Directed Steiner-tree heuristic: attach the cheapest destination branch
+    # from any already-reached relay, not necessarily directly from the source.
+    while remaining:
+        best = None
+        for anchor in sorted(tree.nodes, key=str):
+            for dst in sorted(remaining, key=str):
+                try:
+                    path = nx.dijkstra_path(h, anchor, dst, weight=branch_weight)
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    continue
+                branch_cost = sum(
+                    float(h[u][v]["cost"]) for u, v in zip(path, path[1:])
+                    if not tree.has_edge(u, v)
+                )
+                candidate = (branch_cost, str(dst), str(anchor), dst, path)
+                if best is None or candidate[:3] < best[:3]:
+                    best = candidate
+
+        if best is None:
+            break
+
+        _, _, _, dst, path = best
+        for u, v in zip(path, path[1:]):
+            tree.add_edge(u, v, **dict(h[u][v]))
+        remaining.remove(dst)
+
+    # Materialize each receiver's ordered tree route.  Identical partitions
+    # preserve shared edge records, enabling downstream schedulers to overlap
+    # trunk transmissions and fan-out branches.
+    for dst in dsts:
+        if dst not in tree or not nx.has_path(tree, src, dst):
+            continue
+        path = nx.shortest_path(tree, src, dst)
+        edges = [[u, v, dict(G[u][v])] for u, v in zip(path, path[1:])]
+        for partition in range(num_partitions):
+            bc_topology.set_dst_partition_paths(dst, partition, list(edges))
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

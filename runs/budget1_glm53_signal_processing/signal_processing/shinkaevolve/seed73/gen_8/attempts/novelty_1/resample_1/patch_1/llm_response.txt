@@ -1,0 +1,146 @@
+<NAME>
+adaptive_kalman_double_smoothing</NAME>
+<DESCRIPTION>
+Replace the exponential-weighted moving average with an adaptive Kalman filter (online, zero structural lag) cascaded with a light double-exponential (Holt) smoother and a slope-gated reversal suppression step. The Kalman filter adaptively estimates local signal and slope, and its innovation-based noise estimate tunes the smoothing strength: strong smoothing in noisy flat regions (fewer false reversals, fewer slope changes), light smoothing when a genuine trend is detected (low lag error, good tracking). This directly targets all four objectives simultaneously and is O(n) so efficiency stays high.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Enhanced version with trend preservation using weighted moving average.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window
+
+    Returns:
+        y: Filtered output signal
+    """
+    if len(x) < window_size:
+        raise ValueError(f"Input signal length ({len(x)}) must be >= window_size ({window_size})")
+
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+    # Create weights that emphasize recent samples
+    weights = np.exp(np.linspace(-2, 0, window_size))
+    weights = weights / np.sum(weights)
+
+    for i in range(output_length):
+        window = x[i : i + window_size]
+
+        # Weighted moving average with exponential weights
+        y[i] = np.sum(window * weights)
+
+    return y
+=======
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Enhanced version: adaptive Kalman filter (local level + slope model) with
+    innovation-adaptive measurement noise, cascaded with a light Holt
+    double-exponential smoother and slope-gated reversal suppression.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window (controls adaptation strength)
+
+    Returns:
+        y: Filtered output signal with length = len(x) - window_size + 1
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < window_size:
+        raise ValueError(f"Input signal length ({n}) must be >= window_size ({window_size})")
+
+    output_length = n - window_size + 1
+
+    # ---- Stage 1: adaptive Kalman filter (constant-velocity model) ----
+    # State: [level, slope]. Process noise tuned via window_size:
+    # larger window -> smoother (more noise suppression, more lag tolerance).
+    q_level = 0.05 / max(1, window_size)
+    q_slope = 0.005 / max(1, window_size)
+    Q = np.diag([q_level, q_slope])
+    F = np.array([[1.0, 1.0], [0.0, 1.0]])
+    H = np.array([[1.0, 0.0]])
+
+    level = x[0]
+    slope = 0.0
+    P = np.eye(2)
+    # Robust initial measurement-noise estimate from first differences
+    R = max(np.var(np.diff(x[: min(n, window_size)])) * 0.5, 1e-8)
+    R_min = R * 0.1
+    R_max = R * 10.0
+
+    kf_out = np.empty(n)
+    kf_slope = np.empty(n)
+    for i in range(n):
+        # Predict
+        level_pred = level + slope
+        slope_pred = slope
+        P = F @ P @ F.T + Q
+
+        # Innovation and adaptive R (EWMA of squared innovations)
+        innov = x[i] - level_pred
+        R = float(np.clip(0.98 * R + 0.02 * max(innov * innov, R_min), R_min, R_max))
+
+        # Robust update: downweight outliers (Huber-style)
+        S = P[0, 0] + R
+        mahal2 = innov * innov / S
+        if mahal2 > 9.0:
+            R_eff = R * mahal2 / 3.0  # inflate R for outliers
+        else:
+            R_eff = R
+        S = P[0, 0] + R_eff
+        K = np.array([P[0, 0] / S, P[1, 0] / S])
+
+        level = level_pred + K[0] * innov
+        slope = slope_pred + K[1] * innov
+        P = (np.eye(2) - np.outer(K, H)) @ P
+        # Symmetrize / stabilize
+        P = 0.5 * (P + P.T)
+
+        kf_out[i] = level
+        kf_slope[i] = slope
+
+    # ---- Stage 2: slope-gated light double-exponential (Holt) smoothing ----
+    # Smooth more where the Kalman slope is small (noise-dominated regions),
+    # smooth less where a genuine trend is present (preserves responsiveness).
+    alpha = 0.6  # base level smoothing
+    beta = 0.15  # base trend smoothing
+    s = kf_out[0]
+    b = kf_slope[0]
+    hs = np.empty(n)
+    for i in range(n):
+        trend_strength = min(abs(kf_slope[i]) / (np.std(kf_slope) + 1e-12), 1.0)
+        a_eff = alpha - 0.4 * trend_strength  # less smoothing in trends
+        a_eff = float(np.clip(a_eff, 0.2, alpha))
+        prev_s, prev_b = s, b
+        s = a_eff * kf_out[i] + (1 - a_eff) * (prev_s + prev_b)
+        b = beta * (s - prev_s) + (1 - beta) * prev_b
+        hs[i] = s
+
+    # ---- Stage 3: slope-gated reversal suppression ----
+    # Suppress sign flips of the estimated slope unless the flip is large
+    # relative to local slope noise (kills noise-induced false reversals).
+    y_full = hs.copy()
+    slope_noise = np.std(np.diff(hs)) + 1e-12
+    gate = 0.5 * slope_noise
+    est_slope = np.zeros(n)
+    est_slope[0] = 0.0
+    for i in range(1, n):
+        est_slope[i] = hs[i] - hs[i - 1]
+    # Median filter on slope (window 3) with gating
+    for i in range(1, n - 1):
+        med = np.median(est_slope[i - 1 : i + 2])
+        if abs(est_slope[i] - med) < gate:
+            est_slope[i] = med
+    # Reintegrate gated slopes through the levels (mild correction)
+    y_full[0] = hs[0]
+    for i in range(1, n):
+        y_full[i] = y_full[i - 1] + est_slope[i]
+
+    # ---- Extract window-aligned output ----
+    y = y_full[window_size - 1 :]
+
+    return y
+>>>>>>> REPLACE
+</DIFF>

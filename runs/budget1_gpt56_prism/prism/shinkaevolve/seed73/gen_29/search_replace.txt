@@ -1,0 +1,151 @@
+<NAME>
+pressure_aware_seeds_and_exchanges
+</NAME>
+
+<DESCRIPTION>
+Add objective-aware construction orders and a memory-feasible one-for-two exchange neighborhood. The existing greedy seeds can miss placements where a large high-pressure model must trade places with two smaller models; neither a single move nor a one-for-one swap can cross this capacity barrier. Evaluating such exchanges only after moves and swaps preserves the inexpensive successful search path while expanding its ability to escape fragmentation-driven local optima. The added seed orderings prioritize models whose individual placement leaves little KV-cache capacity, improving the starting basins considered by local search.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Different orderings address both KVPR balancing and memory fragmentation.
+    ordered_inputs = [
+        sorted(models, key=lambda m: (weight(m), m.model_size), reverse=True),
+        sorted(models, key=lambda m: (m.model_size, weight(m)), reverse=True),
+        sorted(models, key=lambda m: weight(m) * m.model_size, reverse=True),
+        sorted(
+            models,
+            key=lambda m: weight(m) / m.model_size if m.model_size > 0 else float("inf"),
+            reverse=True,
+        ),
+        sorted(models, key=lambda m: (m.model_size, -weight(m)), reverse=True),
+    ]
+=======
+    # Different orderings address both KVPR balancing and memory fragmentation.
+    # The final orders directly prioritize the pressure a model can create when
+    # it consumes most of a GPU's available cache capacity.
+    ordered_inputs = [
+        sorted(models, key=lambda m: (weight(m), m.model_size), reverse=True),
+        sorted(models, key=lambda m: (m.model_size, weight(m)), reverse=True),
+        sorted(models, key=lambda m: weight(m) * m.model_size, reverse=True),
+        sorted(
+            models,
+            key=lambda m: weight(m) / m.model_size if m.model_size > 0 else float("inf"),
+            reverse=True,
+        ),
+        sorted(models, key=lambda m: (m.model_size, -weight(m)), reverse=True),
+        sorted(
+            models,
+            key=lambda m: weight(m) / max(1e-9, GPU_MEM_SIZE - m.model_size),
+            reverse=True,
+        ),
+        sorted(models, key=lambda m: (weight(m), -m.model_size), reverse=True),
+    ]
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            if best_action is None:
+                break
+
+            if best_action[0] == "move":
+                _, source, target, model = best_action
+                state.move(source, target, model)
+            else:
+                _, left_gpu, right_gpu, left_model, right_model = best_action
+                state.swap(left_gpu, right_gpu, left_model, right_model)
+=======
+            # A one-for-two exchange crosses capacity barriers that prevent both
+            # relocations and ordinary swaps from improving the placement.
+            if best_action is None:
+                for first_gpu in range(gpu_num):
+                    for second_gpu in range(first_gpu + 1, gpu_num):
+                        for left_gpu, right_gpu in (
+                            (first_gpu, second_gpu),
+                            (second_gpu, first_gpu),
+                        ):
+                            right_models = state.groups[right_gpu]
+                            for left_model in state.groups[left_gpu]:
+                                for first_index in range(len(right_models)):
+                                    for second_index in range(
+                                        first_index + 1, len(right_models)
+                                    ):
+                                        right_a = right_models[first_index]
+                                        right_b = right_models[second_index]
+                                        left_after = (
+                                            state.remaining[left_gpu]
+                                            + left_model.model_size
+                                            - right_a.model_size
+                                            - right_b.model_size
+                                        )
+                                        right_after = (
+                                            state.remaining[right_gpu]
+                                            + right_a.model_size
+                                            + right_b.model_size
+                                            - left_model.model_size
+                                        )
+                                        if left_after < -epsilon or right_after < -epsilon:
+                                            continue
+
+                                        values = [
+                                            ratio(
+                                                state.loads[gpu],
+                                                state.remaining[gpu],
+                                            )
+                                            for gpu in range(gpu_num)
+                                        ]
+                                        left_weight = weight(left_model)
+                                        right_weight = weight(right_a) + weight(right_b)
+                                        values[left_gpu] = ratio(
+                                            state.loads[left_gpu]
+                                            - left_weight
+                                            + right_weight,
+                                            left_after,
+                                        )
+                                        values[right_gpu] = ratio(
+                                            state.loads[right_gpu]
+                                            - right_weight
+                                            + left_weight,
+                                            right_after,
+                                        )
+                                        candidate_score = max(values)
+                                        if candidate_score + epsilon < best_score:
+                                            best_score = candidate_score
+                                            best_action = (
+                                                "exchange",
+                                                left_gpu,
+                                                right_gpu,
+                                                left_model,
+                                                right_a,
+                                                right_b,
+                                            )
+
+            if best_action is None:
+                break
+
+            if best_action[0] == "move":
+                _, source, target, model = best_action
+                state.move(source, target, model)
+            elif best_action[0] == "swap":
+                _, left_gpu, right_gpu, left_model, right_model = best_action
+                state.swap(left_gpu, right_gpu, left_model, right_model)
+            else:
+                _, left_gpu, right_gpu, left_model, right_a, right_b = best_action
+                state.groups[left_gpu].remove(left_model)
+                state.groups[right_gpu].remove(right_a)
+                state.groups[right_gpu].remove(right_b)
+                state.groups[left_gpu].extend((right_a, right_b))
+                state.groups[right_gpu].append(left_model)
+
+                left_weight = weight(left_model)
+                right_weight = weight(right_a) + weight(right_b)
+                state.loads[left_gpu] += right_weight - left_weight
+                state.loads[right_gpu] += left_weight - right_weight
+                memory_delta = (
+                    left_model.model_size - right_a.model_size - right_b.model_size
+                )
+                state.remaining[left_gpu] += memory_delta
+                state.remaining[right_gpu] -= memory_delta
+>>>>>>> REPLACE
+</DIFF>

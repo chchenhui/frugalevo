@@ -1,0 +1,214 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from itertools import combinations
+
+TRI_IDX = np.array(list(combinations(range(13), 3)))
+
+
+def _hull_area(pts):
+    """Shoelace area of convex hull via monotone chain."""
+    P = sorted(map(tuple, pts))
+    P = list(dict.fromkeys(P))
+    if len(P) < 3:
+        return 0.0
+    def cross(o, a, b):
+        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+    lo, up = [], []
+    for p in P:
+        while len(lo) >= 2 and cross(lo[-2], lo[-1], p) <= 0:
+            lo.pop()
+        lo.append(p)
+    for p in reversed(P):
+        while len(up) >= 2 and cross(up[-2], up[-1], p) <= 0:
+            up.pop()
+        up.append(p)
+    hull = lo[:-1] + up[:-1]
+    if len(hull) < 3:
+        return 0.0
+    H = np.array(hull)
+    x, y = H[:, 0], H[:, 1]
+    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+TRI_HAS = []   # TRI_HAS[i]: indices into TRI_IDX of triangles containing vertex i
+TRI_NOT = []   # TRI_NOT[i]: indices into TRI_IDX of triangles NOT containing vertex i
+for i in range(13):
+    has = np.where(np.any(TRI_IDX == i, axis=1))[0]
+    TRI_HAS.append(has)
+    TRI_NOT.append(np.setdiff1d(np.arange(len(TRI_IDX)), has))
+
+
+def _tri_areas(pts, idx=None):
+    if idx is None:
+        sel = TRI_IDX
+    else:
+        sel = TRI_IDX[idx]
+    p = pts[sel]
+    a = p[:, 0]
+    v1 = p[:, 1] - a
+    v2 = p[:, 2] - a
+    return 0.5 * np.abs(v1[:, 0]*v2[:, 1] - v1[:, 1]*v2[:, 0])
+
+
+def _min_tri(pts):
+    return _tri_areas(pts).min()
+
+
+def _score(pts):
+    ha = _hull_area(pts)
+    if ha <= 1e-12:
+        return 0.0
+    return _min_tri(pts) / ha
+
+
+def _bottleneck_vertex(pts):
+    """Index of a vertex participating in the smallest triangle."""
+    ar = _tri_areas(pts)
+    k = int(np.argmin(ar))
+    return int(TRI_IDX[k][0])
+
+
+def _seeds(rng):
+    n = 13
+    t = np.linspace(0, 2*np.pi, n, endpoint=False)
+    seeds = []
+    # regular 13-gon
+    seeds.append(np.column_stack([np.cos(t), np.sin(t)]))
+    # ellipse
+    seeds.append(np.column_stack([1.3*np.cos(t), 0.75*np.sin(t)]))
+    # 12-gon ring + center
+    t12 = np.linspace(0, 2*np.pi, 12, endpoint=False)
+    ring = np.column_stack([np.cos(t12), np.sin(t12)])
+    seeds.append(np.vstack([ring, [[0.0, 0.0]]]))
+    # outer ring 7 + inner ring 6 (3-fold style)
+    t7 = np.linspace(0, 2*np.pi, 7, endpoint=False)
+    t6 = np.linspace(0, 2*np.pi, 6, endpoint=False) + np.pi/6
+    outer = np.column_stack([np.cos(t7), np.sin(t7)])
+    inner = 0.45*np.column_stack([np.cos(t6), np.sin(t6)])
+    seeds.append(np.vstack([outer, inner]))
+    # random
+    seeds.append(rng.random((n, 2)))
+    return seeds
+
+
+def _anneal(pts, rng, deadline, T0=0.01, T_min=1e-6):
+    """Simulated annealing on the normalized score (incremental evaluation).
+
+    Only the 66 triangles containing the moved vertex are recomputed; the min
+    over the remaining 220 and the hull area are cached and refreshed only
+    when needed (acceptance, or when the moved vertex was/is a hull vertex).
+    """
+    pts = pts.copy()
+    hull_a = _hull_area(pts)
+    all_areas = _tri_areas(pts)
+    sc = all_areas.min() / hull_a if hull_a > 1e-12 else 0.0
+    best, best_sc = pts.copy(), sc
+    T = T0
+    sigma = 0.1
+    since_best = 0
+
+    def _hull_mask(p):
+        """Boolean mask of vertices on the convex hull of p."""
+        P = sorted(map(tuple, p))
+        P = list(dict.fromkeys(P))
+        if len(P) < 3:
+            return np.zeros(13, dtype=bool)
+        def cross(o, a, b):
+            return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+        lo, up = [], []
+        for pnt in P:
+            while len(lo) >= 2 and cross(lo[-2], lo[-1], pnt) <= 0:
+                lo.pop()
+            lo.append(pnt)
+        for pnt in reversed(P):
+            while len(up) >= 2 and cross(up[-2], up[-1], pnt) <= 0:
+                up.pop()
+            up.append(pnt)
+        hullset = set(lo[:-1] + up[:-1])
+        return np.array([tuple(p[i]) in hullset for i in range(13)], dtype=bool)
+
+    hmask = _hull_mask(pts)
+    while time.time() < deadline:
+        for _ in range(400):
+            # focus moves on bottleneck vertex half the time
+            if rng.random() < 0.5:
+                i = int(TRI_IDX[int(np.argmin(all_areas))][0])
+            else:
+                i = int(rng.integers(13))
+            was_hull = hmask[i]
+            # min over triangles not containing i (cached areas)
+            not_i = TRI_NOT[i]
+            min_rest = all_areas[not_i].min()
+            cand = pts.copy()
+            cand[i] += rng.normal(0, sigma, 2)
+            aff = _tri_areas(cand, TRI_HAS[i])
+            new_min = min(min_rest, aff.min())
+            if was_hull:
+                new_hull = _hull_area(cand)
+            else:
+                new_hull = hull_a  # hull unchanged if interior point moved (approx: still inside)
+            if new_hull <= 1e-12:
+                continue
+            csc = new_min / new_hull
+            d = csc - sc
+            if d > 0 or (T > 0 and rng.random() < np.exp(d / max(T, 1e-12))):
+                if not was_hull:
+                    # check the moved point didn't escape the hull; if it did,
+                    # recompute hull and score exactly
+                    if _point_outside_hull(cand, pts, hmask):
+                        new_hull = _hull_area(cand)
+                        csc = _tri_areas(cand).min() / new_hull
+                pts, sc = cand, csc
+                hull_a = new_hull
+                # update cached areas: only triangles containing i changed
+                all_areas = all_areas.copy()
+                all_areas[TRI_HAS[i]] = aff
+                hmask = _hull_mask(pts)
+                if sc > best_sc + 1e-14:
+                    best, best_sc = pts.copy(), sc
+                    since_best = 0
+        since_best += 1
+        T = max(T * 0.92, T_min)
+        if since_best > 4:
+            sigma = max(sigma * 0.7, 1e-4)
+            since_best = 0
+        elif since_best == 0:
+            sigma = min(sigma * 1.25, 0.3)
+    return best, best_sc
+
+
+def _point_outside_hull(cand, old_pts, hmask):
+    """True if the moved point likely lies outside the old hull (cheap test)."""
+    hull_pts = old_pts[hmask]
+    if len(hull_pts) < 3:
+        return True
+    H = hull_pts[np.argsort(np.arctan2(hull_pts[:, 1] - hull_pts[:, 1].mean(),
+                                       hull_pts[:, 0] - hull_pts[:, 0].mean()))]
+    x, y = H[:, 0], H[:, 1]
+    px, py = cand[np.where(~hmask)[0][0]] if (~hmask).sum() == 1 else (None, None)
+    return True  # conservative: force exact recompute via caller's logic
+
+
+def heilbronn_convex13() -> np.ndarray:
+    rng = np.random.default_rng(seed=42)
+    t_start = time.time()
+    time_limit = 3.0
+
+    best_pts, best_sc = None, -1.0
+    seeds = _seeds(rng)
+    per_seed = time_limit / len(seeds)
+    for k, s in enumerate(seeds):
+        deadline = min(t_start + (k + 1) * per_seed, t_start + time_limit)
+        pts, sc = _anneal(s, rng, deadline)
+        if sc > best_sc:
+            best_sc, best_pts = sc, pts.copy()
+
+    best_pts = np.asarray(best_pts, dtype=float)
+    if not np.all(np.isfinite(best_pts)) or best_pts.shape != (13, 2):
+        t = np.linspace(0, 2*np.pi, 13, endpoint=False)
+        best_pts = np.column_stack([np.cos(t), np.sin(t)])
+    return best_pts
+
+
+# EVOLVE-BLOCK-END

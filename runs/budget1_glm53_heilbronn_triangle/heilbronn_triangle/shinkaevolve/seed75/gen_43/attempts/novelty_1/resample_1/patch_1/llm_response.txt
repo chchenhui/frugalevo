@@ -1,0 +1,151 @@
+<NAME>
+finer_annealing_plus_argmin_polish</NAME>
+<DESCRIPTION>
+The current annealing ladder stops at temp = 1e-3, which is still ~2e-3 of the triangle area — far too coarse for the softmin to sharpen onto the true minimum-area triplet. Near the optimum, dozens of triplets have nearly equal areas, so optimizing a blurry softmin wastes effort balancing non-binding constraints while the binding one stays under-improved. Following the recommendation, I extend the annealing ladder with much finer absolute temperatures (1e-4, 1e-5, 1e-6), keeping the a.min()-shifted, overflow-safe formulation. After the fine stages, I add an exact-argmin polish: identify the truly worst triplet and perturb only its three points via softmax-reparameterized Powell on a reduced problem (only those three points' logits), then keep the result only if it strictly improves the exact minimum area. This sharpens the final configuration without risking the guarded feasibility machinery.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        K = 20  # focus softmin on the k binding (smallest-area) triples
+
+        def softmin_obj(theta, temp):
+            a = _areas(unpack(theta), triples_arr)
+            amin = a.min()
+            ak = np.partition(a, K)[:K]          # k smallest areas
+            return temp * np.log(np.sum(np.exp(-(ak - amin) / temp))) + amin
+=======
+        K = 20  # focus softmin on the k binding (smallest-area) triples
+
+        def softmin_obj(theta, temp):
+            a = _areas(unpack(theta), triples_arr)
+            amin = a.min()
+            ak = np.partition(a, K)[:K]          # k smallest areas
+            return temp * np.log(np.sum(np.exp(-(ak - amin) / temp))) + amin
+
+        def argmin_polish(pts, iters=200):
+            """Exact-argmin polish: perturb only the worst triplet's points
+            via softmax logits (kept only if the exact min area improves)."""
+            pts = pts.copy()
+            for _ in range(iters // 2):
+                val, worst = _min_area(pts)
+                if worst is None:
+                    break
+                i, j, k = worst
+
+                def obj3(theta):
+                    W = theta.reshape(3, 3)
+                    W = W - W.max(axis=1, keepdims=True)
+                    E = np.exp(W)
+                    W = E / E.sum(axis=1, keepdims=True)
+                    cand = pts.copy()
+                    cand[[i, j, k]] = W @ V
+                    a = _areas(cand, triples_arr)
+                    amin = a.min()
+                    ak = np.partition(a, K)[:K]
+                    return temp_fine * np.log(np.sum(np.exp(-(ak - amin) / temp_fine))) + amin
+
+                # initial logits from current barycentric-ish coords
+                cur = pts[[i, j, k]]
+                lam0 = np.linalg.solve(
+                    np.array([[1.0, V[0, 0], V[0, 1]],
+                              [1.0, V[1, 0], V[1, 1]],
+                              [1.0, V[2, 0], V[2, 1]]]).T,
+                    np.column_stack([np.ones(3), cur]).T).T
+                lam0 = np.clip(lam0, 1e-3, None)
+                lam0 /= lam0.sum(axis=1, keepdims=True)
+                theta0 = np.log(lam0).ravel()
+                try:
+                    res = _scipy_minimize(obj3, theta0, method="Powell",
+                                          options={"maxiter": 100, "xtol": 1e-6, "ftol": 1e-9})
+                    if np.all(np.isfinite(res.x)):
+                        W = res.x.reshape(3, 3)
+                        W = W - W.max(axis=1, keepdims=True)
+                        E = np.exp(W)
+                        W = E / E.sum(axis=1, keepdims=True)
+                        cand = pts.copy()
+                        cand[[i, j, k]] = W @ V
+                        new_val, _ = _min_area(cand)
+                        if new_val > val + 1e-14:
+                            pts = cand
+                        else:
+                            break
+                    else:
+                        break
+                except Exception:
+                    break
+            return pts
+>>>>>>> REPLACE
+```
+
+Then extend the annealing ladder and add the argmin polish invocation:
+
+<DIFF>
+<<<<<<< SEARCH
+        best_pts = fallback
+        best_val, _ = _min_area(fallback)
+
+        if _HAVE_SCIPY:
+            for s in starts:
+                theta = np.array(s, dtype=float)
+                try:
+                    for temp in (5e-3, 1e-3):
+=======
+        best_pts = fallback
+        best_val, _ = _min_area(fallback)
+        temp_fine = 1e-6  # fine-temperature used inside argmin_polish
+
+        if _HAVE_SCIPY:
+            for s in starts:
+                theta = np.array(s, dtype=float)
+                try:
+                    for temp in (5e-3, 1e-3, 1e-4, 1e-5, 1e-6):
+>>>>>>> REPLACE
+```
+
+<DIFF>
+<<<<<<< SEARCH
+                    pts = unpack(theta)
+                    # final feasibility-aware touch-up (kept only if it helps)
+                    pts_r = _bary_repair(pts)
+                    pts_r = _polish(pts_r, iters=200, step=0.006)
+                    val_r, _ = _min_area(pts_r)
+                    val, _ = _min_area(pts)
+                    if val_r > val:
+                        pts, val = pts_r, val_r
+                    if val > best_val:
+                        best_val, best_pts = val, pts
+=======
+                    pts = unpack(theta)
+                    # final feasibility-aware touch-up (kept only if it helps)
+                    pts_r = _bary_repair(pts)
+                    pts_r = _polish(pts_r, iters=200, step=0.006)
+                    val_r, _ = _min_area(pts_r)
+                    val, _ = _min_area(pts)
+                    if val_r > val:
+                        pts, val = pts_r, val_r
+                    # exact-argmin polish on the truly worst triplet
+                    pts_p = argmin_polish(pts, iters=60)
+                    val_p, _ = _min_area(pts_p)
+                    if val_p > val:
+                        pts, val = pts_p, val_p
+                    if val > best_val:
+                        best_val, best_pts = val, pts
+>>>>>>> REPLACE
+```
+
+Finally, reduce maxiter on the coarse stages to keep total runtime bounded after adding stages:
+
+<DIFF>
+<<<<<<< SEARCH
+                        res = _scipy_minimize(
+                            softmin_obj, theta, args=(temp,),
+                            method="Powell",
+                            options={"maxiter": 600, "xtol": 1e-7, "ftol": 1e-10},
+                        )
+=======
+                        res = _scipy_minimize(
+                            softmin_obj, theta, args=(temp,),
+                            method="Powell",
+                            options={"maxiter": 350, "xtol": 1e-7, "ftol": 1e-10},
+                        )
+>>>>>>> REPLACE
+</DIFF>

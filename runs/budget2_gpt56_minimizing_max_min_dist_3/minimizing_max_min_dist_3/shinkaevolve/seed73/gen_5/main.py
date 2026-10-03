@@ -1,0 +1,83 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
+
+    Returns
+        points: np.ndarray of shape (14,3) containing the (x,y) coordinates of the 14 points.
+
+    """
+
+    n = 14
+    d = 3
+
+    # Directly optimize the scale-invariant min-distance / diameter ratio.
+    # A continuation in the soft-min/soft-max exponent gives substantially
+    # better configurations than an unstructured random cloud.
+    rng = np.random.default_rng(18473)
+    best_points = None
+    best_ratio = -np.inf
+    eye = np.eye(n, dtype=bool)
+
+    for restart in range(12):
+        points = rng.normal(size=(n, d))
+        points -= points.mean(axis=0, keepdims=True)
+        points /= np.sqrt(np.mean(np.sum(points * points, axis=1)))
+
+        first_moment = np.zeros_like(points)
+        second_moment = np.zeros_like(points)
+
+        for step in range(2200):
+            delta = points[:, None, :] - points[None, :, :]
+            distance2 = np.sum(delta * delta, axis=2)
+            distance2[eye] = 1.0
+            distance = np.sqrt(distance2)
+
+            current_min = np.min(distance[~eye])
+            current_max = np.max(distance)
+            current_ratio = current_min / current_max
+            if current_ratio > best_ratio:
+                best_ratio = current_ratio
+                best_points = points.copy()
+
+            # Increase p gradually: low p has a broad basin of attraction,
+            # while high p increasingly represents the exact extrema.
+            p = 5.0 + 45.0 * step / 2199.0
+            log_distance = np.log(distance)
+
+            min_scores = -p * log_distance
+            max_scores = p * log_distance
+            min_scores[eye] = -np.inf
+            max_scores[eye] = -np.inf
+
+            min_scores -= np.max(min_scores)
+            max_scores -= np.max(max_scores)
+            min_weights = np.exp(min_scores)
+            max_weights = np.exp(max_scores)
+            min_weights /= np.sum(min_weights)
+            max_weights /= np.sum(max_weights)
+
+            # Gradient of softmin(log d) - softmax(log d).
+            coefficient = (min_weights - max_weights) / distance2
+            coefficient[eye] = 0.0
+            gradient = np.sum(coefficient[:, :, None] * delta, axis=1)
+
+            # Adam ascent is stable despite the increasingly sharp objective.
+            iteration = step + 1
+            first_moment = 0.9 * first_moment + 0.1 * gradient
+            second_moment = 0.999 * second_moment + 0.001 * gradient * gradient
+            mhat = first_moment / (1.0 - 0.9 ** iteration)
+            vhat = second_moment / (1.0 - 0.999 ** iteration)
+            points += 0.045 * mhat / (np.sqrt(vhat) + 1e-8)
+
+            # Remove the objective's translation and uniform-scale null modes.
+            points -= points.mean(axis=0, keepdims=True)
+            points /= np.sqrt(np.mean(np.sum(points * points, axis=1)))
+
+    return np.asarray(best_points, dtype=float)
+
+
+# EVOLVE-BLOCK-END

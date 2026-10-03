@@ -1,0 +1,270 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List
+
+
+class Evolved(Algorithm):
+    """
+    Conditional prefix partition tree with per-row column orderings.
+
+    Build per-row orders by recursively grouping rows on the remaining column
+    with the best length-weighted pair repetition, plus a few global orders.
+    Select the winner by the exact ideal character-Trie reuse (sum of adjacent
+    LCPs over sorted serialized rows, with duplicate credit). All original
+    cells, rows and columns are preserved exactly.
+    """
+
+    MAX_NODE_COLS = 6      # candidate columns examined per tree node
+    MIN_GROUP = 3          # stop branching below this group size
+    MAX_NODES = 4000       # total tree node budget
+
+    # ---------------- serialization helpers ----------------
+
+    @staticmethod
+    def _cell_str(v) -> str:
+        try:
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                return ""
+        except Exception:
+            pass
+        try:
+            if pd.isna(v):
+                return ""
+        except Exception:
+            pass
+        return str(v)
+
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        n = min(len(a), len(b))
+        if n == 0:
+            return 0
+        if a[:n] == b[:n]:
+            return n
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_score(self, row_strings: List[str]) -> int:
+        if len(row_strings) <= 1:
+            return 0
+        counts = {}
+        for r in row_strings:
+            counts[r] = counts.get(r, 0) + 1
+        dup_extra = sum((cnt - 1) * len(r) for r, cnt in counts.items())
+        ss = sorted(counts.keys())
+        total = 0
+        prev = ss[0]
+        for cur in ss[1:]:
+            total += self._lcp(prev, cur)
+            prev = cur
+        return total + dup_extra
+
+    # ---------------- factorization ----------------
+
+    def _factorize(self, col_arrays, cols):
+        """Per column: integer codes, value strings, value lengths."""
+        info = {}
+        for c in cols:
+            vals = col_arrays[c]
+            d = {}
+            codes = np.empty(len(vals), dtype=np.int64)
+            vstr = []
+            vlen = []
+            for i, v in enumerate(vals):
+                code = d.get(v, -1)
+                if code < 0:
+                    code = len(vstr)
+                    d[v] = code
+                    vstr.append(v)
+                    vlen.append(len(v))
+                codes[i] = code
+            info[c] = (codes, np.asarray(vlen, dtype=np.int64), len(vstr))
+        return info
+
+    # ---------------- global candidate orders ----------------
+
+    def _global_candidates(self, cols, col_arrays, pair_scores, distinct):
+        orig = list(cols)
+        order2 = sorted(cols, key=lambda c: (-pair_scores[c], orig.index(c), str(c)))
+        order3 = sorted(cols, key=lambda c: (distinct[c], -pair_scores[c], orig.index(c), str(c)))
+        return [orig, order2, order3]
+
+    # ---------------- conditional partition tree ----------------
+
+    def _tree_orders(self, n_rows, cols, col_arrays, info, pair_scores):
+        """Return per-row column orderings via conditional prefix grouping."""
+        orders = [None] * n_rows
+        orig_index = {c: i for i, c in enumerate(cols)}
+        # heuristic tail order: pair-repetition desc
+        tail_order = sorted(cols, key=lambda c: (-pair_scores[c], orig_index[c], str(c)))
+
+        all_idx = np.arange(n_rows, dtype=np.int64)
+        node_budget = [self.MAX_NODES]
+
+        def assign(group, remaining):
+            for i in group:
+                orders[i] = list(remaining)
+
+        def rec(group, remaining_tuple):
+            remaining = list(remaining_tuple)
+            if len(group) < self.MIN_GROUP or not remaining or node_budget[0] <= 0:
+                # deterministic cheap tail: global heuristic order restricted
+                tail = [c for c in tail_order if c in set(remaining)]
+                assign(group, tail)
+                return
+            node_budget[0] -= 1
+            rem_set = set(remaining)
+            # limit candidate columns on wide tables
+            if len(remaining) > self.MAX_NODE_COLS:
+                cand = sorted(remaining, key=lambda c: (-pair_scores[c], orig_index[c], str(c)))[:self.MAX_NODE_COLS]
+            else:
+                cand = remaining
+            best_col, best_gain = None, 0
+            for c in cand:
+                codes, vlen, nv = info[c]
+                g = codes[group]
+                cnt = np.bincount(g, minlength=nv).astype(np.int64)
+                # gain: sum over values of len(v) * cnt * (cnt-1)
+                gain = int(np.dot(vlen, cnt * (cnt - 1)))
+                if gain > best_gain:
+                    best_gain = gain
+                    best_col = c
+            if best_col is None:
+                tail = [c for c in tail_order if c in rem_set]
+                assign(group, tail)
+                return
+            codes, _, nv = info[best_col]
+            g = codes[group]
+            rest = [c for c in remaining if c is not best_col]
+            # partition rows by value code of best_col
+            order_in_group = np.argsort(g, kind="stable")
+            sorted_group = group[order_in_group]
+            sorted_codes = g[order_in_group]
+            bounds = np.flatnonzero(np.diff(sorted_codes)) + 1
+            starts = np.concatenate(([0], bounds))
+            ends = np.concatenate((bounds, [len(sorted_group)]))
+            for s, e in zip(starts, ends):
+                sub = sorted_group[s:e]
+                for i in sub:
+                    if orders[i] is None:
+                        orders[i] = []
+                # prepend best_col for this subgroup after recursion defines suffix
+                # do recursion first, then prepend
+                rec(sub, tuple(rest))
+                for i in sub:
+                    idx = int(i)
+                    if orders[idx] is not None and best_col not in orders[idx]:
+                        orders[idx].insert(0, best_col)
+
+        rec(all_idx, tuple(cols))
+        # safety: fill any missing
+        for i in range(n_rows):
+            if orders[i] is None:
+                orders[i] = list(tail_order)
+        return orders
+
+    # ---------------- public API ----------------
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        out_df = df.copy()
+
+        if col_merge:
+            for group in col_merge:
+                group_cols = [c for c in out_df.columns if c in group]
+                if len(group_cols) > 1:
+                    try:
+                        out_df = self.merging_columns(out_df, group_cols, prepended=False)
+                    except Exception:
+                        pass
+
+        cols = list(out_df.columns)
+        n_rows = len(out_df)
+
+        if len(cols) == 0 or n_rows == 0:
+            empty_orders: List[List[str]] = [list(cols) for _ in range(n_rows)]
+            return out_df, empty_orders
+
+        col_arrays = {c: [self._cell_str(v) for v in out_df[c].tolist()] for c in cols}
+
+        # global statistics: pair repetition scores and distinct counts
+        pair_scores = {}
+        distinct = {}
+        for c in cols:
+            counts = {}
+            for v in col_arrays[c]:
+                counts[v] = counts.get(v, 0) + 1
+            pair_scores[c] = sum(len(v) * k * (k - 1) for v, k in counts.items())
+            distinct[c] = len(counts)
+
+        info = self._factorize(col_arrays, cols)
+
+        # candidate 1-3: global orders
+        candidates = self._global_candidates(cols, col_arrays, pair_scores, distinct)
+
+        # candidate 4: conditional partition tree (per-row orders)
+        tree_orders = self._tree_orders(n_rows, cols, col_arrays, info, pair_scores)
+
+        def serialize_fixed(order):
+            return ["".join([col_arrays[c][i] for c in order]) for i in range(n_rows)]
+
+        best_orders = None
+        best_score = -1
+        for order in candidates:
+            sc = self._trie_score(serialize_fixed(order))
+            if sc > best_score:
+                best_score = sc
+                best_orders = [list(order) for _ in range(n_rows)]
+        # score tree candidate
+        tree_rows = ["".join([col_arrays[c][i] for c in tree_orders[i]]) for i in range(n_rows)]
+        sc = self._trie_score(tree_rows)
+        if sc > best_score:
+            best_score = sc
+            best_orders = tree_orders
+
+        # build output frame with per-row orders applied consistently:
+        # the returned frame uses the modal (first row's) order for layout,
+        # but per-row orderings describe each row's cell arrangement.
+        # To keep the returned data consistent with per-row orderings, we
+        # rebuild each row according to its own ordering.
+        base_order = list(best_orders[0]) if best_orders else list(cols)
+        data = {}
+        for pos, c in enumerate(base_order):
+            data[c] = [out_df[c].iloc[i] for i in range(n_rows)]
+        result_df = pd.DataFrame(data, columns=base_order, index=out_df.index)
+        try:
+            if result_df.dtypes.apply(lambda d: d == object).any():
+                result_df = result_df.astype(object)
+        except Exception:
+            pass
+
+        # Per-row orderings must be consistent with returned data. Since the
+        # stored values are identical per column, a per-row permutation of the
+        # frame's columns is valid as long as it is a permutation of the frame
+        # columns; the evaluator applies each row's ordering to that row.
+        # Rebuild result so each row's ordering matches its own arrangement.
+        # Simpler consistent representation: keep the frame in base_order and
+        # emit per-row orderings; values per column are preserved.
+        column_orderings: List[List[str]] = [list(o) for o in best_orders]
+
+        assert result_df.shape == out_df.shape
+        return result_df, column_orderings
+
+# EVOLVE-BLOCK-END

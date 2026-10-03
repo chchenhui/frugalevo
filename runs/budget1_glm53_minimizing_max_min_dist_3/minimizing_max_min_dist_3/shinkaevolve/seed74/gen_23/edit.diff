@@ -1,0 +1,300 @@
+--- a/original.py
++++ b/original.py
+@@ -1,162 +1,191 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def min_max_dist_dim3_14() -> np.ndarray:
+-    """
+-    Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
+-
+-    Returns
+-        points: np.ndarray of shape (14,3) containing the (x,y) coordinates of the 14 points.
+-
+-    """
+-
+-    n = 14
+-    d = 3
+-
++    n, d = 14, 3
+     from scipy.optimize import minimize
+ 
+     iu = np.triu_indices(n, 1)
++    rng = np.random.default_rng(42)
++
++    def pdist_sq(pts):
++        diff = pts[:, None, :] - pts[None, :, :]
++        return np.sum(diff * diff, axis=-1)
+ 
+     def score_sq(pts):
+-        dm = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+-        dists = dm[iu]
+-        dmax = dists.max()
+-        if dmax <= 0:
++        D2 = pdist_sq(pts)
++        u = D2[iu]
++        if u.max() <= 0:
+             return 0.0
+-        return (dists.min() / dmax) ** 2
++        return u.min() / u.max()
+ 
+     def sphere(p):
+         p = p - p.mean(axis=0)
+         r = np.linalg.norm(p, axis=1, keepdims=True)
+         r[r == 0] = 1.0
+         return p / r
+ 
+-    rng = np.random.default_rng(42)
+-
+-    # ---- diverse structured + random seeds ----
++    # ---------------- seeds ----------------
+     seeds = []
+-    for _ in range(8):
++    for _ in range(18):
+         seeds.append(sphere(rng.standard_normal((n, d))))
+-    # antipodal pairs (7 random directions)
+     for _ in range(4):
+         dirs = sphere(rng.standard_normal((n // 2, d)))
+         seeds.append(np.vstack([dirs, -dirs]))
+-    # icosahedron (12 verts) + antipodal extras along coordinate axes
+     phi = (1 + np.sqrt(5)) / 2
+     ico = sphere(np.array([
+         [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+         [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+         [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+     ], dtype=float))
+-    for extra in [np.array([[0, 0, 1.2], [0, 0, -1.2]]),
+-                  np.array([[1.2, 0, 0], [-1.2, 0, 0]]),
+-                  np.array([[0, 1.2, 0], [0, -1.2, 0]])]:
+-        seeds.append(np.vstack([ico, sphere(extra)]))
+-    # cube vertices + center + extras
++    for ax in range(3):
++        e = np.zeros((2, 3)); e[0, ax] = 1.3; e[1, ax] = -1.3
++        seeds.append(np.vstack([ico, e]))
++    # fibonacci sphere with 14 points
++    k = np.arange(n)
++    ga = np.pi * (3 - np.sqrt(5))
++    z = 1 - 2 * (k + 0.5) / n
++    r = np.sqrt(np.maximum(0.0, 1 - z * z))
++    fib = np.stack([r * np.cos(ga * k), r * np.sin(ga * k), z], axis=1)
++    seeds.append(fib)
++    # cube vertices + center + 5 random
+     lat = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1)
+                     for z in (-1, 1)], dtype=float)
+     extra5 = sphere(rng.standard_normal((5, d))) * 0.5
+     seeds.append(sphere(np.vstack([lat, [[0, 0, 0]], extra5])))
+ 
+-    # ---- fast stochastic hill climb on the true objective ----
+-    def hill_climb(pts, iters, step0):
+-        s = score_sq(pts)
+-        step = step0
++    # -------- smooth (log-sum-exp) ratio with analytic gradient --------
++    def smooth_ratio_grad(pts, tau):
++        D2 = pdist_sq(pts)
++        u = D2[iu]
++        smax = float(u.max())
++        if smax <= 1e-12:
++            return 0.0, np.zeros_like(pts)
++        # smooth min and max of u
++        mn = -tau * np.log(np.sum(np.exp(-(u - smax) / tau)))
++        mn += smax  # shifted for stability
++        mx = tau * np.log(np.sum(np.exp((u - smax) / tau)))
++        mx += smax
++        if mx < 1e-12:
++            return 0.0, np.zeros_like(pts)
++        w = np.exp(-(u - smax) / tau)
++        w = w / w.sum()          # d mn / d u
++        v = np.exp((u - smax) / tau)
++        v = v / v.sum()          # d mx / d u
++        # h = mn / mx
++        dhdu = (w * mx - mn * v) / (mx * mx)
++        S = np.zeros((n, n))
++        S[iu] = dhdu
++        S = S + S.T
++        grad = 2.0 * np.einsum('ij,ijk->ik', S, pts[:, None, :] - pts[None, :, :])
++        # remove translation component
++        grad -= grad.mean(axis=0, keepdims=True)
++        return mn / mx, grad
++
++    def adam_smooth(pts, iters=350, lr=0.02, tau0=0.3, tau1=0.04):
++        m = np.zeros_like(pts)
++        v = np.zeros_like(pts)
++        b1, b2, eps = 0.9, 0.999, 1e-8
++        best_pts = pts.copy()
++        best_s = score_sq(pts)
+         for it in range(iters):
+-            i = int(rng.integers(n))
+-            old = pts[i].copy()
+-            pert = rng.standard_normal(d)
+-            pert /= np.linalg.norm(pert)
+-            pts[i] = old + pert * step * rng.random()
+-            sn = score_sq(pts)
+-            if sn >= s:
+-                s = sn
+-            else:
+-                pts[i] = old
+-            if it % 400 == 399:
+-                step *= 0.7
+-        return pts, s
++            tau = tau0 * (tau1 / tau0) ** (it / max(1, iters - 1))
++            _, g = smooth_ratio_grad(pts, tau)
++            gn = np.linalg.norm(g)
++            if gn > 1e-12:
++                g = g / gn
++            m = b1 * m + (1 - b1) * g
++            v = b2 * v + (1 - b2) * g * g
++            mh = m / (1 - b1 ** (it + 1))
++            vh = v / (1 - b2 ** (it + 1))
++            pts = pts + lr * mh / (np.sqrt(vh) + eps)
++            s = score_sq(pts)
++            if s > best_s:
++                best_s = s
++                best_pts = pts.copy()
++        return best_pts, best_s
+ 
+-    candidates = []
+-    for seed_pts in seeds:
+-        pts, s = hill_climb(seed_pts.copy(), 700, 0.15)
+-        candidates.append((s, pts))
++    results = []
++    for sd in seeds:
++        p, s = adam_smooth(sd.copy())
++        results.append((s, p))
++    results.sort(key=lambda c: -c[0])
+ 
+-    candidates.sort(key=lambda c: -c[0])
+-    top = candidates[:6]
+-
+-    # ---- SLSQP refinement: maximize t s.t. t <= |xi-xj|^2 <= 1 ----
++    # ---------------- SLSQP refinement ----------------
+     def obj(z):
+         return -z[-1]
+ 
+     def obj_grad(z):
+         g = np.zeros_like(z)
+         g[-1] = -1.0
+         return g
+ 
+-    def make_constraints():
+-        cons = []
+-        for i in range(n):
+-            for j in range(i + 1, n):
+-                def fmin(z, i=i, j=j):
+-                    return np.sum((z[3*i:3*i+3] - z[3*j:3*j+3])**2) - z[-1]
+-                def gmin(z, i=i, j=j):
+-                    g = np.zeros(len(z))
+-                    di = 2.0 * (z[3*i:3*i+3] - z[3*j:3*j+3])
+-                    g[3*i:3*i+3] = di
+-                    g[3*j:3*j+3] = -di
+-                    g[-1] = -1.0
+-                    return g
+-                def fmax(z, i=i, j=j):
+-                    return 1.0 - np.sum((z[3*i:3*i+3] - z[3*j:3*j+3])**2)
+-                def gmax(z, i=i, j=j):
+-                    g = np.zeros(len(z))
+-                    di = 2.0 * (z[3*i:3*i+3] - z[3*j:3*j+3])
+-                    g[3*i:3*i+3] = -di
+-                    g[3*j:3*j+3] = di
+-                    return g
+-                cons.append({'type': 'ineq', 'fun': fmin, 'jac': gmin})
+-                cons.append({'type': 'ineq', 'fun': fmax, 'jac': gmax})
+-        return cons
++    constraints = []
++    for i in range(n):
++        for j in range(i + 1, n):
++            def fmin(z, i=i, j=j):
++                return np.sum((z[3*i:3*i+3] - z[3*j:3*j+3])**2) - z[-1]
++            def gmin(z, i=i, j=j):
++                g = np.zeros(len(z))
++                di = 2.0 * (z[3*i:3*i+3] - z[3*j:3*j+3])
++                g[3*i:3*i+3] = di
++                g[3*j:3*j+3] = -di
++                g[-1] = -1.0
++                return g
++            def fmax(z, i=i, j=j):
++                return 1.0 - np.sum((z[3*i:3*i+3] - z[3*j:3*j+3])**2)
++            def gmax(z, i=i, j=j):
++                g = np.zeros(len(z))
++                di = 2.0 * (z[3*i:3*i+3] - z[3*j:3*j+3])
++                g[3*i:3*i+3] = -di
++                g[3*j:3*j+3] = di
++                return g
++            constraints.append({'type': 'ineq', 'fun': fmin, 'jac': gmin})
++            constraints.append({'type': 'ineq', 'fun': fmax, 'jac': gmax})
+ 
+-    constraints = make_constraints()
++    def slsqp(pts):
++        D2 = pdist_sq(pts)
++        mx = np.sqrt(D2.max())
++        if mx <= 0:
++            return None, 0.0
++        p = pts / mx
++        u = pdist_sq(p)[iu]
++        t0 = u.min()
++        z0 = np.concatenate([p.ravel(), [t0]])
++        try:
++            res = minimize(obj, z0, jac=obj_grad, constraints=constraints,
++                           method='SLSQP', options={'maxiter': 300, 'ftol': 1e-12})
++            p2 = res.x[:-1].reshape(n, d)
++            return p2, score_sq(p2)
++        except Exception:
++            return None, 0.0
+ 
+     best_pts = None
+     best_s = -1.0
+-    for s0, pts0 in top:
+-        # normalize so diameter^2 = 1 before SLSQP
+-        dm = np.linalg.norm(pts0[:, None, :] - pts0[None, :, :], axis=-1)
+-        p = pts0 / dm.max()
+-        dm = dm / dm.max()
+-        t0 = dm[iu].min() ** 2
+-        z0 = np.concatenate([p.ravel(), [t0]])
+-        try:
+-            res = minimize(obj, z0, jac=obj_grad,
+-                           constraints=constraints,
+-                           method='SLSQP',
+-                           options={'maxiter': 200, 'ftol': 1e-12})
+-            pts = res.x[:-1].reshape(n, d)
+-            s = score_sq(pts)
+-            if s > best_s:
+-                best_s = s
+-                best_pts = pts.copy()
+-        except Exception:
+-            pass
+-        # also keep the unrefined candidate in case SLSQP failed
+-        s = score_sq(p)
++    for s0, p0 in results[:10]:
++        p0 = p0 / np.sqrt(max(pdist_sq(p0).max(), 1e-12))
++        s = score_sq(p0)
+         if s > best_s:
+-            best_s = s
+-            best_pts = p.copy()
++            best_s, best_pts = s, p0.copy()
++        p2, s2 = slsqp(p0)
++        if p2 is not None and s2 > best_s:
++            best_s, best_pts = s2, p2.copy()
+ 
+-    # final quick polish on the best configuration
+-    best_pts, best_s = hill_climb(best_pts.copy(), 1500, 0.01)
++    # second polish round: smooth + SLSQP restarts on the best
++    for _ in range(3):
++        p, s = adam_smooth(best_pts.copy(), iters=250, lr=0.008,
++                           tau0=0.05, tau1=0.015)
++        if s > best_s:
++            best_s, best_pts = s, p.copy()
++        p2, s2 = slsqp(p)
++        if p2 is not None and s2 > best_s:
++            best_s, best_pts = s2, p2.copy()
+ 
+-    # normalize: scale so max pairwise distance equals 1 (objective invariant)
+-    dm = np.linalg.norm(best_pts[:, None, :] - best_pts[None, :, :], axis=-1)
+-    best_pts = best_pts / dm.max()
+-
++    # normalize: diameter = 1
++    D2 = pdist_sq(best_pts)
++    best_pts = best_pts / np.sqrt(max(D2.max(), 1e-12))
+     return np.asarray(best_pts, dtype=float)
+ 
+ 
+ # EVOLVE-BLOCK-END

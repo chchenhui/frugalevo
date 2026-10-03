@@ -1,0 +1,226 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+from solver import Algorithm
+from typing import Tuple, List
+from collections import Counter
+
+
+class Evolved(Algorithm):
+    """
+    Row/column reordering optimized for character-level prefix (Trie) reuse.
+    Constructs a small number of bounded candidate per-row column orderings,
+    selects among them using the exact serial-Trie objective (sum of
+    lexicographically-adjacent longest-common-prefix lengths), and returns
+    rows sorted by their serialized string with valid per-row orderings.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------ #
+    # helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _cell_str(v) -> str:
+        """Scoring-only serialization: missing -> '', else str(value)."""
+        if v is None:
+            return ""
+        try:
+            b = pd.isna(v)
+            if isinstance(b, bool) and b:
+                return ""
+        except Exception:
+            pass
+        try:
+            if isinstance(v, float) and v != v:
+                return ""
+        except Exception:
+            pass
+        return str(v)
+
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        """Longest common prefix length using C-level slice equality."""
+        if a == b:
+            return len(a)
+        m = min(len(a), len(b))
+        lo, hi = 0, m
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_reuse(self, strings: List[str]) -> int:
+        """Exact ideal Trie reuse: sum of LCPs of sorted adjacent strings."""
+        s = sorted(strings)
+        reuse = 0
+        prev = None
+        for t in s:
+            if prev is not None:
+                reuse += self._lcp(prev, t)
+            prev = t
+        return reuse
+
+    # ------------------------------------------------------------------ #
+    # public API
+    # ------------------------------------------------------------------ #
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        work = df.copy()
+
+        # Honor column merges through the parent's semantics when available.
+        if col_merge and hasattr(self, "merging_columns") and hasattr(self, "calculate_col_stats"):
+            try:
+                stats = self.calculate_col_stats(work, enable_index=True)
+                ordered = [c for c, *_ in stats]
+                for grp in col_merge:
+                    sub = [c for c in ordered if c in grp]
+                    if len(sub) >= 2:
+                        work = self.merging_columns(work, sub, prepended=False)
+            except Exception:
+                work = df.copy()
+
+        n_rows = len(work)
+        cols = list(work.columns)
+        m = len(cols)
+
+        if n_rows == 0 or m == 0:
+            return work, [list(cols) for _ in range(n_rows)]
+
+        # ---------------- serialization (scoring only) ---------------- #
+        vals = work.values.tolist()
+        strs = [[self._cell_str(v) for v in row] for row in vals]  # row-major
+        col_strs = [[strs[i][j] for i in range(n_rows)] for j in range(m)]
+
+        # integer factorization per column (on serialized keys) + key lengths
+        codes = []
+        code_len = []
+        for j in range(m):
+            d = {}
+            cl = []
+            codecol = []
+            for s in col_strs[j]:
+                k = d.get(s)
+                if k is None:
+                    k = len(cl)
+                    d[s] = k
+                    cl.append(len(s))
+                codecol.append(k)
+            codes.append(codecol)
+            code_len.append(cl)
+
+        # global column scores: sum(len(v) * count * (count - 1))
+        col_score = []
+        col_ndist = []
+        for j in range(m):
+            cnt = Counter(col_strs[j])
+            col_score.append(sum(len(k) * c * (c - 1) for k, c in cnt.items()))
+            col_ndist.append(len(cnt))
+
+        base_order = sorted(range(m), key=lambda j: (-col_score[j], j))
+        too_distinct = [col_ndist[j] > distinct_value_threshold * n_rows for j in range(m)]
+
+        # ---------------- candidate constructions ---------------- #
+        candidates = []  # (name, per-row permutation of column indices)
+        candidates.append(("global", [list(base_order) for _ in range(n_rows)]))
+        candidates.append(("identity", [list(range(m)) for _ in range(n_rows)]))
+
+        depth_cap = 8
+        if row_stop:
+            depth_cap = min(depth_cap, int(row_stop))
+        if col_stop:
+            depth_cap = min(depth_cap, int(col_stop))
+        min_gain = early_stop if early_stop else 0
+        split_candidates = [j for j in base_order if not too_distinct[j]][:12]
+
+        orders = [None] * n_rows
+
+        def _emit(rows, prefix, remaining):
+            tail = [j for j in base_order if j in remaining]
+            o = prefix + tail
+            for r in rows:
+                orders[r] = list(o)
+
+        def _rec(rows, remaining, depth, prefix):
+            if not rows:
+                return
+            if len(rows) == 1 or depth >= depth_cap or not remaining:
+                _emit(rows, prefix, remaining)
+                return
+            best, best_sc = None, min_gain
+            for j in split_candidates:
+                if j not in remaining:
+                    continue
+                cj = codes[j]
+                cl = code_len[j]
+                cnts = {}
+                for r in rows:
+                    k = cj[r]
+                    cnts[k] = cnts.get(k, 0) + 1
+                sc = 0
+                for k, c in cnts.items():
+                    if c > 1:
+                        sc += cl[k] * c * (c - 1)
+                if sc > best_sc:
+                    best_sc = sc
+                    best = j
+            if best is None:
+                _emit(rows, prefix, remaining)
+                return
+            groups = {}
+            cbest = codes[best]
+            for r in rows:
+                groups.setdefault(cbest[r], []).append(r)
+            rem2 = remaining - {best}
+            for g in groups.values():
+                _rec(g, rem2, depth + 1, prefix + [best])
+
+        try:
+            _rec(list(range(n_rows)), set(range(m)), 0, [])
+            if all(o is not None for o in orders):
+                candidates.append(("conditional", orders))
+        except Exception:
+            pass
+
+        total_chars = sum(len(s) for row in strs for s in row)
+
+        def _build_strings(perms):
+            return ["".join(strs[i][j] for j in perms[i]) for i in range(n_rows)]
+
+        # ---------------- bounded construction selection ---------------- #
+        best_name, best_perms = "global", candidates[0][1]
+        if n_rows > 1 and total_chars <= 4_000_000:
+            best_reuse = -1
+            for name, perms in candidates:
+                try:
+                    reuse = self._trie_reuse(_build_strings(perms))
+                except Exception:
+                    continue
+                if reuse > best_reuse:
+                    best_reuse = reuse
+                    best_name, best_perms = name, perms
+
+        # ---------------- final output ---------------- #
+        row_strings = _build_strings(best_perms)
+        positions = sorted(range(n_rows), key=lambda i: row_strings[i])
+
+        final_df = work.iloc[positions].copy()
+        if len(set(map(str, final_df.dtypes))) > 1:
+            final_df = final_df.astype(object)
+
+        orderings = [[cols[j] for j in best_perms[i]] for i in positions]
+        return final_df, orderings
+
+# EVOLVE-BLOCK-END

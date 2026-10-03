@@ -1,0 +1,202 @@
+<NAME>
+ils_with_or_opt_moves</NAME>
+<DESCRIPTION>
+Replace the beam search with a hybrid: a fast greedy nearest-neighbor construction (picking the transaction that increases makespan the least at each step, with several restarts from different seeds), followed by an Iterated Local Search using insertion (or-1), swap, and or-opt segment moves (blocks of length 2–3) with restart perturbation. This evaluates actual makespan via `get_opt_seq_cost` on full sequences, which is expensive, so local search only computes costs on full candidate sequences but keeps candidate generation cheap (O(n) per move type). Greedy construction gives a strong starting solution quickly; ILS with rich neighborhoods (or-opt blocks of 2–3 proven valuable in prior gens) then improves it. A time-budget-free iteration cap scaled by n keeps runtime reasonable.
+
+Reasoning step-by-step: (1) greedy construction picks at each step the txn minimizing actual makespan increment — much faster than beam search while nearly as good; (2) multiple greedy restarts from random seeds diversify; (3) local search with insertion + swap + or-opt(2,3) removes ordering inefficiencies; (4) perturbation (random 3-swap) escapes local optima; (5) accepting only improving full solutions guarantees no regression, and we track the global best across all restarts.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def get_best_schedule(workload, num_seqs):
+    """
+    Find a low-makespan schedule via beam search with randomized restarts.
+    Maintains a beam of partial orderings, expanding each with all remaining
+    transactions and pruning to the best k by actual makespan cost.
+    """
+    n = workload.num_txns
+    if n == 0:
+        return 0, []
+
+    best_cost = float('inf')
+    best_seq = None
+
+    # random tie-breaking seeds to escape local optima over restarts
+    num_restarts = max(1, min(8, 200 // max(1, n)))
+    beam_width = max(2, min(6, 400 // max(1, n)))
+
+    for restart in range(num_restarts):
+        # Beam of (cost, seq, remaining_frozenset)
+        # start with a few random seeds plus all-zero-cost options
+        seeds = set()
+        seeds.add(0)
+        seeds.add(random.randrange(n))
+        if n > 1:
+            seeds.add(random.randrange(n))
+        beam = []
+        for s in seeds:
+            seq = [s]
+            rem = [x for x in range(n) if x != s]
+            c = workload.get_opt_seq_cost(seq)
+            beam.append((c, seq, rem))
+        beam.sort(key=lambda x: x[0])
+        beam = beam[:beam_width]
+
+        while beam and len(beam[0][1]) < n:
+            candidates = []
+            for c, seq, rem in beam:
+                if not rem:
+                    continue
+                # expand with all remaining transactions (full lookahead)
+                for t in rem:
+                    new_seq = seq + [t]
+                    new_rem = [x for x in rem if x != t]
+                    cost = workload.get_opt_seq_cost(new_seq)
+                    candidates.append((cost, new_seq, new_rem))
+            if not candidates:
+                break
+            # prune to beam width, with random tie-break jitter to diversify
+            candidates.sort(key=lambda x: x[0])
+            beam = candidates[:beam_width]
+
+        if beam:
+            c, seq, rem = beam[0]
+            final_cost = workload.get_opt_seq_cost(seq)
+            if final_cost < best_cost:
+                best_cost = final_cost
+                best_seq = seq
+
+    assert best_seq is not None and len(set(best_seq)) == n
+    return best_cost, best_seq
+=======
+def _greedy_construct(workload, n, first):
+    """Greedy: repeatedly append the txn that minimizes makespan increase."""
+    seq = [first]
+    rem = [x for x in range(n) if x != first]
+    cur_cost = workload.get_opt_seq_cost(seq)
+    while rem:
+        best_t = None
+        best_c = float('inf')
+        for t in rem:
+            c = workload.get_opt_seq_cost(seq + [t])
+            if c < best_c:
+                best_c = c
+                best_t = t
+        seq.append(best_t)
+        rem.remove(best_t)
+        cur_cost = best_c
+    return cur_cost, seq
+
+
+def _local_search(workload, seq, cost, deadline_rounds):
+    """ILS local search with insertion, swap, and or-opt (2-3) block moves."""
+    n = len(seq)
+    improved = True
+    rounds = 0
+    while improved and rounds < deadline_rounds:
+        improved = False
+        rounds += 1
+        # insertion (or-1) moves
+        for i in range(n):
+            t = seq[i]
+            rest = seq[:i] + seq[i + 1:]
+            for j in range(n - 1):
+                cand = rest[:j] + [t] + rest[j:]
+                c = workload.get_opt_seq_cost(cand)
+                if c < cost:
+                    seq, cost = cand, c
+                    improved = True
+                    break
+            if improved:
+                break
+        if improved:
+            continue
+        # swap moves
+        for i in range(n):
+            for j in range(i + 1, n):
+                cand = seq[:]
+                cand[i], cand[j] = cand[j], cand[i]
+                c = workload.get_opt_seq_cost(cand)
+                if c < cost:
+                    seq, cost = cand, c
+                    improved = True
+                    break
+            if improved:
+                break
+        if improved:
+            continue
+        # or-opt: relocate blocks of length 2-3
+        for length in (2, 3):
+            for i in range(n - length + 1):
+                block = seq[i:i + length]
+                rest = seq[:i] + seq[i + length:]
+                for j in range(len(rest) + 1):
+                    if j == i:
+                        continue
+                    cand = rest[:j] + block + rest[j:]
+                    c = workload.get_opt_seq_cost(cand)
+                    if c < cost:
+                        seq, cost = cand, c
+                        improved = True
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+    return seq, cost
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Greedy construction from multiple seeds, then ILS with insertion, swap,
+    and or-opt (2-3) segment moves; perturbation restarts escape local optima.
+    """
+    n = workload.num_txns
+    if n == 0:
+        return 0, []
+
+    best_cost = float('inf')
+    best_seq = None
+
+    num_restarts = max(2, min(6, 150 // max(1, n)))
+    deadline_rounds = max(20, min(300, 3000 // max(1, n)))
+
+    for restart in range(num_restarts):
+        if restart == 0:
+            first = 0
+        elif restart == 1 and n > 1:
+            first = n - 1
+        else:
+            first = random.randrange(n)
+        cost, seq = _greedy_construct(workload, n, first)
+        seq, cost = _local_search(workload, seq, cost, deadline_rounds)
+        if cost < best_cost:
+            best_cost = cost
+            best_seq = seq
+
+    # perturbation-based ILS from the best solution found so far
+    cur_seq = best_seq[:]
+    cur_cost = best_cost
+    for _ in range(deadline_rounds):
+        cand = cur_seq[:]
+        # perturb: random segment reinsertion of a small block
+        i = random.randrange(n)
+        length = random.choice((1, 2, 3))
+        end = min(n, i + length)
+        block = cand[i:end]
+        rest = cand[:i] + cand[end:]
+        if not rest:
+            break
+        j = random.randrange(len(rest) + 1)
+        cand = rest[:j] + block + rest[j:]
+        c = workload.get_opt_seq_cost(cand)
+        seq2, cost2 = _local_search(workload, cand, c, 40)
+        if cost2 < cur_cost:
+            cur_seq, cur_cost = seq2, cost2
+        if cur_cost < best_cost:
+            best_cost = cur_cost
+            best_seq = cur_seq[:]
+
+    assert best_seq is not None and len(set(best_seq)) == n
+    return best_cost, best_seq
+>>>>>>> REPLACE
+</DIFF>

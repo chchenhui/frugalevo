@@ -1,0 +1,403 @@
+--- a/original.py
++++ b/original.py
+@@ -1,194 +1,254 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_convex13() -> np.ndarray:
+     """
+-    Construct a deterministic 13-point Heilbronn-style configuration.
+-
+-    The containing convex region is an equilateral triangle.  Its three
+-    vertices are retained as hull points; the remaining ten points consist
+-    of the centroid and three independently phased 3-fold rings.  Since the
+-    maximum ring radius is smaller than the triangle inradius, every point
+-    is guaranteed to lie inside the hull.
+-
+-    Returns
+-    -------
+-    np.ndarray
+-        Array of shape (13, 2).
++    Deterministically construct thirteen points in an equilateral convex hull
++    of area exactly one.  The configuration consists of three hull vertices,
++    the centroid, and three independently phased three-point rings.
++
++    The search operates in a compact six-dimensional parameter space:
++    three ring radii and three phases.  Every generated ring lies within the
++    incircle and therefore every returned point is inside the hull.
+     """
+-    rng = np.random.default_rng(20260313)
++    rng = np.random.default_rng(20260316)
+ 
+     root3 = np.sqrt(3.0)
++    side = np.sqrt(4.0 / root3)
++    height = 0.5 * root3 * side
+     hull = np.array(
+-        [
+-            [0.0, 0.0],
+-            [1.0, 0.0],
+-            [0.5, 0.5 * root3],
+-        ],
+-        dtype=float,
+-    )
+-    center = np.array([0.5, root3 / 6.0], dtype=float)
+-    hull_area = root3 / 4.0
++        [[0.0, 0.0], [side, 0.0], [0.5 * side, height]],
++        dtype=np.float64,
++    )
++    center = np.array([0.5 * side, height / 3.0], dtype=np.float64)
++
++    inradius = height / 3.0
++    radius_lo = 0.070 * inradius
++    radius_hi = 0.978 * inradius
++    period = 2.0 * np.pi / 3.0
++    offsets = np.array([0.0, period, 2.0 * period], dtype=np.float64)
+ 
+     triples = np.array(
+         [
+             (i, j, k)
+             for i in range(13)
+             for j in range(i + 1, 13)
+             for k in range(j + 1, 13)
+         ],
+         dtype=np.intp,
+     )
+ 
+-    # Parameter vector:
+-    # [ring_radius_0, ring_radius_1, ring_radius_2,
+-    #  ring_phase_0,  ring_phase_1,  ring_phase_2].
+-    #
+-    # A disk of radius inradius=0.288675... about the centroid is wholly
+-    # contained in the equilateral triangle, so 0.278 is a safe strict bound.
+-    radius_lo = 0.035
+-    radius_hi = 0.278
+-    angle_period = 2.0 * np.pi / 3.0
+-
+-    def wrap_parameters(x: np.ndarray) -> np.ndarray:
+-        y = x.copy()
+-        y[..., :3] = np.clip(y[..., :3], radius_lo, radius_hi)
+-        y[..., 3:] = np.mod(y[..., 3:], angle_period)
+-        return y
+-
+-    def make_layouts(params: np.ndarray) -> np.ndarray:
+-        """Build a batch of 13-point layouts from ring parameters."""
+-        count = params.shape[0]
+-        layouts = np.empty((count, 13, 2), dtype=float)
+-        layouts[:, :3] = hull
+-        layouts[:, 3] = center
+-
+-        radii = params[:, :3]
+-        phases = params[:, 3:]
+-        offsets = np.array([0.0, angle_period, 2.0 * angle_period])
+-
++    def reflect_unit(x: np.ndarray) -> np.ndarray:
++        y = np.mod(x, 2.0)
++        return np.where(y > 1.0, 2.0 - y, y)
++
++    def canonical(z: np.ndarray) -> np.ndarray:
++        q = np.array(z, dtype=np.float64, copy=True)
++        q[..., :3] = reflect_unit(q[..., :3])
++        q[..., 3:] = np.mod(q[..., 3:], 1.0)
++        return q
++
++    def layouts(z: np.ndarray) -> np.ndarray:
++        z = canonical(z)
++        count = z.shape[0]
++        result = np.empty((count, 13, 2), dtype=np.float64)
++        result[:, :3] = hull
++        result[:, 3] = center
++
++        radii = radius_lo + (radius_hi - radius_lo) * z[:, :3]
++        phases = period * z[:, 3:]
+         for ring in range(3):
+             angles = phases[:, ring, None] + offsets[None, :]
+-            start = 4 + 3 * ring
+-            layouts[:, start:start + 3, 0] = (
++            begin = 4 + 3 * ring
++            result[:, begin:begin + 3, 0] = (
+                 center[0] + radii[:, ring, None] * np.cos(angles)
+             )
+-            layouts[:, start:start + 3, 1] = (
++            result[:, begin:begin + 3, 1] = (
+                 center[1] + radii[:, ring, None] * np.sin(angles)
+             )
+-        return layouts
+-
+-    def score(params: np.ndarray) -> np.ndarray:
+-        """Normalized minimum area for a batch of parameter vectors."""
+-        p = make_layouts(params)
++        return result
++
++    def triangle_areas(z: np.ndarray) -> np.ndarray:
++        p = layouts(z)
+         a = p[:, triples[:, 0]]
+         b = p[:, triples[:, 1]]
+         c = p[:, triples[:, 2]]
+-        double_area = np.abs(
++        return 0.5 * np.abs(
+             (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
+             - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
+         )
+-        return 0.5 * double_area.min(axis=1) / hull_area
++
++    def evaluate(z: np.ndarray, tail_weight: float = 0.0):
++        values = triangle_areas(z)
++        low = np.partition(values, 19, axis=1)[:, :20]
++        minima = low[:, 0]
++        merit = minima + tail_weight * low.mean(axis=1)
++        return merit, minima
+ 
+     population_size = 384
+-    generations = 720
+-
+-    # Stratified initialization gives substantially more radial diversity than
+-    # plain random starts, which is useful for a nonsmooth maximin objective.
+-    population = np.empty((population_size, 6), dtype=float)
+-    for coordinate in range(3):
+-        strata = (np.arange(population_size) + rng.random(population_size))
++    generations = 740
++    elite_count = 32
++
++    population = np.empty((population_size, 6), dtype=np.float64)
++    for coordinate in range(6):
++        strata = np.arange(population_size, dtype=np.float64) + rng.random(population_size)
+         rng.shuffle(strata)
+-        population[:, coordinate] = radius_lo + (
+-            radius_hi - radius_lo
+-        ) * strata / population_size
+-    population[:, 3:] = rng.uniform(
+-        0.0, angle_period, size=(population_size, 3)
+-    )
+-
+-    # Hand-spaced seeds keep useful ring separations present from generation 0.
+-    population[0] = np.array(
+-        [0.090, 0.166, 0.250, 0.070, 0.410, 1.030], dtype=float
+-    )
+-    population[1] = np.array(
+-        [0.112, 0.191, 0.267, 0.225, 0.800, 1.285], dtype=float
+-    )
+-    population = wrap_parameters(population)
+-    values = score(population)
+-
++        population[:, coordinate] = strata / population_size
++
++    seeds = np.array(
++        [
++            [0.11, 0.39, 0.72, 0.03, 0.37, 0.79],
++            [0.16, 0.48, 0.82, 0.10, 0.52, 0.91],
++            [0.22, 0.56, 0.88, 0.20, 0.65, 0.07],
++            [0.28, 0.63, 0.94, 0.34, 0.76, 0.15],
++            [0.09, 0.44, 0.78, 0.28, 0.61, 0.96],
++            [0.34, 0.68, 0.91, 0.06, 0.47, 0.84],
++            [0.18, 0.52, 0.85, 0.42, 0.80, 0.19],
++            [0.25, 0.59, 0.95, 0.17, 0.58, 0.89],
++        ],
++        dtype=np.float64,
++    )
++    population[:len(seeds)] = seeds
++    population = canonical(population)
++
++    _, values = evaluate(population)
+     best_index = int(np.argmax(values))
+     best = population[best_index].copy()
+     best_value = float(values[best_index])
+ 
+     for generation in range(generations):
+         progress = generation / float(generations - 1)
+-
+-        # Current-to-best differential evolution: broad early exploration,
+-        # then increasingly conservative moves around active constraints.
+-        factor = 0.82 - 0.48 * progress
+-        attraction = 0.16 + 0.42 * progress
+-        crossover_rate = 0.78 - 0.22 * progress
+-
+-        order_a = rng.permutation(population_size)
+-        order_b = rng.permutation(population_size)
+-        donor = (
++        tail_weight = 0.115 * (1.0 - progress) ** 1.85
++        merits, minima = evaluate(population, tail_weight)
++
++        rank = np.argsort(merits)
++        elite = population[rank[-elite_count:]]
++        elite_choice = elite[rng.integers(0, elite_count, size=population_size)]
++
++        ia = rng.permutation(population_size)
++        ib = rng.permutation(population_size)
++        ic = rng.permutation(population_size)
++
++        factor = 0.79 - 0.50 * progress
++        pull = 0.08 + 0.56 * progress
++
++        # Broad basin discovery.
++        donor_rand = population[ia] + factor * (population[ib] - population[ic])
++
++        # Progressively stronger incumbent/elite exploitation.
++        donor_current = (
+             population
+-            + attraction * (best[None, :] - population)
+-            + factor * (population[order_a] - population[order_b])
++            + pull * (elite_choice - population)
++            + factor * (population[ia] - population[ib])
+         )
+-        donor = wrap_parameters(donor)
+-
+-        mask = rng.random((population_size, 6)) < crossover_rate
+-        mask[np.arange(population_size), rng.integers(0, 6, population_size)] = True
+-        trial = np.where(mask, donor, population)
+-        trial = wrap_parameters(trial)
+-
+-        trial_values = score(trial)
+-        accepted = trial_values >= values
++
++        # Elite difference mutation is especially useful near the end when
++        # feasible maximin basins are narrow.
++        donor_elite = elite_choice + (
++            0.53 - 0.31 * progress
++        ) * (population[ia] - population[ib])
++
++        mode = rng.random(population_size)
++        rand_probability = 0.52 - 0.31 * progress
++        current_probability = rand_probability + 0.34 + 0.10 * progress
++        donor = np.where(
++            (mode < rand_probability)[:, None],
++            donor_rand,
++            np.where((mode < current_probability)[:, None], donor_current, donor_elite),
++        )
++        donor = canonical(donor)
++
++        crossover_rate = 0.90 - 0.34 * progress
++        cross = rng.random((population_size, 6)) < crossover_rate
++        cross[np.arange(population_size), rng.integers(0, 6, population_size)] = True
++        trial = canonical(np.where(cross, donor, population))
++
++        trial_merit, trial_minima = evaluate(trial, tail_weight)
++        accepted = trial_merit >= merits
+         population[accepted] = trial[accepted]
+-        values[accepted] = trial_values[accepted]
+-
+-        generation_best = int(np.argmax(values))
+-        if values[generation_best] > best_value:
+-            best_value = float(values[generation_best])
+-            best = population[generation_best].copy()
+-
+-        # Deterministic diversity injection prevents all rings from becoming
+-        # phase-locked into the same local arrangement.
+-        if generation in (230, 470):
+-            worst = np.argsort(values)[: population_size // 5]
+-            population[worst, :3] = rng.uniform(
+-                radius_lo, radius_hi, size=(len(worst), 3)
+-            )
+-            population[worst, 3:] = rng.uniform(
+-                0.0, angle_period, size=(len(worst), 3)
+-            )
+-            values[worst] = score(population[worst])
+-
+-    # Batch local refinement.  Unlike coordinate annealing, each round tests
+-    # many correlated radius/phase changes and accepts only true improvements.
+-    for iteration in range(260):
+-        fraction = iteration / 259.0
+-        radial_step = 0.018 * (0.0012 / 0.018) ** fraction
+-        phase_step = 0.160 * (0.0020 / 0.160) ** fraction
+-
+-        candidates = np.repeat(best[None, :], 96, axis=0)
+-        perturb = rng.normal(size=(96, 6))
+-        sparse = rng.random((96, 6)) < 0.48
+-        sparse[0, rng.integers(0, 6)] = True
+-        perturb *= sparse
+-        perturb[:, :3] *= radial_step
+-        perturb[:, 3:] *= phase_step
+-        candidates = wrap_parameters(candidates + perturb)
+-
+-        candidate_values = score(candidates)
+-        candidate_index = int(np.argmax(candidate_values))
+-        if candidate_values[candidate_index] > best_value:
+-            best_value = float(candidate_values[candidate_index])
+-            best = candidates[candidate_index].copy()
+-
+-    return make_layouts(best[None, :])[0]
++        merits[accepted] = trial_merit[accepted]
++        minima[accepted] = trial_minima[accepted]
++
++        current = int(np.argmax(minima))
++        if minima[current] > best_value:
++            best_value = float(minima[current])
++            best = population[current].copy()
++
++        if generation in (215, 455):
++            weakest = np.argsort(minima)[:population_size // 5]
++            population[weakest] = rng.random((len(weakest), 6))
++            _, refreshed = evaluate(population[weakest])
++            minima[weakest] = refreshed
++
++    # Active-constraint-aware stochastic polishing.  Rings involved in tight
++    # triangles receive more proposals, while occasional two-variable moves
++    # can separate coupled active constraints.
++    for iteration in range(330):
++        progress = iteration / 329.0
++        values_now = triangle_areas(best[None, :])[0]
++        tight_ids = np.argpartition(values_now, 27)[:28]
++        tight = triples[tight_ids]
++
++        weights = np.full(6, 0.16, dtype=np.float64)
++        for ring in range(3):
++            ring_points = np.arange(4 + 3 * ring, 7 + 3 * ring)
++            involvement = np.isin(tight, ring_points).sum()
++            weights[ring] += involvement
++            weights[ring + 3] += involvement
++        weights /= weights.sum()
++
++        radial_scale = 0.041 * (0.0008 / 0.041) ** progress
++        phase_scale = 0.110 * (0.0012 / 0.110) ** progress
++        trial_count = 96
++
++        candidates = np.repeat(best[None, :], trial_count, axis=0)
++        for row in range(trial_count):
++            count = 2 if rng.random() < 0.29 else 1
++            selected = rng.choice(6, size=count, replace=False, p=weights)
++            for coordinate in selected:
++                scale = radial_scale if coordinate < 3 else phase_scale
++                candidates[row, coordinate] += rng.normal(0.0, scale)
++
++            if rng.random() < 0.20:
++                ring = int(rng.choice(3, p=weights[:3] / weights[:3].sum()))
++                candidates[row, ring] += rng.normal(0.0, radial_scale)
++                candidates[row, ring + 3] += rng.normal(0.0, phase_scale)
++
++        candidates[0] = best
++        candidates = canonical(candidates)
++        _, candidate_values = evaluate(candidates)
++        winner = int(np.argmax(candidate_values))
++        if candidate_values[winner] > best_value + 1e-14:
++            best_value = float(candidate_values[winner])
++            best = candidates[winner].copy()
++
++    # Final deterministic coordinate-pair pattern refinement.
++    directions = np.array(
++        [
++            [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
++            [1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0],
++        ],
++        dtype=np.float64,
++    )
++    directions[4:] /= np.sqrt(2.0)
++
++    for scale in (0.011, 0.0055, 0.0025, 0.0011):
++        candidates = []
++        for ring in range(3):
++            for direction in directions:
++                trial = best.copy()
++                trial[ring] += scale * direction[0]
++                trial[ring + 3] += scale * direction[1]
++                candidates.append(trial)
++        candidates = canonical(np.asarray(candidates))
++        _, candidate_values = evaluate(candidates)
++        winner = int(np.argmax(candidate_values))
++        if candidate_values[winner] > best_value + 1e-14:
++            best_value = float(candidate_values[winner])
++            best = candidates[winner].copy()
++
++    return layouts(best[None, :])[0]
+ 
+ 
+ # EVOLVE-BLOCK-END

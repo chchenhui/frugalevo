@@ -1,0 +1,321 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List, Dict, Optional
+from collections import defaultdict
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-cache optimized reordering.
+    Builds a few cheap candidate per-row column orderings, scores each with
+    the true character-Trie reuse objective (sum of LCPs of sorted serialized
+    rows), and returns the best. All original values are preserved exactly.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ---------- serialization helpers ----------
+
+    @staticmethod
+    def _ser(val) -> str:
+        if val is None:
+            return ""
+        if isinstance(val, float) and np.isnan(val):
+            return ""
+        try:
+            if pd.isna(val):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        if isinstance(val, bool):
+            return str(val)
+        return str(val)
+
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        if a == b:
+            return len(a)
+        hi = len(a) if len(a) < len(b) else len(b)
+        if hi == 0:
+            return 0
+        if a[0] != b[0]:
+            return 0
+        lo = 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _score(self, strings: List[str]) -> int:
+        """Ideal Trie reuse: sum of LCPs between lexicographically adjacent strings."""
+        if len(strings) < 2:
+            return 0
+        s = sorted(strings)
+        total = 0
+        for i in range(len(s) - 1):
+            total += self._lcp(s[i], s[i + 1])
+        return total
+
+    # ---------- column blocks (col_merge) ----------
+
+    @staticmethod
+    def _build_blocks(columns: List[str], col_merge: List[List[str]]) -> List[List[str]]:
+        """Group columns into blocks; merged columns stay adjacent."""
+        cols = list(columns)
+        merged = set()
+        blocks = []
+        for group in col_merge:
+            members = [c for c in group if c in cols]
+            if len(members) > 1:
+                merged.update(members)
+                blocks.append(members)
+        for c in cols:
+            if c not in merged:
+                blocks.append([c])
+        return blocks
+
+    # ---------- candidate construction ----------
+
+    def _order_blocks_global(self, blocks, block_strings, nrows):
+        """Rank blocks by sum over serialized values v of len(v)*cnt*(cnt-1)."""
+        scores = []
+        for bi, block in enumerate(blocks):
+            if len(block) == 1:
+                strs = block_strings[bi]
+                counts = defaultdict(int)
+                for s in strs:
+                    counts[s] += 1
+                sc = sum(len(v) * c * (c - 1) for v, c in counts.items())
+            else:
+                sc = 0.0  # merged blocks: keep early, stable
+                sc += 1e18
+            scores.append((-sc, block[0]))
+        order = sorted(range(len(blocks)), key=lambda i: scores[i])
+        return [b for i in order for b in blocks[i]]
+
+    def _order_blocks_length(self, blocks, block_strings, nrows):
+        """Rank blocks by average serialized length (descending)."""
+        scores = []
+        for bi, block in enumerate(blocks):
+            if len(block) == 1:
+                strs = block_strings[bi]
+                avg = sum(len(s) for s in strs) / max(1, len(strs))
+            else:
+                avg = float("inf")
+            scores.append((-avg, block[0]))
+        order = sorted(range(len(blocks)), key=lambda i: scores[i])
+        return [b for i in order for b in blocks[i]]
+
+    def _conditional_tree(self, blocks, block_strings, block_codes, nrows):
+        """Conditional prefix partition tree over blocks.
+
+        Returns per-row block sequences (list of block indices per row).
+        """
+        nblocks = len(blocks)
+        row_orders = [None] * nrows
+        # codes: list of numpy arrays (one per block), integer codes per row
+        # start: all rows, no blocks used
+        stack = [(list(range(nrows)), [])]
+        while stack:
+            rows, prefix = stack.pop()
+            remaining = [b for b in range(nblocks) if b not in prefix]
+            if not rows or not remaining or len(rows) < 4 or len(remaining) > 64:
+                # deterministic cheap tail: global heuristic order for remaining
+                tail = self._order_blocks_global(
+                    [blocks[b] for b in remaining],
+                    {b: block_strings[b] for b in remaining},
+                    len(rows),
+                )
+                tail_blocks = [blocks.index([c]) if False else None for c in tail]
+                # map column names back to block indices
+                col_to_block = {}
+                for bi, block in enumerate(blocks):
+                    for c in block:
+                        col_to_block[c] = bi
+                seq = prefix + [col_to_block[c] for c in tail]
+                for r in rows:
+                    row_orders[r] = seq
+                continue
+            # pick best remaining block by length-weighted pair repetition
+            best_b, best_sc = None, 0
+            for b in remaining:
+                codes = block_codes[b][rows]
+                cnt = np.bincount(codes)
+                lens = block_lens[b]
+                sc = float(np.sum(lens[: len(cnt)] * cnt * (cnt - 1)))
+                if sc > best_sc:
+                    best_sc, best_b = sc, b
+            if best_b is None:
+                col_to_block = {}
+                for bi, block in enumerate(blocks):
+                    for c in block:
+                        col_to_block[c] = bi
+                tail = self._order_blocks_global(
+                    [blocks[b] for b in remaining],
+                    {b: block_strings[b] for b in remaining},
+                    len(rows),
+                )
+                seq = prefix + [col_to_block[c] for c in tail]
+                for r in rows:
+                    row_orders[r] = seq
+                continue
+            new_prefix = prefix + [best_b]
+            codes = block_codes[best_b][rows]
+            order_map = np.argsort(codes, kind="stable")
+            sorted_rows = [rows[i] for i in order_map]
+            sorted_codes = codes[order_map]
+            # partition by code value
+            start = 0
+            k = 0
+            while start < len(sorted_rows):
+                end = start
+                c = sorted_codes[start]
+                while end < len(sorted_rows) and sorted_codes[end] == c:
+                    end += 1
+                stack.append((sorted_rows[start:end], new_prefix))
+                start = end
+                k += 1
+                if k > 64:  # bound fan-out
+                    stack.append((sorted_rows[start:], new_prefix))
+                    break
+        return row_orders
+
+    # ---------- main API ----------
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        # Empty / trivial cases
+        if df is None or df.empty:
+            return df.copy(), [list(df.columns)] * len(df)
+
+        columns = list(df.columns)
+        nrows, ncols = df.shape
+        if ncols <= 1:
+            return df.copy(), [columns] * nrows
+
+        # Raw values (object), exact preservation
+        raw = df.astype(object).values.tolist()
+
+        # Serialized strings per column for scoring / heuristics
+        col_ser = [
+            [self._ser(raw[r][ci]) for r in range(nrows)] for ci in range(ncols)
+        ]
+
+        # Column blocks honoring col_merge (merged columns stay adjacent)
+        blocks = self._build_blocks(columns, col_merge)
+        # block -> serialized strings (concatenation for multi-col blocks),
+        # integer codes, per-value lengths
+        block_strings = {}
+        block_codes = {}
+        block_lens = {}
+        for block in blocks:
+            if len(block) == 1:
+                ci = columns.index(block[0])
+                strs = col_ser[ci]
+            else:
+                idxs = [columns.index(c) for c in block]
+                strs = [
+                    "".join(col_ser[ci][r] for ci in idxs) for r in range(nrows)
+                ]
+            # factorize
+            val_map = {}
+            codes = np.empty(nrows, dtype=np.int64)
+            lens_list = []
+            for r, s in enumerate(strs):
+                if s not in val_map:
+                    val_map[s] = len(lens_list)
+                    lens_list.append(len(s))
+                codes[r] = val_map[s]
+            block_strings[columns.index(block[0]) if len(block) == 1 else -1 - blocks.index(block)] = strs
+            block_codes[blocks.index(block)] = codes
+            block_lens[blocks.index(block)] = np.array(lens_list, dtype=np.int64)
+
+        # re-key block_strings by block index
+        bs = {}
+        for bi, block in enumerate(blocks):
+            bs[bi] = block_strings[
+                columns.index(block[0]) if len(block) == 1 else -1 - bi
+            ]
+
+        # Candidate 1: global frequency-ranked order
+        order1 = self._order_blocks_global(blocks, bs, nrows)
+
+        # Candidate 2: length-ranked order
+        order2 = self._order_blocks_length(blocks, bs, nrows)
+
+        # Candidate 3: conditional partition tree (per-row orders)
+        tree_orders = self._conditional_tree(blocks, bs, block_codes, nrows)
+
+        def row_string(row_values_ser, col_order):
+            return "".join(row_values_ser[ci] for ci in col_order)
+
+        def eval_global(col_order):
+            strs = [
+                "".join(col_ser[ci][r] for ci in col_order) for r in range(nrows)
+            ]
+            return self._score(strs)
+
+        sc1 = eval_global(order1)
+        sc2 = eval_global(order2)
+        # candidate 3: per-row orders
+        strs3 = []
+        for r in range(nrows):
+            col_order = []
+            for bi in tree_orders[r]:
+                col_order.extend(blocks[bi])
+            strs3.append("".join(col_ser[ci][r] for ci in col_order))
+        sc3 = self._score(strs3)
+
+        # total serialized length (constant across candidates)
+        total_chars = sum(sum(len(s) for s in col) for col in col_ser)
+
+        best = max(sc1, sc2, sc3)
+        if best == sc1 and sc1 >= sc3 and sc1 >= sc2:
+            chosen_row_orders = [order1] * nrows
+        elif best == sc2 and sc2 >= sc3:
+            chosen_row_orders = [order2] * nrows
+        else:
+            chosen_row_orders = []
+            for r in range(nrows):
+                col_order = []
+                for bi in tree_orders[r]:
+                    col_order.extend(blocks[bi])
+                chosen_row_orders.append(col_order)
+
+        # Build output: row i, position j holds value of column chosen_row_orders[i][j].
+        # Dataframe keeps positional original column names; column_orderings
+        # records the original column behind each position.
+        out_values = []
+        for r in range(nrows):
+            rowvals = raw[r]
+            out_values.append([rowvals[columns.index(c)] for c in chosen_row_orders[r]])
+
+        out_df = pd.DataFrame(out_values, columns=columns).astype(object)
+        # preserve dtypes per position where possible
+        for j, col in enumerate(columns):
+            try:
+                orig = df[col]
+                if len(orig.unique()) and orig.dtype != object:
+                    out_df[col] = out_df[col].astype(orig.dtype)
+            except Exception:
+                pass
+
+        return out_df, [list(o) for o in chosen_row_orders]
+
+
+# EVOLVE-BLOCK-END

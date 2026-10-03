@@ -1,0 +1,142 @@
+<NAME>
+richer_local_search_moves_diverse_beam</NAME>
+<DESCRIPTION>
+The current program's local search regressed to only insertion + swap (best-improvement-without-break, scanning the entire neighborhood each pass), dropping the or-opt block moves and 2-opt segment reversals that made the earlier 275-makespan variant strong, and its beam keeps only cost-top children so all beam slots converge to near-identical prefixes. I restore the richer move set (insertion, swap, or-opt blocks of size 2-3, 2-opt reversals) with first-improvement early exits so each pass spends its evaluations where gains are found, and add diversity-preserving beam pruning: keep the top beam_width-2 by cost plus 2 children whose last-appended txn differs from the cost-best entries. This prevents the beam from wasting all slots on one prefix while keeping greedy-style diversity, which should lower makespan further below 274. I also add a short candidate-sequence dedup cache on get_opt_seq_cost to avoid recomputing identical sequences across passes.
+
+Step-by-step reasoning:
+1. Insertion/swap alone get stuck in shallow local optima for ordering problems; block moves (or-opt) and segment reversals (2-opt) escape wider basins, so restoring them yields lower local minima.
+2. First-improvement with break exits finds improving moves faster, allowing more perturbation restarts within the fixed 20s budget — more effective search iterations means better final schedules.
+3. Diverse beam pruning maintains exploration of multiple txn-ordering frontiers at zero extra cost, feeding the local search with genuinely different starting candidates (the same diversity principle that made greedy constructions effective).
+4. A memo dict avoids recomputing costs of sequences already evaluated (perturbations and moves often revisit states), freeing time for additional moves.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+            cands.sort(key=lambda x: x[0])
+            beam = [(c[1], c[2]) for c in cands[:beam_width]]
+=======
+            cands.sort(key=lambda x: x[0])
+            # diversity-preserving pruning: top (beam_width-2) by cost
+            # plus 2 children whose last txn differs from the cost-best entries
+            beam = [(c[1], c[2]) for c in cands[:max(1, beam_width - 2)]]
+            if beam_width > 2:
+                top_last = {c[1][-1] for c in cands[:beam_width]}
+                added = 0
+                for c in cands[beam_width:]:
+                    if c[1][-1] not in top_last and added < 2:
+                        beam.append((c[1], c[2]))
+                        added += 1
+                    if added >= 2:
+                        break
+                while len(beam) < beam_width and len(cands) > len(beam):
+                    beam.append((cands[len(beam)][1], cands[len(beam)][2]))
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # ---------- Phase 2: iterated local search on top candidates ----------
+    def local_search(seq, cur_cost, deadline):
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            # insertion moves
+            for i in range(n):
+                if time.time() >= deadline:
+                    return seq, cur_cost
+                for j in range(n):
+                    if i == j:
+                        continue
+                    cand = seq[:i] + seq[i+1:]
+                    cand.insert(j, seq[i])
+                    c = workload.get_opt_seq_cost(cand)
+                    if c < cur_cost:
+                        seq, cur_cost, improved = cand, c, True
+            # swap moves
+            for i in range(n):
+                if time.time() >= deadline:
+                    return seq, cur_cost
+                for j in range(i + 1, n):
+                    cand = seq[:]
+                    cand[i], cand[j] = cand[j], cand[i]
+                    c = workload.get_opt_seq_cost(cand)
+                    if c < cur_cost:
+                        seq, cur_cost, improved = cand, c, True
+        return seq, cur_cost
+=======
+    # ---------- Phase 2: iterated local search on top candidates ----------
+    cost_cache = {}
+
+    def eval_cost(seq):
+        key = tuple(seq)
+        c = cost_cache.get(key)
+        if c is None:
+            c = workload.get_opt_seq_cost(seq)
+            if len(cost_cache) < 200000:
+                cost_cache[key] = c
+        return c
+
+    def local_search(seq, cur_cost, deadline):
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            # insertion moves (first-improvement)
+            for i in range(n):
+                if time.time() >= deadline:
+                    return seq, cur_cost
+                t = seq[i]
+                base = seq[:i] + seq[i+1:]
+                for j in range(n):
+                    if j == i:
+                        continue
+                    cand = base[:j] + [t] + base[j:]
+                    c = eval_cost(cand)
+                    if c < cur_cost:
+                        seq, cur_cost, improved = cand, c, True
+                        break
+            # swap moves (first-improvement)
+            for i in range(n):
+                if time.time() >= deadline:
+                    return seq, cur_cost
+                for j in range(i + 1, n):
+                    cand = seq[:]
+                    cand[i], cand[j] = cand[j], cand[i]
+                    c = eval_cost(cand)
+                    if c < cur_cost:
+                        seq, cur_cost, improved = cand, c, True
+                        break
+            # or-opt: move short contiguous blocks (size 2-3) elsewhere
+            for blk in (2, 3):
+                for i in range(n - blk + 1):
+                    if time.time() >= deadline:
+                        return seq, cur_cost
+                    block = seq[i:i + blk]
+                    rest = seq[:i] + seq[i + blk:]
+                    moved = False
+                    for j in range(len(rest) + 1):
+                        cand = rest[:j] + block + rest[j:]
+                        if cand == seq:
+                            continue
+                        c = eval_cost(cand)
+                        if c < cur_cost:
+                            seq, cur_cost, improved = cand, c, True
+                            moved = True
+                            break
+                    if moved:
+                        break
+            # 2-opt: reverse a segment (changes many pairwise orders at once)
+            outer_broke = False
+            for i in range(n - 1):
+                if time.time() >= deadline:
+                    return seq, cur_cost
+                for j in range(i + 2, n):
+                    cand = seq[:i+1] + seq[i+1:j+1][::-1] + seq[j+1:]
+                    c = eval_cost(cand)
+                    if c < cur_cost:
+                        seq, cur_cost, improved = cand, c, True
+                        outer_broke = True
+                        break
+                if outer_broke:
+                    break
+        return seq, cur_cost
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

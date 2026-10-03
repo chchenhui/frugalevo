@@ -1,0 +1,189 @@
+<NAME>
+constrained_slsqp_polish_top_candidates
+</NAME>
+<DESCRIPTION>
+The current program reaches combined_score ≈ 0.96 using only a stochastic
+gradient-style annealing (`_local_search`). The reported metric is
+min_max_ratio = (dmin/dmax)^2 ≈ 0.23 (i.e. dmin/dmax ≈ 0.48), close to the
+reference ratio 1/4.1658 ≈ 0.24 but still below 1.0 combined score.
+
+The known-best approach from the top prior generation (score 1.00 in 1.60s)
+was a two-stage pipeline: (1) smooth log-sum-exp Adam ascent on the ratio
+with analytic gradients, then (2) a **constrained SLSQP polish** that
+maximizes dmin² subject to hard constraints d²ᵢⱼ ≤ 1. The constrained
+formulation is exactly the right geometry: normalizing diameter to 1 and
+maximizing the minimum squared distance is the exact optimal-control
+form of the problem, and SLSQP with per-pair analytic constraint Jacobians
+converges to the boundary of the feasible set far more precisely than
+stochastic annealing (which plateaus around 0.48 because jitter keeps
+kicking points off the active constraints).
+
+The current program lost that constrained polish stage. I add it back,
+applied to the top candidates found by annealing:
+
+1. Keep `_local_search` for global exploration (it produces diverse
+   candidate basins), but track the top-3 distinct candidates instead of
+   only the single best, since the annealing landscape has many near-tied
+   basins and the constrained polish may lift any of them past the best.
+2. For each of the top-3 candidates, apply σ=0.05–0.3 symmetry-breaking
+   perturbations and run SLSQP maximizing t = dmin² with constraints
+   d²ᵢⱼ - t ≥ 0 and 1 - d²ᵢⱼ ≥ 0. Constraints are built in a plain Python
+   loop with per-pair closures (the vectorized Jacobian fill from an
+   earlier generation crashed on a shape mismatch, so it is deliberately
+   avoided here).
+3. Accept the SLSQP result if it improves the raw ratio; also fall back to
+   the annealing best if SLSQP fails.
+
+4. Trim the annealing budget slightly (the seeds sweep was the dominant
+   runtime cost at 5.79s and the SLSQP stage is fast); the final polish
+   iteration count is reduced and the polish stage after selection is
+   replaced by the SLSQP stage, keeping total runtime well within the
+   previous 5.79s while adding the exact constrained refinement that
+   pushed the prior best generation to score 1.00.
+
+The SLSQP stage directly attacks the KKT structure of the optimal
+configuration: at the optimum, the points realizing the minimum distance
+are pushed against the diameter constraints, which is exactly what
+constrained optimization handles and stochastic jitter cannot.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    def _min_dist(points):
+        n = points.shape[0]
+        diff = points[:, None, :] - points[None, :, :]
+        d = np.linalg.norm(diff, axis=-1)
+        iu = np.triu_indices(n, 1)
+        return d[iu].min(), d
+=======
+    def _min_dist(points):
+        n = points.shape[0]
+        diff = points[:, None, :] - points[None, :, :]
+        d = np.linalg.norm(diff, axis=-1)
+        iu = np.triu_indices(n, 1)
+        return d[iu].min(), d
+
+    def _ratio_sq(points):
+        n = points.shape[0]
+        iu = np.triu_indices(n, 1)
+        diff = points[:, None, :] - points[None, :, :]
+        d2 = (diff ** 2).sum(-1)
+        u = d2[iu]
+        mx = u.max()
+        if mx <= 0:
+            return 0.0
+        return u.min() / mx
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    best_pts, best_val = None, -1.0
+    total = len(seeds)
+    for s, pts in enumerate(seeds):
+        if pts.shape != (n, dim):
+            continue
+        # spread iteration budget so runtime stays bounded
+        it = 2200 if s < total - 20 else 1200
+        p, v = _local_search(pts, iters=it, seed=s)
+        if v > best_val:
+            best_val, best_pts = v, p
+
+    # final polish with small steps
+    p, v = _local_search(best_pts, iters=4000, seed=999)
+    if v > best_val:
+        best_val, best_pts = v, p
+
+    best_pts, _, _ = _normalize(best_pts)
+    return best_pts
+=======
+    # keep top candidates (not just the best) for the constrained polish
+    cands = []  # list of (ratio_sq, pts)
+    total = len(seeds)
+    for s, pts in enumerate(seeds):
+        if pts.shape != (n, dim):
+            continue
+        # spread iteration budget so runtime stays bounded
+        it = 1600 if s < total - 20 else 1000
+        p, v = _local_search(pts, iters=it, seed=s)
+        cands.append((v * v, p))
+    # short polish of the current best, then re-collect
+    cands.sort(key=lambda c: -c[0])
+    p, v = _local_search(cands[0][1], iters=1500, seed=999)
+    cands.append((v * v, p))
+    cands.sort(key=lambda c: -c[0])
+
+    # -------- constrained SLSQP polish on top-3 candidates --------
+    # maximize t = dmin^2 subject to d^2_ij - t >= 0 and 1 - d^2_ij >= 0
+    from scipy.optimize import minimize as _minimize
+
+    nvar = 3 * n + 1
+
+    def _obj(z):
+        return -z[-1]
+
+    def _obj_grad(z):
+        g = np.zeros_like(z)
+        g[-1] = -1.0
+        return g
+
+    _cons = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            def fmin(z, i=i, j=j):
+                return (np.sum((z[3*i:3*i+3] - z[3*j:3*j+3])**2)
+                        - z[-1])
+            def gmin(z, i=i, j=j):
+                g = np.zeros(nvar)
+                di = 2.0 * (z[3*i:3*i+3] - z[3*j:3*j+3])
+                g[3*i:3*i+3] = di
+                g[3*j:3*j+3] = -di
+                g[-1] = -1.0
+                return g
+            def fmax(z, i=i, j=j):
+                return 1.0 - np.sum((z[3*i:3*i+3] - z[3*j:3*j+3])**2)
+            def gmax(z, i=i, j=j):
+                g = np.zeros(nvar)
+                di = 2.0 * (z[3*i:3*i+3] - z[3*j:3*j+3])
+                g[3*i:3*i+3] = -di
+                g[3*j:3*j+3] = di
+                return g
+            _cons.append({'type': 'ineq', 'fun': fmin, 'jac': gmin})
+            _cons.append({'type': 'ineq', 'fun': fmax, 'jac': gmax})
+
+    def _slsqp(pts):
+        pts, _, _ = _normalize(pts)
+        d2 = ((pts[:, None, :] - pts[None, :, :]) ** 2).sum(-1)
+        iu = np.triu_indices(n, 1)
+        t0 = d2[iu].min()
+        z0 = np.concatenate([pts.ravel(), [t0]])
+        try:
+            res = _minimize(_obj, z0, jac=_obj_grad, constraints=_cons,
+                            method='SLSQP',
+                            options={'maxiter': 300, 'ftol': 1e-12})
+            p2 = res.x[:-1].reshape(n, dim)
+            r2 = _ratio_sq(p2)
+            if not np.isfinite(r2):
+                return None, 0.0
+            return p2, r2
+        except Exception:
+            return None, 0.0
+
+    rng2 = np.random.default_rng(7)
+    best_pts, best_val = cands[0][1], cands[0][0]
+    for s0, p0 in cands[:3]:
+        for sigma in (0.0, 0.05, 0.15, 0.3):
+            q = p0 if sigma == 0.0 else p0 + sigma * rng2.standard_normal(p0.shape)
+            p2, r2 = _slsqp(q)
+            if p2 is not None and r2 > best_val:
+                best_val, best_pts = r2, p2.copy()
+            # one extra annealing jiggle + SLSQP from the perturbed start
+            if sigma > 0.0:
+                qa, va = _local_search(q, iters=600, seed=1000 + int(sigma * 100))
+                p3, r3 = _slsqp(qa)
+                if p3 is not None and r3 > best_val:
+                    best_val, best_pts = r3, p3.copy()
+
+    best_pts, _, _ = _normalize(best_pts)
+    return best_pts
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

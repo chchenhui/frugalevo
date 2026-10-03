@@ -1,0 +1,84 @@
+# EVOLVE-BLOCK-START
+#include <iostream>
+#include <vector>
+#include <utility>
+#include <algorithm>
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int n, m;
+    if (!(std::cin >> n >> m)) return 0;
+
+    const int h = n / m;
+    std::vector<std::vector<int>> stacks(m);
+    std::vector<std::pair<int, int>> pos(n + 1);
+
+    for (int s = 0; s < m; ++s) {
+        stacks[s].reserve(n);
+        for (int j = 0; j < h; ++j) {
+            int v;
+            std::cin >> v;
+            stacks[s].push_back(v);
+            pos[v] = {s, j};
+        }
+    }
+
+    std::vector<std::pair<int, int>> answer;
+    answer.reserve(2 * n);
+
+    for (int target = 1; target <= n; ++target) {
+        int src = pos[target].first;
+        int target_height = pos[target].second;
+
+        // All boxes above target must be moved away before target can be removed.
+        if (target_height + 1 < static_cast<int>(stacks[src].size())) {
+            int dst = -1;
+            int best_height = n + 1;
+            int best_top = -1;
+
+            // Prefer a shortest stack.  Among equally short stacks, bury the
+            // largest current top label, since it is less likely to be needed soon.
+            for (int s = 0; s < m; ++s) {
+                if (s == src) continue;
+                int current_height = static_cast<int>(stacks[s].size());
+                int current_top = stacks[s].empty() ? n + 1 : stacks[s].back();
+                if (current_height < best_height ||
+                    (current_height == best_height && current_top > best_top)) {
+                    best_height = current_height;
+                    best_top = current_top;
+                    dst = s;
+                }
+            }
+
+            // The official constraints guarantee m = 10. This fallback only protects
+            // against degenerate input with a single stack.
+            if (dst == -1) return 0;
+
+            int old_dst_height = static_cast<int>(stacks[dst].size());
+            int first_moved_height = target_height + 1;
+            int moved_count = static_cast<int>(stacks[src].size()) - first_moved_height;
+
+            answer.push_back({stacks[src][first_moved_height], dst + 1});
+
+            for (int i = 0; i < moved_count; ++i) {
+                int box = stacks[src][first_moved_height + i];
+                stacks[dst].push_back(box);
+                pos[box] = {dst, old_dst_height + i};
+            }
+            stacks[src].resize(first_moved_height);
+        }
+
+        // target is now necessarily at the top of its stack.
+        answer.push_back({target, 0});
+        stacks[src].pop_back();
+    }
+
+    for (const auto& op : answer) {
+        std::cout << op.first << ' ' << op.second << '\n';
+    }
+
+    return 0;
+}
+# EVOLVE-BLOCK-END

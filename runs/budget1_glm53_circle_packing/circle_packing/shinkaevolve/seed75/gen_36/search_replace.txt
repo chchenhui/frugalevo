@@ -1,0 +1,306 @@
+<NAME>
+dual_seed_best_of_two
+
+</NAME>
+<DESCRIPTION>
+Run the identical optimize pipeline (LP water-filling + corner-aware hill-climb + greedy growth pass) on two different seeds — the original wall-aligned hex lattice and the corner-anchored variant — and return the better result. This diversifies the local optimum the hill-climb lands in: the corner-anchored seed favors large corner circles with a small interior, while the wall-aligned seed spreads radius more evenly. Since the hill-climb only accepts strict LP-sum improvements, neither variant can fall below its own LP seed value, and keeping the best of the two can only help. Iterations per run are halved to keep total runtime near the previous ~9s budget.
+
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    n = 26
+    centers_list = []
+    y0 = 0.1
+    dy = 0.1 * np.sqrt(3.0)
+    counts = [6, 5, 6, 5, 6]
+    skip = {(2, 2), (2, 3)}  # remove two adjacent circles in the middle row
+    for row, cnt in enumerate(counts):
+        y = y0 + row * dy
+        for k in range(cnt):
+            if (row, k) in skip:
+                continue
+            if cnt == 6:
+                x = 0.2 * k  # touches walls at x=0 and x=1
+            else:
+                x = 0.1 + 0.2 * k  # staggered by half spacing
+            centers_list.append([x, y])
+    centers = np.array(centers_list)
+    assert centers.shape == (n, 2)
+
+    # --- Corner anchoring: pull the 4 circles nearest each corner
+    # diagonally INTO the corners. Corner circles enjoy three-sided
+    # wall slack, so the LP water-filling grants them large radii,
+    # while interior circles stay small. This asymmetric seed is the
+    # known path toward the AlphaEvolve-style n=26 packing (2.635).
+    corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+    anchor = 0.07  # corner-anchored center offset from each wall
+    for cx, cy in corners:
+        d = np.sum((centers - np.array([cx, cy])) ** 2, axis=1)
+        i = int(np.argmin(d))
+        centers[i] = [
+            anchor if cx == 0.0 else 1.0 - anchor,
+            anchor if cy == 0.0 else 1.0 - anchor,
+        ]
+
+    # Exact LP radii for the seed layout
+    radii = solve_radii_lp(centers)
+    if radii is None:
+        radii = compute_max_radii(centers)
+
+    best_sum = np.sum(radii)
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+
+    # ---- Hill-climb over center positions, re-solving the LP each step ----
+    rng = np.random.default_rng(12345)
+    n_iters = 600
+    for it in range(n_iters):
+        frac = 1.0 - it / n_iters
+        sigma = 0.008 + 0.04 * frac
+
+        cand = best_centers.copy()
+
+        # Directed corner-aware moves:
+        # - circles touching two walls are pulled diagonally INTO the
+        #   corner (three-sided slack -> LP grants them bigger radii)
+        # - circles touching one wall are pushed away from that wall
+        for i in range(n):
+            x, y = cand[i]
+            r = best_radii[i]
+            tol = 1e-7
+            left = r >= x - tol
+            right = r >= 1.0 - x - tol
+            bot = r >= y - tol
+            top = r >= 1.0 - y - tol
+            n_walls = int(left) + int(right) + int(bot) + int(top)
+            if n_walls >= 2:
+                # pull into the nearest corner, away from square interior
+                if left:
+                    cand[i, 0] -= 0.5 * sigma
+                elif right:
+                    cand[i, 0] += 0.5 * sigma
+                if bot:
+                    cand[i, 1] -= 0.5 * sigma
+                elif top:
+                    cand[i, 1] += 0.5 * sigma
+            else:
+                if left:
+                    cand[i, 0] += 0.5 * sigma
+                if right:
+                    cand[i, 0] -= 0.5 * sigma
+                if bot:
+                    cand[i, 1] += 0.5 * sigma
+                if top:
+                    cand[i, 1] -= 0.5 * sigma
+
+        # Random jitter, larger for small circles (more freedom of movement)
+        jitter = sigma * (0.3 + 0.7 * (1.0 - best_radii / (best_radii.max() + 1e-12)))
+        cand += rng.normal(0.0, 1.0, cand.shape) * jitter[:, None]
+
+        cand = np.clip(cand, 0.001, 0.999)
+
+        result = solve_radii_lp(cand)
+        if result is None:
+            continue
+        if np.sum(result) > best_sum:
+            best_sum = np.sum(result)
+            best_centers = cand.copy()
+            best_radii = result.copy()
+
+    # ---- Final greedy "growth pass": single-circle coordinate tweaks ----
+    # Try small shifts for each circle, one coordinate at a time, and keep
+    # any shift that strictly increases the LP-optimal sum. Shrink the step
+    # when no improvement is found, until the step becomes negligible.
+    step = 0.01
+    improved = True
+    while improved and step > 1e-4:
+        improved = False
+        for i in range(n):
+            for axis in (0, 1):
+                for direction in (+1.0, -1.0):
+                    cand = best_centers.copy()
+                    cand[i, axis] = np.clip(
+                        cand[i, axis] + direction * step, 0.001, 0.999
+                    )
+                    if cand[i, axis] == best_centers[i, axis]:
+                        continue
+                    result = solve_radii_lp(cand)
+                    if result is None:
+                        continue
+                    if np.sum(result) > best_sum + 1e-12:
+                        best_sum = np.sum(result)
+                        best_centers = cand.copy()
+                        best_radii = result.copy()
+                        improved = True
+        if not improved:
+            step *= 0.5
+
+    centers = best_centers
+    radii = best_radii * (1.0 - 1e-6)  # tiny safety shrink
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+=======
+    # Run the full pipeline on two complementary seeds and keep the best.
+    # - "aligned": wall-aligned hex lattice (even radius distribution)
+    # - "corner": 4 circles pulled diagonally into the corners (large
+    #   corner radii via three-sided wall slack, small interior)
+    # Strict-improvement acceptance means neither run can end below its
+    # own LP seed value, so best-of-two can only improve the result.
+    candidates = []
+    for anchor_corner in (False, True):
+        centers = _seed_centers(anchor_corner)
+        c, r, s = _optimize(centers, rng_seed=12345, n_iters=300)
+        candidates.append((s, c, r))
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    sum_radii, centers, radii = candidates[0]
+
+    radii = radii * (1.0 - 1e-6)  # tiny safety shrink
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+
+
+def _seed_corners(anchor_corner):
+    """
+    Build the hexagonal-lattice seed (5 staggered rows 6,5,6,5,6, with two
+    adjacent middle-row circles dropped). If anchor_corner is True, pull
+    the 4 circles nearest each corner diagonally INTO the corners; corner
+    circles enjoy three-sided wall slack, so the LP water-filling grants
+    them large radii while interior circles stay small.
+    """
+    centers_list = []
+    y0 = 0.1
+    dy = 0.1 * np.sqrt(3.0)
+    counts = [6, 5, 6, 5, 6]
+    skip = {(2, 2), (2, 3)}  # remove two adjacent circles in the middle row
+    for row, cnt in enumerate(counts):
+        y = y0 + row * dy
+        for k in range(cnt):
+            if (row, k) in skip:
+                continue
+            if cnt == 6:
+                x = 0.2 * k  # touches walls at x=0 and x=1
+            else:
+                x = 0.1 + 0.2 * k  # staggered by half spacing
+            centers_list.append([x, y])
+    centers = np.array(centers_list)
+    assert centers.shape == (26, 2)
+
+    if anchor_corner:
+        corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+        anchor = 0.07  # corner-anchored center offset from each wall
+        for cx, cy in corners:
+            d = np.sum((centers - np.array([cx, cy])) ** 2, axis=1)
+            i = int(np.argmin(d))
+            centers[i] = [
+                anchor if cx == 0.0 else 1.0 - anchor,
+                anchor if cy == 0.0 else 1.0 - anchor,
+            ]
+    return centers
+
+
+def _optimize(centers, rng_seed=12345, n_iters=300):
+    """
+    Full improvement pipeline for a fixed seed layout:
+    exact LP radii -> corner-aware hill-climb (re-solving the LP each
+    step) -> greedy single-coordinate growth pass.
+    Returns (centers, radii, sum_of_radii).
+    """
+    n = centers.shape[0]
+
+    # Exact LP radii for the seed layout
+    radii = solve_radii_lp(centers)
+    if radii is None:
+        radii = compute_max_radii(centers)
+
+    best_sum = np.sum(radii)
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+
+    # ---- Hill-climb over center positions, re-solving the LP each step ----
+    rng = np.random.default_rng(rng_seed)
+    for it in range(n_iters):
+        frac = 1.0 - it / n_iters
+        sigma = 0.008 + 0.04 * frac
+
+        cand = best_centers.copy()
+
+        # Directed corner-aware moves:
+        # - circles touching two walls are pulled diagonally INTO the
+        #   corner (three-sided slack -> LP grants them bigger radii)
+        # - circles touching one wall are pushed away from that wall
+        for i in range(n):
+            x, y = cand[i]
+            r = best_radii[i]
+            tol = 1e-7
+            left = r >= x - tol
+            right = r >= 1.0 - x - tol
+            bot = r >= y - tol
+            top = r >= 1.0 - y - tol
+            n_walls = int(left) + int(right) + int(bot) + int(top)
+            if n_walls >= 2:
+                # pull into the nearest corner, away from square interior
+                if left:
+                    cand[i, 0] -= 0.5 * sigma
+                elif right:
+                    cand[i, 0] += 0.5 * sigma
+                if bot:
+                    cand[i, 1] -= 0.5 * sigma
+                elif top:
+                    cand[i, 1] += 0.5 * sigma
+            else:
+                if left:
+                    cand[i, 0] += 0.5 * sigma
+                if right:
+                    cand[i, 0] -= 0.5 * sigma
+                if bot:
+                    cand[i, 1] += 0.5 * sigma
+                if top:
+                    cand[i, 1] -= 0.5 * sigma
+
+        # Random jitter, larger for small circles (more freedom of movement)
+        jitter = sigma * (0.3 + 0.7 * (1.0 - best_radii / (best_radii.max() + 1e-12)))
+        cand += rng.normal(0.0, 1.0, cand.shape) * jitter[:, None]
+
+        cand = np.clip(cand, 0.001, 0.999)
+
+        result = solve_radii_lp(cand)
+        if result is None:
+            continue
+        if np.sum(result) > best_sum:
+            best_sum = np.sum(result)
+            best_centers = cand.copy()
+            best_radii = result.copy()
+
+    # ---- Final greedy "growth pass": single-circle coordinate tweaks ----
+    # Try small shifts for each circle, one coordinate at a time, and keep
+    # any shift that strictly increases the LP-optimal sum. Shrink the step
+    # when no improvement is found, until the step becomes negligible.
+    step = 0.01
+    improved = True
+    while improved and step > 1e-4:
+        improved = False
+        for i in range(n):
+            for axis in (0, 1):
+                for direction in (+1.0, -1.0):
+                    cand = best_centers.copy()
+                    cand[i, axis] = np.clip(
+                        cand[i, axis] + direction * step, 0.001, 0.999
+                    )
+                    if cand[i, axis] == best_centers[i, axis]:
+                        continue
+                    result = solve_radii_lp(cand)
+                    if result is None:
+                        continue
+                    if np.sum(result) > best_sum + 1e-12:
+                        best_sum = np.sum(result)
+                        best_centers = cand.copy()
+                        best_radii = result.copy()
+                        improved = True
+        if not improved:
+            step *= 0.5
+
+    return best_centers, best_radii, best_sum
+>>>>>>> REPLACE
+</DIFF>

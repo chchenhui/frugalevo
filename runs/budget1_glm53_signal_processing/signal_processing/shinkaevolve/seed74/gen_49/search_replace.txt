@@ -1,0 +1,121 @@
+<NAME>
+local_q_first_pass_plus_tighter_refinement
+</NAME>
+<DESCRIPTION>
+The local block-MAD Q currently only affects the refinement pass; the first (noisy-input) pass still uses the global Q, so busy segments (5 Hz component) are over-smoothed before the adaptive pass can recover them — contributing to lag_error (0.34) and avg_error (0.39). I propose (1) computing the local block-MAD qseq on the rough moving-average trajectory before the first pass and blending it into the first-pass process noise (Q[k] = max(local, global)·Qbase), so busy segments get responsive tracking from the start; and (2) tightening the refinement pass scale from 0.25 to 0.15 to recover noise_reduction (which slipped to 0.55) since the first pass now carries the adaptivity. Block medians over the MA-smoothed input remain robust to transients, unlike recursive EWMA estimates.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # --- Constant-velocity (local linear) state model ---
+    F = np.array([[1.0, 1.0], [0.0, 1.0]])
+    H = np.array([1.0, 0.0])
+    Q = qa * np.array([[0.25, 0.5], [0.5, 1.0]])
+=======
+    # --- Constant-velocity (local linear) state model ---
+    F = np.array([[1.0, 1.0], [0.0, 1.0]])
+    H = np.array([1.0, 0.0])
+    Qbase = np.array([[0.25, 0.5], [0.5, 1.0]])
+    Q = qa * Qbase
+
+    # --- Locally adaptive process noise via robust block-MAD statistics
+    # (explicitly NOT recursive/EWMA), computed on the MA-roughened input.
+    # Overlapping blocks of ~window_size (50% overlap); subtract the
+    # propagated noise floor (sigma_r/sqrt(w))*sqrt(6), floor at 0.05*sigma_r,
+    # cap at 1.5*sigma_r; linearly interpolate to per-sample q_k. Used in the
+    # FIRST pass (max with global qa) so busy segments track responsively
+    # from the start, and re-derived on y1 for the refinement pass. ---
+    def _block_qseq(sig, w, sig_r):
+        step = max(1, w // 2)
+        vals, cens = [], []
+        for start in range(0, max(1, len(sig) - w + 1), step):
+            seg = sig[start:start + w]
+            if seg.size < 3:
+                continue
+            d2s = seg[2:] - 2.0 * seg[1:-1] + seg[:-2]
+            mad_b = np.median(np.abs(d2s - np.median(d2s))) / 0.6745
+            noise_d2_b = (sig_r / np.sqrt(w)) * np.sqrt(6.0)
+            var_b = mad_b * mad_b - noise_d2_b * noise_d2_b
+            s_b = float(np.clip(np.sqrt(max(var_b, 0.0)), 0.05 * sig_r, 1.5 * sig_r))
+            vals.append(s_b)
+            cens.append(start + w // 2)
+        if len(vals) >= 2:
+            return np.interp(
+                np.arange(len(sig), dtype=float),
+                np.asarray(cens, dtype=float),
+                np.asarray(vals, dtype=float),
+            ) ** 2
+        if len(vals) == 1:
+            return np.full(len(sig), vals[0] ** 2)
+        return np.full(len(sig), qa)
+
+    qseq_first = np.maximum(_block_qseq(rough if rough.size >= 3 else x, w_r, sigma_r), qa)
+    Qseq_first = qseq_first
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+        else:
+            xp[k] = F @ x_est
+            Pp[k] = F @ P @ F.T + Q
+=======
+        else:
+            xp[k] = F @ x_est
+            Pp[k] = F @ P @ F.T + Qseq_first[k] * Qbase
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    # --- Locally adaptive process noise via robust block-MAD statistics
+    # (explicitly NOT recursive/EWMA). y1 (the first-pass smoothed output)
+    # is already denoised, so its second differences reflect genuine
+    # dynamics (e.g., the 5 Hz component) that a single global Q
+    # under-serves. Compute sigma_acc in overlapping blocks of length
+    # ~window_size (50% overlap), subtract the propagated noise floor
+    # (sigma_r/sqrt(w))*sqrt(6), floor at 0.05*sigma_r, cap at
+    # 1.5*sigma_r, and linearly interpolate to per-sample q_k. Block
+    # medians are robust to transients, unlike EWMA estimates that chase
+    # bursts and over-trust noisy segments. ---
+    Qbase = np.array([[0.25, 0.5], [0.5, 1.0]])
+    step = max(1, w_r // 2)
+    block_vals = []
+    centers = []
+    for start in range(0, max(1, n - w_r + 1), step):
+        seg = y[start:start + w_r]
+        if seg.size < 3:
+            continue
+        d2s = seg[2:] - 2.0 * seg[1:-1] + seg[:-2]
+        mad_b = np.median(np.abs(d2s - np.median(d2s))) / 0.6745
+        noise_d2_b = (sigma_r / np.sqrt(w_r)) * np.sqrt(6.0)
+        var_b = mad_b * mad_b - noise_d2_b * noise_d2_b
+        s_b = np.sqrt(max(var_b, 0.0))
+        s_b = float(np.clip(s_b, 0.05 * sigma_r, 1.5 * sigma_r))
+        block_vals.append(s_b)
+        centers.append(start + w_r // 2)
+    if len(block_vals) >= 2:
+        qseq = np.interp(
+            np.arange(n, dtype=float),
+            np.asarray(centers, dtype=float),
+            np.asarray(block_vals, dtype=float),
+        ) ** 2
+    elif len(block_vals) == 1:
+        qseq = np.full(n, block_vals[0] ** 2)
+    else:
+        qseq = np.full(n, qa)
+=======
+    # --- Re-derive locally adaptive Q on y1 (denoised) for the refinement
+    # pass: its second differences reflect genuine dynamics (e.g., the 5 Hz
+    # component) that a single global Q under-serves. Block medians are
+    # robust to transients, unlike recursive EWMA estimates. ---
+    qseq = _block_qseq(y, w_r, sigma_r)
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+            else:
+                xp[k] = F @ x_est
+                Q2k = 0.25 * qseq[k] * Qbase
+                Pp[k] = F @ P @ F.T + Q2k
+=======
+            else:
+                xp[k] = F @ x_est
+                Q2k = 0.15 * qseq[k] * Qbase
+                Pp[k] = F @ P @ F.T + Q2k
+>>>>>>> REPLACE
+</DIFF>

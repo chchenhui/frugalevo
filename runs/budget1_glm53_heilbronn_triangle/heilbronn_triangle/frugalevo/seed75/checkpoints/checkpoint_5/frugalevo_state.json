@@ -1,0 +1,313 @@
+{
+  "version": 24,
+  "curve": {
+    "unit": "usd",
+    "budget": 1.0,
+    "spent": 0.0267376,
+    "final_incumbent": 0.0038894804576478674,
+    "ba_auc": 0.0037854850849634615,
+    "ba_auc_normalized": 0.0037854850849634615,
+    "num_points": 6,
+    "points": [
+      {
+        "cost": 0.0,
+        "score": 0.0,
+        "incumbent": 0.0,
+        "iteration": 0,
+        "candidates": 0
+      },
+      {
+        "cost": 0.001027675,
+        "score": 0.0,
+        "incumbent": 0.0,
+        "iteration": 1,
+        "candidates": 2
+      },
+      {
+        "cost": 0.019608874999999998,
+        "score": 0.0,
+        "incumbent": 0.0,
+        "iteration": 2,
+        "candidates": 3
+      },
+      {
+        "cost": 0.021534675,
+        "score": 0.0,
+        "incumbent": 0.0,
+        "iteration": 3,
+        "candidates": 2
+      },
+      {
+        "cost": 0.0247731,
+        "score": 0.0,
+        "incumbent": 0.0,
+        "iteration": 4,
+        "candidates": 3
+      },
+      {
+        "cost": 0.0267376,
+        "score": 0.0038894804576478674,
+        "incumbent": 0.0038894804576478674,
+        "iteration": 5,
+        "candidates": 2
+      }
+    ]
+  },
+  "strategy_objective_guidance": "- The only scored term is `combined_score = min_area_normalized / 0.036529889880030156`, where `min_area_normalized` is the minimum area over all C(11,3)=165 point-triangles, divided by the area of the container triangle. It is a pure max-min objective; there is no time penalty, no smoothness term, no reward for symmetry or aesthetics.\n- Hard validity constraints (any failure \u2192 score 0.0): return an `np.ndarray` of shape (11,2), all points strictly inside/on the triangle with tolerance 1e-6 (the check `check_inside_triangle_wtol` raises on violation), and no exceptions during the call. Duplicate points or collinear triples are not explicitly rejected but drive the score toward 0, so they are effectively forbidden.\n- The complete \"input\" is known offline: nothing is streamed; the function takes no input at all. This permits full offline/batch global optimization \u2014 precomputed point sets, long deterministic multistart, continuation, and returning a hard-coded-but-self-derived incumbent are all legitimate. The only budget constraint is the wall-clock timeout on `heilbronn_triangle11()`, so heavy optimization should either run within the timeout or be done once and the best incumbent embedded (without hard-coding evaluator outputs \u2014 the coordinates themselves are the program's own computation result, which is allowed since they are not evaluator outputs).\n- No weighted term rewards anything other than the nominal domain goal; the highest-scoring program IS the best Heilbronn-11 configuration. The largest lever is simply raising the true minimum triangle area above 0.03653 (normalized ~0.08425 of the container). Known best configurations for n=11 reach slightly above the benchmark, so gains are small and come from high-precision local refinement of a near-optimal topology, not from coarse exploration alone.\n- Conflicting tradeoffs: pushing the minimum up forces many triples to the active set (near-degenerate near-collinearity risk), and feasibility tolerance is only 1e-6, so unconstrained parameterizations that drift outside the triangle are the main failure mode. Barycentric/softplus-style parameterizations resolve this conflict at negligible cost.",
+  "strategy_diverge_guidance": "- Smooth-surrogate max-min optimization: parameterize points in barycentric coordinates (or clip/softmax weights), minimize a soft-min (log-sum-exp with temperature) of the 165 areas via `scipy.optimize.minimize` (L-BFGS-B / SLSQP) with analytic gradients; anneal temperature down to recover the true min. This directly targets the single scored term.\n- Active-set constrained refinement: identify the ~5\u201315 triples attaining near-minimal area, maximize only those areas subject to keeping others above a barrier, using `scipy.optimize.minimize` with method='SLSQP' and explicit inequality constraints (all 165 areas \u2265 t, maximize t). This is the standard mechanism for max-min geometry.\n- Deterministic multistart over topological templates: generate structured seeds exploiting the triangle's 3-fold symmetry (points on 3 rotated orbits, boundary rings, known Heilbronn-type lattice/curve constructions), refine each with L-BFGS-B on the soft-min, keep the best. Different seed families give genuinely different local optima.\n- Nonsmooth/direct methods: since the objective is a piecewise-smooth min, use `scipy.optimize.differential_evolution` or Nelder-Mead on a reduced symmetric parameterization (e.g., only orbit representatives, cutting dimension ~3x) \u2014 global stochastic search made deterministic via fixed `seed`, then polished.\n- Continuation in a penalty/temperature schedule: start from a well-spread configuration (e.g., 11-point Fibonacci/equal-area sampling inside the triangle), gradually increase the weight on the minimum-area term relative to a spread regularizer, tracking the solution; avoids bad local minima without extra families.",
+  "strategy_refine_guidance": "- Tighten the smooth-min temperature: run log-sum-exp minimization with temperature decreasing geometrically (e.g., 1e-3 \u2192 1e-7) so the surrogate converges to the exact minimum; each stage warm-started from the previous.\n- High-precision polish of the active set: after fixing the active triple list, solve the small SLSQP problem maximizing t with constraints `area_i \u2212 t \u2265 0` to tolerance 1e-12; iterate active-set re-identification until the list is stable. Use `np.longdouble` or scaled coordinates if conditioning suffers.\n- Feasibility margin: enforce points with a safety margin of ~1e-7\u20131e-8 inside each barycentric coordinate (strictly positive via `np.abs` or softplus) so the 1e-6 tolerance check never fires even after optimizer round-off; snap final coordinates and re-verify all 165 areas and inside-ness before returning.\n- Symmetry anchoring for initialization: impose exact 3-fold symmetry in seeds (one point at centroid plus two 3-orbits of 5 points each), refine, then optionally release symmetry for a final free polish \u2014 typically recovers the last few percent of min-area.\n- Incumbent caching: embed the best-ever found coordinates (from prior offline runs of the same pipeline) as the return value guarded by a quick validity/area self-check, with the optimizer run only if time permits; guarantees the best valid result is always returned and never regresses below the reference score.",
+  "strategy_guidance_attempted": true,
+  "strategy_guidance_cost": 0.006134799999999999,
+  "strategies": [
+    {
+      "index": 1,
+      "title": "[barycentric-softmin-multistart] Soft-min annealed max-min optimization over bar",
+      "plan": "Mechanism family: smooth-surrogate max-min (log-sum-exp annealing) over barycentric parameterization\nReplacement scope: Replace the entire body of `heilbronn_triangle11()` (currently returns zeros) with a full pipeline: seed generation, soft-min refinement, and final exact-area verification.\nCompute budget: \u2264 12 deterministic seeds \u00d7 \u2264 400 L-BFGS-B iterations per temperature stage, 6 temperature stages (T: 1e-3 \u2192 1e-7 geometric); expected total runtime < 20 s, well within timeout. No evaluation-time effect beyond the single call.\nGain mechanism: The incumbent returns all-zero points, giving min_area_normalized = 0; any strictly positive minimum is a strict gain. Parameterize each point as barycentric coordinates (u,v,w) with u,v,w \u2265 \u03b5 (\u03b5 = 1e-7) and u+v+w = 1, enforced by a softmax-like reparameterization (store raw \u03b1,\u03b2; set u = \u03b5 + (1\u22123\u03b5)\u00b7e^\u03b1/(e^\u03b1+e^\u03b2+1), similarly v, w = 1\u2212u\u2212v). This guarantees every point is inside the triangle with margin \u2265 1e-7, so the 1e-6 tolerance check can never fire. Compute all 165 triangle areas analytically as |det(p_j\u2212p_i, p_k\u2212p_i)|/2 via vectorized NumPy; areas of the container are fixed at \u221a3/4. Objective: minimize LSE = T\u00b7log \u03a3 exp(\u2212A_i/T) (i.e., soft-min of the 165 normalized areas), with analytic gradients obtained by differentiating the area determinants w.r.t. barycentric coordinates (straightforward closed form: each area is linear in each point's coordinates). Seeds: (a) centroid + two 3-orbits of 5 points placed on concentric scaled copies of the triangle's medial structure, (b) uniform grid perturbations, (c) points sampled on three rotated rays from the centroid \u2014 all deterministic formulas, no RNG. After annealing, snap coordinates, recompute the exact minimum over all 165 triples, verify feasibility, and return the best seed's result. Expected-gain check: the incumbent's min_area_normalized is exactly 0, and any valid non-degenerate configuration (e.g., the centroid+orbits seed already yields a strictly positive minimum area since no three points are collinear by construction), so the resulting combined_score strictly exceeds 0; a credible target is \u2265 0.0365/0.03653 \u2248 1.0 based on known near-optimal Heilbronn-11 topologies reachable by this annealing, but any positive value already strictly improves the current score of 0.",
+      "cost": 0.0031264166666666667,
+      "best_score": 0.0,
+      "baseline_score": 0.0,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 1,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.0010223833333333325,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 2,
+      "failure_feedback": []
+    },
+    {
+      "index": 2,
+      "title": "[slsqp-active-set] Epigraph SLSQP with active-set continuation on an auxiliary m",
+      "plan": "Mechanism family: constrained epigraph optimization (maximize t s.t. A_i \u2265 t) with iterative active-set re-identification\nReplacement scope: Replace the refinement phase of `heilbronn_triangle11()` \u2014 used after any initial feasible configuration (from Strategy 1's seeds or a simple structured layout) \u2014 with an SLSQP epigraph solver; the seed generation and final verification remain.\nCompute budget: \u2264 5 outer active-set iterations \u00d7 SLSQP with \u2264 300 iterations on 23 variables (22 barycentric DOF + t); runtime < 10 s. Bounded per call, deterministic.\nGain mechanism: The soft-min surrogate of Strategy 1 converges only approximately to the true nonsmooth max-min; the epigraph formulation directly maximizes the scored quantity. Variables: the 11 points' barycentric coordinates (each point contributes 2 free DOF after the sum-to-one constraint, plus box bounds \u03b5 \u2264 u,v,w \u2264 1\u22122\u03b5 with \u03b5 = 1e-7 preserving feasibility) plus an auxiliary t. Constraints: A_i(p) \u2212 t \u2265 0 for all 165 triples (analytic Jacobian, linear in coordinates, cheap to supply exactly). Objective: maximize t (minimize \u2212t). Active-set continuation: after each solve, identify triples with A_i within 1e-9\u00b7(container area) of t, re-solve with only those constraints plus a slack barrier s_i \u2265 0 on the inactive ones (A_i \u2212 t \u2212 s_i \u2265 0 with s_i fixed from the previous iterate), which stabilizes SLSQP when many constraints are near-active \u2014 the known regime for optimal Heilbronn-11 where ~5\u201315 triples are simultaneously minimal. This recovers the last few percent of min-area that a smooth surrogate leaves on the table, which is exactly the margin needed to push combined_score above 1.0. Expected-gain check: the new degree of freedom is the exact epigraph variable t optimized against hard per-triple constraints with exact Jacobians \u2014 a mechanism the incumbent (which has no optimizer at all, score 0) and a pure soft-min both lack; falsifiable threshold: if the SLSQP-refined minimum area exceeds the soft-min result by \u2265 1e-4 normalized (i.e., combined_score improves by \u2265 0.003), the mechanism is validated, and any result at all strictly exceeds the incumbent's 0.",
+      "cost": 0.0031264166666666667,
+      "best_score": null,
+      "baseline_score": 0.0,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 0,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.0010223833333333325,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 2,
+      "failure_feedback": [
+        "module 'numpy.linalg' has no attribute 'pdist'"
+      ]
+    },
+    {
+      "index": 3,
+      "title": "[symmetry-breaking-topology] Topology restarts over distinct contact graphs: bou",
+      "plan": "Mechanism family: deterministic multistart over geometrically distinct contact topologies with symmetry release\nReplacement scope: Replace the seed-generation block of `heilbronn_triangle11()` (currently nonexistent) with three structurally different seed families feeding the shared soft-min + SLSQP pipeline; the pipeline itself is reused.\nCompute budget: 3 families \u00d7 4 deterministic variants each = 12 starts, each \u2264 300 L-BFGS-B iterations then one SLSQP polish \u2264 200 iterations; total < 30 s. All formulas closed-form, no RNG.\nGain mechanism: Max-min landscapes have many local optima indexed by which triples are active (the contact graph); a single seed family can get trapped. Family A (boundary-ring): 6 points on the triangle boundary at rational arc fractions (e.g., 2 per edge at 1/3, 2/3) + 5 interior points on two concentric 3-orbits around the centroid \u2014 exploits the known fact that optimal Heilbronn configurations for small n place many points on the boundary. Family B (interior-hex): 1 centroid + 6 points on a hexagonal ring (two interleaved 3-orbits at radii r1 \u2260 r2, angles offset by 60\u00b0) + 4 points in a smaller inner square-like orbit \u2014 a fully interior topology with different active-triple structure. Family C (symmetry-broken): start from the 3-fold-symmetric centroid + two 3-orbits + one free point, then apply a fixed asymmetric perturbation (translate one orbit by \u03b4 along a fixed direction, \u03b4 = 0.05\u00b7side) before refinement \u2014 this deliberately breaks the exact C3 symmetry, since exact symmetry forces degenerate equal-area ties that local optimizers cannot escape; releasing symmetry after a symmetric warm start is a known mechanism to reach asymmetric optima with higher minimum area. Each family is refined with the shared pipeline and the best exact verified minimum is returned. Expected-gain check: the incumbent has no seeds and score 0, so any family strictly improves it; the distinct mechanism is the contact-graph diversity (boundary-heavy vs. interior vs. symmetry-broken topologies), which the incumbent cannot realize because it returns zeros \u2014 falsifiable threshold: if Family A or C's refined min_area_normalized exceeds 0.0365 (combined_score > 1.0), the structural exploration has beaten the reference, and at minimum the portfolio's best-of-three exceeds any single-family result with probability corresponding to distinct local optima (verifiable by comparing the three families' final exact minima).",
+      "cost": 0.0031264166666666667,
+      "best_score": null,
+      "baseline_score": 0.0,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 0,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.0010223833333333325,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 2,
+      "failure_feedback": [
+        "The number of bounds is not compatible with the length of `x0`."
+      ]
+    },
+    {
+      "index": 4,
+      "title": "ordered attempt [barycentric-softmin-multistart] Soft-min annealed max-min optimization over bar",
+      "plan": "Mechanism family: smooth-surrogate max-min (log-sum-exp annealing) over barycentric parameterization\nReplacement scope: Replace the entire body of `heilbronn_triangle11()` (currently returns zeros) with a full pipeline: seed generation, soft-min refinement, and final exact-area verification.\nCompute budget: \u2264 12 deterministic seeds \u00d7 \u2264 400 L-BFGS-B iterations per temperature stage, 6 temperature stages (T: 1e-3 \u2192 1e-7 geometric); expected total runtime < 20 s, well within timeout. No evaluation-time effect beyond the single call.\nGain mechanism: The incumbent returns all-zero points, giving min_area_normalized = 0; any strictly positive minimum is a strict gain. Parameterize each point as barycentric coordinates (u,v,w) with u,v,w \u2265 \u03b5 (\u03b5 = 1e-7) and u+v+w = 1, enforced by a softmax-like reparameterization (store raw \u03b1,\u03b2; set u = \u03b5 + (1\u22123\u03b5)\u00b7e^\u03b1/(e^\u03b1+e^\u03b2+1), similarly v, w = 1\u2212u\u2212v). This guarantees every point is inside the triangle with margin \u2265 1e-7, so the 1e-6 tolerance check can never fire. Compute all 165 triangle areas analytically as |det(p_j\u2212p_i, p_k\u2212p_i)|/2 via vectorized NumPy; areas of the container are fixed at \u221a3/4. Objective: minimize LSE = T\u00b7log \u03a3 exp(\u2212A_i/T) (i.e., soft-min of the 165 normalized areas), with analytic gradients obtained by differentiating the area determinants w.r.t. barycentric coordinates (straightforward closed form: each area is linear in each point's coordinates). Seeds: (a) centroid + two 3-orbits of 5 points placed on concentric scaled copies of the triangle's medial structure, (b) uniform grid perturbations, (c) points sampled on three rotated rays from the centroid \u2014 all deterministic formulas, no RNG. After annealing, snap coordinates, recompute the exact minimum over all 165 triples, verify feasibility, and return the best seed's result. Expected-gain check: the incumbent's min_area_normalized is exactly 0, and any valid non-degenerate configuration (e.g., the centroid+orbits seed already yields a strictly positive minimum area since no three points are collinear by construction), so the resulting combined_score strictly exceeds 0; a credible target is \u2265 0.0365/0.03653 \u2248 1.0 based on known near-optimal Heilbronn-11 topologies reachable by this annealing, but any positive value already strictly improves the current score of 0.",
+      "cost": 0.0,
+      "best_score": null,
+      "baseline_score": 0.0,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 2,
+      "implementations": 0,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": 1,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 1,
+      "implementation_spend": 0.0019258000000000018,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 3,
+      "failure_feedback": [
+        "maximum recursion depth exceeded",
+        "too many indices for array: array is 1-dimensional, but 2 were indexed"
+      ]
+    },
+    {
+      "index": 5,
+      "title": "ordered attempt [slsqp-active-set] Epigraph SLSQP with active-set continuation on an auxiliary m",
+      "plan": "Mechanism family: constrained epigraph optimization (maximize t s.t. A_i \u2265 t) with iterative active-set re-identification\nReplacement scope: Replace the refinement phase of `heilbronn_triangle11()` \u2014 used after any initial feasible configuration (from Strategy 1's seeds or a simple structured layout) \u2014 with an SLSQP epigraph solver; the seed generation and final verification remain.\nCompute budget: \u2264 5 outer active-set iterations \u00d7 SLSQP with \u2264 300 iterations on 23 variables (22 barycentric DOF + t); runtime < 10 s. Bounded per call, deterministic.\nGain mechanism: The soft-min surrogate of Strategy 1 converges only approximately to the true nonsmooth max-min; the epigraph formulation directly maximizes the scored quantity. Variables: the 11 points' barycentric coordinates (each point contributes 2 free DOF after the sum-to-one constraint, plus box bounds \u03b5 \u2264 u,v,w \u2264 1\u22122\u03b5 with \u03b5 = 1e-7 preserving feasibility) plus an auxiliary t. Constraints: A_i(p) \u2212 t \u2265 0 for all 165 triples (analytic Jacobian, linear in coordinates, cheap to supply exactly). Objective: maximize t (minimize \u2212t). Active-set continuation: after each solve, identify triples with A_i within 1e-9\u00b7(container area) of t, re-solve with only those constraints plus a slack barrier s_i \u2265 0 on the inactive ones (A_i \u2212 t \u2212 s_i \u2265 0 with s_i fixed from the previous iterate), which stabilizes SLSQP when many constraints are near-active \u2014 the known regime for optimal Heilbronn-11 where ~5\u201315 triples are simultaneously minimal. This recovers the last few percent of min-area that a smooth surrogate leaves on the table, which is exactly the margin needed to push combined_score above 1.0. Expected-gain check: the new degree of freedom is the exact epigraph variable t optimized against hard per-triple constraints with exact Jacobians \u2014 a mechanism the incumbent (which has no optimizer at all, score 0) and a pure soft-min both lack; falsifiable threshold: if the SLSQP-refined minimum area exceeds the soft-min result by \u2265 1e-4 normalized (i.e., combined_score improves by \u2265 0.003), the mechanism is validated, and any result at all strictly exceeds the incumbent's 0.",
+      "cost": 0.0,
+      "best_score": 0.0,
+      "baseline_score": 0.0,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 3,
+      "implementations": 1,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": 2,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 1,
+      "implementation_spend": 0.0032384249999999996,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 4,
+      "failure_feedback": [
+        "module 'numpy.linalg' has no attribute 'pdist'",
+        "operands could not be broadcast together with shapes (165,2) (165,) (165,2)",
+        "No valid diffs found in response: The previous failure was a broadcast bug in the Jacobian assembly (fancy-indexed in-place `+=` on `J[ti, 0]` combined with an inconsistent per-triple loop). I'll rewrite the Jacobian as a fully vectorized scatter with `np.add.at` and assemble the barycentric chain rule with `einsum`, keeping the planned epigraph-SLSQP"
+      ]
+    },
+    {
+      "index": 6,
+      "title": "ordered attempt [symmetry-breaking-topology] Topology restarts over distinct contact graphs: bou",
+      "plan": "Mechanism family: deterministic multistart over geometrically distinct contact topologies with symmetry release\nReplacement scope: Replace the seed-generation block of `heilbronn_triangle11()` (currently nonexistent) with three structurally different seed families feeding the shared soft-min + SLSQP pipeline; the pipeline itself is reused.\nCompute budget: 3 families \u00d7 4 deterministic variants each = 12 starts, each \u2264 300 L-BFGS-B iterations then one SLSQP polish \u2264 200 iterations; total < 30 s. All formulas closed-form, no RNG.\nGain mechanism: Max-min landscapes have many local optima indexed by which triples are active (the contact graph); a single seed family can get trapped. Family A (boundary-ring): 6 points on the triangle boundary at rational arc fractions (e.g., 2 per edge at 1/3, 2/3) + 5 interior points on two concentric 3-orbits around the centroid \u2014 exploits the known fact that optimal Heilbronn configurations for small n place many points on the boundary. Family B (interior-hex): 1 centroid + 6 points on a hexagonal ring (two interleaved 3-orbits at radii r1 \u2260 r2, angles offset by 60\u00b0) + 4 points in a smaller inner square-like orbit \u2014 a fully interior topology with different active-triple structure. Family C (symmetry-broken): start from the 3-fold-symmetric centroid + two 3-orbits + one free point, then apply a fixed asymmetric perturbation (translate one orbit by \u03b4 along a fixed direction, \u03b4 = 0.05\u00b7side) before refinement \u2014 this deliberately breaks the exact C3 symmetry, since exact symmetry forces degenerate equal-area ties that local optimizers cannot escape; releasing symmetry after a symmetric warm start is a known mechanism to reach asymmetric optima with higher minimum area. Each family is refined with the shared pipeline and the best exact verified minimum is returned. Expected-gain check: the incumbent has no seeds and score 0, so any family strictly improves it; the distinct mechanism is the contact-graph diversity (boundary-heavy vs. interior vs. symmetry-broken topologies), which the incumbent cannot realize because it returns zeros \u2014 falsifiable threshold: if Family A or C's refined min_area_normalized exceeds 0.0365 (combined_score > 1.0), the structural exploration has beaten the reference, and at minimum the portfolio's best-of-three exceeds any single-family result with probability corresponding to distinct local optima (verifiable by comparing the three families' final exact minima).",
+      "cost": 0.0,
+      "best_score": 0.0038894804576478674,
+      "baseline_score": 0.0,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 2,
+      "implementations": 2,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": 3,
+      "cumulative_gain": 0.0038894804576478674,
+      "cumulative_relative_gain": 1.0,
+      "productive_rounds": 1,
+      "barren_rounds": 0,
+      "implementation_spend": 0.001964500000000001,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 5,
+      "failure_feedback": [
+        "The number of bounds is not compatible with the length of `x0`."
+      ]
+    }
+  ],
+  "active_strategy": 6,
+  "strategy_queue": [],
+  "ordered_portfolio_roots": [
+    1,
+    2,
+    3
+  ],
+  "ordered_exploitation_queue": [],
+  "ordered_active_root": 3,
+  "ordered_pilot_scores": {
+    "1": 0.0,
+    "2": null,
+    "3": null
+  },
+  "ordered_phase": "exploit",
+  "ordered_reference_feedback": [],
+  "strategy_reference_failure_streak": 0,
+  "strategy_reference_disabled": false,
+  "strategy_costs": [
+    0.00937925
+  ],
+  "implementation_costs": [
+    0.0005138375,
+    0.0010223833333333325,
+    0.0009629000000000009,
+    0.0010794749999999999,
+    0.0009822500000000005
+  ],
+  "guide_implementation_costs": [],
+  "guide_implementation_due": false,
+  "guide_implementation_due_reason": null,
+  "guide_implementation_unguided": false,
+  "strategy_call_count": 1,
+  "anchor_next_cheap_to_incumbent": false,
+  "opening_cheap_probe_done": true,
+  "opening_failure_retries_used": 0,
+  "opening_guide_hedge_done": false,
+  "success_achieved": false,
+  "barren_rounds": 0,
+  "stagnation": 0,
+  "next_strategy_escalation": 32,
+  "strategy_escalation_gap": 32,
+  "seen_solutions": [
+    "410560ccc0d34b66a8230af4f0c52dcba2fcb55c",
+    "971c683e2768dc85190a7f3b4580b959bcf32889",
+    "b56149afefb8c9c09600acb2c39b6fb8ebe7f91d",
+    "eafb9f04f7407bcfc5f381588da9d6879c77e5d7"
+  ],
+  "score_ledger": [
+    [
+      0.0,
+      3
+    ],
+    [
+      0.00388948,
+      1
+    ]
+  ],
+  "cost_samples": [
+    [
+      2,
+      0.001027675
+    ],
+    [
+      3,
+      0.0185812
+    ],
+    [
+      2,
+      0.0019258000000000018
+    ],
+    [
+      3,
+      0.0032384249999999996
+    ],
+    [
+      2,
+      0.001964500000000001
+    ]
+  ],
+  "exploring": false
+}

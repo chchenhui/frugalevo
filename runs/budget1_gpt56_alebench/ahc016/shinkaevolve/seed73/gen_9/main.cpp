@@ -1,0 +1,346 @@
+# EVOLVE-BLOCK-START
+#include <bits/stdc++.h>
+using namespace std;
+
+namespace {
+
+constexpr int SMALL_N_MAX = 6;
+
+struct Problem {
+    int m;
+    double eps;
+};
+
+struct GraphFeatures {
+    int edges = 0;
+    vector<int> sorted_degree;
+};
+
+int edge_count_of_n(int n) {
+    return n * (n - 1) / 2;
+}
+
+GraphFeatures extract_features(const string& graph, int n) {
+    GraphFeatures result;
+    result.sorted_degree.assign(n, 0);
+
+    int p = 0;
+    for (int i = 0; i < n; ++i) {
+        for (int j = i + 1; j < n; ++j, ++p) {
+            if (graph[p] == '1') {
+                ++result.edges;
+                ++result.sorted_degree[i];
+                ++result.sorted_degree[j];
+            }
+        }
+    }
+    sort(result.sorted_degree.begin(), result.sorted_degree.end());
+    return result;
+}
+
+/*
+ * Small exact codec:
+ * Each graph is represented by a bit mask.  Canonicalization enumerates all
+ * vertex permutations, which is only used for N <= 6 and eps == 0.
+ */
+class ExactSmallCodec {
+    int m_;
+    int n_;
+    int l_;
+    vector<uint16_t> representatives_;
+    vector<uint16_t> selected_;
+    unordered_map<uint16_t, int> owner_;
+
+    uint16_t permuted_mask(uint16_t mask, const array<int, SMALL_N_MAX>& perm) const {
+        bool adj[SMALL_N_MAX][SMALL_N_MAX] = {};
+        int bit = 0;
+        for (int i = 0; i < n_; ++i) {
+            for (int j = i + 1; j < n_; ++j, ++bit) {
+                bool x = (mask >> bit) & 1U;
+                adj[i][j] = adj[j][i] = x;
+            }
+        }
+
+        uint16_t result = 0;
+        bit = 0;
+        for (int i = 0; i < n_; ++i) {
+            for (int j = i + 1; j < n_; ++j, ++bit) {
+                if (adj[perm[i]][perm[j]]) result |= uint16_t(1U << bit);
+            }
+        }
+        return result;
+    }
+
+    uint16_t canonical(uint16_t mask) const {
+        array<int, SMALL_N_MAX> perm{};
+        for (int i = 0; i < n_; ++i) perm[i] = i;
+
+        uint16_t best = permuted_mask(mask, perm);
+        while (next_permutation(perm.begin(), perm.begin() + n_)) {
+            best = min(best, permuted_mask(mask, perm));
+        }
+        return best;
+    }
+
+    int orbit_distance(uint16_t a, uint16_t b) const {
+        array<int, SMALL_N_MAX> perm{};
+        for (int i = 0; i < n_; ++i) perm[i] = i;
+
+        int best = l_ + 1;
+        do {
+            uint16_t transformed = permuted_mask(b, perm);
+            best = min(best, __builtin_popcount(unsigned(a ^ transformed)));
+        } while (next_permutation(perm.begin(), perm.begin() + n_));
+        return best;
+    }
+
+    string to_string(uint16_t mask) const {
+        string result(l_, '0');
+        for (int i = 0; i < l_; ++i) {
+            if ((mask >> i) & 1U) result[i] = '1';
+        }
+        return result;
+    }
+
+public:
+    explicit ExactSmallCodec(int m) : m_(m) {
+        if (m_ <= 11) n_ = 4;
+        else if (m_ <= 34) n_ = 5;
+        else n_ = 6;
+        l_ = edge_count_of_n(n_);
+    }
+
+    int n() const {
+        return n_;
+    }
+
+    vector<string> build() {
+        set<uint16_t> unique;
+        const int all_masks = 1 << l_;
+        for (int mask = 0; mask < all_masks; ++mask) {
+            unique.insert(canonical(static_cast<uint16_t>(mask)));
+        }
+        representatives_.assign(unique.begin(), unique.end());
+
+        const int count = int(representatives_.size());
+        vector<vector<unsigned char>> dist(count, vector<unsigned char>(count, 0));
+        for (int i = 0; i < count; ++i) {
+            for (int j = i + 1; j < count; ++j) {
+                int d = orbit_distance(representatives_[i], representatives_[j]);
+                dist[i][j] = dist[j][i] = static_cast<unsigned char>(d);
+            }
+        }
+
+        selected_.clear();
+        vector<char> used(count, false);
+        vector<int> nearest(count, l_ + 1);
+
+        auto add_index = [&](int idx) {
+            selected_.push_back(representatives_[idx]);
+            used[idx] = true;
+            for (int v = 0; v < count; ++v) {
+                nearest[v] = min(nearest[v], int(dist[idx][v]));
+            }
+        };
+
+        add_index(0);
+        while (int(selected_.size()) < m_ && int(selected_.size()) < count) {
+            int best = -1;
+            int best_value = -1;
+            for (int i = 0; i < count; ++i) {
+                if (!used[i] && nearest[i] > best_value) {
+                    best_value = nearest[i];
+                    best = i;
+                }
+            }
+            add_index(best);
+        }
+
+        while (int(selected_.size()) < m_) selected_.push_back(selected_[0]);
+
+        owner_.clear();
+        for (int i = 0; i < m_; ++i) {
+            if (!owner_.count(selected_[i])) owner_[selected_[i]] = i;
+        }
+
+        vector<string> output;
+        output.reserve(m_);
+        for (uint16_t mask : selected_) output.push_back(to_string(mask));
+        return output;
+    }
+
+    int decode(const string& received) const {
+        uint16_t mask = 0;
+        for (int i = 0; i < l_; ++i) {
+            if (received[i] == '1') mask |= uint16_t(1U << i);
+        }
+        uint16_t key = canonical(mask);
+        auto it = owner_.find(key);
+        return it == owner_.end() ? 0 : it->second;
+    }
+};
+
+/*
+ * Large noisy codec:
+ * Codeword densities are uniformly spaced.  A deterministic latent vertex
+ * ranking makes degree profiles visibly non-uniform, supplying an invariant
+ * independent from total edge count after vertex shuffling.
+ */
+class NoisyInvariantCodec {
+    int m_;
+    int n_ = 100;
+    int l_ = edge_count_of_n(100);
+    double eps_;
+    vector<string> graphs_;
+    vector<GraphFeatures> templates_;
+
+    static uint32_t mix(uint32_t x) {
+        x += 0x9e3779b9U;
+        x = (x ^ (x >> 16)) * 0x85ebca6bU;
+        x = (x ^ (x >> 13)) * 0xc2b2ae35U;
+        return x ^ (x >> 16);
+    }
+
+    string make_graph(int code, int target_edges) const {
+        struct Candidate {
+            uint64_t score;
+            int index;
+        };
+
+        vector<uint32_t> latent(n_);
+        for (int v = 0; v < n_; ++v) {
+            // Multiple deterministic latent scales produce label-specific,
+            // strongly heterogeneous degree distributions.
+            uint32_t a = mix(uint32_t(code * 1009 + v * 9176 + 11));
+            uint32_t b = mix(uint32_t(code * 65537 + v * 31337 + 97));
+            latent[v] = (a & 0xffff0000U) | ((b >> 16) & 0xffffU);
+        }
+
+        vector<Candidate> candidates;
+        candidates.reserve(l_);
+        int pos = 0;
+        for (int i = 0; i < n_; ++i) {
+            for (int j = i + 1; j < n_; ++j, ++pos) {
+                uint64_t hi = uint64_t(latent[i]) + uint64_t(latent[j]);
+                uint64_t tie = mix(uint32_t(pos * 31 + code * 100003));
+                candidates.push_back({(hi << 20) ^ tie, pos});
+            }
+        }
+
+        nth_element(
+            candidates.begin(),
+            candidates.begin() + target_edges,
+            candidates.end(),
+            [](const Candidate& a, const Candidate& b) {
+                return a.score > b.score;
+            }
+        );
+
+        string graph(l_, '0');
+        for (int i = 0; i < target_edges; ++i) {
+            graph[candidates[i].index] = '1';
+        }
+        return graph;
+    }
+
+public:
+    NoisyInvariantCodec(int m, double eps) : m_(m), eps_(eps) {}
+
+    int n() const {
+        return n_;
+    }
+
+    vector<string> build() {
+        graphs_.resize(m_);
+        templates_.resize(m_);
+
+        for (int id = 0; id < m_; ++id) {
+            int target = int(llround(double(id) * l_ / double(m_ - 1)));
+            graphs_[id] = make_graph(id, target);
+            templates_[id] = extract_features(graphs_[id], n_);
+        }
+        return graphs_;
+    }
+
+    int decode(const string& received) const {
+        GraphFeatures observed = extract_features(received, n_);
+
+        const double signal = 1.0 - 2.0 * eps_;
+        const double edge_var = max(1.0, double(l_) * eps_ * (1.0 - eps_));
+        const double deg_var = max(1.0, double(n_ - 2) * eps_ * (1.0 - eps_));
+        const double observed_mean = 2.0 * observed.edges / n_;
+
+        int answer = 0;
+        double best = numeric_limits<double>::infinity();
+
+        for (int id = 0; id < m_; ++id) {
+            const GraphFeatures& model = templates_[id];
+
+            double expected_edges = eps_ * l_ + signal * model.edges;
+            double edge_delta = observed.edges - expected_edges;
+            double score = edge_delta * edge_delta / edge_var;
+
+            // Sorted degrees are permutation invariant.  Keep this as a
+            // modest auxiliary term because sorting introduces correlations.
+            double template_mean = 2.0 * model.edges / n_;
+            double degree_sse = 0.0;
+            for (int v = 0; v < n_; ++v) {
+                double expected_centered = signal * (model.sorted_degree[v] - template_mean);
+                double observed_centered = observed.sorted_degree[v] - observed_mean;
+                double d = observed_centered - expected_centered;
+                degree_sse += d * d;
+            }
+            score += 0.18 * degree_sse / deg_var;
+
+            if (score < best) {
+                best = score;
+                answer = id;
+            }
+        }
+        return answer;
+    }
+};
+
+} // namespace
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    Problem problem;
+    if (!(cin >> problem.m >> problem.eps)) return 0;
+
+    // Exact canonical decoding is superior when the channel is noiseless.
+    if (problem.eps == 0.0) {
+        ExactSmallCodec codec(problem.m);
+        vector<string> graphs = codec.build();
+
+        cout << codec.n() << '\n';
+        for (const string& graph : graphs) cout << graph << '\n';
+        cout.flush();
+
+        for (int q = 0; q < 100; ++q) {
+            string received;
+            cin >> received;
+            cout << codec.decode(received) << '\n';
+            cout.flush();
+        }
+    } else {
+        NoisyInvariantCodec codec(problem.m, problem.eps);
+        vector<string> graphs = codec.build();
+
+        cout << codec.n() << '\n';
+        for (const string& graph : graphs) cout << graph << '\n';
+        cout.flush();
+
+        for (int q = 0; q < 100; ++q) {
+            string received;
+            cin >> received;
+            cout << codec.decode(received) << '\n';
+            cout.flush();
+        }
+    }
+
+    return 0;
+}
+# EVOLVE-BLOCK-END

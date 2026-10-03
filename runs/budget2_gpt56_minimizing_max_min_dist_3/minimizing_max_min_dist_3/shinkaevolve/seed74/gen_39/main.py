@@ -1,0 +1,241 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Deterministically construct fourteen points in R^3 maximizing the exact
+    minimum squared distance divided by the exact maximum squared distance.
+    """
+    rng = np.random.default_rng(20250308)
+    n = 14
+    ii, jj = np.triu_indices(n, 1)
+
+    def normalize_rows(x: np.ndarray) -> np.ndarray:
+        norms = np.linalg.norm(x, axis=1, keepdims=True)
+        return x / np.maximum(norms, 1.0e-15)
+
+    def normalize(x: np.ndarray) -> np.ndarray:
+        x = x - x.mean(axis=0, keepdims=True)
+        rms = np.sqrt(np.mean(np.sum(x * x, axis=1)))
+        return x / max(rms, 1.0e-15)
+
+    def distances(x: np.ndarray):
+        d = x[ii] - x[jj]
+        q = np.einsum("ij,ij->i", d, d)
+        return d, q
+
+    def score(x: np.ndarray) -> float:
+        _, q = distances(x)
+        return float(q.min() / q.max())
+
+    def line_coherence(u: np.ndarray) -> float:
+        gram = np.abs(u @ u.T)
+        np.fill_diagonal(gram, 0.0)
+        return float(np.max(gram))
+
+    def line_refine(seed: np.ndarray) -> np.ndarray:
+        """Riemannian low-coherence refinement of seven unoriented lines."""
+        best = seed.copy()
+        best_value = line_coherence(best)
+
+        betas = (12.0, 30.0, 75.0, 180.0, 450.0, 1000.0)
+        counts = (110, 130, 160, 190, 220, 240)
+        rates = (0.052, 0.039, 0.028, 0.018, 0.010, 0.005)
+
+        for restart in range(7):
+            if restart == 0:
+                u = seed.copy()
+            else:
+                scale = 0.040 + 0.024 * restart
+                u = normalize_rows(seed + scale * rng.normal(size=seed.shape))
+
+            for beta, count, rate in zip(betas, counts, rates):
+                velocity = np.zeros_like(u)
+                for step in range(count):
+                    dots = u @ u.T
+                    sq = dots * dots
+                    np.fill_diagonal(sq, -np.inf)
+
+                    peak = np.max(sq)
+                    weights = np.exp(beta * (sq - peak))
+                    np.fill_diagonal(weights, 0.0)
+                    weights /= np.sum(weights)
+
+                    gradient = 2.0 * ((weights * dots) @ u)
+                    gradient -= np.sum(gradient * u, axis=1, keepdims=True) * u
+
+                    gnorm = np.sqrt(np.mean(np.sum(gradient * gradient, axis=1)))
+                    if gnorm > 1.0e-14:
+                        gradient /= gnorm
+
+                    velocity = 0.76 * velocity + 0.24 * gradient
+                    velocity -= np.sum(velocity * u, axis=1, keepdims=True) * u
+                    u = normalize_rows(u - rate * velocity)
+
+                    if step % 20 == 19 or step == count - 1:
+                        value = line_coherence(u)
+                        if value < best_value:
+                            best_value = value
+                            best = u.copy()
+
+        return best
+
+    def gradient(x: np.ndarray, beta: float, active_mix: float) -> np.ndarray:
+        """
+        Projected gradient of log(smooth_min_squared / smooth_max_squared),
+        blended with averaged exact active-contact derivatives at high beta.
+        """
+        d, q = distances(x)
+        lo = float(q.min())
+        hi = float(q.max())
+
+        low_raw = np.exp(-beta * (q - lo))
+        high_raw = np.exp(beta * (q - hi))
+        low_w = low_raw / low_raw.sum()
+        high_w = high_raw / high_raw.sum()
+
+        smooth_lo = lo - np.log(low_raw.sum()) / beta
+        smooth_hi = hi + np.log(high_raw.sum()) / beta
+        coeff = low_w / max(smooth_lo, 1.0e-14)
+        coeff -= high_w / max(smooth_hi, 1.0e-14)
+
+        if active_mix > 0.0:
+            low_active = q <= lo * 1.012
+            high_active = q >= hi * 0.988
+            exact = np.zeros_like(q)
+            exact[low_active] = 1.0 / (
+                max(np.count_nonzero(low_active), 1) * max(lo, 1.0e-14)
+            )
+            exact[high_active] -= 1.0 / (
+                max(np.count_nonzero(high_active), 1) * max(hi, 1.0e-14)
+            )
+            coeff = (1.0 - active_mix) * coeff + active_mix * exact
+
+        pair_force = 2.0 * coeff[:, None] * d
+        g = np.zeros_like(x)
+        np.add.at(g, ii, pair_force)
+        np.add.at(g, jj, -pair_force)
+
+        g -= g.mean(axis=0, keepdims=True)
+        g -= np.sum(g * x) / max(np.sum(x * x), 1.0e-14) * x
+        return g
+
+    def refine(seed: np.ndarray, stages) -> np.ndarray:
+        """Projected continuation ascent retaining the best exact iterate."""
+        x = normalize(seed.copy())
+        best = x.copy()
+        best_value = score(x)
+        velocity = np.zeros_like(x)
+
+        for beta0, beta1, count, rate0, momentum in stages:
+            for step in range(count):
+                t = step / max(count - 1, 1)
+                beta = beta0 + (beta1 - beta0) * t ** 1.55
+                rate = rate0 * (1.0 - 0.62 * t)
+                blend = 0.26 * np.clip((beta - 100.0) / 350.0, 0.0, 1.0)
+
+                g = gradient(x, beta, blend)
+                gn = np.sqrt(np.mean(np.sum(g * g, axis=1)))
+                if gn > 1.0e-14:
+                    g /= gn
+
+                velocity = momentum * velocity + (1.0 - momentum) * g
+                velocity -= velocity.mean(axis=0, keepdims=True)
+                velocity -= (
+                    np.sum(velocity * x) / max(np.sum(x * x), 1.0e-14)
+                ) * x
+                x = normalize(x + rate * velocity)
+
+                if step % 10 == 9 or step == count - 1:
+                    value = score(x)
+                    if value > best_value:
+                        best_value = value
+                        best = x.copy()
+
+        return best
+
+    # Six icosahedral lines form a strong base for the seventh-line search.
+    phi = (1.0 + np.sqrt(5.0)) * 0.5
+    base6 = np.array(
+        [
+            [0.0, 1.0, phi], [0.0, 1.0, -phi],
+            [1.0, phi, 0.0], [1.0, -phi, 0.0],
+            [phi, 0.0, 1.0], [phi, 0.0, -1.0],
+        ],
+        dtype=float,
+    )
+    base6 = normalize_rows(base6)
+
+    trials = normalize_rows(rng.normal(size=(28000, 3)))
+    seventh = trials[np.argmin(np.max(np.abs(trials @ base6.T), axis=1))]
+    lines = line_refine(np.vstack((base6, seventh)))
+    antipodal = np.vstack((lines, -lines))
+
+    broad_stages = (
+        (10.0, 105.0, 145, 0.050, 0.79),
+        (38.0, 290.0, 180, 0.026, 0.82),
+    )
+    sharp_stages = (
+        (150.0, 820.0, 310, 0.0125, 0.75),
+    )
+
+    candidates = []
+    initial = refine(antipodal, broad_stages)
+    candidates.append((score(initial), initial))
+
+    # Broken-antipodal variants retain the strong line-packing contact graph
+    # while allowing access to better nonsymmetric arrangements.
+    for restart in range(20):
+        if restart < 13:
+            scale = 0.018 + 0.019 * restart
+        else:
+            scale = 0.27 + 0.050 * (restart - 13)
+        seed = antipodal + scale * rng.normal(size=(n, 3))
+        candidate = refine(seed, broad_stages)
+        candidates.append((score(candidate), candidate))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    finalists = []
+    for rank, (_, candidate) in enumerate(candidates[:7]):
+        finalists.append(refine(candidate, sharp_stages))
+        if rank < 4:
+            perturb = candidate + (0.012 + 0.006 * rank) * rng.normal(size=(n, 3))
+            finalists.append(refine(perturb, sharp_stages))
+
+    best = max(finalists + [initial], key=score).copy()
+    best_value = score(best)
+
+    # Exact-ratio monotone contact polish.
+    x = best.copy()
+    current = best_value
+    velocity = np.zeros_like(x)
+    step_size = 0.0085
+
+    for _ in range(1500):
+        g = gradient(x, 1900.0, 0.40)
+        gn = np.sqrt(np.mean(np.sum(g * g, axis=1)))
+        if gn > 1.0e-14:
+            g /= gn
+
+        velocity = 0.66 * velocity + 0.34 * g
+        candidate = normalize(x + step_size * velocity)
+        value = score(candidate)
+
+        if value > current + 1.0e-14:
+            x = candidate
+            current = value
+            step_size = min(0.026, step_size * 1.016)
+        else:
+            velocity *= 0.15
+            step_size *= 0.50
+            if step_size < 1.0e-8:
+                break
+
+    if current > best_value:
+        best = x
+
+    return np.asarray(best, dtype=np.float64)
+
+
+# EVOLVE-BLOCK-END

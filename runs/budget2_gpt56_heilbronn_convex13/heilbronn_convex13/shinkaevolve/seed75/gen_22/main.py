@@ -1,0 +1,281 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Deterministically construct 13 points in the unit square.
+
+    The four square corners are retained throughout the search, so the convex
+    hull has area exactly one.  Consequently, maximizing the raw smallest
+    triangle area is also maximizing the normalized score.
+    """
+    rng = np.random.default_rng(13031957)
+
+    n = 13
+    corners = np.array(
+        [[0.0, 0.0],
+         [1.0, 0.0],
+         [1.0, 1.0],
+         [0.0, 1.0]],
+        dtype=float,
+    )
+
+    tri = np.array(
+        [(i, j, k)
+         for i in range(n - 2)
+         for j in range(i + 1, n - 1)
+         for k in range(j + 1, n)],
+        dtype=np.intp,
+    )
+
+    incident = []
+    for p in range(n):
+        incident.append(np.flatnonzero(np.any(tri == p, axis=1)))
+
+    def triangle_areas(pts: np.ndarray) -> np.ndarray:
+        a = pts[tri[:, 0]]
+        b = pts[tri[:, 1]]
+        c = pts[tri[:, 2]]
+        return 0.5 * np.abs(
+            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+        )
+
+    def batch_triangle_areas(configurations: np.ndarray) -> np.ndarray:
+        """Triangle areas for a small batch of complete point configurations."""
+        a = configurations[:, tri[:, 0], :]
+        b = configurations[:, tri[:, 1], :]
+        c = configurations[:, tri[:, 2], :]
+        return 0.5 * np.abs(
+            (b[:, :, 0] - a[:, :, 0]) * (c[:, :, 1] - a[:, :, 1])
+            - (b[:, :, 1] - a[:, :, 1]) * (c[:, :, 0] - a[:, :, 0])
+        )
+
+    def incident_areas(candidates: np.ndarray, point_index: int) -> np.ndarray:
+        """Areas of all triangles containing point_index for many candidates."""
+        local_tri = tri[incident[point_index]]
+        m = candidates.shape[0]
+        work = np.broadcast_to(points, (m, n, 2)).copy()
+        work[:, point_index, :] = candidates
+
+        a = work[:, local_tri[:, 0], :]
+        b = work[:, local_tri[:, 1], :]
+        c = work[:, local_tri[:, 2], :]
+        return 0.5 * np.abs(
+            (b[:, :, 0] - a[:, :, 0]) * (c[:, :, 1] - a[:, :, 1])
+            - (b[:, :, 1] - a[:, :, 1]) * (c[:, :, 0] - a[:, :, 0])
+        )
+
+    def soft_bottleneck(values: np.ndarray, temperature: float) -> np.ndarray:
+        """
+        Stable soft-min score.  The lower tail of the triangle-area spectrum
+        controls the score, while temperature permits early global reshaping.
+        """
+        minimum = np.min(values, axis=1)
+        z = np.exp(-(values - minimum[:, None]) / temperature).sum(axis=1)
+        return minimum - temperature * np.log(z)
+
+    best_points = None
+    best_value = -np.inf
+
+    # The restart portfolio deliberately mixes square-grid and staggered
+    # geometries.  They induce distinct lower-tail triangle patterns before
+    # coordinate search begins, which is valuable for this nonsmooth problem.
+    base_patterns = (
+        np.array(
+            [[0.22, 0.22], [0.50, 0.22], [0.78, 0.22],
+             [0.22, 0.50], [0.50, 0.50], [0.78, 0.50],
+             [0.22, 0.78], [0.50, 0.78], [0.78, 0.78]],
+            dtype=float,
+        ),
+        np.array(
+            [[0.18, 0.22], [0.50, 0.16], [0.82, 0.22],
+             [0.31, 0.42], [0.68, 0.42], [0.15, 0.59],
+             [0.50, 0.64], [0.85, 0.59], [0.50, 0.86]],
+            dtype=float,
+        ),
+        np.array(
+            [[0.18, 0.18], [0.51, 0.15], [0.81, 0.29],
+             [0.17, 0.48], [0.50, 0.45], [0.83, 0.52],
+             [0.28, 0.78], [0.57, 0.82], [0.82, 0.77]],
+            dtype=float,
+        ),
+        np.array(
+            [[0.29, 0.16], [0.66, 0.18], [0.17, 0.35],
+             [0.50, 0.38], [0.82, 0.39], [0.27, 0.65],
+             [0.63, 0.63], [0.18, 0.84], [0.78, 0.83]],
+            dtype=float,
+        ),
+    )
+
+    # Several deterministic initializations are preferable to a single
+    # expensive stochastic trajectory for this highly nonsmooth objective.
+    restarts = 12
+    sweeps = 520
+
+    for restart in range(restarts):
+        # Cycle through lattice, staggered, and skewed seeds.  Jitter prevents
+        # exact collinearities while preserving each family's global structure.
+        base = base_patterns[restart % len(base_patterns)]
+        jitter_scale = 0.115 if restart < 8 else 0.075
+        jitter = rng.uniform(-jitter_scale, jitter_scale, size=(9, 2))
+        points = np.vstack((corners, np.clip(base + jitter, 0.045, 0.955)))
+        areas = triangle_areas(points)
+
+        for sweep in range(sweeps):
+            progress = sweep / max(1, sweeps - 1)
+            # Large early moves escape lattice-like arrangements; late moves
+            # resolve the bottleneck triangles precisely.
+            step = 0.105 * (1.0 - progress) ** 1.65 + 0.0015
+            temperature = 0.010 * (1.0 - progress) ** 2.0 + 0.00022
+
+            # Cycle through a randomly permuted set of movable coordinates.
+            for p in rng.permutation(np.arange(4, n)):
+                current = points[p].copy()
+
+                # Include the present location so every coordinate update is
+                # non-destructive with respect to the current smooth score.
+                proposals = np.empty((13, 2), dtype=float)
+                proposals[0] = current
+
+                directions = rng.normal(size=(12, 2))
+                directions /= np.maximum(
+                    np.linalg.norm(directions, axis=1, keepdims=True), 1e-12
+                )
+                radii = step * (0.25 + 1.15 * rng.random(12))
+                proposals[1:] = current + directions * radii[:, None]
+
+                # Occasional broad deterministic proposals prevent individual
+                # coordinates from becoming permanently trapped.
+                if sweep < sweeps // 3:
+                    proposals[-2:] = rng.uniform(0.075, 0.925, size=(2, 2))
+
+                proposals = np.clip(proposals, 0.035, 0.965)
+
+                local = incident_areas(proposals, p)
+                mask = np.ones(len(tri), dtype=bool)
+                mask[incident[p]] = False
+                fixed = areas[mask]
+
+                all_values = np.empty((len(proposals), len(tri)), dtype=float)
+                all_values[:, mask] = fixed
+                all_values[:, incident[p]] = local
+
+                # The evaluated objective is the strict smallest area.  Use it
+                # as the dominant coordinate-selection criterion; otherwise a
+                # soft-min improvement can silently reduce the true bottleneck.
+                candidate_min = np.minimum(
+                    np.min(local, axis=1),
+                    np.min(fixed),
+                )
+                maximum_min = float(np.max(candidate_min))
+
+                # Among essentially equal max-min alternatives, the smooth
+                # lower-tail score encourages future improvements by enlarging
+                # several currently tight triangles rather than just one.
+                tied = candidate_min >= maximum_min - 2.0e-7
+                scores = soft_bottleneck(all_values, temperature)
+                scores[~tied] = -np.inf
+                choice = int(np.argmax(scores))
+
+                points[p] = proposals[choice]
+                areas[incident[p]] = local[choice]
+
+            # A max-min local optimum frequently requires two vertices of a
+            # tight triangle to move together: neither individual move can be
+            # accepted while the other vertex remains fixed.  Periodically
+            # propose such targeted pair moves from the lower area tail.
+            if sweep % 10 == 9:
+                worst = np.argsort(areas)[:8]
+                joint = np.broadcast_to(points, (25, n, 2)).copy()
+
+                for q in range(1, len(joint)):
+                    tight_triangle = tri[worst[(q - 1) % len(worst)]]
+                    movable = tight_triangle[tight_triangle >= 4]
+
+                    # Corner-only tight triangles cannot be repaired here;
+                    # use a second lower-tail triangle with interior vertices.
+                    if len(movable) < 2:
+                        for offset in range(1, len(worst)):
+                            alternative = tri[
+                                worst[((q - 1) + offset) % len(worst)]
+                            ]
+                            movable = alternative[alternative >= 4]
+                            if len(movable) >= 2:
+                                break
+
+                    if len(movable) >= 2:
+                        p0, p1 = movable[:2]
+                        direction = rng.normal(size=(2, 2))
+                        direction /= np.maximum(
+                            np.linalg.norm(direction, axis=1, keepdims=True),
+                            1e-12,
+                        )
+                        # Alternate common translations and independent moves:
+                        # the former preserves useful local shape, the latter
+                        # can open a nearly collinear bottleneck.
+                        radius = 1.45 * step * (
+                            0.35 + 0.95 * rng.random(2)
+                        )
+                        if q % 3 == 0:
+                            direction[1] = direction[0]
+                        joint[q, p0] += radius[0] * direction[0]
+                        joint[q, p1] += radius[1] * direction[1]
+
+                joint = np.clip(joint, 0.035, 0.965)
+                joint_areas = batch_triangle_areas(joint)
+                joint_min = np.min(joint_areas, axis=1)
+                maximum_min = float(np.max(joint_min))
+                tied = joint_min >= maximum_min - 2.0e-7
+                joint_scores = soft_bottleneck(joint_areas, temperature)
+                joint_scores[~tied] = -np.inf
+                choice = int(np.argmax(joint_scores))
+
+                if joint_min[choice] >= np.min(areas) - 1e-15:
+                    points = joint[choice].copy()
+                    areas = joint_areas[choice].copy()
+
+        # Final strict max-min coordinate polishing.  At this point the
+        # objective is the actual evaluation metric rather than its surrogate.
+        for polish_step in (0.008, 0.004, 0.002, 0.0008):
+            for _ in range(4):
+                for p in range(4, n):
+                    current = points[p].copy()
+                    proposals = np.empty((49, 2), dtype=float)
+                    proposals[0] = current
+
+                    angles = np.linspace(0.0, 2.0 * np.pi, 48, endpoint=False)
+                    proposals[1:] = current + polish_step * np.column_stack(
+                        (np.cos(angles), np.sin(angles))
+                    )
+                    proposals = np.clip(proposals, 0.035, 0.965)
+
+                    local = incident_areas(proposals, p)
+                    mask = np.ones(len(tri), dtype=bool)
+                    mask[incident[p]] = False
+
+                    candidate_min = np.minimum(
+                        np.min(local, axis=1),
+                        np.min(areas[mask]),
+                    )
+                    choice = int(np.argmax(candidate_min))
+
+                    if candidate_min[choice] >= np.min(areas) - 1e-15:
+                        points[p] = proposals[choice]
+                        areas[incident[p]] = local[choice]
+
+        value = float(np.min(areas))
+        if value > best_value:
+            best_value = value
+            best_points = points.copy()
+
+    # Defensive fallback is never normally reached, but preserves the required
+    # output shape if an unexpected numerical failure occurs.
+    if best_points is None or not np.all(np.isfinite(best_points)):
+        return np.vstack((corners, np.full((9, 2), 0.5, dtype=float)))
+
+    return best_points
+
+
+# EVOLVE-BLOCK-END

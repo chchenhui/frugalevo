@@ -1,0 +1,282 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+from solver import Algorithm
+from typing import Tuple, List, Dict
+from collections import defaultdict
+import heapq
+
+
+class Evolved(Algorithm):
+    """
+    Safe bounded prompt-prefix optimizer.
+
+    The returned dataframe always has the original dataframe's columns.  A row's
+    values may appear in a different positional order; column_orderings[row]
+    records which original source column occupies each returned position.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    @staticmethod
+    def _cell_string(value) -> str:
+        """Match evaluator normalization without changing the stored value."""
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, bool) and missing:
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(value)
+
+    @staticmethod
+    def _lcp(left: str, right: str) -> int:
+        if left == right:
+            return len(left)
+        limit = min(len(left), len(right))
+        lo, hi = 0, limit
+        # Slice equality is implemented in C and avoids a Python char loop.
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if left[:mid] == right[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_score(self, strings: List[str]) -> int:
+        if len(strings) < 2:
+            return 0
+        ordered = sorted(strings)
+        return sum(self._lcp(ordered[i - 1], ordered[i])
+                   for i in range(1, len(ordered)))
+
+    @staticmethod
+    def _resolve_column(columns, name):
+        """Use exact names first, then the historical unique-substring rule."""
+        if name in columns:
+            return columns.index(name)
+        found = [i for i, column in enumerate(columns) if str(name) in str(column)]
+        return found[0] if len(found) == 1 else None
+
+    def _atomic_groups(self, columns, col_merge):
+        """Make requested merge groups indivisible while preserving all columns."""
+        used = set()
+        groups = []
+        for requested in col_merge or []:
+            members = []
+            for name in requested:
+                pos = self._resolve_column(columns, name)
+                if pos is not None and pos not in used:
+                    members.append(pos)
+                    used.add(pos)
+            if members:
+                groups.append(members)
+        for pos in range(len(columns)):
+            if pos not in used:
+                groups.append([pos])
+        return groups
+
+    def _ordered_groups(self, groups, weights, columns, one_way_dep):
+        """Weighted deterministic topological order of merge groups."""
+        group_of = {}
+        for group_id, group in enumerate(groups):
+            for col in group:
+                group_of[col] = group_id
+
+        edges = defaultdict(set)
+        indegree = [0] * len(groups)
+        for before, after in one_way_dep or []:
+            a = self._resolve_column(columns, before)
+            b = self._resolve_column(columns, after)
+            if a is None or b is None:
+                continue
+            ga, gb = group_of[a], group_of[b]
+            if ga != gb and gb not in edges[ga]:
+                edges[ga].add(gb)
+                indegree[gb] += 1
+
+        # A priority queue makes ties reproducible and honors dependencies.
+        ready = []
+        for group_id, degree in enumerate(indegree):
+            if degree == 0:
+                heapq.heappush(ready, (-weights[group_id], group_id))
+
+        result = []
+        while ready:
+            _, group_id = heapq.heappop(ready)
+            result.extend(groups[group_id])
+            for nxt in edges[group_id]:
+                indegree[nxt] -= 1
+                if indegree[nxt] == 0:
+                    heapq.heappush(ready, (-weights[nxt], nxt))
+
+        # Invalid cyclic dependency input cannot be fully topologically sorted.
+        # Keep all columns rather than dropping or fabricating any data.
+        seen = set(result)
+        for group_id, group in enumerate(groups):
+            if group_id not in seen and not all(col in seen for col in group):
+                result.extend(col for col in group if col not in seen)
+                seen.update(group)
+        return result
+
+    def _global_order(self, values, columns, groups, one_way_dep, alternate=False):
+        nrows = len(values)
+        weights = []
+        for group in groups:
+            score = 0
+            for col in group:
+                counts = defaultdict(lambda: [0, 0])
+                for row in range(nrows):
+                    text = values[row][col]
+                    counts[text][0] += 1
+                    counts[text][1] = len(text)
+                for count, length in counts.values():
+                    # Required frequency heuristic: len(v)*count*(count-1).
+                    if alternate:
+                        score += length * max(0, count - 1)
+                    else:
+                        score += length * count * max(0, count - 1)
+            weights.append(score)
+        return self._ordered_groups(groups, weights, columns, one_way_dep)
+
+    def _conditional_orders(self, values, base_order, groups, columns, one_way_dep):
+        """
+        Bounded conditional prefix partitioning.  Constraints are conservatively
+        handled by retaining the global order whenever merge/dependency rules
+        were requested.
+        """
+        nrows = len(values)
+        ncols = len(columns)
+        if nrows < 2 or ncols < 2 or col_merge_present(groups, ncols) or one_way_dep:
+            return [list(base_order) for _ in range(nrows)]
+
+        orders = [None] * nrows
+        # Bound both selected fields and group-node work on wide datasets.
+        candidate_columns = base_order[:min(len(base_order), 40)]
+        max_depth = min(ncols, 12)
+        node_budget = 256
+
+        def visit(rows, remaining, prefix, depth):
+            nonlocal node_budget
+            if (len(rows) <= 1 or not remaining or depth >= max_depth or
+                    node_budget <= 0):
+                tail = [c for c in base_order if c in remaining]
+                for row in rows:
+                    orders[row] = prefix + tail
+                return
+
+            node_budget -= 1
+            best_col = None
+            best_score = 0
+            for col in candidate_columns:
+                if col not in remaining:
+                    continue
+                counts = defaultdict(lambda: [0, 0])
+                for row in rows:
+                    text = values[row][col]
+                    counts[text][0] += 1
+                    counts[text][1] = len(text)
+                score = sum(length * count * (count - 1)
+                            for count, length in counts.values() if count > 1)
+                if score > best_score or (score == best_score and
+                                          score > 0 and
+                                          (best_col is None or col < best_col)):
+                    best_col, best_score = col, score
+
+            if best_col is None or best_score <= 0:
+                tail = [c for c in base_order if c in remaining]
+                for row in rows:
+                    orders[row] = prefix + tail
+                return
+
+            partitions = defaultdict(list)
+            for row in rows:
+                partitions[values[row][best_col]].append(row)
+            next_remaining = set(remaining)
+            next_remaining.remove(best_col)
+            for key in sorted(partitions):
+                visit(partitions[key], next_remaining, prefix + [best_col], depth + 1)
+
+        visit(list(range(nrows)), set(range(ncols)), [], 0)
+        return [order if order is not None else list(base_order) for order in orders]
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        # Do not mutate df: normalization is solely an objective representation.
+        nrows, ncols = df.shape
+        columns = list(df.columns)
+        if nrows == 0 or ncols == 0:
+            return df.copy(), [[] for _ in range(nrows)]
+
+        raw_rows = [list(df.iloc[row].values) for row in range(nrows)]
+        values = [[self._cell_string(value) for value in row] for row in raw_rows]
+        groups = self._atomic_groups(columns, col_merge)
+
+        global_order = self._global_order(
+            values, columns, groups, one_way_dep, alternate=False
+        )
+        # A second cheap frequency tradeoff is retained as a bounded alternative.
+        alternate_order = self._global_order(
+            values, columns, groups, one_way_dep, alternate=True
+        )
+
+        candidates = [
+            [list(global_order) for _ in range(nrows)],
+            [list(alternate_order) for _ in range(nrows)],
+        ]
+        candidates.append(self._conditional_orders(
+            values, global_order, groups, columns, one_way_dep
+        ))
+
+        best_orders = candidates[0]
+        best_score = -1
+        for candidate in candidates:
+            serial = [
+                "".join(values[row][col] for col in candidate[row])
+                for row in range(nrows)
+            ]
+            score = self._trie_score(serial)
+            if score > best_score:
+                best_score = score
+                best_orders = candidate
+
+        # Lexicographic output order is deterministic and is compatible with the
+        # serial Trie representation.  Source indices remain attached to rows.
+        serial = [
+            "".join(values[row][col] for col in best_orders[row])
+            for row in range(nrows)
+        ]
+        row_indices = sorted(range(nrows), key=lambda row: (serial[row], row))
+        output_rows = [
+            [raw_rows[row][col] for col in best_orders[row]]
+            for row in row_indices
+        ]
+        output_orders = [
+            [columns[col] for col in best_orders[row]]
+            for row in row_indices
+        ]
+
+        result = pd.DataFrame(
+            output_rows,
+            columns=columns,
+            index=[df.index[row] for row in row_indices],
+            dtype=object,
+        )
+        return result, output_orders
+
+
+def col_merge_present(groups, ncols):
+    """True when any requested merge created a non-singleton atomic group."""
+    return len(groups) < ncols or any(len(group) > 1 for group in groups)
+
+# EVOLVE-BLOCK-END

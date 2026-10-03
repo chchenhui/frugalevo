@@ -1,0 +1,297 @@
+--- a/original.py
++++ b/original.py
+@@ -1,97 +1,214 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+-# The hull is the reference triangle (0,0), (1,0), (0,1).  In this
+-# normalization a triangle's area divided by the hull area is simply the
+-# absolute two-dimensional determinant.
+-_TRIANGLES_13 = np.array(
+-    [(i, j, k) for i in range(13) for j in range(i + 1, 13)
+-     for k in range(j + 1, 13)],
++_N = 13
++_FIXED = 3
++_TRIPLES = np.array(
++    [(i, j, k) for i in range(_N) for j in range(i + 1, _N)
++     for k in range(j + 1, _N)],
+     dtype=np.intp,
+ )
+-
+-
+-def _project_to_reference_triangle(p: np.ndarray) -> np.ndarray:
+-    """Project a point to x >= 0, y >= 0, x + y <= 1."""
+-    p = np.maximum(p, 0.0)
+-    s = float(p[0] + p[1])
+-    if s > 1.0:
+-        p /= s
+-    return p
+-
+-
+-def _minimum_normalized_area(points: np.ndarray) -> tuple[float, np.ndarray]:
+-    triples = points[_TRIANGLES_13]
+-    determinants = np.abs(
+-        (triples[:, 1, 0] - triples[:, 0, 0])
+-        * (triples[:, 2, 1] - triples[:, 0, 1])
+-        - (triples[:, 1, 1] - triples[:, 0, 1])
+-        * (triples[:, 2, 0] - triples[:, 0, 0])
++_POINT_TRIANGLES = tuple(
++    np.flatnonzero(np.any(_TRIPLES == point, axis=1))
++    for point in range(_N)
++)
++_REFERENCE_HULL = np.array(
++    [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
++    dtype=float,
++)
++
++
++def _project_triangle(point: np.ndarray) -> np.ndarray:
++    """Project one coordinate onto x >= 0, y >= 0, x + y <= 1."""
++    x = max(0.0, float(point[0]))
++    y = max(0.0, float(point[1]))
++    total = x + y
++    if total > 1.0:
++        x /= total
++        y /= total
++    return np.array((x, y), dtype=float)
++
++
++def _determinants(points: np.ndarray) -> np.ndarray:
++    """Return twice-areas, equal to normalized areas in this reference hull."""
++    triangles = points[_TRIPLES]
++    return np.abs(
++        (triangles[:, 1, 0] - triangles[:, 0, 0])
++        * (triangles[:, 2, 1] - triangles[:, 0, 1])
++        - (triangles[:, 1, 1] - triangles[:, 0, 1])
++        * (triangles[:, 2, 0] - triangles[:, 0, 0])
+     )
+-    return float(np.min(determinants)), determinants
++
++
++def _initial_points(rng: np.random.Generator, restart: int) -> np.ndarray:
++    """
++    Generate complementary deterministic starts.  Dirichlet samples give
++    genuinely uniform samples in the reference triangle; alternate starts
++    include a lightly disturbed barycentric lattice.
++    """
++    if restart % 3 == 0:
++        bary = rng.dirichlet((1.0, 1.0, 1.0), size=10)
++        interior = bary[:, 1:]
++    elif restart % 3 == 1:
++        lattice = np.array(
++            [
++                [0.16, 0.12], [0.40, 0.10], [0.68, 0.11],
++                [0.10, 0.36], [0.31, 0.31], [0.54, 0.27],
++                [0.13, 0.62], [0.34, 0.49], [0.19, 0.77],
++                [0.47, 0.42],
++            ],
++            dtype=float,
++        )
++        interior = lattice + rng.normal(0.0, 0.055, size=(10, 2))
++        interior = np.array([_project_triangle(p) for p in interior])
++    else:
++        bary = rng.dirichlet((1.35, 1.35, 1.35), size=10)
++        interior = bary[:, 1:]
++        interior += rng.normal(0.0, 0.025, size=(10, 2))
++        interior = np.array([_project_triangle(p) for p in interior])
++
++    return np.vstack((_REFERENCE_HULL, interior))
++
++
++def _guided_displacement(
++    points: np.ndarray,
++    triple_index: int,
++    point_index: int,
++) -> np.ndarray:
++    """
++    Gradient direction for increasing the signed area of one selected
++    bottleneck triangle with respect to one of its movable vertices.
++    """
++    a, b, c = _TRIPLES[triple_index]
++    triangle = points[[a, b, c]]
++    signed = (
++        (triangle[1, 0] - triangle[0, 0])
++        * (triangle[2, 1] - triangle[0, 1])
++        - (triangle[1, 1] - triangle[0, 1])
++        * (triangle[2, 0] - triangle[0, 0])
++    )
++    sign = 1.0 if signed >= 0.0 else -1.0
++
++    if point_index == a:
++        opposite_a, opposite_b = points[b], points[c]
++    elif point_index == b:
++        opposite_a, opposite_b = points[c], points[a]
++    else:
++        opposite_a, opposite_b = points[a], points[b]
++
++    edge = opposite_b - opposite_a
++    gradient = sign * np.array((-edge[1], edge[0]))
++    length = float(np.hypot(gradient[0], gradient[1]))
++    if length > 1.0e-14:
++        gradient /= length
++    return gradient
++
++
++def _search_restart(
++    rng: np.random.Generator,
++    start: np.ndarray,
++    iterations: int,
++) -> tuple[np.ndarray, float]:
++    """
++    Annealed max-min search.  Only triangle areas incident to a moved point
++    are recomputed, which makes critical-point mutation inexpensive.
++    """
++    points = start.copy()
++    areas = _determinants(points)
++    value = float(np.min(areas))
++
++    best_points = points.copy()
++    best_value = value
++
++    for iteration in range(iterations):
++        progress = iteration / float(iterations)
++        cooling = (1.0 - progress) ** 1.7
++        step = 0.070 * cooling + 0.0012
++        temperature = 0.0022 * cooling * cooling + 0.000002
++
++        # A small active set avoids overfitting only the single smallest
++        # triangle while retaining strong pressure on the bottleneck.
++        active_count = 10 if progress < 0.70 else 5
++        active = np.argpartition(areas, active_count - 1)[:active_count]
++        tri_index = int(active[rng.integers(active_count)])
++        triple = _TRIPLES[tri_index]
++        movable = triple[triple >= _FIXED]
++        point_index = int(movable[rng.integers(len(movable))])
++
++        direction = _guided_displacement(points, tri_index, point_index)
++        random_direction = rng.normal(0.0, 1.0, size=2)
++        random_norm = float(np.hypot(random_direction[0], random_direction[1]))
++        if random_norm > 0.0:
++            random_direction /= random_norm
++
++        guided_weight = 0.63 if progress < 0.82 else 0.80
++        move_direction = (
++            guided_weight * direction
++            + (1.0 - guided_weight) * random_direction
++        )
++        move_norm = float(np.hypot(move_direction[0], move_direction[1]))
++        if move_norm > 0.0:
++            move_direction /= move_norm
++
++        proposal = _project_triangle(
++            points[point_index] + step * move_direction
++        )
++
++        incident = _POINT_TRIANGLES[point_index]
++        candidate_areas = areas.copy()
++        trial = points.copy()
++        trial[point_index] = proposal
++        candidate_areas[incident] = _determinants(trial)[incident]
++        candidate_value = float(np.min(candidate_areas))
++
++        delta = candidate_value - value
++        if delta >= 0.0 or rng.random() < np.exp(delta / temperature):
++            points = trial
++            areas = candidate_areas
++            value = candidate_value
++
++            if value > best_value:
++                best_value = value
++                best_points = points.copy()
++
++    return best_points, best_value
+ 
+ 
+ def heilbronn_convex13() -> np.ndarray:
+     """
+-    Deterministically search for thirteen points in a triangular convex hull.
+-
+-    Fixing three hull vertices removes affine degrees of freedom: since the
+-    evaluator normalizes by hull area, this loses no scale information while
+-    making every candidate automatically feasible.
++    Construct thirteen deterministic points in a triangular convex region.
++
++    The reference triangle has vertices (0,0), (1,0), and (0,1).  Its area
++    normalization makes each returned determinant directly comparable to the
++    required minimum-area-over-hull-area objective.
+     """
+     rng = np.random.default_rng(13031957)
+-    hull = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+-
+-    best_points = None
+-    best_value = -1.0
+-
+-    # Several independently jittered starts are substantially more reliable
+-    # than one long run for this highly nonsmooth max-min objective.
+-    for restart in range(6):
+-        interior = rng.random((10, 2))
+-        interior.sort(axis=1)
+-        interior[:, 0] = 0.04 + 0.88 * interior[:, 0]
+-        interior[:, 1] = (1.0 - interior[:, 0] - 0.04) * interior[:, 1] + 0.02
+-        points = np.vstack((hull, interior))
+-
+-        value, areas = _minimum_normalized_area(points)
+-        local_best = points.copy()
+-        local_best_value = value
+-
+-        for iteration in range(14000):
+-            fraction = iteration / 14000.0
+-            temperature = 0.0045 * (1.0 - fraction) ** 2 + 0.00003
+-            step = 0.105 * (1.0 - fraction) + 0.003
+-
+-            # Select an interior member of a worst (or nearly worst) triple.
+-            cutoff = np.partition(areas, min(7, len(areas) - 1))[min(7, len(areas) - 1)]
+-            critical = np.flatnonzero(areas <= cutoff)
+-            triple = _TRIANGLES_13[critical[rng.integers(len(critical))]]
+-            movable = triple[triple >= 3]
+-            index = int(movable[rng.integers(len(movable))])
+-
+-            candidate = points.copy()
+-            candidate[index] = _project_to_reference_triangle(
+-                candidate[index] + rng.normal(0.0, step, size=2)
++
++    global_best = None
++    global_value = -np.inf
++
++    try:
++        for restart in range(12):
++            initial = _initial_points(rng, restart)
++            candidate, value = _search_restart(
++                rng=rng,
++                start=initial,
++                iterations=9000,
+             )
+-            candidate_value, candidate_areas = _minimum_normalized_area(candidate)
+-
+-            # Annealing permits temporary loss of the bottleneck, which is
+-            # essential when several near-degenerate triples compete.
+-            if (candidate_value >= value or
+-                    rng.random() < np.exp((candidate_value - value) / temperature)):
+-                points, value, areas = candidate, candidate_value, candidate_areas
+-
+-            if value > local_best_value:
+-                local_best_value = value
+-                local_best = points.copy()
+-
+-        if local_best_value > best_value:
+-            best_value = local_best_value
+-            best_points = local_best
+-
+-    return best_points
++            if value > global_value:
++                global_value = value
++                global_best = candidate
++
++        if global_best is None or not np.all(np.isfinite(global_best)):
++            raise RuntimeError("search did not produce a valid configuration")
++
++        return global_best
++
++    except (FloatingPointError, RuntimeError, ValueError):
++        # Deterministic valid fallback, retained for graceful failure handling.
++        fallback_rng = np.random.default_rng(13031957)
++        return _initial_points(fallback_rng, 1)
+ 
+ 
+ # EVOLVE-BLOCK-END

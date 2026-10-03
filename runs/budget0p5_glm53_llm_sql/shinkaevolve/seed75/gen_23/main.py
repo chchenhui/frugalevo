@@ -1,0 +1,321 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List
+
+
+class Evolved(Algorithm):
+    """
+    Character-Trie prefix reuse optimizer, restructured:
+
+      1. Serialize cells ONCE into column-major string lists.
+      2. Factorize each column into integer codes + per-code lengths.
+      3. Build a small set of candidate per-row column orderings:
+           - global length-weighted frequency order
+           - original column order
+           - conditional partition tree (per-row orderings)
+           - class-marker candidate (rarest cells first, global tail after)
+      4. Score every candidate with the exact Trie objective
+         (sum of LCPs of lexicographically adjacent serialized rows).
+      5. Apply the best; sort output rows lexicographically.
+    All cell values preserved exactly.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ---------------- serialization ---------------- #
+    @staticmethod
+    def _cell_str(v):
+        if v is None:
+            return ""
+        if isinstance(v, float) and np.isnan(v):
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(v)
+
+    def _serialize_cells(self, df):
+        return [[self._cell_str(v) for v in df[c].tolist()] for c in df.columns]
+
+    # ---------------- exact objective ---------------- #
+    @staticmethod
+    def _lcp(a, b):
+        n = min(len(a), len(b))
+        if n == 0:
+            return 0
+        if a[:n] == b[:n]:
+            return n
+        lo, hi = 0, n - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_score(self, strings):
+        if len(strings) <= 1:
+            return 0
+        ss = sorted(strings)
+        total = 0
+        prev = ss[0]
+        for cur in ss[1:]:
+            if cur == prev:
+                total += len(cur)
+            else:
+                total += self._lcp(prev, cur)
+            prev = cur
+        return total
+
+    # ---------------- candidate constructions ---------------- #
+    def _column_stats(self, columns, cell_strings, col_index):
+        """Return per column: codes (list[int]), code->len map, gscore."""
+        stats = {}
+        for c in columns:
+            arr = cell_strings[col_index[c]]
+            uniq = {}
+            code_arr = []
+            lens = []
+            for v in arr:
+                if v not in uniq:
+                    uniq[v] = len(uniq)
+                    lens.append(len(v))
+                code_arr.append(uniq[v])
+            cnt = np.bincount(np.array(code_arr, dtype=np.int64), minlength=len(lens))
+            lens_arr = np.array(lens, dtype=np.int64)
+            gscore = int(np.sum(lens_arr * cnt * np.maximum(cnt - 1, 0)))
+            stats[c] = {"codes": code_arr, "lens": lens, "gscore": gscore}
+        return stats
+
+    def _global_order(self, columns, stats):
+        return sorted(columns, key=lambda c: (-stats[c]["gscore"], str(c)))
+
+    def _conditional_orderings(self, columns, stats, global_order, n_rows,
+                               min_group=4, max_depth=12, max_cols=None):
+        gpos = {c: i for i, c in enumerate(global_order)}
+        orderings = [None] * n_rows
+        code_map = {c: stats[c]["codes"] for c in columns}
+        len_map = {c: stats[c]["lens"] for c in columns}
+
+        def tail_order(remaining):
+            return sorted(remaining, key=lambda c: (gpos.get(c, 10**9), str(c)))
+
+        def recurse(row_idx, remaining, depth):
+            if not remaining:
+                return
+            if (len(row_idx) < min_group or depth >= max_depth
+                    or len(remaining) <= 1):
+                tail = tail_order(remaining)
+                for r in row_idx:
+                    orderings[r] = (orderings[r] or []) + tail
+                return
+            best_col, best_gain = None, -1.0
+            cand_cols = remaining if max_cols is None or len(remaining) <= max_cols \
+                else sorted(remaining, key=lambda c: -stats[c]["gscore"])[:max_cols]
+            for c in cand_cols:
+                arr = code_map[c]
+                sub = np.array([arr[r] for r in row_idx], dtype=np.int64)
+                m = sub.max() + 1 if len(sub) else 1
+                cnt = np.bincount(sub, minlength=m)
+                lens = np.array(len_map[c], dtype=np.int64)
+                k = cnt[:len(lens)]
+                gain = float(np.sum(lens * k * np.maximum(k - 1, 0)))
+                if gain > best_gain:
+                    best_gain, best_col = gain, c
+            if best_col is None or best_gain <= 0:
+                tail = tail_order(remaining)
+                for r in row_idx:
+                    orderings[r] = (orderings[r] or []) + tail
+                return
+            groups = {}
+            arr = code_map[best_col]
+            for r in row_idx:
+                groups.setdefault(arr[r], []).append(r)
+            rest = [c for c in remaining if c != best_col]
+            for r in row_idx:
+                orderings[r] = (orderings[r] or []) + [best_col]
+            for v in sorted(groups.keys(), key=str):
+                recurse(groups[v], rest, depth + 1)
+
+        recurse(list(range(n_rows)), columns, 0)
+        for i in range(n_rows):
+            if orderings[i] is None:
+                orderings[i] = columns[:]
+        return orderings
+
+    def _class_marker_orderings(self, columns, stats, global_order, cell_strings,
+                                col_index, n_rows, n_markers=3):
+        """Group rows by their rarest cells: put the 2-3 lowest-gscore
+        columns first as class markers, then the global tail order."""
+        if len(columns) <= n_markers + 1 or n_rows < 4:
+            return None
+        ranked = sorted(columns, key=lambda c: (stats[c]["gscore"], str(c)))
+        markers = ranked[:n_markers]
+        # groups keyed by tuple of marker codes
+        code_map = {c: stats[c]["codes"] for c in columns}
+        marker_codes = [code_map[c] for c in markers]
+        groups = {}
+        for r in range(n_rows):
+            key = tuple(mc[r] for mc in marker_codes)
+            groups.setdefault(key, []).append(r)
+        if len(groups) <= 1:
+            return None
+        # order markers by descending gscore among markers, then tail
+        markers_sorted = sorted(markers, key=lambda c: (-stats[c]["gscore"], str(c)))
+        tail_cols = [c for c in global_order if c not in set(markers)]
+        head = markers_sorted
+        orderings = []
+        # rows in the same group share the same order (head + tail)
+        for r in range(n_rows):
+            orderings.append(head + tail_cols)
+        return orderings
+
+    # ---------------- main API ---------------- #
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        work = df.copy()
+        n_rows, n_cols = work.shape
+        if n_rows == 0 or n_cols == 0:
+            if n_cols == 0:
+                return work, []
+            return work, [[] for _ in range(n_rows)]
+
+        columns = work.columns.tolist()
+        col_index = {c: i for i, c in enumerate(columns)}
+
+        # ---- constraint units ----
+        merge_units, in_merge = [], set()
+        for group in (col_merge or []):
+            g = [c for c in group if c in col_index]
+            if len(g) > 1:
+                merge_units.append(g)
+                in_merge.update(g)
+        dep_units = []
+        for a, b in (one_way_dep or []):
+            ca = [c for c in columns if a in str(c)]
+            cb = [c for c in columns if b in str(c)]
+            if ca and cb and ca[0] != cb[0]:
+                dep_units.append([ca[0], cb[0]])
+        dep_units = [g for g in dep_units if not (set(g) & in_merge)]
+        unit_of = {}
+        for g in merge_units + dep_units:
+            for c in g:
+                unit_of[c] = g
+        unit_head = {g[0]: g for g in merge_units + dep_units}
+
+        def apply_units(order):
+            out, seen = [], set()
+            for c in order:
+                if c in seen:
+                    continue
+                u = unit_head.get(c)
+                if u is None:
+                    if c not in unit_of:
+                        out.append(c)
+                        seen.add(c)
+                else:
+                    for x in u:
+                        if x not in seen:
+                            out.append(x)
+                            seen.add(x)
+            for c in columns:
+                if c not in seen:
+                    out.append(c)
+                    seen.add(c)
+            return out
+
+        # ---- shared precomputation ----
+        cell_strings = self._serialize_cells(work)
+        stats = self._column_stats(columns, cell_strings, col_index)
+        base_global = self._global_order(columns, stats)
+
+        def score_rows(row_orders):
+            cache = {}
+            strs = []
+            for r in range(n_rows):
+                key = row_orders[r][0] if isinstance(row_orders[r], list) else None
+                key = tuple(row_orders[r])
+                idxs = cache.get(key)
+                if idxs is None:
+                    idxs = [col_index[c] for c in row_orders[r]]
+                    cache[key] = idxs
+                strs.append("".join(cell_strings[ci][r] for ci in idxs))
+            return self._trie_score(strs)
+
+        best_per_row, best_score = None, -1
+
+        def consider(per_row_cand):
+            nonlocal best_per_row, best_score
+            try:
+                s = score_rows(per_row_cand)
+            except Exception:
+                return
+            if s > best_score:
+                best_score, best_per_row = s, per_row_cand
+
+        # candidate 1: global frequency order
+        cand1 = apply_units(base_global)
+        consider([cand1 for _ in range(n_rows)])
+        # candidate 2: original order
+        cand2 = apply_units(columns)
+        consider([cand2 for _ in range(n_rows)])
+        # candidate 3: conditional partition tree
+        try:
+            cond = self._conditional_orderings(
+                columns, stats, base_global, n_rows,
+                max_cols=64 if n_cols > 64 else None)
+            cond_applied = [apply_units(o) for o in cond]
+            consider(cond_applied)
+        except Exception:
+            pass
+        # candidate 4: class-marker grouping
+        try:
+            cm = self._class_marker_orderings(
+                columns, stats, base_global, cell_strings, col_index, n_rows)
+            if cm is not None:
+                cm_applied = [apply_units(o) for o in cm]
+                consider(cm_applied)
+        except Exception:
+            pass
+
+        per_row = best_per_row if best_per_row is not None else [cand1[:] for _ in range(n_rows)]
+
+        # ---- build output preserving all values ----
+        col_arrays = {c: work[c].tolist() for c in columns}
+        data = np.empty((n_rows, n_cols), dtype=object)
+        for r in range(n_rows):
+            order = per_row[r]
+            for j, c in enumerate(order):
+                data[r, j] = col_arrays[c][r]
+
+        out = pd.DataFrame(data, columns=columns, index=work.index.copy())
+        for c in out.columns:
+            if out[c].dtype != object:
+                out[c] = out[c].astype(object)
+
+        # deterministic lexicographic row sort (trie total is order-independent)
+        idxs0 = [col_index[c] for c in per_row[0]]
+        keys = ["".join(cell_strings[ci][r] for ci in idxs0) for r in range(n_rows)]
+        sort_perm = sorted(range(n_rows), key=lambda r: keys[r])
+        if sort_perm != list(range(n_rows)):
+            out = out.iloc[sort_perm].reset_index(drop=True)
+            per_row = [per_row[r] for r in sort_perm]
+
+        return out, per_row
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,191 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Find a low-makespan transaction order using the actual simulator cost.
+
+    For small workloads the complete permutation space is searched exactly.
+    Larger workloads use a conflict-cost beam search followed by insertion/swap
+    local search.  Every ordering decision is evaluated with
+    workload.get_opt_seq_cost rather than transaction-size proxies.
+    """
+    num_txns = workload.num_txns
+
+    if num_txns == 0:
+        return 0, []
+
+    # All search phases share this cache.  Prefixes are evaluated repeatedly by
+    # beam search, greedy diversification, and local improvement.
+    cost_cache = {}
+
+    def sequence_cost(sequence):
+        key = tuple(sequence)
+        if key not in cost_cache:
+            cost_cache[key] = workload.get_opt_seq_cost(list(key))
+        return cost_cache[key]
+
+    # Exhaustive search is both more reliable and usually cheaper than applying
+    # several heuristic phases on tiny workloads.
+    if num_txns <= 8:
+        best_sequence = None
+        best_cost = float("inf")
+
+        def enumerate_orders(prefix, remaining):
+            nonlocal best_sequence, best_cost
+            if not remaining:
+                current_cost = sequence_cost(prefix)
+                if current_cost < best_cost:
+                    best_cost = current_cost
+                    best_sequence = list(prefix)
+                return
+
+            for txn in remaining:
+                next_remaining = [x for x in remaining if x != txn]
+                enumerate_orders(prefix + [txn], next_remaining)
+
+        enumerate_orders([], list(range(num_txns)))
+        return best_cost, best_sequence
+
+    # num_seqs is treated as a genuine search-budget parameter.  A minimum
+    # width keeps the search useful even if callers request one sequence.
+    beam_width = max(4, min(16, int(num_seqs) if num_seqs else 4))
+    randomized_restarts = max(2, beam_width)
+    rcl_width = 3
+    local_passes = 5
+
+    # Beam states contain (partial_order, remaining_transactions).  Keeping
+    # multiple prefixes avoids committing permanently to the first locally best
+    # conflict decision.
+    beam = [([], tuple(range(num_txns)))]
+    for _ in range(num_txns):
+        expanded = []
+        for prefix, remaining in beam:
+            for txn in remaining:
+                next_prefix = prefix + [txn]
+                next_remaining = tuple(x for x in remaining if x != txn)
+                expanded.append((sequence_cost(next_prefix),
+                                 next_prefix,
+                                 next_remaining))
+
+        expanded.sort(key=lambda state: (state[0], state[1]))
+        beam = [(list(prefix), remaining)
+                for _, prefix, remaining in expanded[:beam_width]]
+
+    candidate_orders = {tuple(prefix) for prefix, _ in beam}
+
+    # Diversified greedy constructions are useful when several next operations
+    # have nearly identical prefix costs.  The choice is always restricted to
+    # the best conflict-aware candidates, rather than being fully random.
+    for _ in range(randomized_restarts):
+        remaining = list(range(num_txns))
+        random.shuffle(remaining)
+        prefix = []
+
+        while remaining:
+            ranked = []
+            for txn in remaining:
+                ranked.append((sequence_cost(prefix + [txn]), txn))
+            ranked.sort(key=lambda item: (item[0], item[1]))
+
+            width = min(rcl_width, len(ranked))
+            _, chosen = random.choice(ranked[:width])
+            prefix.append(chosen)
+            remaining.remove(chosen)
+
+        candidate_orders.add(tuple(prefix))
+
+    # Improve only the strongest completed candidates.  This keeps the local
+    # search budget focused on schedules already favored by the global search.
+    ordered_candidates = sorted(candidate_orders, key=sequence_cost)
+    local_budget = max(4, beam_width)
+    ordered_candidates = ordered_candidates[:local_budget]
+
+    def improve_locally(initial_order):
+        current = list(initial_order)
+        current_cost = sequence_cost(current)
+
+        for _ in range(local_passes):
+            best_order = current
+            best_cost = current_cost
+            improved = False
+
+            # Relocation moves are particularly effective for moving a
+            # transaction away from the transactions with which it conflicts.
+            for source in range(num_txns):
+                without_source = current[:source] + current[source + 1:]
+                moved_txn = current[source]
+
+                for destination in range(num_txns):
+                    if destination == source:
+                        continue
+                    proposal = (without_source[:destination] +
+                                [moved_txn] +
+                                without_source[destination:])
+                    proposal_cost = sequence_cost(proposal)
+                    if proposal_cost < best_cost:
+                        best_cost = proposal_cost
+                        best_order = proposal
+                        improved = True
+
+            # A swap can improve schedules that cannot be improved by a single
+            # relocation under the current local landscape.
+            if not improved:
+                for left in range(num_txns - 1):
+                    for right in range(left + 1, num_txns):
+                        proposal = list(current)
+                        proposal[left], proposal[right] = (
+                            proposal[right], proposal[left]
+                        )
+                        proposal_cost = sequence_cost(proposal)
+                        if proposal_cost < best_cost:
+                            best_cost = proposal_cost
+                            best_order = proposal
+                            improved = True
+
+            if not improved:
+                break
+
+            current = list(best_order)
+            current_cost = best_cost
+
+        return current_cost, current
+
+    best_cost = float("inf")
+    best_schedule = None
+
+    for candidate in ordered_candidates:
+        candidate_cost, candidate_schedule = improve_locally(candidate)
+        if candidate_cost < best_cost:
+            best_cost = candidate_cost
+            best_schedule = candidate_schedule
+
+    return best_cost, best_schedule
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

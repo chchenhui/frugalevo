@@ -1,0 +1,158 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct eleven points using a deterministic maximin search.
+
+    The search is performed in the unit barycentric simplex.  If a point has
+    simplex coordinates (u, v), its Cartesian position is
+    (u + v / 2, sqrt(3) * v / 2).  Consequently, the absolute determinant of
+    three (u, v) pairs is exactly that triangle's area normalized by the area
+    of the enclosing equilateral triangle.
+    """
+    n = 11
+    sqrt3_over_2 = np.sqrt(3.0) / 2.0
+    triples = np.array(
+        [(i, j, k) for i in range(n - 2)
+         for j in range(i + 1, n - 1)
+         for k in range(j + 1, n)],
+        dtype=np.intp,
+    )
+
+    def normalize_simplex(p: np.ndarray) -> np.ndarray:
+        """Project a proposed barycentric pair into u >= 0, v >= 0, u + v <= 1."""
+        p = np.maximum(p, 0.0)
+        total = float(p[0] + p[1])
+        if total > 1.0:
+            p = p / total
+        return p
+
+    def areas_and_score(p: np.ndarray) -> tuple[np.ndarray, float]:
+        a = p[triples[:, 0]]
+        b = p[triples[:, 1]]
+        c = p[triples[:, 2]]
+        areas = np.abs(
+            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+        )
+        return areas, float(np.min(areas))
+
+    rng = np.random.default_rng(11031987)
+    vertices = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    best = np.vstack((vertices, np.full((8, 2), 1.0 / 3.0)))
+    _, best_score = areas_and_score(best)
+
+    # Several moderate restarts are much more reliable than one long walk for
+    # this nonsmooth objective.  The fixed seed keeps the returned design
+    # reproducible.
+    for restart in range(8):
+        interior_bary = rng.dirichlet((1.15, 1.15, 1.15), size=8)
+        current = np.vstack((vertices, interior_bary[:, 1:]))
+        current_areas, current_score = areas_and_score(current)
+
+        # The exact minimum is discontinuous whenever the active triple
+        # changes.  This exponentially weighted lower-tail energy is a smooth
+        # surrogate which converges to the minimum as its scale is cooled.
+        def tail_energy(areas: np.ndarray, scale: float) -> float:
+            shifted = areas - float(np.min(areas))
+            return float(np.min(areas) - scale * np.log(np.mean(np.exp(-shifted / scale))))
+
+        iterations = 30000
+        for iteration in range(iterations):
+            progress = iteration / iterations
+            scale = 0.0100 * (1.0 - progress) + 0.00065
+            current_energy = tail_energy(current_areas, scale)
+
+            # Sample from the genuinely dangerous lower tail rather than
+            # repeatedly reacting to just one arbitrarily selected tie.
+            if rng.random() < 0.90:
+                cutoff = current_score + 2.8 * scale
+                active = np.flatnonzero(current_areas <= cutoff)
+                chosen = triples[int(rng.choice(active))]
+                movable = chosen[chosen >= 3]
+                index = int(rng.choice(movable)) if len(movable) else int(rng.integers(3, n))
+            else:
+                index = int(rng.integers(3, n))
+
+            step = 0.090 * (1.0 - progress) ** 1.35 + 0.0012
+            candidate = current.copy()
+            candidate[index] = normalize_simplex(
+                candidate[index] + rng.normal(0.0, step, size=2)
+            )
+            candidate_areas, candidate_score = areas_and_score(candidate)
+            candidate_energy = tail_energy(candidate_areas, scale)
+
+            temperature = 0.0018 * (1.0 - progress) ** 2 + 2.0e-6
+            delta = candidate_energy - current_energy
+            if delta >= 0.0 or rng.random() < np.exp(delta / temperature):
+                current = candidate
+                current_areas = candidate_areas
+                current_score = candidate_score
+
+            if current_score > best_score:
+                best = current.copy()
+                best_score = current_score
+
+    # Several determinants are generally tight at a good Heilbronn design.
+    # Refine their whole active set rather than reacting to one arbitrary
+    # minimum triple.  Directions involving the other two vertices' centroid
+    # are especially effective because they directly change that determinant.
+    for step in (0.012, 0.006, 0.003, 0.0015, 0.0007, 0.0003):
+        for _ in range(18):
+            areas, score = areas_and_score(best)
+            tail_count = min(16, len(areas))
+            tail_value = float(np.partition(areas, tail_count - 1)[:tail_count].mean())
+            active = triples[areas <= score + max(3.0 * step, 2.0e-5)]
+            indices = np.unique(active[active >= 3])
+            improved = False
+
+            for index in indices:
+                directions = [
+                    np.array((1.0, 0.0)), np.array((-1.0, 0.0)),
+                    np.array((0.0, 1.0)), np.array((0.0, -1.0)),
+                    np.array((1.0, -1.0)), np.array((-1.0, 1.0)),
+                    np.array((1.0, 1.0)), np.array((-1.0, -1.0)),
+                ]
+                for triple in active:
+                    if index in triple:
+                        partners = triple[triple != index]
+                        direction = best[partners].mean(axis=0) - best[index]
+                        length = float(np.linalg.norm(direction))
+                        if length > 1.0e-12:
+                            directions.extend((direction / length, -direction / length))
+
+                local_best = best
+                local_score = score
+                local_tail = tail_value
+                for direction in directions:
+                    candidate = best.copy()
+                    candidate[index] = normalize_simplex(
+                        candidate[index] + step * direction
+                    )
+                    candidate_areas, candidate_score = areas_and_score(candidate)
+                    candidate_tail = float(
+                        np.partition(candidate_areas, tail_count - 1)[:tail_count].mean()
+                    )
+                    if (candidate_score > local_score + 1.0e-12 or
+                            (abs(candidate_score - local_score) <= 1.0e-12 and
+                             candidate_tail > local_tail + 1.0e-13)):
+                        local_best = candidate
+                        local_score = candidate_score
+                        local_tail = candidate_tail
+
+                if local_best is not best:
+                    best = local_best
+                    best_score = local_score
+                    improved = True
+            if not improved:
+                break
+
+    points = np.empty((n, 2), dtype=float)
+    points[:, 0] = best[:, 0] + 0.5 * best[:, 1]
+    points[:, 1] = sqrt3_over_2 * best[:, 1]
+    return points
+
+
+# EVOLVE-BLOCK-END

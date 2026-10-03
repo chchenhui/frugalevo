@@ -1,0 +1,223 @@
+--- a/original.py
++++ b/original.py
+@@ -1,134 +1,156 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+-
+ _SQRT3 = float(np.sqrt(3.0))
++_TOTAL_AREA = 0.25 * _SQRT3
+ 
+ 
+ def _to_xy(b):
+     b = np.asarray(b, dtype=float)
+     u, v = b[:, 0], b[:, 1]
+     return np.column_stack([u + 0.5 * v, 0.5 * _SQRT3 * v])
+ 
+ 
+ def _project(b):
+     b = np.clip(b, 0.0, 1.0)
+     s = b.sum(axis=1)
+     over = s > 1.0
+     if np.any(over):
+-        b[over] *= (1.0 - 1e-9) / s[over, None]
++        b[over] *= (1.0 - 2e-9) / s[over, None]
+     return b
+ 
+ 
+ def _make_triples(n):
+     return np.array([(i, j, k) for i in range(n) for j in range(i + 1, n)
+                      for k in range(j + 1, n)])
+ 
+ 
+ def _areas(xy, tri):
+     p = xy[tri[:, 0]]
+     q = xy[tri[:, 1]]
+     r = xy[tri[:, 2]]
+     return 0.5 * np.abs((q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1])
+                         - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0]))
+ 
+ 
+-class _Annealer:
+-    def __init__(self, tri, seed):
+-        self.tri = tri
+-        self.n_pts = tri.max() + 1
+-        self.rng = np.random.default_rng(seed)
+-        # precompute point->triples membership for bottleneck detection
+-        self.member = np.zeros((self.n_pts, len(tri)), dtype=bool)
+-        for c in range(3):
+-            self.member[tri[:, c], np.arange(len(tri))] = True
++def _score(b, tri):
++    return float(_areas(_to_xy(b), tri).min())
+ 
+-    def score(self, b):
+-        return float(_areas(_to_xy(b), self.tri).min())
+ 
+-    def bottleneck_points(self, b, m=3):
+-        a = _areas(_to_xy(b), self.tri)
+-        thresh = a.min() * 1.5 + 1e-12
+-        tight = a <= thresh
+-        cnt = self.member[:, tight].sum(axis=1)
+-        return np.argsort(-cnt)[:m]
++def _lift_step(b, tri, step):
++    """Move the three vertices of the current bottleneck triangle along the
++    gradient of its signed area so the area increases."""
++    xy = _to_xy(b)
++    a = _areas(xy, tri)
++    t = int(np.argmin(a))
++    i, j, k = tri[t]
++    p, q, r = xy[i], xy[j], xy[k]
++    cross = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
++    sgn = 1.0 if cross >= 0 else -1.0
++    # gradient of 0.5*cross wrt each vertex (times sgn to always increase)
++    gi = 0.5 * sgn * np.array([r[1] - q[1], q[0] - r[0]])
++    gj = 0.5 * sgn * np.array([p[1] - r[1], r[0] - p[0]])
++    gk = 0.5 * sgn * np.array([q[1] - p[1], p[0] - q[0]])
++    # convert xy-gradient direction to barycentric-simplex direction:
++    # x = u + 0.5v, y = 0.5*sqrt3*v  =>  du = dx - dy/sqrt3, dv = 2dy/sqrt3
++    def to_b(g):
++        return np.array([g[0] - g[1] / _SQRT3, 2.0 * g[1] / _SQRT3])
+ 
+-    def anneal(self, b, iters=2500, T0=0.012, T1=1e-4):
+-        b = _project(b.copy())
+-        cur = self.score(b)
+-        best, best_b = cur, b.copy()
+-        for it in range(iters):
+-            T = T0 * (T1 / T0) ** (it / iters)
+-            # bottleneck points get random-direction moves
+-            cand = b.copy()
+-            k = int(self.rng.integers(1, 4))  # move 1-3 points
+-            pts = self.bottleneck_points(b, m=k)
+-            for pt in pts:
+-                # random directions: isotropic gaussian (equivalent to any
+-                # random angle fan, but rotationally uniform in simplex coords)
+-                cand[pt] += self.rng.normal(0.0, T * 3.0, 2)
+-            # occasionally jitter every point slightly
+-            if self.rng.random() < 0.15:
+-                cand += self.rng.normal(0.0, T * 0.4, cand.shape)
+-            cand = _project(cand)
+-            v = self.score(cand)
+-            if v >= cur or self.rng.random() < np.exp((v - cur) / max(T * 1e-3, 1e-15)):
++    cand = b.copy()
++    for idx, g in ((i, gi), (j, gj), (k, gk)):
++        d = to_b(g)
++        nrm = np.hypot(*d)
++        if nrm > 1e-15:
++            cand[idx] += step * d / nrm
++    return _project(cand)
++
++
++def _optimize(b, tri, rng, iters=3500, step0=0.02):
++    b = _project(b.copy())
++    cur = _score(b, tri)
++    best_b, best_v = b.copy(), cur
++    step = step0
++    stall = 0
++    for it in range(iters):
++        # backtracking line search on the bottleneck lift
++        ok = False
++        s = step
++        for _ in range(6):
++            cand = _lift_step(b, tri, s)
++            v = _score(cand, tri)
++            if v > cur + 1e-14:
+                 b, cur = cand, v
+-                if v > best:
+-                    best, best_b = v, b.copy()
+-        return best_b, best
++                ok = True
++                break
++            s *= 0.5
++        if ok:
++            stall = 0
++            step = min(step * 1.3, 0.02)
++            if cur > best_v:
++                best_v, best_b = cur, b.copy()
++        else:
++            step *= 0.5
++            stall += 1
++            if step < 1e-5 or stall > 25:
++                # annealing kick to escape this local optimum
++                kick = b + rng.normal(0.0, 0.02, b.shape)
++                kv = _score(kick, tri)
++                # accept kicks that aren't catastrophically worse (SA-style)
++                if kv > best_v * 0.9:
++                    b, cur = _project(kick), kv
++                step = step0
++                stall = 0
++    return best_b, best_v
+ 
+ 
+ def _seeds():
+-    s = []
+-    # lattice-ish seeds (vertices pinned)
+-    s.append(np.array([
++    base = np.array([
+         [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+         [1/3, 0.0], [2/3, 0.0], [0.0, 1/3], [0.0, 2/3],
+         [1/3, 1/3], [2/3, 1/3], [1/3, 2/3], [0.5, 1/6],
+-    ]))
+-    s.append(np.array([
++    ])
++    base2 = np.array([
+         [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+         [0.5, 0.0], [0.25, 0.25], [0.0, 0.5],
+         [0.5, 0.5], [0.25, 0.0], [0.0, 0.25],
+         [0.5, 0.25], [0.25, 0.5],
+-    ]))
+-    # jittered variants, deterministic
++    ])
++    seeds = [base.copy(), base2.copy()]
+     rng = np.random.default_rng(2024)
+-    for base in list(s):
+-        j = base + rng.normal(0.0, 0.03, base.shape)
++    for _ in range(6):
++        j = base + rng.normal(0.0, 0.035, base.shape)
+         j[:3] = base[:3]
+-        s.append(_project(j))
+-    # one free-form random seed
+-    r = rng.random((11, 2))
+-    r[:3] = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+-    s.append(_project(r))
+-    return s
++        seeds.append(_project(j))
++    for _ in range(4):
++        r = rng.random((11, 2)) * 0.9
++        r[:3] = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
++        seeds.append(_project(r))
++    return seeds
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     n = 11
+     fallback_b = np.array([
+         [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+         [1/3, 0.0], [2/3, 0.0], [0.0, 1/3], [0.0, 2/3],
+         [1/3, 1/3], [2/3, 1/3], [1/3, 2/3], [0.5, 1/6],
+     ])
+     try:
+         tri = _make_triples(n)
++        fb_val = _score(fallback_b, tri)
++        # non-degeneracy floor: result must clearly beat a trivial lattice
++        floor = max(fb_val * 1.5, 0.01)
+         best_xy, best_val = None, -1.0
+         for si, seed in enumerate(_seeds()):
+-            ann = _Annealer(tri, seed=777 + 13 * si)
+-            b, val = ann.anneal(seed)
++            rng = np.random.default_rng(31337 + 17 * si)
++            b, val = _optimize(seed, tri, rng)
+             if val > best_val:
+                 best_val, best_xy = val, _to_xy(b)
+-        if best_xy is None or not np.all(np.isfinite(best_xy)):
+-            raise RuntimeError("optimization failed")
+-        fb_val = float(_areas(_to_xy(fallback_b), tri).min())
+-        if best_val < fb_val:
+-            best_xy = _to_xy(fallback_b)
++        if best_xy is None or not np.all(np.isfinite(best_xy)) or best_val < floor:
++            raise RuntimeError("optimization failed degenerate")
+         return np.ascontiguousarray(best_xy, dtype=float)
+     except Exception:
+         return np.ascontiguousarray(_to_xy(fallback_b), dtype=float)
+ 
+ 
+ # EVOLVE-BLOCK-END

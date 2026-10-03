@@ -1,0 +1,134 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct 14 points as seven optimized antipodal pairs.
+
+    If u_i are unit vectors, the returned points are +/- u_i.  Their
+    diameter is exactly 2, and their squared min/maximum distance ratio is
+
+        (1 - max_{i<j} |u_i dot u_j|) / 2.
+
+    Thus the problem becomes a compact minimax line-packing problem on S^2.
+    """
+    try:
+        from scipy.optimize import minimize
+    except Exception:
+        # Deterministic geometric fallback; normally SciPy is available.
+        phi = (1.0 + np.sqrt(5.0)) / 2.0
+        base = np.array([
+            [1.0, phi, 0.0],
+            [1.0, -phi, 0.0],
+            [phi, 0.0, 1.0],
+            [phi, 0.0, -1.0],
+            [0.0, 1.0, phi],
+            [0.0, 1.0, -phi],
+            [1.0, 1.0, 1.0],
+        ])
+        base /= np.linalg.norm(base, axis=1)[:, None]
+        return np.vstack((base, -base))
+
+    rng = np.random.default_rng(148937)
+    m = 7
+    pairs = np.array([(i, j) for i in range(m) for j in range(i + 1, m)],
+                     dtype=int)
+
+    def normalize_rows(u):
+        return u / np.linalg.norm(u, axis=1)[:, None]
+
+    def coherence_sq(u):
+        dots = u[pairs[:, 0]] * u[pairs[:, 1]]
+        return float(np.max(np.sum(dots, axis=1) ** 2))
+
+    def annealed_relaxation(u):
+        """Projected line-repulsion, with powers approaching a max norm."""
+        u = normalize_rows(u.copy())
+        for power, count in ((2, 90), (4, 110), (8, 130), (16, 150),
+                             (32, 170)):
+            step = 0.035 / power
+            for _ in range(count):
+                dot = u @ u.T
+                np.fill_diagonal(dot, 0.0)
+                q = dot * dot
+                largest = max(float(np.max(q)), 1.0e-14)
+
+                # Gradient of a scaled sum |u_i.u_j|^(2*power).
+                weights = (q / largest) ** (power - 1)
+                grad = 2.0 * power * (weights * dot) @ u
+                grad -= np.sum(grad * u, axis=1)[:, None] * u
+
+                old = np.sum((q / largest) ** power)
+                trial = normalize_rows(u - step * grad)
+                td = trial @ trial.T
+                np.fill_diagonal(td, 0.0)
+                tq = td * td
+                tlargest = max(float(np.max(tq)), 1.0e-14)
+                new = np.sum((tq / tlargest) ** power)
+
+                if new <= old:
+                    u = trial
+                    step = min(step * 1.025, 0.08 / power)
+                else:
+                    step *= 0.5
+                    if step < 1.0e-7:
+                        break
+        return u
+
+    # Diverse starts are useful because different contact graphs can be
+    # locally stable.  The relaxation stage is inexpensive and deterministic.
+    candidates = []
+    for _ in range(28):
+        start = normalize_rows(rng.normal(size=(m, 3)))
+        relaxed = annealed_relaxation(start)
+        candidates.append(relaxed)
+
+    candidates.sort(key=coherence_sq)
+    best = candidates[0]
+    best_value = coherence_sq(best)
+
+    def objective(x):
+        return float(x[-1])
+
+    def eq_norms(x):
+        u = x[:-1].reshape(m, 3)
+        return np.sum(u * u, axis=1) - 1.0
+
+    def inequality_correlations(x):
+        u = x[:-1].reshape(m, 3)
+        t = x[-1]
+        dots = np.sum(u[pairs[:, 0]] * u[pairs[:, 1]], axis=1)
+        return t - dots * dots
+
+    constraints = (
+        {"type": "eq", "fun": eq_norms},
+        {"type": "ineq", "fun": inequality_correlations},
+    )
+
+    # Direct constrained minimax polish.  The variable t is max |dot|^2.
+    for candidate in candidates[:10]:
+        initial_t = coherence_sq(candidate) + 1.0e-7
+        x0 = np.concatenate((candidate.ravel(), [initial_t]))
+        result = minimize(
+            objective,
+            x0,
+            method="SLSQP",
+            constraints=constraints,
+            options={"maxiter": 700, "ftol": 1.0e-13, "disp": False},
+        )
+
+        if result.x.size == 22 and np.all(np.isfinite(result.x)):
+            polished = result.x[:-1].reshape(m, 3)
+            polished = normalize_rows(polished)
+            value = coherence_sq(polished)
+            if value < best_value:
+                best_value = value
+                best = polished
+
+    # Explicit antipodes make the maximum pairwise distance positive and
+    # fixed, independent of the final global rotation of the line packing.
+    return np.ascontiguousarray(np.vstack((best, -best)), dtype=float)
+
+
+# EVOLVE-BLOCK-END

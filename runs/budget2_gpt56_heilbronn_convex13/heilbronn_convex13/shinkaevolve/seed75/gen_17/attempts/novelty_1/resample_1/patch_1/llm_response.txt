@@ -1,0 +1,240 @@
+<NAME>
+lexicographic_square13
+</NAME>
+
+<DESCRIPTION>
+This version retains the unit-square hull, guaranteeing normalized area equals raw triangle area, but improves the internal optimizer with stronger deterministic multi-start search, larger candidate sets, efficient precomputed incidence masks, and lexicographic lower-tail selection.
+
+The selection rule maximizes the strict minimum triangle area first. Among numerically tied candidates it improves the mean of the smallest triangle areas, reducing neutral moves and following the requested bottleneck-first / lower-tail refinement strategy. Final polishing uses dense deterministic radial proposals and the same lexicographic criterion.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Deterministically construct 13 points in the unit square.
+
+    The four square corners remain fixed, so the convex hull has unit area.
+    Therefore the raw minimum triangle area is exactly the normalized score.
+    """
+    rng = np.random.default_rng(13031957)
+
+    n = 13
+    movable = np.arange(4, n)
+    corners = np.array(
+        [[0.0, 0.0],
+         [1.0, 0.0],
+         [1.0, 1.0],
+         [0.0, 1.0]],
+        dtype=float,
+    )
+
+    tri = np.array(
+        [(i, j, k)
+         for i in range(n - 2)
+         for j in range(i + 1, n - 1)
+         for k in range(j + 1, n)],
+        dtype=np.intp,
+    )
+    triangle_count = len(tri)
+
+    incident = [np.flatnonzero(np.any(tri == p, axis=1)) for p in range(n)]
+    fixed_masks = []
+    for p in range(n):
+        mask = np.ones(triangle_count, dtype=bool)
+        mask[incident[p]] = False
+        fixed_masks.append(mask)
+
+    def triangle_areas(pts: np.ndarray) -> np.ndarray:
+        a = pts[tri[:, 0]]
+        b = pts[tri[:, 1]]
+        c = pts[tri[:, 2]]
+        return 0.5 * np.abs(
+            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+        )
+
+    def incident_areas(
+        pts: np.ndarray, candidates: np.ndarray, point_index: int
+    ) -> np.ndarray:
+        """Evaluate all triangles involving one replaced point."""
+        local_tri = tri[incident[point_index]]
+        m = len(candidates)
+
+        work = np.broadcast_to(pts, (m, n, 2)).copy()
+        work[:, point_index, :] = candidates
+
+        a = work[:, local_tri[:, 0], :]
+        b = work[:, local_tri[:, 1], :]
+        c = work[:, local_tri[:, 2], :]
+        return 0.5 * np.abs(
+            (b[:, :, 0] - a[:, :, 0]) * (c[:, :, 1] - a[:, :, 1])
+            - (b[:, :, 1] - a[:, :, 1]) * (c[:, :, 0] - a[:, :, 0])
+        )
+
+    def lower_tail_score(values: np.ndarray, tail_size: int = 14):
+        """
+        Lexicographic auxiliary quality measure.
+
+        The strict minimum remains the principal objective.  This quantity is
+        only used among candidates whose minima agree to numerical tolerance.
+        """
+        low = np.partition(values, tail_size - 1, axis=1)[:, :tail_size]
+        return np.mean(low, axis=1)
+
+    def choose_candidate(
+        local: np.ndarray,
+        fixed: np.ndarray,
+        tolerance: float,
+    ) -> int:
+        """
+        Select max-min candidate; improve the lower tail only for tied minima.
+        """
+        m = local.shape[0]
+        values = np.empty((m, triangle_count), dtype=float)
+        values[:, :len(fixed)] = fixed
+        values[:, len(fixed):] = local
+
+        minima = np.min(values, axis=1)
+        best_min = float(np.max(minima))
+        tied = minima >= best_min - tolerance
+
+        tail = lower_tail_score(values)
+        tail[~tied] = -np.inf
+
+        # A second lower-tail statistic makes ties deterministic and avoids
+        # accepting candidates with one improved area but many weak areas.
+        second_tail = np.partition(values, 5, axis=1)[:, :6].mean(axis=1)
+        second_tail[~tied] = -np.inf
+
+        top_tail = np.max(tail)
+        finalists = tied & (tail >= top_tail - 1e-15)
+        second_tail[~finalists] = -np.inf
+        return int(np.argmax(second_tail))
+
+    best_points = None
+    best_value = -np.inf
+    best_tail = -np.inf
+
+    base_patterns = (
+        np.array(
+            [[0.18, 0.19], [0.50, 0.16], [0.82, 0.20],
+             [0.16, 0.49], [0.50, 0.49], [0.84, 0.50],
+             [0.20, 0.80], [0.50, 0.84], [0.80, 0.80]],
+            dtype=float,
+        ),
+        np.array(
+            [[0.25, 0.16], [0.54, 0.18], [0.78, 0.29],
+             [0.16, 0.39], [0.48, 0.47], [0.78, 0.53],
+             [0.26, 0.73], [0.55, 0.77], [0.80, 0.85]],
+            dtype=float,
+        ),
+        np.array(
+            [[0.17, 0.27], [0.48, 0.15], [0.79, 0.23],
+             [0.25, 0.51], [0.55, 0.43], [0.83, 0.57],
+             [0.14, 0.78], [0.49, 0.82], [0.76, 0.78]],
+            dtype=float,
+        ),
+    )
+
+    restarts = 12
+    sweeps = 570
+
+    for restart in range(restarts):
+        base = base_patterns[restart % len(base_patterns)]
+        jitter_scale = 0.105 if restart < 8 else 0.075
+        interior = np.clip(
+            base + rng.uniform(-jitter_scale, jitter_scale, size=(9, 2)),
+            0.012,
+            0.988,
+        )
+        points = np.vstack((corners, interior))
+        areas = triangle_areas(points)
+
+        for sweep in range(sweeps):
+            progress = sweep / (sweeps - 1)
+            step = 0.125 * (1.0 - progress) ** 1.72 + 0.0011
+
+            for p in rng.permutation(movable):
+                current = points[p].copy()
+                proposal_count = 17
+                proposals = np.empty((proposal_count, 2), dtype=float)
+                proposals[0] = current
+
+                directions = rng.normal(size=(proposal_count - 1, 2))
+                directions /= np.maximum(
+                    np.linalg.norm(directions, axis=1, keepdims=True), 1e-14
+                )
+                radii = step * (0.20 + 1.20 * rng.random(proposal_count - 1))
+                proposals[1:] = current + directions * radii[:, None]
+
+                # Broad relocation candidates matter early, before the strict
+                # bottleneck has frozen into its final combinatorial pattern.
+                if sweep < sweeps // 4:
+                    proposals[-3:] = rng.uniform(0.025, 0.975, size=(3, 2))
+
+                proposals = np.clip(proposals, 0.0, 1.0)
+
+                local = incident_areas(points, proposals, p)
+                mask = fixed_masks[p]
+                fixed = areas[mask]
+
+                tolerance = 2.5e-6 * (1.0 - progress) + 2.0e-8
+                choice = choose_candidate(local, fixed, tolerance)
+
+                points[p] = proposals[choice]
+                areas[incident[p]] = local[choice]
+
+        # Strict dense coordinate polishing.  No tolerance is allowed here:
+        # this phase only preserves or improves the actual evaluation metric.
+        angles = np.linspace(0.0, 2.0 * np.pi, 72, endpoint=False)
+        unit_ring = np.column_stack((np.cos(angles), np.sin(angles)))
+
+        for polish_step in (0.012, 0.006, 0.003, 0.00125, 0.0005):
+            for _ in range(3):
+                for p in movable:
+                    current = points[p].copy()
+                    proposals = np.empty((73, 2), dtype=float)
+                    proposals[0] = current
+                    proposals[1:] = current + polish_step * unit_ring
+                    proposals = np.clip(proposals, 0.0, 1.0)
+
+                    local = incident_areas(points, proposals, p)
+                    mask = fixed_masks[p]
+                    fixed = areas[mask]
+
+                    choice = choose_candidate(local, fixed, 1e-14)
+                    candidate_min = min(float(np.min(local[choice])),
+                                        float(np.min(fixed)))
+
+                    if candidate_min >= float(np.min(areas)) - 1e-14:
+                        points[p] = proposals[choice]
+                        areas[incident[p]] = local[choice]
+
+        value = float(np.min(areas))
+        tail_value = float(np.mean(np.partition(areas, 13)[:14]))
+
+        if (value > best_value + 1e-15 or
+                (abs(value - best_value) <= 1e-15 and tail_value > best_tail)):
+            best_value = value
+            best_tail = tail_value
+            best_points = points.copy()
+
+    if best_points is None or not np.all(np.isfinite(best_points)):
+        fallback = np.array(
+            [[0.19, 0.19], [0.50, 0.17], [0.81, 0.19],
+             [0.18, 0.50], [0.50, 0.50], [0.82, 0.50],
+             [0.19, 0.81], [0.50, 0.83], [0.81, 0.81]],
+            dtype=float,
+        )
+        return np.vstack((corners, fallback))
+
+    return best_points
+
+
+# EVOLVE-BLOCK-END
+```

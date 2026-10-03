@@ -1,0 +1,175 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+import time
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Multi-restart randomized greedy with a scheduled exploration rate
+    (0.95 -> 0.85) and sample count (6 -> 10), followed by local search
+    on the top-3 candidates plus iterated local search (perturbation +
+    descent) on the incumbent.
+    """
+    n = workload.num_txns
+    start_time = time.time()
+    deadline = start_time + 30.0
+
+    cost_cache = {}
+    def cost(seq):
+        key = tuple(seq)
+        c = cost_cache.get(key)
+        if c is None:
+            c = workload.get_opt_seq_cost(list(seq))
+            if len(cost_cache) < 2000000:
+                cost_cache[key] = c
+        return c
+
+    def greedy_construct(num_samples, sample_rate, seed):
+        rng = random.Random(seed)
+        start = rng.randrange(n)
+        seq = [start]
+        remaining = [t for t in range(n) if t != start]
+        while remaining:
+            if rng.random() > sample_rate and len(remaining) > 1:
+                idx = rng.randint(0, len(remaining) - 1)
+                seq.append(remaining.pop(idx))
+                continue
+            k = min(num_samples, len(remaining))
+            sampled = rng.sample(remaining, k)
+            best_t, best_c = None, None
+            for t in sampled:
+                c = cost(seq + [t])
+                if best_c is None or c < best_c:
+                    best_c, best_t = c, t
+            seq.append(best_t)
+            remaining.remove(best_t)
+        return cost(seq), seq
+
+    def swap_descent(seq):
+        cur = list(seq)
+        cur_cost = cost(cur)
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            for i in range(n - 1):
+                for j in range(i + 1, min(n, i + 8)):
+                    if time.time() >= deadline:
+                        return cur_cost, cur
+                    cur[i], cur[j] = cur[j], cur[i]
+                    c = cost(cur)
+                    if c < cur_cost:
+                        cur_cost = c
+                        improved = True
+                    else:
+                        cur[i], cur[j] = cur[j], cur[i]
+        return cur_cost, cur
+
+    def insertion_descent(seq):
+        cur = list(seq)
+        cur_cost = cost(cur)
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            for i in range(n):
+                if time.time() >= deadline:
+                    break
+                t = cur.pop(i)
+                best_j, best_c = i, None
+                for j in range(n):
+                    if j == i:
+                        continue
+                    cand = cur[:j] + [t] + cur[j:]
+                    c = cost(cand)
+                    if best_c is None or c < best_c:
+                        best_c, best_j = c, j
+                cur = cur[:best_j] + [t] + cur[best_j:]
+                if best_c is not None and best_c < cur_cost:
+                    cur_cost = best_c
+                    improved = True
+        return cur_cost, cur
+
+    def perturb(seq, rng, k=3):
+        cur = list(seq)
+        for _ in range(k):
+            if len(cur) < 2:
+                break
+            i = rng.randint(0, len(cur) - 1)
+            t = cur.pop(i)
+            j = rng.randint(0, len(cur))
+            cur.insert(j, t)
+        return cur
+
+    # ---- Phase 1: scheduled multi-restart greedy ----
+    best_cost, best_seq = None, None
+    top = []
+    restart = 0
+    max_restarts = 24
+    while time.time() < deadline and restart < max_restarts:
+        frac = min(1.0, restart / max_restarts)
+        sample_rate = 0.95 - 0.10 * frac
+        num_samples = 6 if restart < max_restarts // 2 else 10
+        c, seq = greedy_construct(num_samples, sample_rate,
+                                  seed=restart * 7919 + 13)
+        if best_cost is None or c < best_cost:
+            best_cost, best_seq = c, seq
+        top.append((c, seq))
+        top.sort(key=lambda x: x[0])
+        if len(top) > 3:
+            top.pop()
+        restart += 1
+
+    if best_seq is None:
+        best_seq = list(range(n))
+        best_cost = cost(best_seq)
+
+    # ---- Phase 2: local search on top-3 candidates ----
+    for c, seq in top:
+        if time.time() >= deadline:
+            break
+        c1, s1 = swap_descent(seq)
+        c2, s2 = insertion_descent(s1) if c1 >= c else (c1, s1)
+        c3, s3 = swap_descent(s2)
+        if c3 < best_cost:
+            best_cost, best_seq = c3, s3
+
+    # ---- Phase 3: iterated local search on incumbent ----
+    rng = random.Random(12345)
+    while time.time() < deadline:
+        cand = perturb(best_seq, rng, k=3)
+        c1, s1 = swap_descent(cand)
+        if c1 < best_cost:
+            best_cost, best_seq = c1, s1
+            continue
+        c2, s2 = insertion_descent(cand)
+        if c2 < best_cost:
+            best_cost, best_seq = c2, s2
+
+    return best_cost, best_seq
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

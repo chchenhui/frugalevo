@@ -1,0 +1,323 @@
+# EVOLVE-BLOCK-START
+"""Multi-start constructive circle packing for 26 circles in a unit square."""
+import numpy as np
+
+
+N_CIRCLES = 26
+
+
+class PackingModel:
+    """Vectorized nonlinear-program representation of the packing problem."""
+
+    def __init__(self, n):
+        self.n = n
+        self.dimension = 3 * n
+        self.i, self.j = np.triu_indices(n, 1)
+        self.pair_count = len(self.i)
+
+    def objective(self, z):
+        return -float(np.sum(z[2 * self.n:]))
+
+    def objective_jacobian(self, z):
+        gradient = np.zeros(self.dimension, dtype=float)
+        gradient[2 * self.n:] = -1.0
+        return gradient
+
+    def constraints(self, z):
+        points = z[:2 * self.n].reshape(self.n, 2)
+        radii = z[2 * self.n:]
+
+        x = points[:, 0]
+        y = points[:, 1]
+        dx = x[self.i] - x[self.j]
+        dy = y[self.i] - y[self.j]
+
+        # Squared contact constraints avoid square roots and have simple
+        # derivatives: distance^2 >= (r_i + r_j)^2.
+        pair_gap = dx * dx + dy * dy - (radii[self.i] + radii[self.j]) ** 2
+
+        return np.concatenate((
+            x - radii,
+            y - radii,
+            1.0 - x - radii,
+            1.0 - y - radii,
+            pair_gap,
+        ))
+
+    def constraint_jacobian(self, z):
+        points = z[:2 * self.n].reshape(self.n, 2)
+        radii = z[2 * self.n:]
+
+        rows = 4 * self.n + self.pair_count
+        jac = np.zeros((rows, self.dimension), dtype=float)
+        indices = np.arange(self.n)
+
+        # Left, bottom, right, and top boundary derivatives.
+        jac[indices, 2 * indices] = 1.0
+        jac[indices, 2 * self.n + indices] = -1.0
+
+        offset = self.n
+        jac[offset + indices, 2 * indices + 1] = 1.0
+        jac[offset + indices, 2 * self.n + indices] = -1.0
+
+        offset = 2 * self.n
+        jac[offset + indices, 2 * indices] = -1.0
+        jac[offset + indices, 2 * self.n + indices] = -1.0
+
+        offset = 3 * self.n
+        jac[offset + indices, 2 * indices + 1] = -1.0
+        jac[offset + indices, 2 * self.n + indices] = -1.0
+
+        # Pair-contact derivatives.
+        offset = 4 * self.n
+        pair_rows = offset + np.arange(self.pair_count)
+        dx = points[self.i, 0] - points[self.j, 0]
+        dy = points[self.i, 1] - points[self.j, 1]
+        radius_sum = radii[self.i] + radii[self.j]
+
+        jac[pair_rows, 2 * self.i] = 2.0 * dx
+        jac[pair_rows, 2 * self.i + 1] = 2.0 * dy
+        jac[pair_rows, 2 * self.j] = -2.0 * dx
+        jac[pair_rows, 2 * self.j + 1] = -2.0 * dy
+        jac[pair_rows, 2 * self.n + self.i] = -2.0 * radius_sum
+        jac[pair_rows, 2 * self.n + self.j] = -2.0 * radius_sum
+
+        return jac
+
+
+def _row_layout(row_sizes, horizontal_phase=0.0):
+    """
+    Build a finite-square staggered lattice.  Different row populations are
+    deliberately used because boundary circles benefit from unequal spacing.
+    """
+    row_count = len(row_sizes)
+    points = []
+
+    for row, count in enumerate(row_sizes):
+        y = (row + 0.5) / row_count
+
+        # Alternate lateral phases without moving points beyond the square.
+        phase = horizontal_phase if row % 2 else -horizontal_phase
+        for col in range(count):
+            x = (col + 0.5 + phase) / count
+            points.append((x, y))
+
+    return np.asarray(points, dtype=float)
+
+
+def _make_seed(row_sizes, seed, phase):
+    """Create one safely feasible low-radius starting packing."""
+    rng = np.random.default_rng(seed)
+    centers = _row_layout(row_sizes, phase)
+
+    # Mild asymmetry is important: it lets SLSQP choose unequal-radius
+    # boundary configurations instead of repeatedly converging to a grid.
+    jitter = rng.normal(0.0, 0.017, centers.shape)
+    jitter[:, 1] *= 0.72
+    centers += jitter
+    centers = np.clip(centers, 0.045, 0.955)
+
+    radii = rng.uniform(0.010, 0.014, N_CIRCLES)
+    return np.concatenate((centers.ravel(), radii))
+
+
+def _repair_candidate(z, model):
+    """
+    Apply one global inward radius scaling.  This retains the optimized
+    geometry while making returned solutions strictly feasible despite tiny
+    nonlinear optimizer tolerances.
+    """
+    n = model.n
+    candidate = np.asarray(z, dtype=float).copy()
+
+    if candidate.shape != (3 * n,) or not np.all(np.isfinite(candidate)):
+        return None
+
+    centers = np.clip(candidate[:2 * n].reshape(n, 2), 0.0, 1.0)
+    radii = np.maximum(candidate[2 * n:], 0.0)
+
+    border = np.minimum.reduce((
+        centers[:, 0],
+        centers[:, 1],
+        1.0 - centers[:, 0],
+        1.0 - centers[:, 1],
+    ))
+    scale = float(np.min(border / np.maximum(radii, 1e-15)))
+
+    dx = centers[model.i, 0] - centers[model.j, 0]
+    dy = centers[model.i, 1] - centers[model.j, 1]
+    distances = np.sqrt(dx * dx + dy * dy)
+    radius_sums = radii[model.i] + radii[model.j]
+    pair_scale = distances / np.maximum(radius_sums, 1e-15)
+
+    scale = min(1.0, scale, float(np.min(pair_scale)))
+    radii *= max(0.0, scale) * (1.0 - 2e-10)
+
+    return np.concatenate((centers.ravel(), radii))
+
+
+def _solve_seed(model, initial, maxiter):
+    """Optimize one seed, returning a repaired feasible candidate."""
+    try:
+        from scipy.optimize import minimize
+
+        result = minimize(
+            model.objective,
+            initial,
+            method="SLSQP",
+            jac=model.objective_jacobian,
+            bounds=[(0.0, 1.0)] * (2 * model.n) + [(1e-7, 0.5)] * model.n,
+            constraints={
+                "type": "ineq",
+                "fun": model.constraints,
+                "jac": model.constraint_jacobian,
+            },
+            options={
+                "maxiter": maxiter,
+                "ftol": 2e-11,
+                "disp": False,
+            },
+        )
+        raw = result.x if np.all(np.isfinite(result.x)) else initial
+    except Exception:
+        raw = initial
+
+    return _repair_candidate(raw, model)
+
+
+def _score(z, n):
+    return float(np.sum(z[2 * n:]))
+
+
+def construct_packing():
+    """
+    Construct a high-quality packing of 26 non-overlapping circles.
+
+    Returns:
+        Tuple of (centers, radii, sum_of_radii).
+    """
+    model = PackingModel(N_CIRCLES)
+
+    # These families cover balanced grids, alternating hexagonal rows, and
+    # deliberately uneven boundary layers.  Every pattern contains 26 points.
+    families = (
+        (5, 6, 5, 5, 5),
+        (5, 5, 6, 5, 5),
+        (5, 5, 5, 6, 5),
+        (5, 6, 5, 6, 4),
+        (4, 6, 5, 6, 5),
+        (4, 5, 4, 5, 4, 4),
+        (4, 5, 5, 4, 4, 4),
+        (6, 5, 5, 5, 5),
+    )
+
+    candidates = []
+    for index, family in enumerate(families):
+        for variation in range(2):
+            phase = (0.16 if variation else -0.10) + 0.025 * (index % 3)
+            initial = _make_seed(
+                family,
+                seed=1729 + 37 * index + variation,
+                phase=phase,
+            )
+            solved = _solve_seed(model, initial, maxiter=1050)
+            if solved is not None:
+                candidates.append(solved)
+
+    # A longer second stage spends work only on promising basins.
+    candidates.sort(key=lambda z: _score(z, N_CIRCLES), reverse=True)
+    polished = candidates[:5]
+
+    for rank, candidate in enumerate(polished):
+        continuation = candidate.copy()
+        continuation[2 * N_CIRCLES:] *= 0.999995
+        solved = _solve_seed(model, continuation, maxiter=2200 + 200 * rank)
+        if solved is not None:
+            candidates.append(solved)
+
+    if not candidates:
+        fallback = _make_seed((5, 6, 5, 5, 5), seed=1, phase=0.0)
+        candidates = [_repair_candidate(fallback, model)]
+
+    best = max(candidates, key=lambda z: _score(z, N_CIRCLES))
+    centers = best[:2 * N_CIRCLES].reshape(N_CIRCLES, 2)
+    radii = best[2 * N_CIRCLES:]
+
+    return centers, radii, float(np.sum(radii))
+
+
+def compute_max_radii(centers):
+    """
+    Compatibility helper retained from the original public interface.
+
+    This computes conservative sequential radii for arbitrary supplied
+    centers; construct_packing itself uses simultaneous optimization.
+    """
+    centers = np.asarray(centers, dtype=float)
+    n = len(centers)
+    radii = np.minimum.reduce((
+        centers[:, 0],
+        centers[:, 1],
+        1.0 - centers[:, 0],
+        1.0 - centers[:, 1],
+    ))
+    radii = np.maximum(radii, 0.0)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            distance = float(np.linalg.norm(centers[i] - centers[j]))
+            total = radii[i] + radii[j]
+            if total > distance and total > 0.0:
+                factor = distance / total
+                radii[i] *= factor
+                radii[j] *= factor
+
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

@@ -1,0 +1,184 @@
+<NAME>
+ils_basin_hopping_with_ties_and_swaps</NAME>
+<DESCRIPTION>
+Add a perturbation-based iterated local search (ILS) on top of the existing local search: (1) accept equal-score moves in the local search occasionally to enable escaping flat basins, (2) add pairwise swap moves between GPUs, and (3) apply a few random perturbations (random model relocation to a feasible GPU) followed by re-running local search, keeping the best solution found. Runtime remains tiny since problem sizes are small, and the best-found solution is always returned.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    improved = True
+    while improved:
+        improved = False
+        best_max = max_kvpr()
+        for src in range(gpu_num):
+            if improved:
+                break
+            for mi in range(len(placement[src])):
+                if improved:
+                    break
+                model = placement[src][mi]
+                w = model.req_rate / model.slo
+                for dst in range(gpu_num):
+                    if dst == src:
+                        continue
+                    if model.model_size > shared_kv[dst]:
+                        continue
+                    # Apply move tentatively
+                    placement[src].pop(mi)
+                    placement[dst].append(model)
+                    weighted_req_rate[src] -= w
+                    weighted_req_rate[dst] += w
+                    shared_kv[src] += model.model_size
+                    shared_kv[dst] -= model.model_size
+                    if max_kvpr() < best_max - 1e-12:
+                        best_max = max_kvpr()
+                        improved = True
+                        break
+                    else:
+                        # Revert
+                        placement[dst].pop()
+                        placement[src].insert(mi, model)
+                        weighted_req_rate[dst] -= w
+                        weighted_req_rate[src] += w
+                        shared_kv[dst] += model.model_size
+                        shared_kv[src] -= model.model_size
+
+    return placement
+=======
+    import copy
+    import random
+
+    def snapshot():
+        return ([list(placement[g]) for g in range(gpu_num)],
+                list(weighted_req_rate), list(shared_kv))
+
+    def restore(snap):
+        nonlocal placement, weighted_req_rate, shared_kv
+        pl, wr, sk = snap
+        placement = {g: list(pl[g]) for g in range(gpu_num)}
+        weighted_req_rate = list(wr)
+        shared_kv = list(sk)
+
+    def local_search():
+        # Local search with moves and pairwise swaps; accept equal scores
+        # occasionally to allow escaping flat basins.
+        nonlocal placement, weighted_req_rate, shared_kv
+        improved = True
+        tie_budget = 3  # allow a few equal-score acceptances per pass
+        while improved:
+            improved = False
+            best_max = max_kvpr()
+            for src in range(gpu_num):
+                if improved:
+                    break
+                for mi in range(len(placement[src])):
+                    if improved:
+                        break
+                    model = placement[src][mi]
+                    w = model.req_rate / model.slo
+                    for dst in range(gpu_num):
+                        if dst == src:
+                            continue
+                        if model.model_size > shared_kv[dst]:
+                            continue
+                        # Apply move tentatively
+                        placement[src].pop(mi)
+                        placement[dst].append(model)
+                        weighted_req_rate[src] -= w
+                        weighted_req_rate[dst] += w
+                        shared_kv[src] += model.model_size
+                        shared_kv[dst] -= model.model_size
+                        new_max = max_kvpr()
+                        if new_max < best_max - 1e-12 or (new_max <= best_max + 1e-12 and tie_budget > 0):
+                            if new_max <= best_max + 1e-12:
+                                tie_budget -= 1
+                            improved = True
+                            break
+                        else:
+                            # Revert
+                            placement[dst].pop()
+                            placement[src].insert(mi, model)
+                            weighted_req_rate[dst] -= w
+                            weighted_req_rate[src] += w
+                            shared_kv[dst] += model.model_size
+                            shared_kv[src] -= model.model_size
+            if improved:
+                continue
+            # Try pairwise swaps between GPUs
+            for src in range(gpu_num):
+                if improved:
+                    break
+                for dst in range(src + 1, gpu_num):
+                    if improved:
+                        break
+                    for si in range(len(placement[src])):
+                        if improved:
+                            break
+                        for di in range(len(placement[dst])):
+                            ms = placement[src][si]
+                            md = placement[dst][di]
+                            ws = ms.req_rate / ms.slo
+                            wd = md.req_rate / md.slo
+                            # Feasibility of the swap
+                            if (shared_kv[src] + ms.model_size - md.model_size) < 0:
+                                continue
+                            if (shared_kv[dst] + md.model_size - ms.model_size) < 0:
+                                continue
+                            # Apply swap
+                            placement[src][si] = md
+                            placement[dst][di] = ms
+                            weighted_req_rate[src] += wd - ws
+                            weighted_req_rate[dst] += ws - wd
+                            shared_kv[src] += ms.model_size - md.model_size
+                            shared_kv[dst] += md.model_size - ms.model_size
+                            if max_kvpr() < best_max - 1e-12:
+                                improved = True
+                                break
+                            else:
+                                # Revert
+                                placement[src][si] = ms
+                                placement[dst][di] = md
+                                weighted_req_rate[src] -= wd - ws
+                                weighted_req_rate[dst] -= ws - wd
+                                shared_kv[src] -= ms.model_size - md.model_size
+                                shared_kv[dst] -= md.model_size - ms.model_size
+
+    local_search()
+    best_snap = snapshot()
+    best_score = max_kvpr()
+
+    # ILS: perturb then re-optimize, keep the best solution
+    rng = random.Random(0)
+    for _ in range(8):
+        # Perturbation: try to move up to 2 random models to random feasible GPUs
+        moves_done = 0
+        all_items = [(g, mi) for g in range(gpu_num) for mi in range(len(placement[g]))]
+        rng.shuffle(all_items)
+        for g, mi in all_items:
+            if moves_done >= 2:
+                break
+            if mi >= len(placement[g]):
+                continue
+            model = placement[g][mi]
+            dst = rng.randrange(gpu_num)
+            if dst == g or model.model_size > shared_kv[dst]:
+                continue
+            w = model.req_rate / model.slo
+            placement[g].pop(mi)
+            placement[dst].append(model)
+            weighted_req_rate[g] -= w
+            weighted_req_rate[dst] += w
+            shared_kv[g] += model.model_size
+            shared_kv[dst] -= model.model_size
+            moves_done += 1
+        if moves_done == 0:
+            break
+        local_search()
+        cur_score = max_kvpr()
+        if cur_score < best_score - 1e-12:
+            best_score = cur_score
+            best_snap = snapshot()
+        else:
+            restore(best_snap)
+
+    restore(best_snap)
+    return placement
+>>>>>>> REPLACE</DIFF>

@@ -1,0 +1,467 @@
+# EVOLVE-BLOCK-START
+"""
+Multiscale robust real-time filtering for volatile non-stationary signals.
+
+Enhanced path:
+    trailing local-linear trend estimates at two horizons
+    -> dual-timescale robust MAD noise estimation
+    -> confidence-weighted trend consensus
+    -> causal adaptive correction and reversal persistence control
+
+The output remains aligned with the final sample of each original trailing
+window: len(output) == len(x) - window_size + 1.
+"""
+import numpy as np
+
+
+def _validate_signal(x, window_size):
+    signal = np.asarray(x, dtype=float)
+
+    if signal.ndim != 1:
+        raise ValueError("Input signal must be a 1D array")
+
+    if int(window_size) != window_size or window_size <= 0:
+        raise ValueError("window_size must be a positive integer")
+
+    window_size = int(window_size)
+
+    if signal.size < window_size:
+        raise ValueError(
+            f"Input signal length ({signal.size}) must be >= "
+            f"window_size ({window_size})"
+        )
+
+    if not np.all(np.isfinite(signal)):
+        raise ValueError("Input signal must contain only finite values")
+
+    return signal, window_size
+
+
+def adaptive_filter(x, window_size=20):
+    """
+    Basic trailing moving-average filter.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window
+
+    Returns:
+        Filtered output signal with length len(x) - window_size + 1.
+    """
+    signal, window_size = _validate_signal(x, window_size)
+    cumulative = np.concatenate(([0.0], np.cumsum(signal, dtype=float)))
+    return (cumulative[window_size:] - cumulative[:-window_size]) / window_size
+
+
+def _robust_difference_scale(values, floor=1e-6):
+    """MAD-derived measurement-noise estimate from consecutive differences."""
+    if values.size < 3:
+        return floor
+
+    differences = np.diff(values)
+    center = np.median(differences)
+    mad = np.median(np.abs(differences - center))
+
+    # Difference noise has sqrt(2) larger standard deviation than sample noise.
+    mad_scale = mad / (0.6745 * np.sqrt(2.0))
+    fallback = np.std(differences) / np.sqrt(2.0)
+    return max(float(mad_scale), float(fallback) * 0.35, floor)
+
+
+def _endpoint_linear_fit(values):
+    """
+    Robust endpoint local-linear estimate.
+
+    The fitted level is evaluated at the most recent sample, so there is no
+    centered-window phase delay. One Huber reweighting pass limits the effect
+    of impulsive observations without requiring expensive iterative regression.
+    """
+    n = values.size
+    if n == 1:
+        return float(values[0]), 0.0, 1e-6
+
+    t = np.arange(n, dtype=float) - float(n - 1)
+
+    # Gentle recency weighting preserves causality while retaining enough
+    # historical evidence to reject noisy single-sample fluctuations.
+    weights = np.exp(t / max(2.0, 0.55 * n))
+
+    sum_w = np.sum(weights)
+    mean_t = np.sum(weights * t) / sum_w
+    mean_y = np.sum(weights * values) / sum_w
+    denominator = np.sum(weights * (t - mean_t) ** 2)
+
+    if denominator <= 1e-12:
+        return float(values[-1]), 0.0, 1e-6
+
+    slope = np.sum(weights * (t - mean_t) * (values - mean_y)) / denominator
+    intercept = mean_y - slope * mean_t
+    residuals = values - (intercept + slope * t)
+
+    residual_mad = np.median(np.abs(residuals - np.median(residuals)))
+    residual_scale = max(residual_mad / 0.6745, 1e-6)
+
+    # Huber weights: downweight spikes, preserve legitimate coherent ramps.
+    huber_limit = 2.8 * residual_scale
+    robust_weights = weights * np.minimum(
+        1.0, huber_limit / np.maximum(np.abs(residuals), 1e-12)
+    )
+
+    sum_w = np.sum(robust_weights)
+    mean_t = np.sum(robust_weights * t) / sum_w
+    mean_y = np.sum(robust_weights * values) / sum_w
+    denominator = np.sum(robust_weights * (t - mean_t) ** 2)
+
+    if denominator > 1e-12:
+        slope = np.sum(
+            robust_weights * (t - mean_t) * (values - mean_y)
+        ) / denominator
+        intercept = mean_y - slope * mean_t
+
+    endpoint = intercept
+    final_residuals = values - (intercept + slope * t)
+    final_mad = np.median(np.abs(final_residuals - np.median(final_residuals)))
+    fit_scale = max(final_mad / 0.6745, 1e-6)
+
+    return float(endpoint), float(slope), float(fit_scale)
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Causal multiscale robust trend-consensus filter.
+
+    A fast local model tracks genuine changes, while a longer robust model
+    suppresses noise. Their blend is controlled by fast/slow robust noise
+    estimates and agreement between local slopes.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Trailing output alignment window
+
+    Returns:
+        Filtered output with length len(x) - window_size + 1.
+    """
+    signal, window_size = _validate_signal(x, window_size)
+    n_samples = signal.size
+
+    # The short model supplies prompt turn tracking. The long model is bounded
+    # so very large API windows do not create excessive computational latency.
+    fast_span = int(np.clip(max(5, window_size // 3), 5, 11))
+    slow_span = int(np.clip(window_size, fast_span + 2, 31))
+    diff_fast_span = int(np.clip(fast_span, 4, 10))
+    diff_slow_span = int(np.clip(slow_span, 8, 31))
+
+    estimates = np.empty(n_samples, dtype=float)
+    estimates[0] = signal[0]
+
+    level = float(signal[0])
+    velocity = 0.0
+    slow_noise = max(abs(signal[0]) * 0.01, 1e-5)
+
+    direction = 0
+    pending_direction = 0
+    pending_count = 0
+    pending_distance = 0.0
+
+    for index in range(1, n_samples):
+        start_fast = max(0, index - fast_span + 1)
+        start_slow = max(0, index - slow_span + 1)
+
+        fast_values = signal[start_fast:index + 1]
+        slow_values = signal[start_slow:index + 1]
+
+        fast_level, fast_slope, fast_fit_scale = _endpoint_linear_fit(fast_values)
+        slow_level, slow_slope, slow_fit_scale = _endpoint_linear_fit(slow_values)
+
+        diff_fast_start = max(0, index - diff_fast_span)
+        diff_slow_start = max(0, index - diff_slow_span)
+        fast_noise = _robust_difference_scale(signal[diff_fast_start:index + 1])
+        measured_slow_noise = _robust_difference_scale(signal[diff_slow_start:index + 1])
+
+        # Slow scale is stable; fast scale catches current volatility. The
+        # bounded blend prevents one unusual observation from dominating gain.
+        slow_noise = 0.91 * slow_noise + 0.09 * measured_slow_noise
+        noise_scale = max(
+            1e-6,
+            0.42 * fast_noise + 0.58 * slow_noise,
+            0.35 * fast_fit_scale,
+            0.20 * slow_fit_scale,
+        )
+
+        scale = max(noise_scale, 1e-6)
+        fast_strength = abs(fast_slope) / scale
+        slow_strength = abs(slow_slope) / scale
+        slope_gap = abs(fast_slope - slow_slope) / scale
+
+        # Signed normalized alignment avoids treating two negligible slopes as
+        # compelling agreement.  Its confidence rises only when both horizons
+        # carry meaningful same-direction trend evidence.
+        alignment = (fast_slope * slow_slope) / (
+            abs(fast_slope) * abs(slow_slope) + 1e-12
+        )
+        joint_strength = min(fast_strength, slow_strength)
+        consensus_confidence = max(0.0, alignment) * (
+            joint_strength / (joint_strength + 0.45)
+        )
+
+        # Strong continuous consensus gives the responsive endpoint additional
+        # weight, while weak or conflicting slopes smoothly favor the stable
+        # fit instead of causing a binary reactivity jump.
+        activity = fast_strength
+        fast_weight = 0.22 + 0.36 * (activity / (activity + 1.5))
+        fast_weight += 0.17 * consensus_confidence
+        fast_weight -= 0.15 * min(1.0, slope_gap / 3.0)
+        fast_weight = float(np.clip(fast_weight, 0.18, 0.70))
+
+        consensus_level = fast_weight * fast_level + (1.0 - fast_weight) * slow_level
+        consensus_slope = fast_weight * fast_slope + (1.0 - fast_weight) * slow_slope
+
+        predicted = level + velocity
+        innovation = consensus_level - predicted
+        normalized = abs(innovation) / scale
+
+        # Gain scheduling uses the same continuous consensus: coherent trends
+        # receive prompt correction, whereas marginal directional evidence is
+        # kept conservative to suppress noise-induced output reversals.
+        gain = (
+            0.16
+            + 0.24 * (normalized / (normalized + 1.8))
+            + 0.11 * consensus_confidence
+        )
+        gain = float(np.clip(gain, 0.16, 0.51))
+
+        innovation_limit = max(3.2 * noise_scale, 0.75 * abs(consensus_slope))
+        bounded_innovation = float(
+            np.clip(innovation, -innovation_limit, innovation_limit)
+        )
+
+        candidate = predicted + gain * bounded_innovation
+        velocity = 0.72 * velocity + 0.28 * consensus_slope + 0.045 * bounded_innovation
+
+        # A small predictive lead compensates causal smoothing, limited to local
+        # noise scale so it cannot overshoot around genuine turning points.
+        lead = float(np.clip(0.32 * velocity, -0.65 * noise_scale, 0.65 * noise_scale))
+        candidate += lead
+
+        previous = estimates[index - 1]
+        step = candidate - previous
+        movement_threshold = max(0.10 * noise_scale, 1e-7)
+
+        if abs(step) <= movement_threshold:
+            # Preserve continuous motion but do not let tiny jitter define trend.
+            output = previous + 0.22 * step
+        else:
+            move_direction = 1 if step > 0.0 else -1
+
+            if direction == 0 or move_direction == direction:
+                output = candidate
+                direction = move_direction
+                pending_direction = 0
+                pending_count = 0
+                pending_distance = 0.0
+            else:
+                strong_turn = abs(step) >= max(1.35 * noise_scale, 1.8 * abs(velocity))
+
+                # A reversal supported by both local models is substantially
+                # less likely to be endpoint-fit jitter.  A strong fast and
+                # consensus slope is also sufficient when the slower horizon
+                # has not yet rotated at a sharp genuine turn.
+                fast_support = fast_slope * move_direction > 0.0
+                slow_support = slow_slope * move_direction > 0.0
+                consensus_support = consensus_slope * move_direction > 0.0
+                normalized_slope = abs(consensus_slope) / max(noise_scale, 1e-6)
+                model_confirmed = (
+                    fast_support and slow_support
+                ) or (
+                    fast_support
+                    and consensus_support
+                    and normalized_slope >= 0.70
+                )
+
+                # Persistence evidence must agree with at least one local
+                # derivative model. This prevents alternating endpoint-fit
+                # jitter from becoming a confirmed trend change.
+                partial_support = (
+                    consensus_support and normalized_slope >= 0.24
+                ) or (
+                    fast_support
+                    and abs(fast_slope) / max(noise_scale, 1e-6) >= 0.38
+                )
+
+                if partial_support:
+                    if move_direction != pending_direction:
+                        pending_direction = move_direction
+                        pending_count = 1
+                        pending_distance = abs(step)
+                    else:
+                        pending_count += 1
+                        pending_distance += abs(step)
+                else:
+                    # Do not let stale, weak counter-moves survive until a
+                    # later unrelated fluctuation supplies the final count.
+                    pending_count = max(0, pending_count - 1)
+                    pending_distance *= 0.80
+                    if pending_count == 0:
+                        pending_direction = 0
+                        pending_distance = 0.0
+
+                # A strongly model-confirmed large turn remains prompt. Less
+                # decisive turns require both persistent excursion and ongoing
+                # directional slope evidence.
+                if (strong_turn and model_confirmed) or (
+                    partial_support
+                    and pending_count >= 2
+                    and pending_distance >= 0.75 * noise_scale
+                ):
+                    output = candidate
+                    direction = move_direction
+                    pending_direction = 0
+                    pending_count = 0
+                    pending_distance = 0.0
+                else:
+                    output = previous + 0.10 * step
+
+        level = output
+        estimates[index] = output
+
+    return estimates[window_size - 1:]
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """
+    Main signal processing dispatcher.
+
+    Args:
+        input_signal: Input time series data
+        window_size: Size of the processing window
+        algorithm_type: "basic" or "enhanced"
+
+    Returns:
+        Filtered signal.
+    """
+    if algorithm_type == "enhanced":
+        return enhanced_filter_with_trend_preservation(input_signal, window_size)
+    return adaptive_filter(input_signal, window_size)
+
+
+# EVOLVE-BLOCK-END
+
+
+def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+    """
+    Generate synthetic test signal with known characteristics.
+
+    Args:
+        length: Length of the signal
+        noise_level: Standard deviation of noise to add
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (noisy_signal, clean_signal)
+    """
+    np.random.seed(seed)
+    t = np.linspace(0, 10, length)
+
+    # Create a complex signal with multiple components
+    clean_signal = (
+        2 * np.sin(2 * np.pi * 0.5 * t)  # Low frequency component
+        + 1.5 * np.sin(2 * np.pi * 2 * t)  # Medium frequency component
+        + 0.5 * np.sin(2 * np.pi * 5 * t)  # Higher frequency component
+        + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)  # Decaying oscillation
+    )
+
+    # Add non-stationary behavior
+    trend = 0.1 * t * np.sin(0.2 * t)  # Slowly varying trend
+    clean_signal += trend
+
+    # Add random walk component for non-stationarity
+    random_walk = np.cumsum(np.random.randn(length) * 0.05)
+    clean_signal += random_walk
+
+    # Add noise
+    noise = np.random.normal(0, noise_level, length)
+    noisy_signal = clean_signal + noise
+
+    return noisy_signal, clean_signal
+
+
+def run_signal_processing(noisy_signal=None, signal_length=1000, noise_level=0.3, window_size=20):
+    """
+    Run the signal processing algorithm on a test signal.
+
+    Args:
+        noisy_signal: Input signal to filter (if provided, use this; otherwise generate)
+        signal_length: Length if generating signal (for backward compatibility)
+        noise_level: Noise level if generating signal (for backward compatibility)
+        window_size: Window size for processing
+
+    Returns:
+        Dictionary containing results and metrics
+    """
+    # Use provided signal or generate test signal (for backward compatibility)
+    if noisy_signal is not None:
+        # Filter the provided signal
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+        clean_signal = None  # Not available when using provided signal
+    else:
+        # Generate test signal (for __main__ and backward compatibility)
+        noisy_signal, clean_signal = generate_test_signal(signal_length, noise_level)
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+
+    # Calculate basic metrics (only if we have clean_signal from generation)
+    if len(filtered_signal) > 0 and clean_signal is not None:
+        # Align signals for comparison (account for processing delay)
+        delay = window_size - 1
+        aligned_clean = clean_signal[delay:]
+        aligned_noisy = noisy_signal[delay:]
+
+        # Ensure same length
+        min_length = min(len(filtered_signal), len(aligned_clean))
+        filtered_signal = filtered_signal[:min_length]
+        aligned_clean = aligned_clean[:min_length]
+        aligned_noisy = aligned_noisy[:min_length]
+
+        # Calculate correlation with clean signal
+        correlation = np.corrcoef(filtered_signal, aligned_clean)[0, 1] if min_length > 1 else 0
+
+        # Calculate noise reduction
+        noise_before = np.var(aligned_noisy - aligned_clean)
+        noise_after = np.var(filtered_signal - aligned_clean)
+        noise_reduction = (noise_before - noise_after) / noise_before if noise_before > 0 else 0
+
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": aligned_clean,
+            "noisy_signal": aligned_noisy,
+            "correlation": correlation,
+            "noise_reduction": noise_reduction,
+            "signal_length": min_length,
+        }
+    elif len(filtered_signal) > 0:
+        # When using provided signal (no clean_signal available), just return filtered signal
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": None,
+            "noisy_signal": None,
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": len(filtered_signal),
+        }
+    else:
+        return {
+            "filtered_signal": [],
+            "clean_signal": [],
+            "noisy_signal": [],
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": 0,
+        }
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    results = run_signal_processing()
+    print("Signal processing completed!")
+    print(f"Correlation with clean signal: {results['correlation']:.3f}")
+    print(f"Noise reduction: {results['noise_reduction']:.3f}")
+    print(f"Processed signal length: {results['signal_length']}")

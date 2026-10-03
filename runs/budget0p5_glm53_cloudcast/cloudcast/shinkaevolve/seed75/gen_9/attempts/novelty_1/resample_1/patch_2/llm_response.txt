@@ -1,0 +1,201 @@
+<NAME>
+steiner_bcast_router</NAME>
+<DESCRIPTION>
+Restructured into a layered pipeline: (1) RouteIndex computes single-source Dijkstra once (reused for all destinations instead of per-destination runs), (2) SharedPrefixCache avoids redundant re-transfer of shared segments, and (3) BroadcastPlanner assigns load-balanced diverse paths per partition using edge usage counts. Same inputs/outputs; lower total cost via prefix sharing and load spreading across networks.</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+
+
+# ---------- Layer 1: Route Index ----------
+class RouteIndex:
+    """Computes single-source shortest paths once; reused for all destinations."""
+
+    def __init__(self, G: nx.DiGraph, src: str):
+        self.G = G
+        self.src = src
+        h = G.copy()
+        h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+        self.dist, self.pred = nx.dijkstra_predecessor_and_distance(h, src, weight="cost")
+        self._cache: Dict[str, List[str]] = {}
+
+    def cheapest_path(self, dst: str) -> List[str]:
+        if dst in self._cache:
+            return self._cache[dst]
+        if dst == self.src:
+            return [self.src]
+        if dst not in self.pred or not self.pred[dst]:
+            raise nx.NetworkXNoPath(f"No path from {self.src} to {dst}")
+        node = dst
+        path = [dst]
+        while node != self.src:
+            node = self.pred[node][0]
+            path.append(node)
+        path.reverse()
+        self._cache[dst] = path
+        return path
+
+    def diverse_path(self, dst: str, used_edges: set) -> List[str]:
+        """Find a low-cost path avoiding already-loaded edges when possible."""
+        h = self.G.copy()
+        h.remove_edges_from(list(h.in_edges(self.src)) + list(nx.selfloop_edges(h)))
+        to_remove = [e for e in list(h.edges()) if e in used_edges]
+        h.remove_edges_from(to_remove)
+        try:
+            return nx.dijkstra_path(h, self.src, dst, weight="cost")
+        except nx.NetworkXNoPath:
+            return self.cheapest_path(dst)
+
+
+# ---------- Layer 2: Shared Prefix Cache ----------
+class SharedPrefixCache:
+    """Tracks (src, dst, partition) segments already transferred to avoid
+    redundant re-transfers across shared path prefixes."""
+
+    def __init__(self):
+        self.delivered = set()
+
+    def needs_transfer(self, s, t, partition):
+        return (s, t, partition) not in self.delivered
+
+    def mark_transferred(self, s, t, partition):
+        self.delivered.add((s, t, partition))
+
+
+# ---------- Layer 3: Broadcast Planner ----------
+class BroadcastPlanner:
+    def __init__(self, src, dsts, G, num_partitions):
+        self.src = src
+        self.dsts = list(dsts)
+        self.num_partitions = num_partitions
+        self.index = RouteIndex(G, src)
+        self.prefix_cache = SharedPrefixCache()
+        self.topology = BroadCastTopology(src, self.dsts, num_partitions)
+        self.edge_usage: Dict[tuple, int] = {}
+
+    def _emit(self, path, dst, partition):
+        for i in range(len(path) - 1):
+            s, t = path[i], path[i + 1]
+            if self.prefix_cache.needs_transfer(s, t, partition):
+                self.topology.append_dst_partition_path(dst, partition, [s, t, self.index.G[s][t]])
+                self.prefix_cache.mark_transferred(s, t, partition)
+                self.edge_usage[(s, t)] = self.edge_usage.get((s, t), 0) + 1
+
+    def plan(self) -> "BroadCastTopology":
+        # Order destinations by path cost so common prefixes are established
+        # early and reused by later destinations.
+        ordered = sorted(self.dsts, key=lambda d: self.index.dist.get(d, float("inf")))
+        for dst in ordered:
+            base = self.index.cheapest_path(dst)
+            for p in range(self.num_partitions):
+                if p == 0 or len(self.dsts) == 1:
+                    path = base
+                else:
+                    # Diversify across partitions to balance load across
+                    # networks; fall back to cheapest path if disconnected.
+                    loaded = {e for e in self.edge_usage if self.edge_usage[e] > 0}
+                    path = self.index.diverse_path(dst, loaded)
+                self._emit(path, dst, p)
+        return self.topology
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    planner = BroadcastPlanner(src, dsts, G, num_partitions)
+    return planner.plan()
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]  # [[src, dst, edge data]]
+
+
+class BroadCastTopology:
+    def __init__(self, src: str, dsts: List[str], num_partitions: int = 4, paths: Dict[str, SingleDstPath] = None):
+        self.src = src  # single str
+        self.dsts = dsts  # list of strs
+        self.num_partitions = num_partitions
+
+        # dict(dst) --> dict(partition) --> list(nx.edges)
+        # example: {dst1: {partition1: [src->node1, node1->dst1], partition 2: [src->dst1]}}
+        if paths is not None:
+            self.paths = paths
+        else:
+            self.paths = {dst: {str(i): None for i in range(num_partitions)} for dst in dsts}
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        """Set paths for partition = partition to reach dst"""
+        self.paths[dst][str(partition)] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        """Append path for partition = partition to reach dst"""
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    """
+    Default graph with capacity constraints and cost info
+    nodes: regions, edges: links
+    per edge:
+        throughput: max tput achievable (gbps)
+        cost: $/GB
+        flow: actual flow (gbps), must be < throughput, default = 0
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if cost_path is None:
+        cost = pd.read_csv(os.path.join(current_dir, "profiles/cost.csv"))
+    else:
+        cost = pd.read_csv(cost_path)
+
+    if throughput_path is None:
+        throughput = pd.read_csv(os.path.join(current_dir, "profiles/throughput.csv"))
+    else:
+        throughput = pd.read_csv(throughput_path)
+
+    G = nx.DiGraph()
+    for _, row in throughput.iterrows():
+        if row["src_region"] == row["dst_region"]:
+            continue
+        G.add_edge(row["src_region"], row["dst_region"], cost=None, throughput=num_vms * row["throughput_sent"] / 1e9)
+
+    for _, row in cost.iterrows():
+        if row["src"] in G and row["dest"] in G[row["src"]]:
+            G[row["src"]][row["dest"]]["cost"] = row["cost"]
+
+    # some pairs not in the cost grid: fill with a large penalty so routing avoids them
+    no_cost_pairs = []
+    for s, t, data in G.edges(data=True):
+        if data["cost"] is None:
+            no_cost_pairs.append((s, t))
+            data["cost"] = 1e6
+    print("Unable to get costs for: ", no_cost_pairs)
+
+    return G
+
+# EVOLVE-BLOCK-END
+
+# Helper functions that won't be evolved
+def create_broadcast_topology(src: str, dsts: List[str], num_partitions: int = 4):
+    """Create a broadcast topology instance"""
+    return BroadCastTopology(src, dsts, num_partitions)
+
+def run_search_algorithm(src: str, dsts: List[str], G, num_partitions: int):
+    """Run the search algorithm and return the topology"""
+    return search_algorithm(src, dsts, G, num_partitions)
+```
+</CODE>

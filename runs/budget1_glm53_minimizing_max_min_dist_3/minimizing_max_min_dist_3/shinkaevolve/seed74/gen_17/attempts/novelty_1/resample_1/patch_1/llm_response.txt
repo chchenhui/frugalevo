@@ -1,0 +1,136 @@
+<NAME>
+hard_constrained_polish_stage</NAME>
+<DESCRIPTION>
+The current soft-min gradient scheme has two weaknesses: (1) the step-size heuristic `lr * (t/0.1) * G/gn * sqrt(...)` is poorly scaled and can oscillate as t shrinks; (2) nothing explicitly controls the diameter (max distance), so much of the gain from spreading the closest pair is lost to the diameter also growing. Since the objective dmin/dmax is scale-invariant, an equivalent and much more stable formulation is: fix the diameter by imposing the constraint max_ij d_ij ≤ 1 and maximize dmin alone. This suggests a two-stage approach: (a) a repulsion preprocessing stage minimizing Σ 1/d_ij² (as recommended) to reach a well-spread basin quickly, then (b) a projected-gradient polish that maximizes a soft-min of the pair distances while softly penalizing any pair exceeding the current diameter target, with an adaptive annealing of the smoothing temperature and a decaying learning rate. Gradient descent on a Coulomb energy is cheap (O(n²)) and reliably de-clusters random starts, and the constrained polish directly pushes the true ratio up instead of a proxy. I keep the best-of-trials structure and the final normalization, only replacing the optimizer internals and the seeding loop, with a fixed seed for reproducibility and a step budget small enough to stay well within the timeout.
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def _softmin_ratio_grad(X, t):
+    """Value and gradient of -t*log(sum exp(-d_ij/t)) / dmax (smooth lower bound of dmin/dmax).
+
+    Simpler: maximize sum over pairs of -exp(-d_ij/t) approximated via softmax on -d_ij/t.
+    Returns grad of (smooth min distance) w.r.t. X.
+    """
+    n = X.shape[0]
+    diff = X[:, None, :] - X[None, :, :]
+    dist = np.sqrt(np.sum(diff ** 2, axis=-1) + 1e-12)
+    iu = np.triu_indices(n, 1)
+    d = dist[iu]
+    w = np.exp(-(d - d.min()) / t)
+    w /= w.sum()
+    # gradient of weighted-sum distance d (smooth min) wrt X
+    # d_k for pair (i,j): grad wrt X_i = (X_i - X_j)/d_k, X_j opposite
+    pairs_i, pairs_j = iu
+    u = (X[pairs_i] - X[pairs_j]) / d[:, None]
+    G = np.zeros_like(X)
+    contrib = (w[:, None] * u)
+    np.add.at(G, pairs_i, contrib)
+    np.add.at(G, pairs_j, -contrib)
+    sm = float((w * d).sum())
+    return sm, G
+
+
+def _optimize(X0, steps=400, lr=0.03, t0=0.3, t1=0.04):
+    X = X0.copy()
+    n = X.shape[0]
+    iu = np.triu_indices(n, 1)
+    for k in range(steps):
+        t = t0 + (t1 - t0) * k / steps
+        sm, G = _softmin_ratio_grad(X, t)
+        # scale-aware step: normalize gradient
+        gn = np.sqrt((G ** 2).sum())
+        if gn < 1e-12:
+            break
+        # repulsion also from max distance: penalize pairs near dmax slightly
+        # (skip; scale-free enough)
+        X = X + lr * (t / 0.1) * G / gn * np.sqrt((X ** 2).sum() / n)
+    return X
+=======
+def _repulse(X0, steps=200, lr=0.002):
+    """Coulomb-style repulsion: minimize sum 1/d_ij^2 via gradient descent.
+
+    Cheap O(n^2) preprocessing that turns a clustered random start into a
+    well-spread quasi-uniform configuration. Normalized steps keep it stable.
+    """
+    X = X0.copy()
+    n = X.shape[0]
+    ii, jj = np.triu_indices(n, 1)
+    for _ in range(steps):
+        diff = X[ii] - X[jj]
+        d2 = np.sum(diff ** 2, axis=1) + 1e-9
+        # grad of sum 1/d^2 wrt pair diff is -2*diff/d^4
+        coef = -2.0 / (d2 ** 2)[:, None]
+        G = np.zeros_like(X)
+        contrib = coef * diff
+        np.add.at(G, ii, contrib)
+        np.add.at(G, jj, -contrib)
+        gn = np.sqrt((G ** 2).sum())
+        if gn < 1e-12:
+            break
+        # normalize so each step moves a bounded amount; decay learning rate
+        X = X - (lr / (1.0 + 0.01 * _)) * G / gn
+        # re-center to avoid drift
+        X = X - X.mean(axis=0)
+    return X
+
+
+def _polish(X0, steps=350, lr=0.02, t0=0.15, t1=0.01):
+    """Maximize dmin/dmax by maximizing a soft-min of pair distances while
+    penalizing pairs that exceed the current diameter target (scale-invariant
+    reformulation: keep dmax pinned, push dmin up).
+
+    Objective (to maximize):
+        softmin_t(d_ij) - lambda * softplus_excess(max-side)
+    implemented as: weighted (softmax on -d/t) mean of distances, minus a
+    quadratic penalty on pairs with d > diam_target, where diam_target tracks
+    the current max distance.
+    """
+    X = X0.copy()
+    n = X.shape[0]
+    ii, jj = np.triu_indices(n, 1)
+    lam = 4.0
+    for k in range(steps):
+        t = t0 * (t1 / t0) ** (k / max(steps - 1, 1))
+        diff = X[ii] - X[jj]
+        d = np.sqrt(np.sum(diff ** 2, axis=1) + 1e-12)
+        diam = d.max()
+        # soft-min weights (maximize weighted mean distance)
+        w = np.exp(-(d - d.min()) / max(t, 1e-6))
+        w /= w.sum()
+        u = diff / d[:, None]
+        # diameter penalty: pairs above diam get pushed together
+        over = np.maximum(d - diam, 0.0)
+        # gradient contributions
+        Gi = np.zeros_like(X)
+        np.add.at(Gi, ii, w[:, None] * u)
+        np.add.at(Gi, jj, -(w[:, None] * u))
+        # penalize the single farthest pair (moves to reduce diameter)
+        kfar = np.argmax(d)
+        pf = (X[ii[kfar]] - X[jj[kfar]]) / d[kfar]
+        Gi[ii[kfar]] -= lam * pf
+        Gi[jj[kfar]] += lam * pf
+        gn = np.sqrt((Gi ** 2).sum())
+        if gn < 1e-12:
+            break
+        step = lr * (0.5 ** (k / steps))  # decaying steps
+        X = X + step * Gi / gn * diam
+        X = X - X.mean(axis=0)
+    return X
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    for trial in range(12):
+        X0 = rng.standard_normal((n, d))
+        # quick preprocessing: spread out via simple gradient on softmin
+        X = _optimize(X0, steps=350)
+=======
+    for trial in range(12):
+        X0 = rng.standard_normal((n, d))
+        # stage 1: repulsion to spread points (Coulomb energy descent)
+        X = _repulse(X0, steps=200)
+        # stage 2: constrained polish maximizing dmin with dmax pinned
+        X = _polish(X, steps=350)
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

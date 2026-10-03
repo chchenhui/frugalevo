@@ -1,0 +1,183 @@
+<NAME>
+lp_radii_hill_climb_pipeline</NAME>
+<DESCRIPTION>
+Restructures the solver into a three-stage pipeline: (1) a staggered hex-lattice seed generator, (2) an exact LP-based radius solver (maximize sum of radii subject to wall and pairwise constraints) built with vectorized numpy broadcasting and a sparse CSR constraint matrix, and (3) a deterministic hill-climb that perturbs individual centers and re-solves the LP, accepting improvements. The LP replaces the suboptimal shrink-to-fit heuristic (which leaves slack on most circles), and the vectorized constraint assembly makes each LP solve fast enough to afford many hill-climb refinement steps within the time budget.</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles.
+
+Pipeline: hex-lattice seed -> exact LP radii -> hill-climb on centers
+with LP re-solve (vectorized sparse constraint assembly).
+"""
+import time
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.optimize import linprog
+
+_N = 26
+_TIME_BUDGET = 1.20
+
+
+def construct_packing():
+    """Construct an arrangement of 26 circles in a unit square."""
+    centers = _initial_hex_grid(_N)
+    radii, total = _solve_radii_lp(centers)
+    centers, radii, total = _hill_climb(centers, radii, total)
+    return centers, radii, float(total)
+
+
+def _initial_hex_grid(n):
+    """Staggered rows 5,6,5,6,4 -> 26 hex-like centers."""
+    rows = [5, 6, 5, 6, 4]
+    assert sum(rows) == n
+    n_rows = len(rows)
+    dy = 1.0 / (n_rows + 1)
+    centers = []
+    for r, count in enumerate(rows):
+        y = (r + 1) * dy
+        dx = 1.0 / (count + 1)
+        offset = 0.0 if r % 2 == 0 else 0.5 * dx
+        for c in range(count):
+            x = (c + 1) * dx + offset
+            centers.append([x, y])
+    return np.array(centers)
+
+
+def _solve_radii_lp(centers):
+    """Exact max-sum radii for fixed centers via LP (HiGHS).
+
+    Vectorized constraint assembly: rows for walls and pairwise
+    non-overlap, sparse CSR matrix, single linprog call.
+    """
+    n = centers.shape[0]
+    x = centers[:, 0]
+    y = centers[:, 1]
+
+    # Wall constraints: r_i <= min(x, 1-x, y, 1-y)
+    wall_ub = np.minimum(np.minimum(x, 1 - x), np.minimum(y, 1 - y))
+
+    # Pairwise: r_i + r_j <= d_ij
+    ii, jj = np.triu_indices(n, 1)
+    d = np.linalg.norm(centers[ii] - centers[jj], axis=1)
+
+    m = 4 * n + len(ii)
+    # Build sparse matrix: wall rows (one +1 entry each), pair rows
+    # (+1 at i and j).
+    rows_idx = np.concatenate([
+        np.arange(4 * n) // 4,   # wall rows: 4 rows per circle, same column
+        ii,
+        jj,
+    ])
+    cols_idx = np.concatenate([
+        np.tile(np.arange(n), 4),
+        np.arange(len(ii)) * 0,  # placeholder, fixed below
+        np.zeros(len(jj), dtype=int),
+    ])
+    cols_idx[4 * n:4 * n + len(ii)] = ii
+    cols_idx[4 * n + len(ii):] = jj
+    data = np.ones(m)
+
+    A = csr_matrix((data, (rows_idx, cols_idx)), shape=(m, n))
+    b = np.concatenate([
+        np.tile(wall_ub, 4),
+        d,
+    ])
+
+    res = linprog(-np.ones(n), A_ub=A, b_ub=b, bounds=(0, None),
+                  method="highs")
+    if res.success:
+        radii = res.x
+    else:
+        # Fallback: safe shrink heuristic
+        radii = wall_ub.copy()
+        for _ in range(200):
+            worst = 0.0
+            dd = np.linalg.norm(centers[ii] - centers[jj], axis=1)
+            s = radii[ii] + radii[jj]
+            bad = s > dd
+            if not bad.any():
+                break
+            scale = np.where(bad, dd / np.maximum(s, 1e-12), 1.0)
+            np.maximum.at(radii, ii, 1.0)  # no-op keep dtype
+            upd_i = np.ones(n)
+            upd_j = np.ones(n)
+            np.minimum.at(upd_i, ii, scale)
+            np.minimum.at(upd_j, jj, scale)
+            radii *= upd_i * upd_j
+        radii = np.minimum(radii, wall_ub)
+    return radii, float(np.sum(radii))
+
+
+def _hill_climb(centers, radii, total, budget=_TIME_BUDGET):
+    """Deterministic hill-climb: perturb one center, re-solve LP."""
+    rng = np.random.default_rng(12345)
+    n = centers.shape[0]
+    best_c = centers.copy()
+    best_r = radii.copy()
+    best_t = total
+    t0 = time.time()
+    step = 0.05
+    iters = 0
+    while time.time() - t0 < budget:
+        iters += 1
+        i = rng.integers(n)
+        cand = best_c.copy()
+        cand[i] += rng.normal(0.0, step, size=2)
+        cand[i] = np.clip(cand[i], 0.01, 0.99)
+        r, t = _solve_radii_lp(cand)
+        if t > best_t + 1e-9:
+            best_c, best_r, best_t = cand, r, t
+            step = max(step * 0.95, 0.005)
+        else:
+            step = max(step * 0.995, 0.005)
+    return best_c, best_r, best_t
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) and (x, y)
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    # visualize(centers, radii)
+```
+</CODE>

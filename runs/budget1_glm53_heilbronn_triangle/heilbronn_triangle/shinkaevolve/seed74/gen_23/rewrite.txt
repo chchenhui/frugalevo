@@ -1,0 +1,168 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+_SQRT3 = float(np.sqrt(3.0))
+
+
+def _to_xy(b):
+    b = np.asarray(b, dtype=float)
+    u, v = b[:, 0], b[:, 1]
+    return np.column_stack([u + 0.5 * v, 0.5 * _SQRT3 * v])
+
+
+def _project(b):
+    b = np.clip(b, 0.0, 1.0)
+    s = b.sum(axis=1)
+    over = s > 1.0
+    if np.any(over):
+        b[over] *= (1.0 - 1e-9) / s[over, None]
+    return b
+
+
+def _make_triples(n):
+    return np.array([(i, j, k) for i in range(n) for j in range(i + 1, n)
+                     for k in range(j + 1, n)])
+
+
+def _areas(xy, tri):
+    p, q, r = xy[tri[:, 0]], xy[tri[:, 1]], xy[tri[:, 2]]
+    return 0.5 * np.abs((q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1])
+                        - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0]))
+
+
+def _repulsion_seed(rng, n=11, iters=300, eps=1e-3):
+    """Electrostatic-style repulsion inside the simplex (barycentric coords)."""
+    b = rng.random((n, 2)) * 0.6 + 0.05
+    b[:3] = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    for t in range(iters):
+        d = b[:, None, :] - b[None, :, :]
+        dist2 = (d ** 2).sum(axis=2) + 1e-6
+        np.fill_diagonal(dist2, np.inf)
+        # repulsive force ~ 1/dist^3 direction, scale annealed
+        f = (d / (dist2 ** 2)[:, :, None]).sum(axis=1)
+        step = 0.02 * (0.995 ** t)
+        b[3:] += step * f[3:]
+        b = _project(b)
+    return b
+
+
+def _golden_seed(n=11):
+    """Deterministic golden-ratio jittered layout, vertices pinned."""
+    g = (np.sqrt(5.0) - 1.0) / 2.0
+    pts = []
+    for k in range(3, n):
+        u = ((k * g) % 1.0) * 0.8 + 0.05
+        v = ((k * g * g) % 1.0) * (0.9 - u) + 0.02
+        pts.append([u, v])
+    b = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]] + pts)
+    return _project(b)
+
+
+def _anneal_and_polish(tri, seed, b, iters=1200, T0=0.02, T1=1e-5):
+    """Simulated annealing + cheap local polish on the bottleneck point."""
+    rng = np.random.default_rng(seed)
+    n_pts = tri.max() + 1
+
+    member = np.zeros((n_pts, len(tri)), dtype=bool)
+    for c in range(3):
+        member[tri[:, c], np.arange(len(tri))] = True
+
+    def score(bb):
+        return float(_areas(_to_xy(bb), tri).min())
+
+    b = _project(b.copy())
+    cur = score(b)
+    best, best_b = cur, b.copy()
+    for it in range(iters):
+        T = T0 * (T1 / T0) ** (it / iters)
+        cand = b.copy()
+        a = _areas(_to_xy(b), tri)
+        tight = a <= a.min() * 1.5 + 1e-12
+        cnt = member[:, tight].sum(axis=1)
+        worst = np.argsort(-cnt)[:2]
+        for pt in worst:
+            cand[pt] += rng.normal(0.0, T, 2)
+        cand = _project(cand)
+        v = score(cand)
+        if v >= cur or rng.random() < np.exp((v - cur) / max(T * 1e-3, 1e-15)):
+            b, cur = cand, v
+            if v > best:
+                best, best_b = v, b.copy()
+    # polish: axis-aligned micro-moves on the bottleneck point
+    scales = [0.004, 0.001, 0.0003]
+    for _round in range(40):
+        improved = False
+        a = _areas(_to_xy(best_b), tri)
+        tight = a <= a.min() * 1.3 + 1e-12
+        cnt = member[:, tight].sum(axis=1)
+        pt = int(np.argmax(cnt))
+        for sc in scales:
+            for du, dv in [(sc, 0), (-sc, 0), (0, sc), (0, -sc)]:
+                cand = best_b.copy()
+                cand[pt] += np.array([du, dv])
+                cand = _project(cand)
+                v = score(cand)
+                if v > best + 1e-15:
+                    best_b, best = cand, v
+                    improved = True
+                    break
+            if improved:
+                break
+        if not improved:
+            break
+    return best_b, best
+
+
+def _seeds():
+    s = []
+    # lattice seeds
+    s.append(np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+        [1/3, 0.0], [2/3, 0.0], [0.0, 1/3], [0.0, 2/3],
+        [1/3, 1/3], [2/3, 1/3], [1/3, 2/3], [0.5, 1/6],
+    ]))
+    s.append(np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+        [0.5, 0.0], [0.25, 0.25], [0.0, 0.5],
+        [0.5, 0.5], [0.25, 0.0], [0.0, 0.25],
+        [0.5, 0.25], [0.25, 0.5],
+    ]))
+    # golden-ratio asymmetric layout
+    s.append(_golden_seed())
+    # repulsion layouts (deterministic seeds)
+    for rs in (11, 202, 303):
+        s.append(_repulsion_seed(np.random.default_rng(rs)))
+    # jittered lattice variants
+    rng = np.random.default_rng(2024)
+    for base in list(s[:2]):
+        j = base + rng.normal(0.0, 0.03, base.shape)
+        j[:3] = base[:3]
+        s.append(_project(j))
+    return s
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    n = 11
+    fallback_b = np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+        [1/3, 0.0], [2/3, 0.0], [0.0, 1/3], [0.0, 2/3],
+        [1/3, 1/3], [2/3, 1/3], [1/3, 2/3], [0.5, 1/6],
+    ])
+    try:
+        tri = _make_triples(n)
+        fb_val = float(_areas(_to_xy(fallback_b), tri).min())
+        best_xy, best_val = None, -1.0
+        for si, seed in enumerate(_seeds()):
+            b, val = _anneal_and_polish(tri, 777 + 13 * si, seed)
+            if val > best_val:
+                best_val, best_xy = val, _to_xy(b)
+        if best_xy is None or not np.all(np.isfinite(best_xy)):
+            raise RuntimeError("optimization failed")
+        if best_val < fb_val:
+            best_xy = _to_xy(fallback_b)
+        return np.ascontiguousarray(best_xy, dtype=float)
+    except Exception:
+        return np.ascontiguousarray(_to_xy(fallback_b), dtype=float)
+
+
+# EVOLVE-BLOCK-END

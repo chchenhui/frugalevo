@@ -1,0 +1,92 @@
+<NAME>
+swap_refine_packing
+</NAME>
+
+<DESCRIPTION>
+Add a small batched pairwise-swap refinement after cardinality-constrained LPT packing. LPT is fast and provides a strong initial makespan solution, but it can leave avoidable variance when two items assigned to different packs can be exchanged. The refinement evaluates all cross-pack swaps in parallel for each layer and applies only the best variance-reducing swap per layer for a bounded number of passes.
+
+This preserves the exact number of items per pack, keeps the algorithm deterministic, and improves GPU/node load balance without changing replica counts or topology constraints. The bounded number of tensorized passes avoids the high execution cost of an unbounded local-search procedure.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    return pack_index, rank_in_pack
+
+
+def replicate_experts(
+=======
+    # LPT minimizes large early imbalances well, but cardinality constraints can
+    # leave beneficial cross-pack exchanges.  Refine it with a few batched
+    # best-improving swaps.  For a swap of item i in pack p and item j in pack
+    # q, the change in the sum of squared pack loads is:
+    #   2 * (w_j - w_i) * (load_p - load_q) + 2 * (w_j - w_i) ** 2.
+    # This objective is inexpensive to evaluate for every pair and reduces
+    # residual load variance while preserving every pack's cardinality.
+    if num_packs > 1:
+        item_ids = torch.arange(num_groups, device=weight.device)
+        upper_triangle = torch.triu(
+            torch.ones((num_groups, num_groups),
+                       dtype=torch.bool,
+                       device=weight.device),
+            diagonal=1,
+        )
+        layer_ids = torch.arange(num_layers, device=weight.device)
+
+        # A constant bound prevents local search from dominating rebalancing
+        # time on configurations with many physical experts.
+        for _ in range(min(4, num_groups)):
+            item_pack = pack_index
+            item_load = pack_weights.gather(1, item_pack)
+            weight_difference = (packing_weight.unsqueeze(1) -
+                                 packing_weight.unsqueeze(2))
+            load_difference = (item_load.unsqueeze(1) -
+                               item_load.unsqueeze(2))
+            swap_delta = (2 * weight_difference * load_difference +
+                          2 * weight_difference.square())
+
+            cross_pack = item_pack.unsqueeze(1) != item_pack.unsqueeze(2)
+            swap_delta.masked_fill_(~(upper_triangle.unsqueeze(0) &
+                                      cross_pack), torch.inf)
+            best_delta, best_flat = swap_delta.flatten(1).min(dim=1)
+            active = torch.isfinite(best_delta) & (best_delta < 0)
+            if not active.any():
+                break
+
+            first_item = best_flat // num_groups
+            second_item = best_flat % num_groups
+            first_pack = item_pack[layer_ids, first_item]
+            second_pack = item_pack[layer_ids, second_item]
+            first_slot = (first_pack * groups_per_pack +
+                          rank_in_pack[layer_ids, first_item])
+            second_slot = (second_pack * groups_per_pack +
+                           rank_in_pack[layer_ids, second_item])
+
+            # Inactive layers retain their current assignment.
+            first_slot = torch.where(active, second_slot, first_slot)
+            second_slot = torch.where(active,
+                                      (first_pack * groups_per_pack +
+                                       rank_in_pack[layer_ids, first_item]),
+                                      second_slot)
+            pack_index[layer_ids, first_item] = first_slot // groups_per_pack
+            rank_in_pack[layer_ids, first_item] = first_slot % groups_per_pack
+            pack_index[layer_ids, second_item] = second_slot // groups_per_pack
+            rank_in_pack[layer_ids,
+                         second_item] = second_slot % groups_per_pack
+
+            transfer = torch.where(
+                active,
+                packing_weight[layer_ids, second_item] -
+                packing_weight[layer_ids, first_item],
+                torch.zeros_like(best_delta),
+            )
+            pack_weights.scatter_add_(1, first_pack.unsqueeze(1),
+                                      transfer.unsqueeze(1))
+            pack_weights.scatter_add_(1, second_pack.unsqueeze(1),
+                                      (-transfer).unsqueeze(1))
+
+    return pack_index, rank_in_pack
+
+
+def replicate_experts(
+>>>>>>> REPLACE
+</DIFF>

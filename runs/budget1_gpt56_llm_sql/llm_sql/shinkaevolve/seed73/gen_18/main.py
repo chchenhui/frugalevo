@@ -1,0 +1,337 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+from solver import Algorithm
+from typing import Tuple, List, Dict
+from collections import defaultdict
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-cache-oriented row/column reordering.
+
+    The dataframe returned by this class retains the original number of rows
+    and columns.  A row may have a different source-column order from another
+    row; column_orderings[i] describes the source columns used to construct
+    returned_dataframe.iloc[i].
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+        self.row_stop = None
+        self.col_stop = None
+
+    @staticmethod
+    def _score_value(value) -> str:
+        """Match evaluator normalization without changing stored cell values."""
+        if value is None:
+            return ""
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, bool) and missing:
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(value)
+
+    @staticmethod
+    def _lcp(left: str, right: str) -> int:
+        """Bounded Python-level LCP using C-level slice equality."""
+        limit = min(len(left), len(right))
+        if limit == 0:
+            return 0
+        if left == right:
+            return limit
+
+        lo, hi = 0, limit
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if left[:mid] == right[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_score(self, strings: List[str]) -> int:
+        """Exact serial Trie reuse for a fixed collection of strings."""
+        if len(strings) < 2:
+            return 0
+        ordered = sorted(strings)
+        return sum(
+            self._lcp(ordered[i - 1], ordered[i])
+            for i in range(1, len(ordered))
+        )
+
+    @staticmethod
+    def _frequency_order(serial_cells: List[List[str]], num_cols: int) -> List[int]:
+        """
+        Required global proposal: sum(len(v) * count(v) * (count(v)-1)).
+        """
+        totals = [0] * num_cols
+        for col in range(num_cols):
+            counts = defaultdict(int)
+            for row in serial_cells:
+                counts[row[col]] += 1
+            totals[col] = sum(
+                len(value) * count * (count - 1)
+                for value, count in counts.items()
+            )
+        return sorted(range(num_cols), key=lambda col: (-totals[col], col))
+
+    @staticmethod
+    def _secondary_frequency_order(
+        serial_cells: List[List[str]], num_cols: int
+    ) -> List[int]:
+        """A cheap independent global length/frequency proposal."""
+        totals = [0] * num_cols
+        for col in range(num_cols):
+            counts = defaultdict(int)
+            for row in serial_cells:
+                counts[row[col]] += 1
+            totals[col] = sum(
+                len(value) * count * count
+                for value, count in counts.items()
+            )
+        return sorted(range(num_cols), key=lambda col: (-totals[col], col))
+
+    def _conditional_orders(
+        self,
+        serial_cells: List[List[str]],
+        global_order: List[int],
+        max_depth: int,
+        max_nodes: int,
+    ) -> List[List[int]]:
+        """
+        Build a bounded conditional prefix partition tree.  Statistics are
+        computed from already-normalized strings rather than pandas objects.
+        """
+        nrows = len(serial_cells)
+        ncols = len(global_order)
+        orders = [list(global_order) for _ in range(nrows)]
+        if nrows < 2 or ncols == 0:
+            return orders
+
+        candidate_cols = global_order[:min(48, ncols)]
+        node_count = 0
+
+        def assign(rows, prefix, remaining):
+            tail = [col for col in global_order if col in remaining]
+            final_order = prefix + tail
+            for row in rows:
+                orders[row] = final_order
+
+        def visit(rows, remaining, prefix, depth):
+            nonlocal node_count
+            if (
+                len(rows) < 2
+                or not remaining
+                or depth >= max_depth
+                or node_count >= max_nodes
+            ):
+                assign(rows, prefix, remaining)
+                return
+
+            node_count += 1
+            best_col = None
+            best_score = 0
+            best_groups = None
+
+            for col in remaining:
+                groups = defaultdict(list)
+                for row in rows:
+                    groups[serial_cells[row][col]].append(row)
+                score = sum(
+                    len(value) * len(group) * (len(group) - 1)
+                    for value, group in groups.items()
+                )
+                if score > best_score or (
+                    score == best_score and score > 0 and
+                    (best_col is None or col < best_col)
+                ):
+                    best_col = col
+                    best_score = score
+                    best_groups = groups
+
+            if best_col is None or best_score <= 0:
+                assign(rows, prefix, remaining)
+                return
+
+            next_remaining = [col for col in remaining if col != best_col]
+            for group in best_groups.values():
+                visit(group, next_remaining, prefix + [best_col], depth + 1)
+
+        visit(list(range(nrows)), candidate_cols, [], 0)
+        return orders
+
+    @staticmethod
+    def _resolve_column(name, columns):
+        """Resolve exact names first, then the legacy unique-substring form."""
+        if name in columns:
+            return columns.index(name)
+        matches = [i for i, col in enumerate(columns) if str(name) in str(col)]
+        return matches[0] if len(matches) == 1 else None
+
+    def _apply_constraints(
+        self,
+        order: List[int],
+        columns: List,
+        col_merge: List[List[str]],
+        one_way_dep: List[Tuple[str, str]],
+    ) -> List[int]:
+        """
+        Preserve API constraints while retaining a complete permutation.
+        Merged groups are kept contiguous and dependency sources precede their
+        destinations when both columns can be resolved unambiguously.
+        """
+        result = list(order)
+
+        for source_name, target_name in one_way_dep or []:
+            source = self._resolve_column(source_name, columns)
+            target = self._resolve_column(target_name, columns)
+            if source is None or target is None or source == target:
+                continue
+            source_pos = result.index(source)
+            target_pos = result.index(target)
+            if source_pos > target_pos:
+                result.pop(source_pos)
+                target_pos = result.index(target)
+                result.insert(target_pos, source)
+
+        for requested_group in col_merge or []:
+            group = []
+            for name in requested_group:
+                position = self._resolve_column(name, columns)
+                if position is not None and position not in group:
+                    group.append(position)
+            if len(group) < 2:
+                continue
+
+            positions = [result.index(col) for col in group]
+            insert_at = min(positions)
+            group_set = set(group)
+            retained = [col for col in result if col not in group_set]
+            # Use requested merge order, matching the supplied API order.
+            result = retained[:insert_at] + group + retained[insert_at:]
+
+        return result
+
+    def fixed_reorder(
+        self, df: pd.DataFrame, row_sort: bool = True
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        """Safe compatibility helper using one deterministic global ordering."""
+        columns = list(df.columns)
+        values = df.to_numpy(dtype=object, copy=False)
+        serial = [
+            [self._score_value(values[row, col]) for col in range(df.shape[1])]
+            for row in range(df.shape[0])
+        ]
+        order = self._frequency_order(serial, df.shape[1])
+        out_values = [
+            [values[row, col] for col in order]
+            for row in range(df.shape[0])
+        ]
+        strings = ["".join(serial[row][col] for col in order) for row in range(df.shape[0])]
+        row_ids = list(range(df.shape[0]))
+        if row_sort:
+            row_ids.sort(key=lambda row: strings[row])
+
+        output = pd.DataFrame(
+            [out_values[row] for row in row_ids],
+            index=df.index.take(row_ids),
+            columns=columns,
+            dtype=object,
+        )
+        ordering = [[columns[col] for col in order] for _ in row_ids]
+        return output, ordering
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        """
+        Construct at most three bounded ordering proposals and select by exact
+        serialized-string Trie reuse.  `parallel`, `early_stop`, and threshold
+        are retained for API compatibility; no evaluator state is accessed.
+        """
+        del early_stop, distinct_value_threshold, parallel
+
+        nrows, ncols = df.shape
+        columns = list(df.columns)
+        if nrows == 0:
+            return df.copy(), []
+        if ncols == 0:
+            return df.copy(), [[] for _ in range(nrows)]
+
+        raw_values = df.to_numpy(dtype=object, copy=False)
+        serial_cells = [
+            [self._score_value(raw_values[row, col]) for col in range(ncols)]
+            for row in range(nrows)
+        ]
+
+        global_order = self._frequency_order(serial_cells, ncols)
+        secondary_order = self._secondary_frequency_order(serial_cells, ncols)
+
+        requested_depth = col_stop if col_stop is not None and col_stop > 0 else 10
+        requested_rows = row_stop if row_stop is not None and row_stop > 0 else nrows
+        tree_depth = min(ncols, max(1, min(12, requested_depth)))
+        tree_nodes = min(128, max(8, requested_rows))
+        conditional = self._conditional_orders(
+            serial_cells, global_order, tree_depth, tree_nodes
+        )
+
+        proposals = [
+            [list(global_order) for _ in range(nrows)],
+            [list(secondary_order) for _ in range(nrows)],
+            conditional,
+        ]
+
+        best_orders = None
+        best_score = None
+        for proposal in proposals:
+            constrained = [
+                self._apply_constraints(order, columns, col_merge, one_way_dep)
+                for order in proposal
+            ]
+            strings = [
+                "".join(serial_cells[row][col] for col in constrained[row])
+                for row in range(nrows)
+            ]
+            score = self._trie_score(strings)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_orders = constrained
+
+        output_strings = [
+            "".join(serial_cells[row][col] for col in best_orders[row])
+            for row in range(nrows)
+        ]
+        row_ids = sorted(range(nrows), key=lambda row: output_strings[row])
+
+        output_values = [
+            [raw_values[row, col] for col in best_orders[row]]
+            for row in row_ids
+        ]
+        reordered = pd.DataFrame(
+            output_values,
+            index=df.index.take(row_ids),
+            columns=columns,
+            dtype=object,
+        )
+        column_orderings = [
+            [columns[col] for col in best_orders[row]]
+            for row in row_ids
+        ]
+
+        assert reordered.shape == df.shape
+        assert len(column_orderings) == len(reordered)
+        assert all(len(order) == ncols for order in column_orderings)
+        return reordered, column_orderings
+
+
+# EVOLVE-BLOCK-END

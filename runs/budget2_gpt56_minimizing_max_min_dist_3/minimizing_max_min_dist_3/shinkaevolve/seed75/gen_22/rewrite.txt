@@ -1,0 +1,213 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct fourteen points as seven optimized antipodal pairs.
+
+    For unit line representatives u_i, the points +/-u_i have diameter 2.
+    Their minimum distance is determined by the largest absolute line
+    correlation, so this is optimized directly as a projective line-packing
+    problem in R^3.
+    """
+    rng = np.random.default_rng(170141)
+
+    line_i, line_j = np.triu_indices(7, 1)
+    n_pairs = len(line_i)
+    eps = 1.0e-7
+
+    def canonical_parameters(lines: np.ndarray) -> np.ndarray:
+        """Remove global rotation and convert seven unit lines to angles."""
+        lines = np.asarray(lines, dtype=float).copy()
+        lines /= np.linalg.norm(lines, axis=1)[:, None]
+
+        # Put line zero on the z-axis and line one into the x-z plane.
+        ez = lines[0]
+        v = lines[1] - np.dot(lines[1], ez) * ez
+        nv = np.linalg.norm(v)
+        if nv < 1.0e-10:
+            trial = np.array([1.0, 0.0, 0.0])
+            if abs(np.dot(trial, ez)) > 0.8:
+                trial = np.array([0.0, 1.0, 0.0])
+            v = trial - np.dot(trial, ez) * ez
+            nv = np.linalg.norm(v)
+        ex = v / nv
+        ey = np.cross(ez, ex)
+
+        coords = np.column_stack((
+            lines @ ex,
+            lines @ ey,
+            lines @ ez,
+        ))
+        theta = np.arccos(np.clip(coords[:, 2], -1.0, 1.0))
+        phi = np.arctan2(coords[:, 1], coords[:, 0])
+
+        # u_1 has positive x by construction; its azimuth is fixed to zero.
+        out = [theta[1]]
+        for k in range(2, 7):
+            out.extend((theta[k], phi[k]))
+        correlations = coords[line_i] * coords[line_j]
+        worst = np.max(np.sum(correlations, axis=1) ** 2)
+        out.append(min(0.999999, worst + 2.0e-5))
+        return np.asarray(out, dtype=float)
+
+    def lines_from_parameters(x: np.ndarray):
+        lines = np.zeros((7, 3), dtype=float)
+        deriv_theta = np.zeros((7, 3), dtype=float)
+        deriv_phi = np.zeros((7, 3), dtype=float)
+
+        lines[0, 2] = 1.0
+        theta = x[0]
+        lines[1] = (np.sin(theta), 0.0, np.cos(theta))
+        deriv_theta[1] = (np.cos(theta), 0.0, -np.sin(theta))
+
+        q = 1
+        for k in range(2, 7):
+            theta = x[q]
+            phi = x[q + 1]
+            st, ct = np.sin(theta), np.cos(theta)
+            sp, cp = np.sin(phi), np.cos(phi)
+            lines[k] = (st * cp, st * sp, ct)
+            deriv_theta[k] = (ct * cp, ct * sp, -st)
+            deriv_phi[k] = (-st * sp, st * cp, 0.0)
+            q += 2
+
+        return lines, deriv_theta, deriv_phi
+
+    def coherence_value(x: np.ndarray) -> float:
+        lines, _, _ = lines_from_parameters(x)
+        dots = np.sum(lines[line_i] * lines[line_j], axis=1)
+        return float(np.max(dots * dots))
+
+    def constraints(x: np.ndarray) -> np.ndarray:
+        lines, _, _ = lines_from_parameters(x)
+        dots = np.sum(lines[line_i] * lines[line_j], axis=1)
+        return x[-1] - dots * dots
+
+    def constraint_jacobian(x: np.ndarray) -> np.ndarray:
+        lines, dtheta, dphi = lines_from_parameters(x)
+        jac = np.zeros((n_pairs, 12), dtype=float)
+        dots = np.sum(lines[line_i] * lines[line_j], axis=1)
+
+        # Parameter location of each line's polar and azimuth angles.
+        theta_col = {1: 0, 2: 1, 3: 3, 4: 5, 5: 7, 6: 9}
+        phi_col = {2: 2, 3: 4, 4: 6, 5: 8, 6: 10}
+
+        for row, (a, b) in enumerate(zip(line_i, line_j)):
+            dot = dots[row]
+            for point, other in ((a, b), (b, a)):
+                if point in theta_col:
+                    derivative = np.dot(dtheta[point], lines[other])
+                    jac[row, theta_col[point]] -= 2.0 * dot * derivative
+                if point in phi_col:
+                    derivative = np.dot(dphi[point], lines[other])
+                    jac[row, phi_col[point]] -= 2.0 * dot * derivative
+            jac[row, -1] = 1.0
+
+        return jac
+
+    def antipodal_score(lines: np.ndarray) -> float:
+        dots = np.abs(lines @ lines.T)
+        np.fill_diagonal(dots, 0.0)
+        mu = float(np.max(dots))
+        return 0.5 * (1.0 - mu)
+
+    # A deterministic structured seed: four cube diagonal lines and the
+    # three coordinate axes.  Random projective starts complement it.
+    cube_lines = np.array(
+        [
+            [1.0, 1.0, 1.0],
+            [1.0, 1.0, -1.0],
+            [1.0, -1.0, 1.0],
+            [-1.0, 1.0, 1.0],
+        ],
+        dtype=float,
+    )
+    axis_lines = np.eye(3)
+    structured = np.vstack((cube_lines, axis_lines))
+    structured /= np.linalg.norm(structured, axis=1)[:, None]
+
+    starts = [canonical_parameters(structured)]
+
+    # Icosahedral lines are a strong low-coherence six-line core.  A seventh
+    # line and several random gauges provide diverse nearby basins.
+    golden = 0.5 * (1.0 + np.sqrt(5.0))
+    ico = np.array(
+        [
+            [0.0, 1.0, golden],
+            [0.0, 1.0, -golden],
+            [1.0, golden, 0.0],
+            [1.0, -golden, 0.0],
+            [golden, 0.0, 1.0],
+            [golden, 0.0, -1.0],
+        ]
+    )
+    for _ in range(5):
+        extra = rng.normal(size=(1, 3))
+        starts.append(canonical_parameters(np.vstack((ico, extra))))
+
+    for _ in range(24):
+        starts.append(canonical_parameters(rng.normal(size=(7, 3))))
+
+    best_lines = structured.copy()
+    best_score = antipodal_score(best_lines)
+
+    try:
+        from scipy.optimize import minimize
+
+        bounds = (
+            [(eps, np.pi - eps)] +
+            [(eps, np.pi - eps), (-np.pi, np.pi)] * 5 +
+            [(0.0, 0.999999)]
+        )
+        con = {"type": "ineq", "fun": constraints, "jac": constraint_jacobian}
+        objective_gradient = np.zeros(12, dtype=float)
+        objective_gradient[-1] = 1.0
+
+        for x0 in starts:
+            result = minimize(
+                fun=lambda x: x[-1],
+                x0=x0,
+                jac=lambda x: objective_gradient,
+                method="SLSQP",
+                bounds=bounds,
+                constraints=con,
+                options={"maxiter": 360, "ftol": 2.0e-12, "disp": False},
+            )
+
+            if result.x is None or not np.all(np.isfinite(result.x)):
+                continue
+
+            candidate, _, _ = lines_from_parameters(result.x)
+            candidate /= np.linalg.norm(candidate, axis=1)[:, None]
+            value = antipodal_score(candidate)
+            if value > best_score:
+                best_score = value
+                best_lines = candidate.copy()
+
+        # A final local restart from the strongest discovered contact graph.
+        x0 = canonical_parameters(best_lines)
+        result = minimize(
+            fun=lambda x: x[-1],
+            x0=x0,
+            jac=lambda x: objective_gradient,
+            method="SLSQP",
+            bounds=bounds,
+            constraints=con,
+            options={"maxiter": 600, "ftol": 5.0e-14, "disp": False},
+        )
+        if result.x is not None and np.all(np.isfinite(result.x)):
+            candidate, _, _ = lines_from_parameters(result.x)
+            candidate /= np.linalg.norm(candidate, axis=1)[:, None]
+            if antipodal_score(candidate) > best_score:
+                best_lines = candidate
+
+    except Exception:
+        pass
+
+    points = np.vstack((best_lines, -best_lines))
+    return np.asarray(points, dtype=float)
+
+
+# EVOLVE-BLOCK-END

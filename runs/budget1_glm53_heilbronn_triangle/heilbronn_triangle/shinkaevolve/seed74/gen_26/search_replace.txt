@@ -1,0 +1,138 @@
+<NAME>
+bottleneck_coordinated_moves</NAME>
+<DESCRIPTION>
+The current anneal/polish only moves single uniformly-random points. The key structural weakness: the minimum-area triplet ("bottleneck") typically requires *correlated* movement of 2+ of its member points (e.g., sliding two points apart along the triangle side) — independent single-point perturbations can't escape such traps. I add a new refinement stage that: (1) computes each point's bottleneck membership count (how many near-minimal triplets contain it), (2) picks points proportionally to that count rather than uniformly, and (3) occasionally moves the top-2 bottleneck points simultaneously along the *same* correlated direction (plus a correlated "spread along the bottleneck edge" move). This is cheap because incremental area updates already exist; I reuse the `contains` structure by recomputing areas for the union of affected triplets when 2 points move. This directly implements the recommended idea while keeping determinism (fixed seeds) and error handling unchanged.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def heilbronn_triangle11() -> np.ndarray:
+    n = 11
+    tri = np.array(list(combinations(range(n), 3)))
+
+    best_b, best_val = None, -1.0
+    try:
+        for si, seed in enumerate(_seed_layouts()):
+            rng = np.random.default_rng(20240611 + 101 * si)
+            b, val = _anneal(seed, tri, rng)
+            b, val = _polish(b, tri, rng)
+            if val > best_val:
+                best_val, best_b = val, b
+        # extra polish rounds on the winner with fresh randomness
+        rng = np.random.default_rng(777)
+        for _ in range(3):
+            best_b, v = _polish(best_b, tri, rng)
+            best_val = max(best_val, v)
+    except Exception:
+        best_b = None
+=======
+def _bottleneck_polish(b, tri, rng, iters=3000):
+    """Bottleneck-weighted multi-point polish: pick points to move with
+    probability proportional to how many near-minimal-area triplets contain
+    them, and occasionally move the top-2 bottleneck points simultaneously
+    along the SAME correlated direction (or apart along their mutual edge)
+    to escape single-point local optima."""
+    n = b.shape[0]
+    b = _project(b.copy())
+    areas = _all_areas_xy(_to_xy(b), tri)
+    cur = areas.min()
+    best, best_b = cur, b.copy()
+    contains = []
+    for i in range(n):
+        mask = (tri[:, 0] == i) | (tri[:, 1] == i) | (tri[:, 2] == i)
+        contains.append((tri[mask], np.nonzero(mask)[0]))
+
+    def _eval_move(cand):
+        cxy = _to_xy(cand)
+        return _all_areas_xy(cxy, tri).min()
+
+    for it in range(iters):
+        scale = 0.006 * (1.0 - it / iters) + 2e-4
+        # bottleneck membership counts: near-min triplets (within 15% of min)
+        near = areas < cur * 1.15 + 1e-15
+        cnt = np.zeros(n)
+        for t, is_near in zip(tri, near):
+            if is_near:
+                cnt[t[0]] += 1
+                cnt[t[1]] += 1
+                cnt[t[2]] += 1
+        tot = cnt.sum()
+        if tot > 0:
+            weights = cnt / tot
+        else:
+            weights = np.full(n, 1.0 / n)
+        i = int(rng.choice(n, p=weights))
+        if rng.random() < 0.35:
+            # coordinated 2-point move: top-2 bottleneck points, same direction
+            order = np.argsort(cnt)[::-1]
+            j = int(order[0]) if order[0] != i else int(order[1])
+            d = rng.normal(0.0, 1.0, 2)
+            d /= (np.linalg.norm(d) + 1e-12)
+            if rng.random() < 0.5:
+                # correlated "spread" move: push the two points apart
+                d_i, d_j = d, -d
+            else:
+                # common drift direction
+                d_i, d_j = d, d
+            cand = b.copy()
+            cand[i] += scale * d_i
+            cand[j] += scale * d_j
+            cand = _project(cand)
+            val = _eval_move(cand)
+            if val > cur + 1e-14:
+                b, cur = cand, val
+                areas = _all_areas_xy(_to_xy(b), tri)
+                if val > best:
+                    best, best_b = val, b.copy()
+                continue
+        # otherwise: single bottleneck-weighted point move (incremental update)
+        sub_tri, sub_idx = contains[i]
+        done = False
+        for _ in range(3):
+            d = rng.normal(0.0, 1.0, 2)
+            d /= (np.linalg.norm(d) + 1e-12)
+            cand = b.copy()
+            cand[i] += scale * d
+            cand = _project(cand)
+            cxy = _to_xy(cand)
+            new_areas = areas.copy()
+            a, bb, c = cxy[sub_tri[:, 0]], cxy[sub_tri[:, 1]], cxy[sub_tri[:, 2]]
+            new_areas[sub_idx] = 0.5 * np.abs(
+                (bb[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+                (bb[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+            val = new_areas.min()
+            if val > cur + 1e-14:
+                b, areas, cur = cand, new_areas, val
+                if val > best:
+                    best, best_b = val, b.copy()
+                done = True
+                break
+        if not done:
+            continue
+    return best_b, best
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    n = 11
+    tri = np.array(list(combinations(range(n), 3)))
+
+    best_b, best_val = None, -1.0
+    try:
+        for si, seed in enumerate(_seed_layouts()):
+            rng = np.random.default_rng(20240611 + 101 * si)
+            b, val = _anneal(seed, tri, rng)
+            b, val = _polish(b, tri, rng)
+            b, val = _bottleneck_polish(b, tri, rng)
+            b, val = _polish(b, tri, rng)
+            if val > best_val:
+                best_val, best_b = val, b
+        # extra alternating polish rounds on the winner with fresh randomness
+        rng = np.random.default_rng(777)
+        for _ in range(2):
+            best_b, v = _bottleneck_polish(best_b, tri, rng)
+            best_val = max(best_val, v)
+            best_b, v = _polish(best_b, tri, rng)
+            best_val = max(best_val, v)
+    except Exception:
+        best_b = None
+>>>>>>> REPLACE
+</DIFF>

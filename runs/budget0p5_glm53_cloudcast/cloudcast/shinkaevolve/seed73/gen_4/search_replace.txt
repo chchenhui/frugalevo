@@ -1,0 +1,73 @@
+<NAME>
+multi_path_redundancy_elimination_broadcast
+</NAME>
+<DESCRIPTION>
+The current algorithm sends each partition of the data from src to every destination independently via Dijkstra, so shared link segments are traversed once per (dst, partition) — causing massive redundant transfers and high cost. Key improvement: treat the broadcast as a Steiner-tree-like shared delivery problem. For each partition, find a set of paths to all destinations that maximally share edges, so each shared edge is only paid for once across the destinations it serves. Concretely: (1) add a small epsilon to all edge costs so Dijkstra prefers fewer hops (fewer, longer-shared links), (2) greedily route destinations one at a time over the cheapest available path in a residual graph where edges already used for this partition are free (cost ~0) — this reuses shared trunk links and only pays for the diverging tails, (3) drop unreachable destinations gracefully instead of crashing. This dramatically reduces total data transfer cost while keeping the API (BroadCastTopology, append_dst_partition_path) unchanged.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    # Add a tiny hop penalty so ties are broken toward fewer, longer (shared) links
+    for u, v, data in h.edges(data=True):
+        if data.get("cost") is not None:
+            data["cost"] = data["cost"] + 1e-6
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Try to route each destination; skip unreachable ones instead of crashing
+    reachable_dsts = []
+    for dst in dsts:
+        try:
+            nx.dijkstra_path(h, src, dst, weight="cost")
+            reachable_dsts.append(dst)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+
+    # Route each partition as a shared-delivery tree: order destinations by
+    # proximity to the source so early paths establish cheap shared trunks.
+    for j in range(bc_topology.num_partitions):
+        # Track edges already used by this partition's shared trunk; reuse is free.
+        used_edges = set()
+        dist_cache = {dst: nx.single_source_dijkstra(h, src, weight="cost")[0] for dst in reachable_dsts}
+        order = sorted(reachable_dsts, key=lambda d: dist_cache.get(d, float("inf")))
+        for dst in order:
+            # Make already-used edges free for this partition (shared trunk reuse)
+            for (us, ut) in used_edges:
+                if h.has_edge(us, ut):
+                    h[us][ut]["cost"] = 0.0
+            try:
+                path = nx.dijkstra_path(h, src, dst, weight="cost")
+            except nx.NetworkXNoPath:
+                continue
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                used_edges.add((s, t))
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+            # Restore original costs for the next destination search
+            for (us, ut) in used_edges:
+                if h.has_edge(us, ut) and (us, ut) not in [(path[k], path[k + 1]) for k in range(len(path) - 1)]:
+                    h[us][ut]["cost"] = G[us][ut]["cost"] + 1e-6
+            # Re-zero only the trunk edges for the *next* destination's search:
+            # edges in the current path stay free (they are part of the shared tree)
+            # Restore all, then we re-zero at loop start anyway.
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

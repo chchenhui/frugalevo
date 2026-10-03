@@ -1,0 +1,102 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
+
+    Returns
+        points: np.ndarray of shape (14,3) containing the (x,y) coordinates of the 14 points.
+
+    """
+
+    from scipy.optimize import minimize
+    from scipy.special import logsumexp
+
+    n = 14
+    d = 3
+    iu = np.triu_indices(n, 1)
+
+    def unit(x):
+        p = x.reshape(n, d)
+        return p / np.linalg.norm(p, axis=1, keepdims=True)
+
+    def dists(p):
+        diff = p[:, None, :] - p[None, :, :]
+        D2 = (diff * diff).sum(-1)
+        return np.sqrt(np.maximum(D2[iu], 1e-12))
+
+    def ratio(p):
+        D = dists(p)
+        return D.min() / D.max()
+
+    rng = np.random.default_rng(0)
+    best_pts = None
+    best_r = -1.0
+
+    seeds = []
+
+    # D6-symmetric Tammes-14 seeds: two staggered hexagonal rings + 2 poles.
+    # Parameterize by ring height z (radius = sqrt(1 - z^2)); the optimal
+    # configuration lies in this family, so scan several z values.
+    for z in (0.75, 0.80, 0.85, 0.90, 0.95, 0.60, 0.70):
+        r = np.sqrt(max(1e-9, 1.0 - z * z))
+        ang = np.pi / 3.0
+        pts = []
+        for k in range(6):
+            pts.append([r * np.cos(ang * k), r * np.sin(ang * k), z])
+            pts.append([r * np.cos(ang * k + ang / 2),
+                        r * np.sin(ang * k + ang / 2), -z])
+        pts.append([0.0, 0.0, 1.0])
+        pts.append([0.0, 0.0, -1.0])
+        seeds.append(np.array(pts))
+
+    for trial in range(4):
+        pts = rng.normal(size=(n, d))
+        pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+        seeds.append(pts)
+
+    for pts in seeds:
+
+        # Annealed soft-min maximization of minimum distance on the unit sphere.
+        for T in (0.08, 0.03, 0.012, 0.005, 0.002):
+            def loss(x, T=T):
+                p = unit(x)
+                D = dists(p)
+                return T * logsumexp(-D / T)
+
+            res = minimize(loss, pts.ravel(), method="L-BFGS-B",
+                           options={"maxiter": 500, "maxfun": 2000})
+            pts = unit(res.x)
+
+        r = ratio(pts)
+        if r > best_r:
+            best_r = r
+            best_pts = pts.copy()
+
+    # Final polish: directly maximize dmin/dmax on the sphere with a smooth
+    # surrogate (soft-min numerator, soft-max denominator) at low temperature.
+    def polish_loss(x):
+        p = unit(x)
+        D = dists(p)
+        Tn = 0.002
+        dmin_soft = -Tn * logsumexp(-D / Tn)
+        dmax_soft = Tn * logsumexp(D / Tn)
+        return -dmin_soft / max(dmax_soft, 1e-9)
+
+    for _ in range(3):
+        res = minimize(polish_loss, best_pts.ravel(), method="L-BFGS-B",
+                       options={"maxiter": 800, "maxfun": 3000})
+        cand = unit(res.x)
+        rc = ratio(cand)
+        if rc >= best_r:
+            best_r = rc
+            best_pts = cand
+        else:
+            break
+
+    return best_pts
+
+
+# EVOLVE-BLOCK-END

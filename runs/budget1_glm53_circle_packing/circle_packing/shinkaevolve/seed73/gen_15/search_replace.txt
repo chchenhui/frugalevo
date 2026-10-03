@@ -1,0 +1,161 @@
+<NAME>
+multi_layout_enumeration
+</NAME>
+<DESCRIPTION>
+The current program commits to a single hexagonal lattice spacing and a fixed stagger pattern, then uses a slow O(n²·iters) Python relaxation loop. Two improvements:
+
+1. **Enumerate multiple base topologies and spacings.** All prior progress came from one hex layout. Since the radius-computation machinery is layout-agnostic, we should sweep the lattice spacing `s` over a range (the fixed analytic choice 1/(5+√3/2) is just one candidate, and stretch is empirically the most successful tuning axis), and also add alternative row-count/stagger patterns for 26 circles (e.g. rows [5,4,5,4,5,3] hex and mixed square-like rows), keeping the best result.
+
+2. **Vectorize the relaxation.** The pairwise relaxation loop is the runtime bottleneck (0.67s). Replacing nested Python loops with NumPy broadcasting (computing all pairwise distances at once via `np.triu_indices`) gives a large speedup, which both reduces eval_time and allows many more relaxation iterations/candidates per evaluation.
+
+Sweeping the spacing is particularly promising because the optimal hex packing of 26 circles in a square is known to be slightly *stretched* relative to the perfect lattice — the fixed spacing currently used leaves the 4-circle rows underutilized horizontally.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Hexagonal lattice layout: 6 staggered rows with counts 4,5,4,5,4,4
+    # Lattice spacing s chosen so rows of 5 fit horizontally (5s <= 1)
+    # and rows fit vertically with row spacing h = sqrt(3)/2 * s.
+    sqrt3_2 = np.sqrt(3.0) / 2.0
+    s = 1.0 / (5.0 + sqrt3_2)  # solve (1 - s)/5 = sqrt(3)/2 * s
+    h = sqrt3_2 * s
+    row_counts = [4, 5, 4, 5, 4, 4]
+
+    idx = 0
+    for r_i, cnt in enumerate(row_counts):
+        y = s / 2.0 + r_i * h
+        # Stagger odd rows by half a spacing
+        x0 = 0.5 - (cnt - 1) * s / 2.0
+        if r_i % 2 == 1:
+            x0 += s / 2.0
+        for c in range(cnt):
+            centers[idx] = [x0 + c * s, y]
+            idx += 1
+
+    # Repulsion-based positional relaxation:
+    # treat every circle as having the target uniform radius r0 = s/2 and
+    # push apart centers that are too close, while keeping them off walls.
+    r0 = s / 2.0
+    n_iters = 300
+    for _ in range(n_iters):
+        max_move = 0.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = centers[i] - centers[j]
+                d = np.sqrt(np.sum(diff ** 2))
+                if d < 2 * r0 and d > 1e-12:
+                    push = (2 * r0 - d) / 2.0
+                    u = diff / d
+                    step = 0.05 * push
+                    centers[i] += step * u
+                    centers[j] -= step * u
+                    max_move = max(max_move, step)
+        # Keep circles away from the walls by at least r0
+        m = r0
+        centers[:, 0] = np.clip(centers[:, 0], m, 1 - m)
+        centers[:, 1] = np.clip(centers[:, 1], m, 1 - m)
+        if max_move < 1e-8:
+            break
+
+    # Compute maximum valid radii for this configuration
+    radii = compute_max_radii(centers)
+
+    # Calculate the sum of radii
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+=======
+    # Enumerate multiple lattice topologies and spacings; relax each and
+    # keep the configuration with the largest sum of radii.
+    sqrt3_2 = np.sqrt(3.0) / 2.0
+    iu = np.triu_indices(n, k=1)
+
+    def make_layout(row_counts, s, stagger):
+        pts = np.zeros((n, 2))
+        h = sqrt3_2 * s if stagger else s
+        idx = 0
+        for r_i, cnt in enumerate(row_counts):
+            y = s / 2.0 + r_i * h
+            x0 = 0.5 - (cnt - 1) * s / 2.0
+            if stagger and r_i % 2 == 1:
+                x0 += s / 2.0
+            for c in range(cnt):
+                pts[idx] = [x0 + c * s, y]
+                idx += 1
+        return pts
+
+    def relax(pts, r0, n_iters=200):
+        pts = pts.copy()
+        for _ in range(n_iters):
+            diff = pts[:, None, :] - pts[None, :, :]
+            dist = np.sqrt((diff ** 2).sum(-1))
+            d = dist[iu]
+            ov = 2.0 * r0 - d
+            mask = ov > 1e-12
+            if not mask.any():
+                break
+            ii, jj = iu[0][mask], iu[1][mask]
+            u = diff[ii, jj] / d[mask][:, None]
+            push = 0.05 * ov[mask][:, None] * u
+            move = np.zeros_like(pts)
+            np.add.at(move, ii, push)
+            np.add.at(move, jj, -push)
+            pts += move
+            pts[:, 0] = np.clip(pts[:, 0], r0, 1 - r0)
+            pts[:, 1] = np.clip(pts[:, 1], r0, 1 - r0)
+        return pts
+
+    candidates = []
+    for s in [0.155, 0.17, 0.185, 0.19, 1.0 / (5.0 + sqrt3_2)]:
+        candidates.append(make_layout([4, 5, 4, 5, 4, 4], s, True))
+        candidates.append(make_layout([5, 4, 5, 4, 5, 3], s, True))
+        candidates.append(make_layout([5, 4, 5, 4, 4, 4], s, False))
+        candidates.append(make_layout([4, 5, 4, 5, 4, 4], s, False))
+
+    best = None
+    for pts0 in candidates:
+        s_eff = np.min(np.sqrt((pts0[:, None, :] - pts0[None, :, :]) ** 2).sum(-1)
+                       + np.eye(n) * 1e9, axis=1).min()
+        pts = relax(pts0, s_eff / 2.0)
+        radii_c = compute_max_radii(pts)
+        total = radii_c.sum()
+        if best is None or total > best[2]:
+            best = (pts, radii_c, total)
+
+    centers, radii, sum_radii = best
+    return centers, radii, sum_radii
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    for _ in range(200):
+        changed = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                total = radii[i] + radii[j]
+                if total > dist and total > 1e-15:
+                    scale = dist / total
+                    radii[i] *= scale
+                    radii[j] *= scale
+                    changed = True
+        if not changed:
+            break
+=======
+    # Vectorized: shrink all overlapping pairs per sweep until feasible.
+    iu = np.triu_indices(n, k=1)
+    diff = centers[:, None, :] - centers[None, :, :]
+    dist = np.sqrt((diff ** 2).sum(-1))
+    for _ in range(200):
+        t = radii[iu[0]] + radii[iu[1]]
+        d = dist[iu]
+        bad = t > d + 1e-15
+        if not bad.any():
+            break
+        bi, bj = iu[0][bad], iu[1][bad]
+        scale = d[bad] / t[bad]
+        for a, b, sc in zip(bi, bj, scale):
+            radii[a] *= sc
+            radii[b] *= sc
+>>>>>>> REPLACE
+</DIFF>

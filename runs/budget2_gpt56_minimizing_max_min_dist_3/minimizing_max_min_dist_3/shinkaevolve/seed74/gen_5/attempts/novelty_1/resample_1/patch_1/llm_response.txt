@@ -1,0 +1,112 @@
+<NAME>
+antipodal_linepack_polish
+</NAME>
+
+<DESCRIPTION>
+This version keeps the strong antipodal spherical-code formulation from the current program, ensuring a fixed diameter of 2 and reducing the problem to minimizing the maximum absolute inner product among seven lines.
+
+It improves the optimization through a multi-stage continuation schedule: lower soft-max sharpness first finds a well-separated global arrangement, while higher sharpness stages focus progressively on the limiting pairwise contacts. A deterministic final active-pair polishing stage directly reduces the true maximum squared inner product. Multiple seeded restarts retain reproducibility while selecting the best code found.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct 14 antipodal points in R^3 from an optimized packing of
+    seven unoriented lines on the unit sphere.
+
+    For an antipodal configuration the maximum distance is exactly 2.
+    Thus maximizing the requested distance ratio is equivalent to
+    minimizing the largest absolute inner product between distinct lines.
+    """
+    rng = np.random.default_rng(314159)
+    n_lines = 7
+    best_vectors = None
+    best_coherence = np.inf
+
+    # Continuation from a broad repulsive energy to a close approximation
+    # of the maximum pairwise squared inner product.
+    betas = (8.0, 16.0, 32.0, 64.0, 128.0, 240.0)
+    stage_steps = (190, 220, 250, 290, 330, 380)
+
+    for restart in range(20):
+        vectors = rng.normal(size=(n_lines, 3))
+        vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+
+        velocity = np.zeros_like(vectors)
+
+        for beta, iterations in zip(betas, stage_steps):
+            for iteration in range(iterations):
+                dots = vectors @ vectors.T
+                values = dots * dots
+                np.fill_diagonal(values, -np.inf)
+
+                maximum = np.max(values)
+                weights = np.exp(beta * (values - maximum))
+                np.fill_diagonal(weights, 0.0)
+                weights /= np.sum(weights)
+
+                # Derivative of the soft maximum of squared inner products.
+                gradient = 4.0 * ((weights * dots) @ vectors)
+                gradient -= (
+                    np.sum(gradient * vectors, axis=1, keepdims=True) * vectors
+                )
+
+                progress = iteration / max(1, iterations - 1)
+                learning_rate = 0.115 * (1.0 - 0.55 * progress)
+                velocity = 0.72 * velocity - learning_rate * gradient
+                vectors += velocity
+                vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+
+        # Active-contact minimax polishing.  At this point only pairs close
+        # to the true limiting coherence receive appreciable force.
+        step = 0.035
+        for iteration in range(850):
+            dots = vectors @ vectors.T
+            values = dots * dots
+            np.fill_diagonal(values, -np.inf)
+            old_maximum = np.max(values)
+
+            beta = 420.0
+            weights = np.exp(beta * (values - old_maximum))
+            np.fill_diagonal(weights, 0.0)
+            weights /= np.sum(weights)
+
+            gradient = 4.0 * ((weights * dots) @ vectors)
+            gradient -= (
+                np.sum(gradient * vectors, axis=1, keepdims=True) * vectors
+            )
+
+            candidate = vectors - step * gradient
+            candidate /= np.linalg.norm(candidate, axis=1, keepdims=True)
+
+            candidate_dots = candidate @ candidate.T
+            candidate_values = candidate_dots * candidate_dots
+            np.fill_diagonal(candidate_values, -np.inf)
+            candidate_maximum = np.max(candidate_values)
+
+            if candidate_maximum <= old_maximum:
+                vectors = candidate
+                step = min(0.055, step * 1.012)
+            else:
+                step *= 0.55
+                if step < 1.0e-7:
+                    break
+
+        coherence_matrix = np.abs(vectors @ vectors.T)
+        np.fill_diagonal(coherence_matrix, 0.0)
+        coherence = np.max(coherence_matrix)
+
+        if coherence < best_coherence:
+            best_coherence = coherence
+            best_vectors = vectors.copy()
+
+    return np.vstack((best_vectors, -best_vectors))
+
+
+# EVOLVE-BLOCK-END
+```

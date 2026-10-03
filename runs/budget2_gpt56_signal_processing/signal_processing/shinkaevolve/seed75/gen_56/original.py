@@ -1,0 +1,432 @@
+# EVOLVE-BLOCK-START
+"""
+Reliable dual-scale adaptive signal filter for volatile non-stationary series.
+
+Enhanced mode combines robust causal alpha-beta tracking, adaptive noise
+estimation, reliability-weighted fast/slow slope consensus, bounded predictive
+lead, and confirmed directional hysteresis. Outputs are causally aligned to the
+newest sample of every trailing window.
+"""
+from collections import deque
+import numpy as np
+
+
+class _ConfirmedDualScaleTracker:
+    """Robust low-lag causal tracker with impulse-resistant turn confirmation."""
+
+    def __init__(self, window_size):
+        self.window_size = max(3, int(window_size))
+        self.fast_span = max(4, min(9, self.window_size))
+
+        self.level = None
+        self.slope = 0.0
+        self.fast_slope = 0.0
+        self.slow_slope = 0.0
+        self.last_sample = None
+        self.last_output = None
+
+        self.noise_scale = None
+        self.fast_noise_scale = None
+        self.slow_noise_scale = None
+        self.differences = deque(maxlen=self.window_size)
+
+        self.output_direction = 0.0
+        self.pending_direction = 0.0
+        self.pending_count = 0
+        self.confirmation_energy = 0.0
+
+    @staticmethod
+    def _difference_scale(values):
+        """Robust observation-noise scale estimated from first differences."""
+        if len(values) < 3:
+            return None
+
+        values = np.asarray(values, dtype=float)
+        median = np.median(values)
+        deviation = np.abs(values - median)
+        mad_scale = np.median(deviation) / (0.67448975 * np.sqrt(2.0))
+
+        # A trimmed RMS supplies a stable scale for quantized signals where
+        # the MAD may collapse to zero.
+        cutoff = np.percentile(deviation, 78)
+        trimmed = deviation[deviation <= cutoff]
+        if trimmed.size:
+            rms_scale = np.sqrt(np.mean(trimmed * trimmed)) / np.sqrt(2.0)
+            mad_scale = max(mad_scale, 0.42 * rms_scale)
+
+        return float(max(mad_scale, 1e-6))
+
+    def _update_noise(self):
+        slow = self._difference_scale(self.differences)
+        if slow is None:
+            return
+
+        values = list(self.differences)
+        fast = (
+            self._difference_scale(values[-self.fast_span:])
+            if len(values) >= self.fast_span
+            else slow
+        )
+        fast = float(np.clip(fast, 0.48 * slow, 2.50 * slow))
+
+        self.fast_noise_scale = fast
+        self.slow_noise_scale = slow
+        target = 0.60 * fast + 0.40 * slow
+
+        if self.noise_scale is None:
+            self.noise_scale = target
+        else:
+            # Expand reasonably quickly in sustained volatile regions, but
+            # decay slowly to prevent one quiet interval causing oversensitivity.
+            rate = 0.082 if target > self.noise_scale else 0.026
+            self.noise_scale = max(
+                1e-6, (1.0 - rate) * self.noise_scale + rate * target
+            )
+
+    def update(self, sample):
+        """Consume one finite sample and return a causal filtered estimate."""
+        sample = float(sample)
+
+        if self.level is None:
+            self.level = sample
+            self.last_sample = sample
+            self.last_output = sample
+            self.noise_scale = max(abs(sample) * 0.025, 0.03, 1e-6)
+            return sample
+
+        raw_difference = sample - self.last_sample
+        self.last_sample = sample
+        self.differences.append(raw_difference)
+        self._update_noise()
+
+        sigma = max(float(self.noise_scale), 1e-6)
+        fast_scale = max(float(self.fast_noise_scale or sigma), 1e-6)
+        slow_scale = max(float(self.slow_noise_scale or sigma), 1e-6)
+
+        predicted = self.level + self.slope
+        raw_innovation = sample - predicted
+        clip_limit = max(3.25 * sigma, 1e-6)
+        innovation = float(np.clip(raw_innovation, -clip_limit, clip_limit))
+
+        normalized = abs(innovation) / sigma
+
+        # Downweight endpoint impulses. A large innovation is useful when the
+        # derivative model agrees, but is suspicious when it opposes both
+        # slope estimates.
+        derivative_direction = np.sign(0.55 * self.fast_slope + 0.45 * self.slow_slope)
+        innovation_direction = np.sign(innovation)
+        opposition = (
+            derivative_direction != 0.0
+            and innovation_direction != 0.0
+            and derivative_direction != innovation_direction
+        )
+        impulse_reliability = 1.0 / (1.0 + max(0.0, normalized - 2.0))
+        if opposition:
+            impulse_reliability *= 0.78
+
+        response = normalized / (normalized + 2.55)
+        response *= 0.62 + 0.38 * impulse_reliability
+
+        alpha = 0.070 + 0.365 * response
+        beta = 0.0022 + 0.064 * response * response
+
+        self.level = predicted + alpha * innovation
+        self.slope = (1.0 - beta) * self.slope + beta * innovation
+
+        # Short derivative detects genuine turns promptly; long derivative
+        # controls false reversals during noisy local counter-moves.
+        self.fast_slope = 0.76 * self.fast_slope + 0.24 * raw_difference
+        self.slow_slope = 0.935 * self.slow_slope + 0.065 * raw_difference
+
+        volatility_ratio = fast_scale / slow_scale
+        volatility_reliability = 1.0 / (1.0 + max(0.0, volatility_ratio - 1.0))
+
+        endpoint_residual = abs(raw_difference - self.fast_slope) / sigma
+        endpoint_reliability = 1.0 / (
+            1.0 + max(0.0, endpoint_residual / 2.15 - 1.0)
+        )
+
+        slope_activity = min(1.0, abs(self.fast_slope) / (1.35 * sigma))
+
+        # Fast influence requires all three: meaningful activity, stable local
+        # scale, and a newest sample consistent with the short derivative.
+        fast_weight = 0.24 + (
+            0.34
+            * slope_activity
+            * volatility_reliability
+            * endpoint_reliability
+        )
+        fast_weight = float(np.clip(fast_weight, 0.20, 0.53))
+
+        consensus_slope = (
+            fast_weight * self.fast_slope
+            + (1.0 - fast_weight) * self.slow_slope
+        )
+        model_slope = 0.56 * self.slope + 0.44 * consensus_slope
+
+        coherence = min(
+            1.0,
+            abs(consensus_slope) / (1.25 * sigma)
+        ) * volatility_reliability * endpoint_reliability
+
+        # Predictive lead compensates filter delay only where slope evidence is
+        # coherent. During impulse-like motion it naturally falls toward zero.
+        lead_gain = 0.16 + 0.18 * coherence
+        lead_limit = max(0.92 * sigma, 0.72 * abs(model_slope), 1e-8)
+        lead = float(np.clip(lead_gain * model_slope, -lead_limit, lead_limit))
+        candidate = self.level + lead
+
+        delta = candidate - self.last_output
+        direction = float(np.sign(delta))
+        if direction == 0.0:
+            return self.last_output
+
+        small_band = max(0.40 * sigma, 1e-7)
+        immediate_band = max(1.16 * sigma, 1e-7)
+
+        if self.output_direction == 0.0 or direction == self.output_direction:
+            self.output_direction = direction
+            self.pending_direction = 0.0
+            self.pending_count = 0
+            self.confirmation_energy = 0.0
+            self.last_output = candidate
+            return self.last_output
+
+        fast_sign = np.sign(self.fast_slope)
+        slow_sign = np.sign(self.slow_slope)
+        consensus_sign = np.sign(consensus_slope)
+        strength = abs(consensus_slope) / sigma
+
+        both_models_agree = fast_sign == direction and slow_sign == direction
+        strong_consensus = consensus_sign == direction and strength >= 0.92
+        model_confirmed = both_models_agree or strong_consensus
+
+        if abs(delta) <= small_band:
+            self.pending_direction = 0.0
+            self.pending_count = 0
+            self.confirmation_energy *= 0.55
+            return self.last_output
+
+        if direction == self.pending_direction:
+            self.pending_count += 1
+            self.confirmation_energy += abs(delta) / sigma
+        else:
+            self.pending_direction = direction
+            self.pending_count = 1
+            self.confirmation_energy = abs(delta) / sigma
+
+        immediate = (
+            abs(delta) >= immediate_band
+            and model_confirmed
+            and endpoint_reliability >= 0.45
+        )
+        decisive = (
+            abs(delta) >= 1.85 * sigma
+            and consensus_sign == direction
+            and strength >= 1.15
+        )
+
+        required = 2 if both_models_agree else (3 if strong_consensus else 4)
+        accumulated_confirmation = self.confirmation_energy >= (
+            1.85 if model_confirmed else 3.10
+        )
+
+        if immediate or decisive or (
+            self.pending_count >= required and accumulated_confirmation
+        ):
+            self.output_direction = direction
+            self.pending_direction = 0.0
+            self.pending_count = 0
+            self.confirmation_energy = 0.0
+            self.last_output = candidate
+
+        return self.last_output
+
+
+class _SignalProcessingPipeline:
+    """Validation and execution coordinator preserving the original API."""
+
+    def __init__(self, window_size, mode):
+        self.window_size = int(window_size)
+        self.mode = mode
+
+    @staticmethod
+    def _as_signal_array(x):
+        signal = np.asarray(x, dtype=float)
+        if signal.ndim != 1:
+            raise ValueError("Input signal must be a 1D array of real-valued samples")
+        return signal
+
+    def validate(self, x):
+        signal = self._as_signal_array(x)
+        if self.window_size <= 0:
+            raise ValueError("window_size must be a positive integer")
+        if len(signal) < self.window_size:
+            raise ValueError(
+                f"Input signal length ({len(signal)}) must be >= "
+                f"window_size ({self.window_size})"
+            )
+        return signal
+
+    def run_basic(self, signal):
+        cumulative = np.concatenate(([0.0], np.cumsum(signal, dtype=float)))
+        return (
+            cumulative[self.window_size:] - cumulative[:-self.window_size]
+        ) / self.window_size
+
+    def run_enhanced(self, signal):
+        tracker = _ConfirmedDualScaleTracker(self.window_size)
+        estimates = np.empty(signal.size, dtype=float)
+        last_valid = 0.0
+
+        for index, value in enumerate(signal):
+            if np.isfinite(value):
+                last_valid = float(value)
+            estimates[index] = tracker.update(last_valid)
+
+        return estimates[self.window_size - 1:]
+
+    def run(self, x):
+        signal = self.validate(x)
+        if self.mode == "enhanced":
+            return self.run_enhanced(signal)
+        return self.run_basic(signal)
+
+
+def adaptive_filter(x, window_size=20):
+    """Basic trailing moving-average filter."""
+    return _SignalProcessingPipeline(window_size, "basic").run(x)
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """Robust causal low-lag trend-preserving adaptive filter."""
+    return _SignalProcessingPipeline(window_size, "enhanced").run(x)
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """Apply enhanced adaptive filtering or the basic trailing average."""
+    mode = "enhanced" if algorithm_type == "enhanced" else "basic"
+    return _SignalProcessingPipeline(window_size, mode).run(input_signal)
+
+
+# EVOLVE-BLOCK-END
+
+
+def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+    """
+    Generate synthetic test signal with known characteristics.
+
+    Args:
+        length: Length of the signal
+        noise_level: Standard deviation of noise to add
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (noisy_signal, clean_signal)
+    """
+    np.random.seed(seed)
+    t = np.linspace(0, 10, length)
+
+    # Create a complex signal with multiple components
+    clean_signal = (
+        2 * np.sin(2 * np.pi * 0.5 * t)  # Low frequency component
+        + 1.5 * np.sin(2 * np.pi * 2 * t)  # Medium frequency component
+        + 0.5 * np.sin(2 * np.pi * 5 * t)  # Higher frequency component
+        + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)  # Decaying oscillation
+    )
+
+    # Add non-stationary behavior
+    trend = 0.1 * t * np.sin(0.2 * t)  # Slowly varying trend
+    clean_signal += trend
+
+    # Add random walk component for non-stationarity
+    random_walk = np.cumsum(np.random.randn(length) * 0.05)
+    clean_signal += random_walk
+
+    # Add noise
+    noise = np.random.normal(0, noise_level, length)
+    noisy_signal = clean_signal + noise
+
+    return noisy_signal, clean_signal
+
+
+def run_signal_processing(noisy_signal=None, signal_length=1000, noise_level=0.3, window_size=20):
+    """
+    Run the signal processing algorithm on a test signal.
+
+    Args:
+        noisy_signal: Input signal to filter (if provided, use this; otherwise generate)
+        signal_length: Length if generating signal (for backward compatibility)
+        noise_level: Noise level if generating signal (for backward compatibility)
+        window_size: Window size for processing
+
+    Returns:
+        Dictionary containing results and metrics
+    """
+    # Use provided signal or generate test signal (for backward compatibility)
+    if noisy_signal is not None:
+        # Filter the provided signal
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+        clean_signal = None  # Not available when using provided signal
+    else:
+        # Generate test signal (for __main__ and backward compatibility)
+        noisy_signal, clean_signal = generate_test_signal(signal_length, noise_level)
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+
+    # Calculate basic metrics (only if we have clean_signal from generation)
+    if len(filtered_signal) > 0 and clean_signal is not None:
+        # Align signals for comparison (account for processing delay)
+        delay = window_size - 1
+        aligned_clean = clean_signal[delay:]
+        aligned_noisy = noisy_signal[delay:]
+
+        # Ensure same length
+        min_length = min(len(filtered_signal), len(aligned_clean))
+        filtered_signal = filtered_signal[:min_length]
+        aligned_clean = aligned_clean[:min_length]
+        aligned_noisy = aligned_noisy[:min_length]
+
+        # Calculate correlation with clean signal
+        correlation = np.corrcoef(filtered_signal, aligned_clean)[0, 1] if min_length > 1 else 0
+
+        # Calculate noise reduction
+        noise_before = np.var(aligned_noisy - aligned_clean)
+        noise_after = np.var(filtered_signal - aligned_clean)
+        noise_reduction = (noise_before - noise_after) / noise_before if noise_before > 0 else 0
+
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": aligned_clean,
+            "noisy_signal": aligned_noisy,
+            "correlation": correlation,
+            "noise_reduction": noise_reduction,
+            "signal_length": min_length,
+        }
+    elif len(filtered_signal) > 0:
+        # When using provided signal (no clean_signal available), just return filtered signal
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": None,
+            "noisy_signal": None,
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": len(filtered_signal),
+        }
+    else:
+        return {
+            "filtered_signal": [],
+            "clean_signal": [],
+            "noisy_signal": [],
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": 0,
+        }
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    results = run_signal_processing()
+    print("Signal processing completed!")
+    print(f"Correlation with clean signal: {results['correlation']:.3f}")
+    print(f"Noise reduction: {results['noise_reduction']:.3f}")
+    print(f"Processed signal length: {results['signal_length']}")

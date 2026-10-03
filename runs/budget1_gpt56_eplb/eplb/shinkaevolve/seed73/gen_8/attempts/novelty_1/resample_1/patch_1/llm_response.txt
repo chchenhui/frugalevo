@@ -1,0 +1,123 @@
+<NAME>
+incremental_replica_selection
+</NAME>
+
+<DESCRIPTION>
+Avoid recomputing the full `weight / logcnt` matrix for every added replica. The greedy replication policy only changes the per-replica load of the selected logical expert in each layer, so maintain that value incrementally. This preserves the exact expert selection and replica ranks of the existing algorithm while reducing replication from O(num_redundant * layers * num_logical_experts) division work to O(num_redundant * layers) updates plus the required reductions.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+=======
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+
+    # Only the selected expert's effective per-replica load changes after an
+    # allocation. Maintaining it incrementally avoids materializing a full
+    # weight / logcnt tensor for every redundant physical slot.
+    replica_load = weight.clone()
+    for i in range(num_log, num_phy):
+        redundant_indices = replica_load.max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        previous_count = logcnt[arangen, redundant_indices]
+        rank[:, i] = previous_count
+        logcnt[arangen, redundant_indices] = previous_count + 1
+        replica_load[arangen, redundant_indices] = (
+            weight[arangen, redundant_indices] / (previous_count + 1))
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+all_pack_exchange_refinement
+</NAME>
+
+<DESCRIPTION>
+The current refinement considers swaps only between the single heaviest and lightest packs. A cardinality-constrained packing can instead be improved by exchanging items between the heaviest pack and another moderately loaded pack, or between a non-extreme pair whose exchange reduces the global maximum. Evaluate the same one-swap neighborhood across all pack pairs and accept the best strict maximum-load improvement. This retains fixed physical-slot cardinality and permutation validity, while substantially improving the quality of the greedy LPT placement for GPU packing.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # A greedy cardinality-constrained LPT packing can leave a beneficial
+        # exchange between its extremes. Test that small neighborhood once and
+        # accept only a strict reduction of the maximum pack load.
+        if num_packs > 1:
+            heavy = max(range(num_packs), key=pack_weights.__getitem__)
+            light = min(range(num_packs), key=pack_weights.__getitem__)
+            current_max = max(pack_weights)
+            other_max = max(
+                (pack_weights[p] for p in range(num_packs)
+                 if p != heavy and p != light),
+                default=float("-inf"),
+            )
+            best_max = current_max
+            best_swap = None
+            for heavy_group, heavy_rank, heavy_weight in members[heavy]:
+                for light_group, light_rank, light_weight in members[light]:
+                    new_heavy = pack_weights[heavy] - heavy_weight + light_weight
+                    new_light = pack_weights[light] - light_weight + heavy_weight
+                    candidate_max = max(other_max, new_heavy, new_light)
+                    if candidate_max < best_max:
+                        best_max = candidate_max
+                        best_swap = (heavy_group, heavy_rank, light_group,
+                                     light_rank, new_heavy, new_light)
+
+            if best_swap is not None:
+                (heavy_group, heavy_rank, light_group, light_rank, new_heavy,
+                 new_light) = best_swap
+                # Exchange both slot ranks as well as pack IDs, retaining a
+                # valid one-item-per-physical-slot permutation.
+                pack_index[i, heavy_group] = light
+                rank_in_pack[i, heavy_group] = light_rank
+                pack_index[i, light_group] = heavy
+                rank_in_pack[i, light_group] = heavy_rank
+                pack_weights[heavy] = new_heavy
+                pack_weights[light] = new_light
+=======
+        # Refine greedy LPT with the best cardinality-preserving one-item
+        # exchange. Considering every pair catches improvements that do not
+        # involve the globally lightest pack.
+        if num_packs > 1:
+            current_max = max(pack_weights)
+            best_max = current_max
+            best_swap = None
+            for first in range(num_packs - 1):
+                for second in range(first + 1, num_packs):
+                    other_max = max(
+                        (pack_weights[p] for p in range(num_packs)
+                         if p != first and p != second),
+                        default=float("-inf"),
+                    )
+                    for first_group, first_rank, first_weight in members[first]:
+                        for second_group, second_rank, second_weight in members[
+                                second]:
+                            new_first = (pack_weights[first] - first_weight +
+                                         second_weight)
+                            new_second = (pack_weights[second] - second_weight +
+                                          first_weight)
+                            candidate_max = max(other_max, new_first, new_second)
+                            if candidate_max < best_max:
+                                best_max = candidate_max
+                                best_swap = (first, first_group, first_rank,
+                                             second, second_group, second_rank,
+                                             new_first, new_second)
+
+            if best_swap is not None:
+                (first, first_group, first_rank, second, second_group,
+                 second_rank, new_first, new_second) = best_swap
+                # Exchange both slot ranks and pack IDs, retaining a valid
+                # one-item-per-physical-slot permutation.
+                pack_index[i, first_group] = second
+                rank_in_pack[i, first_group] = second_rank
+                pack_index[i, second_group] = first
+                rank_in_pack[i, second_group] = first_rank
+                pack_weights[first] = new_first
+                pack_weights[second] = new_second
+>>>>>>> REPLACE
+</DIFF>

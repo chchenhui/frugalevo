@@ -1,0 +1,165 @@
+<NAME>
+full_greedy_plus_local_search
+</NAME>
+<DESCRIPTION>
+Two improvements confined to the editable block: (1) full greedy — at each step evaluate ALL remaining transactions with the true makespan cost instead of a random sample of 6, making each greedy decision fully informed; (2) local search — after each greedy construction, apply random relocation/swap moves that reduce makespan until no improvement, repeated with randomized restarts under a time budget. Since `import time` cannot be added outside the block, it is imported inside the function.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    def get_greedy_cost_sampled(num_samples, sample_rate):
+        # greedy with random starting point
+        start_txn = random.randint(0, workload.num_txns - 1)
+        txn_seq = [start_txn]
+        remaining_txns = [x for x in range(0, workload.num_txns)]
+        remaining_txns.remove(start_txn)
+        running_cost = workload.txns[start_txn][0][3]
+        # min_costs = []
+        # key_map, total_cost = workload.get_incremental_seq_cost(start_txn, {}, 0)
+        for i in range(0, workload.num_txns - 1):
+            min_cost = 100000 # MAX
+            min_relative_cost = 10
+            min_txn = -1
+            # min_index = 0
+            holdout_txns = []
+            done = False
+            key_maps = []
+
+            sample = random.random()
+            if sample > sample_rate:
+                idx = random.randint(0, len(remaining_txns) - 1)
+                t = remaining_txns[idx]
+                txn_seq.append(t)
+                remaining_txns.pop(idx)
+                continue
+
+            for j in range(0, num_samples):
+                idx = 0
+                if len(remaining_txns) > 1:
+                    idx = random.randint(0, len(remaining_txns) - 1)
+                else:
+                    done = True
+                t = remaining_txns[idx]
+                holdout_txns.append(remaining_txns.pop(idx))
+                if workload.debug:
+                    print(remaining_txns, holdout_txns)
+                txn_len = workload.txns[t][0][3]
+                test_seq = txn_seq.copy()
+                test_seq.append(t)
+                cost = 0
+                cost = workload.get_opt_seq_cost(test_seq)
+                if cost < min_cost:
+                # if relative_cost < min_relative_cost:
+                    min_cost = cost
+                    min_txn = t
+                    # min_relative_cost = relative_cost
+                    # min_index = j
+                if done:
+                    break
+            assert(min_txn != -1)
+            running_cost = min_cost
+            txn_seq.append(min_txn)
+            holdout_txns.remove(min_txn)
+            remaining_txns.extend(holdout_txns)
+
+            if workload.debug:
+                print("min: ", min_txn, remaining_txns, holdout_txns, txn_seq)
+        if workload.debug:
+            print(txn_seq)
+            print(len(set(txn_seq)))
+        assert len(set(txn_seq)) == workload.num_txns
+        # print(txn_seq)
+
+        overall_cost = workload.get_opt_seq_cost(txn_seq)
+
+        return overall_cost, txn_seq
+
+    best_cost = None
+    best_seq = None
+    # Best-of-N randomized greedy restarts: each restart uses a random
+    # starting transaction and partial sampling for diversity. Keeping the
+    # best schedule found across all restarts substantially lowers makespan
+    # compared to a single greedy pass.
+    num_restarts = 40
+    for _ in range(num_restarts):
+        cost, seq = get_greedy_cost_sampled(6, 0.85)
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            best_seq = seq
+    return best_cost, best_seq
+=======
+    import time
+
+    def get_full_greedy(perturb_rate):
+        # Full greedy: at each step evaluate ALL remaining transactions
+        # with the true makespan cost and append the cheapest one.
+        start_txn = random.randint(0, workload.num_txns - 1)
+        txn_seq = [start_txn]
+        remaining_txns = [x for x in range(0, workload.num_txns)
+                          if x != start_txn]
+        while remaining_txns:
+            min_cost = None
+            min_txn = -1
+            # occasionally accept a random (non-best) candidate to
+            # diversify across restarts
+            if random.random() < perturb_rate:
+                idx = random.randint(0, len(remaining_txns) - 1)
+                min_txn = remaining_txns[idx]
+                test_seq = txn_seq + [min_txn]
+                min_cost = workload.get_opt_seq_cost(test_seq)
+            else:
+                for t in remaining_txns:
+                    test_seq = txn_seq + [t]
+                    cost = workload.get_opt_seq_cost(test_seq)
+                    if min_cost is None or cost < min_cost:
+                        min_cost = cost
+                        min_txn = t
+            txn_seq.append(min_txn)
+            remaining_txns.remove(min_txn)
+        assert len(set(txn_seq)) == workload.num_txns
+        return workload.get_opt_seq_cost(txn_seq), txn_seq
+
+    def local_search(seq, cost, deadline, max_moves_per_pass=200):
+        # Relocation + swap local search on the full-sequence cost.
+        n = workload.num_txns
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            moves = []
+            for _ in range(min(max_moves_per_pass, n * 2)):
+                i = random.randint(0, n - 1)
+                j = random.randint(0, n - 1)
+                if i != j:
+                    moves.append((i, j))
+            for i, j in moves:
+                if time.time() >= deadline:
+                    break
+                cand = seq[:]
+                if random.random() < 0.5:
+                    # relocation: move txn at i to position j
+                    t = cand.pop(i)
+                    cand.insert(j, t)
+                else:
+                    # swap positions i and j
+                    cand[i], cand[j] = cand[j], cand[i]
+                c = workload.get_opt_seq_cost(cand)
+                if c < cost:
+                    seq = cand
+                    cost = c
+                    improved = True
+        return cost, seq
+
+    time_budget = 20.0  # seconds per workload
+    deadline = time.time() + time_budget
+    best_cost = None
+    best_seq = None
+    # Greedy construction followed by local search, repeated with
+    # randomized restarts under a time budget.
+    while time.time() < deadline:
+        cost, seq = get_full_greedy(0.05)
+        cost, seq = local_search(seq, cost, deadline)
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            best_seq = seq
+    return best_cost, best_seq
+>>>>>>> REPLACE
+</DIFF>

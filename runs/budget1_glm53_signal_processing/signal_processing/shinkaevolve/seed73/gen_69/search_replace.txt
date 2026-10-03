@@ -1,0 +1,108 @@
+<NAME>
+fix_despike_and_two_scale_sg
+
+</NAME>
+<DESCRIPTION>
+The current program has a structural defect: `_impulse_despike` was accidentally nested *inside* `adaptive_filter`, so it is not reachable at module level (a latent NameError path), and `adaptive_filter` retains an O(n·W) Python loop. Fix 1 relocates the despike to module scope and vectorizes the baseline moving average via cumsum.
+
+Fix 2 targets the two weakest metrics — noise_reduction (0.33) and slope_changes (42.6) — without touching the validated five-stage structure or the (window, tilt) output convention: (a) cap the Kalman adaptive process-noise multiplier at 4x (the champion's cap, which reduced slope changes), and (b) add a second, coarser zero-phase Savitzky-Golay pass (order 2, odd window, length-clamped with the same defensive edge clamps that kept the champion's 100% validation rate). SG is zero-phase, so extra smoothing costs no lag error, but it directly increases noise reduction and fewer residual slope reversals.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Initialize output array
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+
+def _impulse_despike(xf, strength=0.5, factor=2.0):
+    """
+    Stage 0: remove impulse-like, noise-sized outliers via a 5-tap running
+    median with robust MAD thresholding. Purely additive preprocessing;
+    edge-clamped padding keeps short inputs safe.
+    """
+    n = len(xf)
+    if n < 5:
+        return xf
+    dx = np.diff(xf)
+    sig_x = 1.4826 * np.median(np.abs(dx - np.median(dx))) + 1e-12
+    pad = np.concatenate((xf[:2][::-1], xf, xf[-2:][::-1]))
+    stacked = np.stack([pad[0:n], pad[1:n + 1], pad[2:n + 2],
+                        pad[3:n + 3], pad[4:n + 4]])
+    med5 = np.median(stacked, axis=0)
+    dev = np.abs(xf - med5)
+    snap_mask = dev < factor * sig_x
+    out = xf.copy()
+    out[snap_mask] = (1 - strength) * out[snap_mask] + strength * med5[snap_mask]
+    return out
+
+    # Simple moving average as baseline
+    for i in range(output_length):
+        window = x[i : i + window_size]
+
+        # Basic moving average filter
+        y[i] = np.mean(window)
+
+    return y
+=======
+    # Vectorized moving average via cumulative sum (O(n), no Python loop)
+    xf = np.asarray(x, dtype=float)
+    c = np.cumsum(xf)
+    y = (c[window_size - 1:] - np.concatenate(([0.0], c[:-window_size]))) / window_size
+    return y
+
+
+def _impulse_despike(xf, strength=0.5, factor=2.0):
+    """
+    Stage 0: remove impulse-like, noise-sized outliers via a 5-tap running
+    median with robust MAD thresholding. Purely additive preprocessing;
+    edge-clamped padding keeps short inputs safe.
+    """
+    n = len(xf)
+    if n < 5:
+        return xf
+    dx = np.diff(xf)
+    sig_x = 1.4826 * np.median(np.abs(dx - np.median(dx))) + 1e-12
+    pad = np.concatenate((xf[:2][::-1], xf, xf[-2:][::-1]))
+    stacked = np.stack([pad[0:n], pad[1:n + 1], pad[2:n + 2],
+                        pad[3:n + 3], pad[4:n + 4]])
+    med5 = np.median(stacked, axis=0)
+    dev = np.abs(xf - med5)
+    snap_mask = dev < factor * sig_x
+    out = xf.copy()
+    out[snap_mask] = (1 - strength) * out[snap_mask] + strength * med5[snap_mask]
+    return out
+>>>>>>> REPLACE
+=======
+<<<<<<< SEARCH
+        # Adapt process noise: small NIS -> smooth; large NIS -> responsive
+        q_scale = q_base * (1.0 + 10.0 * min(nis, 50.0) / 10.0)
+=======
+        # Adapt process noise: small NIS -> smooth; large NIS -> responsive.
+        # Cap the multiplier at 4x so large NIS (often noise-driven) cannot
+        # inject excessive process noise and cause spurious slope churn.
+        q_scale = q_base * min(1.0 + 3.0 * min(nis, 50.0) / 10.0, 4.0)
+>>>>>>> REPLACE
+=======
+<<<<<<< SEARCH
+    x_smooth = savgol_filter(x_kalman, sg_window, poly_order)
+
+    # Keep the same output convention as the sliding-window version,
+=======
+    x_smooth = savgol_filter(x_kalman, sg_window, poly_order)
+
+    # --- Stage 2b: second coarser zero-phase SG pass (order 2) ---
+    # Additional noise attenuation with no phase delay. Defensive clamps:
+    # odd length, never exceeding the signal length, never above poly order.
+    n_k = len(x_kalman)
+    sg2 = 2 * sg_window - 1  # odd since sg_window is odd
+    if sg2 > n_k:
+        sg2 = n_k if n_k % 2 == 1 else n_k - 1
+    if sg2 < 5:
+        sg2 = 5
+    if sg2 >= sg_window + 2 and sg2 < n_k:
+        x_smooth = savgol_filter(x_smooth, sg2, min(2, sg2 - 1))
+
+    # Keep the same output convention as the sliding-window version,
+>>>>>>> REPLACE
+</DIFF>

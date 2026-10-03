@@ -1,0 +1,151 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _normalize_rows(points: np.ndarray) -> np.ndarray:
+    """Normalize the final coordinate axis of a point batch."""
+    norms = np.linalg.norm(points, axis=-1, keepdims=True)
+    return points / np.maximum(norms, 1e-15)
+
+
+def _icosahedral_lines() -> np.ndarray:
+    """
+    Return six mutually well-separated unoriented directions obtained from
+    opposite vertex pairs of a regular icosahedron.
+    """
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    return _normalize_rows(
+        np.array(
+            [
+                [0.0, 1.0, phi],
+                [0.0, 1.0, -phi],
+                [1.0, phi, 0.0],
+                [1.0, -phi, 0.0],
+                [phi, 0.0, 1.0],
+                [phi, 0.0, -1.0],
+            ],
+            dtype=float,
+        )
+    )
+
+
+def _coherence(directions: np.ndarray) -> np.ndarray:
+    """
+    Largest absolute inner product for each member of a batched collection
+    of seven-line configurations.
+    """
+    products = np.abs(np.matmul(directions, np.swapaxes(directions, -1, -2)))
+    diagonal = np.arange(products.shape[-1])
+    products[..., diagonal, diagonal] = 0.0
+    return np.max(products, axis=(-2, -1))
+
+
+def _softmax_repulsion(
+    directions: np.ndarray,
+    beta: float,
+) -> np.ndarray:
+    """
+    Tangential descent direction for a soft maximum of absolute inner
+    products.  A low coherence gives a large minimum antipodal distance.
+    """
+    dots = np.matmul(directions, np.swapaxes(directions, 1, 2))
+    absolute = np.abs(dots)
+
+    count = directions.shape[1]
+    diagonal = np.arange(count)
+    absolute[:, diagonal, diagonal] = -np.inf
+
+    logits = beta * absolute
+    logits -= np.max(logits, axis=(1, 2), keepdims=True)
+    weights = np.exp(logits)
+    weights[:, diagonal, diagonal] = 0.0
+    weights /= np.sum(weights, axis=(1, 2), keepdims=True)
+
+    signed_weights = weights * np.sign(dots)
+    gradient = np.matmul(signed_weights, directions)
+
+    # Optimization takes place on the product of seven unit spheres.
+    gradient -= (
+        np.sum(gradient * directions, axis=2, keepdims=True) * directions
+    )
+    return gradient
+
+
+def _initial_population(rng: np.random.Generator, population: int) -> np.ndarray:
+    """Build diversified, reproducible seven-direction starting states."""
+    candidates = _normalize_rows(rng.normal(size=(population, 7, 3)))
+
+    # Seed several nearby variants of the highly symmetric six-line code.
+    base = _icosahedral_lines()
+    for index in range(min(20, population)):
+        candidate = np.empty((7, 3), dtype=float)
+        candidate[:6] = base + 0.16 * rng.normal(size=(6, 3))
+        candidate[6] = rng.normal(size=3)
+        candidates[index] = _normalize_rows(candidate)
+
+    return candidates
+
+
+def _optimize_line_code() -> np.ndarray:
+    """
+    Batched deterministic minimax search for seven unoriented 3D lines.
+    The evaluator's fourteen points are their positive and negative ends.
+    """
+    rng = np.random.default_rng(19384721)
+    population = 96
+    directions = _initial_population(rng, population)
+    velocity = np.zeros_like(directions)
+
+    current = _coherence(directions)
+    best_index = int(np.argmin(current))
+    best = directions[best_index].copy()
+    best_value = float(current[best_index])
+
+    # Annealing shifts gradually from broad separation to the true
+    # max-coherence objective without relying on external optimizers.
+    phases = (
+        (9.0, 220, 0.100),
+        (22.0, 260, 0.070),
+        (55.0, 300, 0.043),
+        (130.0, 340, 0.026),
+        (300.0, 380, 0.014),
+    )
+
+    for beta, iterations, initial_step in phases:
+        for iteration in range(iterations):
+            gradient = _softmax_repulsion(directions, beta)
+            velocity = 0.62 * velocity - gradient
+
+            # Prevent a rare early active-pair imbalance from producing an
+            # unnecessarily large geodesic update.
+            speed = np.linalg.norm(velocity, axis=2, keepdims=True)
+            velocity *= np.minimum(1.0, 2.0 / np.maximum(speed, 1e-15))
+
+            fraction = iteration / max(iterations - 1, 1)
+            step = initial_step * (1.0 - 0.72 * fraction)
+            directions = _normalize_rows(directions + step * velocity)
+
+            if iteration % 8 == 0 or iteration == iterations - 1:
+                values = _coherence(directions)
+                index = int(np.argmin(values))
+                if values[index] < best_value:
+                    best_value = float(values[index])
+                    best = directions[index].copy()
+
+    return best
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct fourteen finite 3D points with antipodal symmetry.
+
+    Unit directions and their negatives have fixed maximum squared distance
+    four.  Therefore minimizing line coherence directly maximizes the
+    evaluator's minimum-squared-distance / maximum-squared-distance ratio.
+    """
+    directions = _optimize_line_code()
+    points = np.vstack((directions, -directions))
+    return np.asarray(points, dtype=float)
+
+
+# EVOLVE-BLOCK-END

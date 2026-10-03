@@ -1,0 +1,513 @@
+--- a/original.py
++++ b/original.py
+@@ -1,273 +1,287 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ _N = 11
+ _FREE = 8
+-_DIM = 16
+ _HEIGHT = np.sqrt(3.0) * 0.5
+-_CORNERS = np.array(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)), dtype=np.float64)
++
++# Affine simplex coordinates: (u, v) -> (u + v/2, height*v).
++_CORNERS = np.array(
++    [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
++    dtype=np.float64,
++)
++
+ _TRIPLES = np.array(
+-    [
+-        (i, j, k)
+-        for i in range(_N - 2)
+-        for j in range(i + 1, _N - 1)
+-        for k in range(j + 1, _N)
+-    ],
++    [(i, j, k)
++     for i in range(_N - 2)
++     for j in range(i + 1, _N - 1)
++     for k in range(j + 1, _N)],
+     dtype=np.intp,
+ )
+ 
+ 
+-def _project_simplex_batch(points: np.ndarray) -> np.ndarray:
+-    """Map affine coordinates into u >= 0, v >= 0, u + v <= 1."""
+-    result = np.abs(np.asarray(points, dtype=np.float64)).copy()
+-    total = result[..., 0] + result[..., 1]
+-    outside = total > 1.0
+-    if np.any(outside):
+-        result[outside] /= total[outside, None]
+-    return result
+-
+-
+-def _all_areas(population: np.ndarray) -> np.ndarray:
+-    """
+-    Areas normalized by the enclosing triangle area.
+-
+-    In affine simplex coordinates this is simply the absolute determinant.
+-    """
+-    count = population.shape[0]
+-    corners = np.broadcast_to(_CORNERS, (count, 3, 2))
+-    points = np.concatenate((corners, population), axis=1)
+-
+-    a = points[:, _TRIPLES[:, 0]]
+-    b = points[:, _TRIPLES[:, 1]]
+-    c = points[:, _TRIPLES[:, 2]]
+-
++def _project(x: np.ndarray) -> np.ndarray:
++    """Fold arbitrary planar coordinates deterministically into the simplex."""
++    y = np.abs(np.asarray(x, dtype=np.float64)).copy()
++    s = y[..., 0] + y[..., 1]
++    mask = s > 1.0
++    if np.any(mask):
++        y[mask] /= s[mask, None]
++    return y
++
++
++def _areas(states: np.ndarray) -> np.ndarray:
++    """All normalized triangle areas for a batch of eight-free-point states."""
++    m = states.shape[0]
++    pts = np.empty((m, _N, 2), dtype=np.float64)
++    pts[:, :3] = _CORNERS
++    pts[:, 3:] = states
++
++    a = pts[:, _TRIPLES[:, 0]]
++    b = pts[:, _TRIPLES[:, 1]]
++    c = pts[:, _TRIPLES[:, 2]]
+     return np.abs(
+         (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
+         - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
+     )
+ 
+ 
+-def _rank_values(population: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+-    """
+-    Return strict min areas and a lexicographic-style selection value.
+-
+-    The lower-tail statistic is deliberately scaled far below meaningful
+-    min-area changes, so it stabilizes the evolutionary search without
+-    sacrificing the primary objective.
+-    """
+-    areas = _all_areas(population)
+-    tail = np.partition(areas, 13, axis=1)[:, :14]
+-    minimum = tail[:, 0]
+-    support = np.mean(tail[:, 1:], axis=1)
+-    return minimum, minimum + 2.0e-5 * support
+-
+-
+-def _random_simplex(rng: np.random.Generator, count: int) -> np.ndarray:
+-    values = rng.random((count, _FREE, 2))
+-    over = values.sum(axis=2) > 1.0
+-    values[over] = 1.0 - values[over]
+-    return values
+-
+-
+-def _template_population(rng: np.random.Generator, count: int) -> np.ndarray:
+-    """
+-    Start from both a separated triangular pattern and unbiased simplex draws.
+-    Keeping a fixed point ordering is important for covariance adaptation.
+-    """
+-    template = np.array(
++def _quality(states: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++    """
++    Primary value is the actual bottleneck determinant.  The secondary value
++    balances its active set without ever outweighing a meaningful bottleneck
++    improvement.
++    """
++    ar = _areas(states)
++    low = np.partition(ar, 15, axis=1)[:, :16]
++    minimum = low[:, 0]
++    # Tail value is only a tie breaker, but remains useful to swarm movement.
++    value = minimum + 1.0e-5 * np.mean(low[:, 1:], axis=1)
++    return minimum, value
++
++
++def _better(new_min, new_aux, old_min, old_aux):
++    return (new_min > old_min + 1.0e-13) | (
++        (np.abs(new_min - old_min) <= 1.0e-13) & (new_aux > old_aux)
++    )
++
++
++def _initial_population(rng: np.random.Generator, size: int) -> np.ndarray:
++    """Use several combinatorially different support patterns."""
++    pop = rng.dirichlet((1.0, 1.0, 1.0), size=(size, _FREE))[:, :, 1:]
++
++    # A separated triangular pattern provides substantially better starts than
++    # entirely uniform samples.
++    lattice = np.array(
+         [
+-            [0.13, 0.075],
+-            [0.43, 0.060],
+-            [0.75, 0.075],
+-            [0.075, 0.335],
+-            [0.350, 0.255],
+-            [0.640, 0.240],
+-            [0.145, 0.610],
+-            [0.405, 0.445],
++            [0.125, 0.070], [0.405, 0.055], [0.735, 0.070],
++            [0.065, 0.330], [0.350, 0.245], [0.655, 0.230],
++            [0.135, 0.605], [0.410, 0.430],
+         ],
+         dtype=np.float64,
+     )
+-
+-    population = _random_simplex(rng, count)
+-    seeded = count * 3 // 4
+-    population[:seeded] = _project_simplex_batch(
+-        template[None, :, :] + rng.normal(0.0, 0.105, (seeded, _FREE, 2))
+-    )
+-    return population
+-
+-
+-def _elite_island(
+-    rng: np.random.Generator,
+-    population_size: int = 176,
+-    generations: int = 255,
+-) -> np.ndarray:
+-    """
+-    Covariance-adapting cross-entropy search in the full 16-dimensional
+-    configuration space.  It proposes coordinated displacement vectors rather
+-    than the independent single-point moves used by annealing.
+-    """
+-    population = _template_population(rng, population_size)
+-    minimum, score = _rank_values(population)
+-
+-    elite_count = 28
+-    keep_count = 12
+-    mean = population[0].reshape(_DIM).copy()
+-    covariance = np.eye(_DIM, dtype=np.float64) * 0.030
+-
+-    best = population[int(np.argmax(minimum))].copy()
+-    best_area = float(np.max(minimum))
+-
+-    for generation in range(generations):
+-        order = np.argsort(score)[::-1]
+-        elite = population[order[:elite_count]]
+-        elite_vectors = elite.reshape(elite_count, _DIM)
+-
+-        # Rank weighting reduces sensitivity to a single fortunate candidate.
+-        weights = np.log(elite_count + 0.75) - np.log(
+-            np.arange(1, elite_count + 1, dtype=np.float64)
++    count = size * 3 // 5
++    pop[:count] = _project(
++        lattice[None] + rng.normal(0.0, 0.105, size=(count, _FREE, 2))
++    )
++
++    # Explicit boundary-rich starts explore a qualitatively separate family.
++    edge_count = size // 6
++    for q in range(edge_count):
++        z = rng.dirichlet((1.2, 1.2, 1.2), size=_FREE)[:, 1:]
++        for j in range(4):
++            t = rng.uniform(0.08, 0.92)
++            edge = (j + q) % 3
++            if edge == 0:
++                z[j] = (t, 0.0)
++            elif edge == 1:
++                z[j] = (0.0, t)
++            else:
++                z[j] = (t, 1.0 - t)
++        pop[count + q] = z
++    return pop
++
++
++def _swarm_search(rng: np.random.Generator) -> np.ndarray:
++    """
++    Particle swarm optimization on complete configurations.
++
++    Unlike pointwise annealing, each particle carries a 16-dimensional
++    velocity, so it can cross bottlenecks requiring coupled motion of several
++    active points.
++    """
++    particles = 224
++    iterations = 690
++
++    x = _initial_population(rng, particles)
++    velocity = rng.normal(0.0, 0.025, size=x.shape)
++
++    pmin, paux = _quality(x)
++    personal = x.copy()
++
++    g = int(np.argmax(pmin))
++    global_best = x[g].copy()
++    global_min = float(pmin[g])
++    global_aux = float(paux[g])
++
++    for it in range(iterations):
++        f = it / float(iterations - 1)
++        inertia = 0.78 - 0.43 * f
++        cognitive = 1.32 - 0.26 * f
++        social = 0.72 + 1.22 * f
++
++        r1 = rng.random((particles, _FREE, 1))
++        r2 = rng.random((particles, _FREE, 1))
++        velocity = (
++            inertia * velocity
++            + cognitive * r1 * (personal - x)
++            + social * r2 * (global_best[None] - x)
+         )
+-        weights /= weights.sum()
+-
+-        new_mean = np.sum(elite_vectors * weights[:, None], axis=0)
+-        centered = elite_vectors - new_mean
+-        empirical = (centered * weights[:, None]).T @ centered
+-
+-        # A smoothed covariance retains exploratory directions while adapting
+-        # to the active geometric constraints.
+-        covariance = 0.62 * covariance + 0.38 * empirical
+-        covariance += np.eye(_DIM) * (2.0e-6 + 2.0e-5 * (1.0 - generation / generations))
+-        mean = 0.58 * mean + 0.42 * new_mean
+-
+-        try:
+-            samples = rng.multivariate_normal(
+-                mean, covariance, size=population_size - keep_count,
+-                method="cholesky",
++
++        # Early isotropic kicks retain diverse triangular order types.
++        kick = 0.019 * (1.0 - f) ** 1.5 + 0.00035
++        velocity += rng.normal(0.0, kick, size=velocity.shape)
++        x = _project(x + velocity)
++
++        cur_min, cur_aux = _quality(x)
++        take = _better(cur_min, cur_aux, pmin, paux)
++        personal[take] = x[take]
++        pmin[take] = cur_min[take]
++        paux[take] = cur_aux[take]
++
++        idx = int(np.argmax(pmin))
++        if (
++            pmin[idx] > global_min + 1.0e-13
++            or (
++                abs(pmin[idx] - global_min) <= 1.0e-13
++                and paux[idx] > global_aux
+             )
+-        except (np.linalg.LinAlgError, ValueError):
+-            covariance = np.eye(_DIM) * 0.008
+-            samples = rng.normal(0.0, 0.09, (population_size - keep_count, _DIM)) + mean
+-
+-        # Occasional broad samples keep an island from covariance collapse.
+-        broad = rng.random(samples.shape[0]) < 0.10
+-        if np.any(broad):
+-            samples[broad] += rng.normal(0.0, 0.075, (np.sum(broad), _DIM))
+-
+-        offspring = _project_simplex_batch(samples.reshape(-1, _FREE, 2))
+-        population = np.concatenate((elite[:keep_count], offspring), axis=0)
+-
+-        minimum, score = _rank_values(population)
+-        index = int(np.argmax(minimum))
+-        if minimum[index] > best_area:
+-            best_area = float(minimum[index])
+-            best = population[index].copy()
++        ):
++            global_best = personal[idx].copy()
++            global_min = float(pmin[idx])
++            global_aux = float(paux[idx])
++
++        # Rejuvenate persistently weak particles around both the archive and a
++        # broad simplex distribution.  This prevents a single swarm collapse.
++        if it % 46 == 45 and it < 570:
++            worst = np.argsort(pmin)[:particles // 9]
++            noise = rng.normal(0.0, 0.080 * (1.0 - f) + 0.014,
++                               size=(len(worst), _FREE, 2))
++            x[worst] = _project(global_best[None] + noise)
++            velocity[worst] = rng.normal(0.0, 0.035, size=velocity[worst].shape)
++
++    return global_best
++
++
++def _active_refine(rng: np.random.Generator, state: np.ndarray) -> np.ndarray:
++    """
++    Deterministic batched pattern search on points occurring in the currently
++    smallest constraints.  Late acceptance is genuinely lexicographic.
++    """
++    best = state.copy()
++    best_min, best_aux = _quality(best[None])
++    best_min = float(best_min[0])
++    best_aux = float(best_aux[0])
++
++    directions = np.array(
++        [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
++         [0.707, 0.707], [-0.707, 0.707],
++         [0.707, -0.707], [-0.707, -0.707]],
++        dtype=np.float64,
++    )
++
++    rounds = 480
++    batch = 144
++    for it in range(rounds):
++        frac = it / float(rounds - 1)
++        scale = 0.025 * (1.0 - frac) ** 1.85 + 0.00016
++
++        ar = _areas(best[None])[0]
++        active = np.argpartition(ar, 19)[:20]
++        involved = np.unique(_TRIPLES[active].ravel())
++        movable = involved[involved >= 3] - 3
++        if len(movable) == 0:
++            movable = np.arange(_FREE)
++
++        candidates = np.broadcast_to(best, (batch, _FREE, 2)).copy()
++
++        # Half directional coordinate trials, half coupled active-set trials.
++        for row in range(batch):
++            p = int(movable[row % len(movable)])
++            if row < 64:
++                d = directions[(row // len(movable)) % len(directions)]
++                candidates[row, p] += scale * d
++            else:
++                p2 = int(movable[rng.integers(len(movable))])
++                candidates[row, p] += rng.normal(0.0, scale, 2)
++                if p2 != p:
++                    candidates[row, p2] += rng.normal(0.0, 0.58 * scale, 2)
++                if row % 7 == 0:
++                    selected = rng.choice(movable, min(3, len(movable)), replace=False)
++                    candidates[row, selected] += rng.normal(
++                        0.0, 0.24 * scale, size=(len(selected), 2)
++                    )
++
++        candidates = _project(candidates)
++        cm, ca = _quality(candidates)
++
++        # Exact minimum is the dominant final ranking criterion.
++        order = np.lexsort((ca, cm))
++        winner = int(order[-1])
++        if (
++            cm[winner] > best_min + 1.0e-13
++            or (
++                abs(cm[winner] - best_min) <= 1.0e-13
++                and ca[winner] > best_aux
++            )
++        ):
++            best = candidates[winner].copy()
++            best_min = float(cm[winner])
++            best_aux = float(ca[winner])
+ 
+     return best
+ 
+ 
+-def _active_polish(
+-    rng: np.random.Generator,
+-    seed: np.ndarray,
+-    rounds: int = 440,
+-    batch_size: int = 192,
+-) -> np.ndarray:
+-    """
+-    Batch local search driven by currently binding triangle constraints.
+-    """
+-    best = seed.copy()
+-    best_minimum, best_score = _rank_values(best[None, ...])
+-    best_minimum = float(best_minimum[0])
+-    best_score = float(best_score[0])
+-
+-    for iteration in range(rounds):
+-        fraction = iteration / max(1, rounds - 1)
+-        scale = 0.030 * (1.0 - fraction) ** 1.65 + 0.00055
+-
+-        current_areas = _all_areas(best[None, ...])[0]
+-        active_ids = np.argpartition(current_areas, 15)[:16]
+-        active_triangles = _TRIPLES[active_ids]
+-
+-        candidates = np.broadcast_to(best, (batch_size, _FREE, 2)).copy()
+-
+-        # Most proposals move an incident point from a currently restrictive
+-        # triangle; some coordinated two-point proposals cross narrow barriers.
+-        for row in range(batch_size):
+-            triangle = active_triangles[int(rng.integers(len(active_triangles)))]
+-            movable = triangle[triangle >= 3] - 3
+-            if len(movable):
+-                point = int(movable[rng.integers(len(movable))])
+-            else:
+-                point = int(rng.integers(_FREE))
+-
+-            candidates[row, point] += rng.normal(0.0, scale, 2)
+-
+-            if rng.random() < 0.30:
+-                other = int(rng.integers(_FREE))
+-                if other != point:
+-                    candidates[row, other] += rng.normal(0.0, 0.62 * scale, 2)
+-
+-        candidates = _project_simplex_batch(candidates)
+-        minimum, scores = _rank_values(candidates)
+-
+-        # Strict minimum remains primary; the support score resolves only
+-        # essentially equal numerical minima.
+-        winner = int(np.argmax(scores))
+-        improves_minimum = minimum[winner] > best_minimum + 1.0e-12
+-        tied_better = (
+-            abs(minimum[winner] - best_minimum) <= 1.0e-12
+-            and scores[winner] > best_score
+-        )
+-
+-        if improves_minimum or tied_better:
+-            best = candidates[winner]
+-            best_minimum = float(minimum[winner])
+-            best_score = float(scores[winner])
+-
+-    return best
+-
+-
+ def _fallback() -> np.ndarray:
+-    affine = np.vstack(
+-        (
+-            _CORNERS,
+-            np.array(
+-                [
+-                    [0.13, 0.075], [0.43, 0.060], [0.75, 0.075],
+-                    [0.075, 0.335], [0.350, 0.255], [0.640, 0.240],
+-                    [0.145, 0.610], [0.405, 0.445],
+-                ],
+-                dtype=np.float64,
+-            ),
+-        )
+-    )
++    affine = np.vstack((
++        _CORNERS,
++        np.array(
++            [[0.125, 0.070], [0.405, 0.055], [0.735, 0.070],
++             [0.065, 0.330], [0.350, 0.245], [0.655, 0.230],
++             [0.135, 0.605], [0.410, 0.430]],
++            dtype=np.float64,
++        ),
++    ))
+     result = np.empty_like(affine)
+     result[:, 0] = affine[:, 0] + 0.5 * affine[:, 1]
+     result[:, 1] = _HEIGHT * affine[:, 1]
+     return result
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+-    """
+-    Return eleven deterministic points in or on the prescribed triangle.
+-    """
++    """Return eleven deterministic points in the prescribed equilateral triangle."""
+     try:
+         rng = np.random.default_rng(11031991)
+-        finalists = [_elite_island(rng) for _ in range(5)]
+-
+-        finalist_array = np.asarray(finalists)
+-        finalist_minimum, _ = _rank_values(finalist_array)
+-        seed = finalist_array[int(np.argmax(finalist_minimum))]
+-
+-        affine = np.vstack((_CORNERS, _active_polish(rng, seed)))
++
++        # Independent swarms explore distinct ordering families; only their
++        # best archive is sent to the more expensive active-set polish.
++        seeds = [_swarm_search(rng) for _ in range(3)]
++        seed_array = np.asarray(seeds)
++        values, aux = _quality(seed_array)
++        pick = int(np.lexsort((aux, values))[-1])
++        free = _active_refine(rng, seed_array[pick])
++
++        affine = np.vstack((_CORNERS, free))
+         result = np.empty_like(affine)
+         result[:, 0] = affine[:, 0] + 0.5 * affine[:, 1]
+         result[:, 1] = _HEIGHT * affine[:, 1]
+ 
+         if result.shape != (11, 2) or not np.all(np.isfinite(result)):
+             return _fallback()
+         return result
+     except Exception:
+         return _fallback()
+ 
+ 
+ # EVOLVE-BLOCK-END

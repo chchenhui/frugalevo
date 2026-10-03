@@ -1,0 +1,138 @@
+<NAME>
+minimax_polish
+</NAME>
+
+<DESCRIPTION>
+Add a bounded best-improvement local-search pass after threshold packing. The binary-search feasibility routine finds a strong packing, but its multidimensional best-fit choices can leave avoidable imbalance because it does not reconsider earlier assignments. Relocations and memory-feasible swaps are evaluated against the complete descending KVPR profile: the maximum KVPR remains the primary objective, while the profile deterministically breaks exact maximum-pressure ties. This can escape greedy packing artifacts without changing feasibility guarantees.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    return best[0]
+=======
+    # Threshold packing is a construction heuristic.  Polish its result with
+    # feasible relocations and swaps, using the maximum KVPR as the primary
+    # objective and the full pressure profile only to break exact ties.
+    placement, loads, remaining = best
+    placement = {gpu_id: list(placement[gpu_id]) for gpu_id in range(gpu_num)}
+
+    def pressure_profile():
+        values = []
+        for gpu_id in range(gpu_num):
+            if remaining[gpu_id] <= EPS:
+                values.append(
+                    float("inf") if loads[gpu_id] > EPS else 0.0
+                )
+            else:
+                values.append(loads[gpu_id] / remaining[gpu_id])
+        return tuple(sorted(values, reverse=True))
+
+    current_profile = pressure_profile()
+    for _ in range(min(24, max(1, len(model_list)))):
+        best_profile = current_profile
+        action = None
+
+        for source in range(gpu_num):
+            for model in placement[source]:
+                size = model.model_size
+                demand = model.req_rate / model.slo
+
+                for target in range(gpu_num):
+                    if target == source or size > remaining[target] + EPS:
+                        continue
+                    if demand > EPS and remaining[target] - size <= EPS:
+                        continue
+
+                    old_source_load = loads[source]
+                    old_target_load = loads[target]
+                    old_source_remaining = remaining[source]
+                    old_target_remaining = remaining[target]
+                    loads[source] -= demand
+                    remaining[source] += size
+                    loads[target] += demand
+                    remaining[target] -= size
+                    candidate_profile = pressure_profile()
+                    loads[source] = old_source_load
+                    loads[target] = old_target_load
+                    remaining[source] = old_source_remaining
+                    remaining[target] = old_target_remaining
+
+                    if candidate_profile < best_profile:
+                        best_profile = candidate_profile
+                        action = ("move", source, target, model)
+
+        # Swaps are particularly useful when a low-memory target cannot accept
+        # a direct move.  Avoid quadratic work for unusually large inputs.
+        if len(model_list) <= 120:
+            for left in range(gpu_num):
+                for right in range(left + 1, gpu_num):
+                    for first in placement[left]:
+                        for second in placement[right]:
+                            left_remaining = (
+                                remaining[left] + first.model_size
+                                - second.model_size
+                            )
+                            right_remaining = (
+                                remaining[right] + second.model_size
+                                - first.model_size
+                            )
+                            if left_remaining < -EPS or right_remaining < -EPS:
+                                continue
+
+                            first_demand = first.req_rate / first.slo
+                            second_demand = second.req_rate / second.slo
+                            left_load = loads[left] - first_demand + second_demand
+                            right_load = loads[right] - second_demand + first_demand
+                            if ((left_load > EPS and left_remaining <= EPS) or
+                                    (right_load > EPS and right_remaining <= EPS)):
+                                continue
+
+                            old_left_load = loads[left]
+                            old_right_load = loads[right]
+                            old_left_remaining = remaining[left]
+                            old_right_remaining = remaining[right]
+                            loads[left] = left_load
+                            loads[right] = right_load
+                            remaining[left] = left_remaining
+                            remaining[right] = right_remaining
+                            candidate_profile = pressure_profile()
+                            loads[left] = old_left_load
+                            loads[right] = old_right_load
+                            remaining[left] = old_left_remaining
+                            remaining[right] = old_right_remaining
+
+                            if candidate_profile < best_profile:
+                                best_profile = candidate_profile
+                                action = ("swap", left, right, first, second)
+
+        if action is None:
+            break
+
+        if action[0] == "move":
+            _, source, target, model = action
+            placement[source].remove(model)
+            placement[target].append(model)
+            loads[source] -= model.req_rate / model.slo
+            remaining[source] += model.model_size
+            loads[target] += model.req_rate / model.slo
+            remaining[target] -= model.model_size
+        else:
+            _, left, right, first, second = action
+            placement[left].remove(first)
+            placement[right].remove(second)
+            placement[left].append(second)
+            placement[right].append(first)
+            loads[left] += (
+                second.req_rate / second.slo - first.req_rate / first.slo
+            )
+            loads[right] += (
+                first.req_rate / first.slo - second.req_rate / second.slo
+            )
+            remaining[left] += first.model_size - second.model_size
+            remaining[right] += second.model_size - first.model_size
+
+        current_profile = best_profile
+
+    return placement
+>>>>>>> REPLACE
+</DIFF>

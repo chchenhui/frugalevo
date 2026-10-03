@@ -1,0 +1,110 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _min_triple_area(points: np.ndarray) -> float:
+    """Area of the smallest triangle among all C(13,3) triples, via cross products."""
+    n = len(points)
+    best = np.inf
+    for i in range(n - 2):
+        for j in range(i + 1, n - 1):
+            v1x = points[j, 0] - points[i, 0]
+            v1y = points[j, 1] - points[i, 1]
+            dx = points[j + 1:, 0] - points[i, 0]
+            dy = points[j + 1:, 1] - points[i, 1]
+            areas = 0.5 * np.abs(v1x * dy - v1y * dx)
+            m = areas.min()
+            if m < best:
+                best = m
+    return float(best)
+
+
+def _hull_area(points: np.ndarray) -> float:
+    """Area of convex hull via the shoelace formula on hull vertices."""
+    pts = points[np.lexsort((points[:, 1], points[:, 0]))]
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lower, upper = [], []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    for p in pts[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = np.array(lower[:-1] + upper[:-1])
+    x, y = hull[:, 0], hull[:, 1]
+    return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def _score(points: np.ndarray) -> float:
+    ha = _hull_area(points)
+    if ha <= 1e-12:
+        return 0.0
+    return _min_triple_area(points) / ha
+
+
+def _refine(points: np.ndarray, dirs: np.ndarray) -> np.ndarray:
+    """Deterministic coordinate-descent refinement of the min-triangle score."""
+    step = 0.25
+    best = _score(points)
+    while step > 1e-5:
+        improved = False
+        for i in range(len(points)):
+            for d in dirs:
+                for s in (step, 0.5 * step):
+                    trial = points.copy()
+                    trial[i] += s * d
+                    sc = _score(trial)
+                    if sc > best + 1e-12:
+                        points = trial
+                        best = sc
+                        improved = True
+        if not improved:
+            step *= 0.5
+    return points
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct an arrangement of 13 points maximizing the smallest triangle area
+    (normalized by convex hull area). Deterministic multi-start coordinate
+    descent with a 16-direction search set (22.5-degree increments) so the
+    optimizer can break the initial ring symmetry, which is known to
+    characterize suboptimal placements for n = 13.
+    """
+    n = 13
+    # 16 directions at 22.5-degree increments: axis, diagonal and off-diagonal.
+    thetas = np.arange(16) * (np.pi / 8.0)
+    dirs = np.stack([np.cos(thetas), np.sin(thetas)], axis=1)
+
+    # Initialization 1: 12 points on a circle + center.
+    ang = 2.0 * np.pi * np.arange(12) / 12.0
+    init1 = np.zeros((n, 2))
+    init1[:12, 0] = np.cos(ang)
+    init1[:12, 1] = np.sin(ang)
+    init1[12] = 0.0
+
+    # Initialization 2: deterministically perturbed circle (breaks symmetry
+    # immediately, letting the descent explore irregular configurations).
+    rng = np.random.default_rng(seed=1234)
+    init2 = init1 + 0.08 * rng.standard_normal((n, 2))
+    init2[12] = rng.standard_normal(2) * 0.05
+
+    # Initialization 3: jittered triangular-lattice-like arrangement.
+    base = np.array([[x + 0.5 * (y % 2), y * 0.87]
+                     for y in range(4) for x in range(4)], dtype=float)[:n]
+    base = (base - base.mean(axis=0)) / np.max(np.abs(base)) * 0.9
+    init3 = base + 0.05 * rng.standard_normal((n, 2))
+
+    best_pts, best_sc = None, -np.inf
+    for init in (init1, init2, init3):
+        pts = _refine(init.copy(), dirs)
+        sc = _score(pts)
+        if sc > best_sc:
+            best_sc, best_pts = sc, pts
+    return best_pts
+
+
+# EVOLVE-BLOCK-END

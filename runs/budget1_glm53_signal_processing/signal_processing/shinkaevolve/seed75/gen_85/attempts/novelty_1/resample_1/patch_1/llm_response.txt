@@ -1,0 +1,313 @@
+<NAME>
+kalman_rts_adaptive_sg_hybrid
+</NAME>
+<DESCRIPTION>
+Crossover of the two best-performing programs. From the pipeline version we keep the adaptive-R forward Kalman with robust gating, the RTS smoother, the slope-lead compensation (which gave it the best slope_changes=48.4 and false_reversals=34.6), and the light third SG polish. From the volatility-adaptive version we import the multi-scale zero-phase SG blend with Gaussian volatility-gated soft weights (which gave it the best lag_error=0.27, correlation=0.97, noise_reduction=0.82), but with gentler base half-width (window_size//4) so the pipeline's smoothness advantage is not lost. The combined pipeline: volatility schedule → Kalman → RTS → volatility-gated multi-scale SG blend → slope-lead compensation → light zero-phase SG polish → end-aligned trim. This targets simultaneously responsiveness (small scales in quiet regions), noise suppression (large scales in volatile regions), and reversal suppression (lead compensation + polish), while keeping the identical API (adaptive_filter, enhanced_filter_with_trend_preservation, process_signal) and output contract (length = n - window_size + 1).
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""
+Real-Time Adaptive Signal Processing Algorithm for Non-Stationary Time Series
+
+Hybrid pipeline (crossover of Kalman+RTS pipeline and volatility-adaptive
+multi-scale SG blend):
+
+    Stage A: volatility model (adaptive R schedule, O(n))
+    Stage B: forward constant-velocity Kalman (robust 3-sigma gating)
+    Stage C: RTS backward smoother on [level, slope]
+    Stage D: volatility-gated multi-scale zero-phase SG blend
+             (narrow in quiet regions -> responsiveness;
+              wide in volatile regions -> fewer false reversals)
+    Stage E: conservative slope-lead compensation (corner restoration)
+    Stage F: light zero-phase SG polish (kills residual ripple)
+    Stage G: end-aligned trim to sliding-window output length
+"""
+import numpy as np
+
+
+# ----------------------------------------------------------------------
+# Stage A: volatility model
+# ----------------------------------------------------------------------
+def _volatility_schedule(x):
+    dx = np.diff(x)
+    q_scale = np.median(np.abs(dx)) + 1e-12
+    local_std = np.convolve(np.abs(dx), np.ones(3) / 3.0, mode="same")
+    r_arr = np.concatenate([[q_scale], local_std]) + 1e-9
+    return r_arr, q_scale, local_std
+
+
+# ----------------------------------------------------------------------
+# Stage B: forward Kalman
+# ----------------------------------------------------------------------
+def _forward_kalman(x, r_arr, q_scale):
+    n = len(x)
+    F = np.array([[1.0, 1.0], [0.0, 1.0]])
+    H = np.array([[1.0, 0.0]])
+    Q = np.eye(2) * (q_scale ** 2) * 0.05
+
+    s_f = np.zeros((n, 2))
+    P_f = np.zeros((n, 2, 2))
+    s_pred = np.zeros((n, 2))
+    P_pred = np.zeros((n, 2, 2))
+
+    P = np.eye(2) * (r_arr[0] ** 2)
+    s = np.array([x[0], 0.0])
+    s_f[0] = s
+    P_f[0] = P
+
+    for i in range(1, n):
+        s = F @ s
+        P = F @ P @ F.T + Q
+        s_pred[i] = s
+        P_pred[i] = P
+
+        R = max(r_arr[i] ** 2, 1e-12)
+        S = H @ P @ H.T + R
+        K = (P @ H.T) / S
+        innov = x[i] - (H @ s)[0]
+
+        Sv = float(S[0, 0]) if np.ndim(S) else float(S)
+        if abs(innov) > 3.0 * np.sqrt(Sv):
+            R = R * 9.0
+            S = H @ P @ H.T + R
+            K = (P @ H.T) / S
+            innov = x[i] - (H @ s)[0]
+
+        s = s + (K.flatten() * innov)
+        P = P - K @ H @ P
+        s_f[i] = s
+        P_f[i] = P
+
+    return s_f, P_f, s_pred, P_pred, F
+
+
+# ----------------------------------------------------------------------
+# Stage C: RTS backward smoother
+# ----------------------------------------------------------------------
+def _rts_smoother(s_f, P_f, s_pred, P_pred, F):
+    n = len(s_f)
+    s_smooth = s_f.copy()
+    for i in range(n - 2, -1, -1):
+        Pm = P_pred[i + 1]
+        G = P_f[i] @ F.T @ np.linalg.inv(Pm)
+        s_smooth[i] = s_f[i] + G @ (s_smooth[i + 1] - s_pred[i + 1])
+    return s_smooth[:, 0]
+
+
+# ----------------------------------------------------------------------
+# Stage D/F helpers: zero-phase SG
+# ----------------------------------------------------------------------
+def _sg_kernel(half, order=2):
+    L = 2 * half + 1
+    order = min(order, L - 1)
+    t_off = np.arange(-half, half + 1, dtype=float)
+    A = np.vstack([t_off ** k for k in range(order + 1)]).T
+    return (np.linalg.pinv(A.T @ A) @ A.T)[0]
+
+
+def _zero_phase_smooth(sig, half, kernel=None):
+    m = len(sig)
+    if kernel is None:
+        kernel = _sg_kernel(half)
+    if m < 2 * half + 1:
+        return sig.copy()
+    left = 2 * sig[0] - sig[1 : half + 1][::-1]
+    right = 2 * sig[-1] - sig[-2 : -half - 2 : -1][::-1]
+    padded = np.concatenate([left, sig, right])
+    out = np.convolve(padded, kernel, mode="valid")
+    return out[:m] if len(out) >= m else sig.copy()
+
+
+# ----------------------------------------------------------------------
+# Top-level pipeline
+# ----------------------------------------------------------------------
+def adaptive_filter(x, window_size=20):
+    """Adaptive sliding-window filter (pipeline of stages A-G)."""
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < window_size:
+        raise ValueError(
+            f"Input signal length ({n}) must be >= window_size ({window_size})")
+
+    output_length = n - window_size + 1
+
+    # A: volatility model
+    r_arr, q_scale, local_std = _volatility_schedule(x)
+
+    # B: forward Kalman
+    s_f, P_f, s_pred, P_pred, F = _forward_kalman(x, r_arr, q_scale)
+
+    # C: RTS smoother
+    kf_out = _rts_smoother(s_f, P_f, s_pred, P_pred, F)
+
+    # D: volatility-gated multi-scale zero-phase SG blend
+    base_half = max(2, window_size // 4)
+    cand = sorted({max(1, base_half // 2), base_half, 2 * base_half})
+    halves = [h for h in cand if 2 * h + 1 <= max(3, n)] or [1]
+
+    # per-sample volatility aligned with kf_out
+    v = np.concatenate([local_std[:1], local_std]) if n > 1 else np.zeros(1)
+    v = np.maximum(v, 1e-12)
+
+    if len(halves) == 1 or n < 2 * max(halves) + 1:
+        smoothed = _zero_phase_smooth(kf_out, halves[0])
+    else:
+        centers = np.percentile(v, [20.0, 50.0, 80.0])[:len(halves)]
+        spread = max(centers[-1] - centers[0], 1e-9)
+        W = np.stack([np.exp(-0.5 * ((v - c) / spread) ** 2) for c in centers])
+        W = W / (W.sum(axis=0, keepdims=True) + 1e-12)
+        smoothed = np.zeros(n)
+        for j, h in enumerate(halves):
+            smoothed += W[j] * _zero_phase_smooth(kf_out, h)
+
+    # E: conservative slope-lead compensation (restore corner dynamics)
+    slope = np.gradient(smoothed)
+    smoothed = smoothed + (0.5 * base_half * 0.25) * slope
+
+    # F: light zero-phase SG polish (kills residual ripple)
+    h3 = max(2, base_half // 2)
+    smoothed = _zero_phase_smooth(smoothed, h3, kernel=_sg_kernel(h3, order=2))
+
+    # G: end-aligned trim (minimal lag)
+    if len(smoothed) >= output_length:
+        y = smoothed[-output_length:]
+    else:
+        y = kf_out[-output_length:]
+    return y
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """Alias for the adaptive pipeline filter."""
+    return adaptive_filter(x, window_size)
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """Main entry point. Applies the adaptive pipeline filter."""
+    x = np.asarray(input_signal, dtype=float)
+    return adaptive_filter(x, window_size)
+
+
+# EVOLVE-BLOCK-END
+
+
+def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+    """
+    Generate synthetic test signal with known characteristics.
+
+    Args:
+        length: Length of the signal
+        noise_level: Standard deviation of noise to add
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (noisy_signal, clean_signal)
+    """
+    np.random.seed(seed)
+    t = np.linspace(0, 10, length)
+
+    # Create a complex signal with multiple components
+    clean_signal = (
+        2 * np.sin(2 * np.pi * 0.5 * t)  # Low frequency component
+        + 1.5 * np.sin(2 * np.pi * 2 * t)  # Medium frequency component
+        + 0.5 * np.sin(2 * np.pi * 5 * t)  # Higher frequency component
+        + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)  # Decaying oscillation
+    )
+
+    # Add non-stationary behavior
+    trend = 0.1 * t * np.sin(0.2 * t)  # Slowly varying trend
+    clean_signal += trend
+
+    # Add random walk component for non-stationarity
+    random_walk = np.cumsum(np.random.randn(length) * 0.05)
+    clean_signal += random_walk
+
+    # Add noise
+    noise = np.random.normal(0, noise_level, length)
+    noisy_signal = clean_signal + noise
+
+    return noisy_signal, clean_signal
+
+
+def run_signal_processing(noisy_signal=None, signal_length=1000, noise_level=0.3, window_size=20):
+    """
+    Run the signal processing algorithm on a test signal.
+
+    Args:
+        noisy_signal: Input signal to filter (if provided, use this; otherwise generate)
+        signal_length: Length if generating signal (for backward compatibility)
+        noise_level: Noise level if generating signal (for backward compatibility)
+        window_size: Window size for processing
+
+    Returns:
+        Dictionary containing results and metrics
+    """
+    # Use provided signal or generate test signal (for __main__ and backward compatibility)
+    if noisy_signal is not None:
+        # Filter the provided signal
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+        clean_signal = None  # Not available when using provided signal
+    else:
+        # Generate test signal (for __main__ and backward compatibility)
+        noisy_signal, clean_signal = generate_test_signal(signal_length, noise_level)
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+
+    # Calculate basic metrics (only if we have clean_signal from generation)
+    if len(filtered_signal) > 0 and clean_signal is not None:
+        # Align signals for comparison (account for processing delay)
+        delay = window_size - 1
+        aligned_clean = clean_signal[delay:]
+        aligned_noisy = noisy_signal[delay:]
+
+        # Ensure same length
+        min_length = min(len(filtered_signal), len(aligned_clean))
+        filtered_signal = filtered_signal[:min_length]
+        aligned_clean = aligned_clean[:min_length]
+        aligned_noisy = aligned_noisy[:min_length]
+
+        # Calculate correlation with clean signal
+        correlation = np.corrcoef(filtered_signal, aligned_clean)[0, 1] if min_length > 1 else 0
+
+        # Calculate noise reduction
+        noise_before = np.var(aligned_noisy - aligned_clean)
+        noise_after = np.var(filtered_signal - aligned_clean)
+        noise_reduction = (noise_before - noise_after) / noise_before if noise_before > 0 else 0
+
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": aligned_clean,
+            "noisy_signal": aligned_noisy,
+            "correlation": correlation,
+            "noise_reduction": noise_reduction,
+            "signal_length": min_length,
+        }
+    elif len(filtered_signal) > 0:
+        # When using provided signal (no clean_signal available), just return filtered signal
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": None,
+            "noisy_signal": None,
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": len(filtered_signal),
+        }
+    else:
+        return {
+            "filtered_signal": [],
+            "clean_signal": [],
+            "noisy_signal": [],
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": 0,
+        }
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    results = run_signal_processing()
+    print("Signal processing completed!")
+    print(f"Correlation with clean signal: {results['correlation']:.3f}")
+    print(f"Noise reduction: {results['noise_reduction']:.3f}")
+    print(f"Processed signal length: {results['signal_length']}")
+```
+</CODE>

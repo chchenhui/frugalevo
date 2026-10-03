@@ -1,0 +1,275 @@
+{
+  "version": 24,
+  "curve": {
+    "unit": "usd",
+    "budget": 0.5,
+    "spent": 0.040353565,
+    "final_incumbent": 0.7255787889378273,
+    "ba_auc": 0.3393374884891417,
+    "ba_auc_normalized": 0.6786749769782834,
+    "num_points": 6,
+    "points": [
+      {
+        "cost": 0.0,
+        "score": 0.0,
+        "incumbent": 0.0,
+        "iteration": 0,
+        "candidates": 0
+      },
+      {
+        "cost": 0.002364445,
+        "score": 0.0,
+        "incumbent": 0.0,
+        "iteration": 1,
+        "candidates": 2
+      },
+      {
+        "cost": 0.0310031,
+        "score": 0.1145082353841661,
+        "incumbent": 0.1145082353841661,
+        "iteration": 2,
+        "candidates": 3
+      },
+      {
+        "cost": 0.032544275,
+        "score": 0.7207679413407874,
+        "incumbent": 0.7207679413407874,
+        "iteration": 3,
+        "candidates": 1
+      },
+      {
+        "cost": 0.03565133,
+        "score": 0.7255787889378273,
+        "incumbent": 0.7255787889378273,
+        "iteration": 4,
+        "candidates": 2
+      },
+      {
+        "cost": 0.040353565,
+        "score": 0.7255285126186414,
+        "incumbent": 0.7255787889378273,
+        "iteration": 5,
+        "candidates": 3
+      }
+    ]
+  },
+  "strategy_objective_guidance": "- **Scored terms:** `combined_score = 0.95 * mean(hit_rate) + 0.05 * (12 - min(12, avg_runtime))/12`.\n  - **Hit rate (weight 0.95):** per dataset, `serial_trie_hit_count(serialized_rows) / total_serialized_chars`. Serialization is `\"\".join(row.fillna(\"\").astype(str).values)` \u2014 no separators, NaN \u2192 \"\". Reward is *matched character length* on a character Trie, so partial-field prefixes and cross-field boundaries count. For a fixed multiset of serialized row strings, total reuse equals sum of LCPs between lexicographically adjacent sorted strings \u2014 **row order is irrelevant to hit rate**; only the multiset of per-row column orderings matters.\n  - **Runtime (weight 0.05):** average per-dataset wall time of `reorder`, capped at 12 s. Max contribution 0.05 when avg runtime \u2264 0; 0 when \u2265 12 s. At, say, 2 s average the term is worth ~0.042 \u2014 the full 0.05 spread is only 0.05 points, while hit-rate differences of a few percentage points are worth 3\u20135\u00d7 more.\n- **Near maximum vs. far:** runtime is easily saturated (a few seconds average is fine; only pathological >12 s costs anything). Hit rate is the dominant remaining lever. The two conflict mildly: richer recursive constructions cost time, but the 0.05 cap makes heavy search a bad trade \u2014 spend at most a few seconds total.\n- **Rewards other than the nominal goal?** The nominal \"reorder rows\" framing is a red herring: row reordering is worth exactly nothing for hit rate (order-independent Trie reuse). The true objective is choosing **per-row column permutations** (and honoring `col_merge` groupings) that maximize shared character prefixes across the whole string collection. Guidance that optimizes adjacent-row overlap or row sorting optimizes an unscored property.\n- **Hard constraints:** preserve all rows, columns, cell values, shape, character count; return `(df, column_orderings)` with per-row orderings consistent with the returned data; all 5 datasets must succeed (any exception \u2192 score 0). Only pandas + networkx available. Missing/mixed types must round-trip through object dtype without altering stored values.\n- **Input availability:** the full DataFrame is given at once to `reorder` \u2014 this is a **batch/offline** problem. Global statistics (factorization, value counts, full-string LCP scoring of candidate orderings) are legitimate and cheap; no streaming/causality requirement.",
+  "strategy_diverge_guidance": "- **Global frequency-ranked column ordering:** score each column by `sum(len(v) * cnt(v) * (cnt(v)-1))` over factorized values, order columns descending, all rows share one ordering; rank alternatives by the true sorted-string LCP sum. Mechanism: puts long, repetitive columns first so many rows share long prefixes. Use `pandas.factorize` / `numpy.unique(..., return_counts=True)` once, reused across all candidates.\n- **Conditional prefix partition tree:** recursively pick, within each row group, the remaining column maximizing actual character savings, partition rows on its factorized value codes, choose suffix column orders per group; per-row orderings emerge from group membership. Mechanism: different clusters of rows (e.g., BIRD posts, PDMX paths) get different beneficial leading columns. Bound depth, group size, and candidate columns; deterministic tie-breaks.\n- **Length/frequency tradeoff variant:** same tree but scoring candidates by `len * cnt * (cnt-1)` (pair-repetition, as required) vs. immediate `len * (cnt-1)` savings, or a greedy longest-common-leading-column alignment \u2014 a genuinely different ranking function, still selected by the real LCP objective.\n- **Merge-aware serialization:** since `col_merge` fields are concatenated adjacently in scoring, treat merged groups as units when choosing positions (e.g., PDMX's boolean block) \u2014 placement of a merged block relative to other columns is the only free choice for those columns.\n- **Bounded construction selection (the wrapper mechanism):** build at most 3 whole-table candidates (global order, conditional tree, third variant), score each exactly once via sorted-string adjacent-LCP sum (identical strings handled directly; LCP via binary search on prefix-slice equality so comparisons run in C), return the best. Mechanism: guarantees no candidate regresses the parent while total cost stays in the low seconds.",
+  "strategy_refine_guidance": "- **Factorize once:** compute serialized cell strings, integer codes, and lengths a single time (`pd.factorize` per column, object-dtype numpy arrays); never call `fillna/value_counts/astype` inside group or node loops. Pass codes into `np.bincount` for group-level counts.\n- **Fast LCP scorer:** deduplicate identical strings first; sort unique strings; compute adjacent LCP by binary search over prefix slices with slice-equality (C-speed), not per-character Python loops. Cache this scorer; call it \u22643 times total.\n- **Tree pruning:** stop branching when a group's best candidate saving is \u2264 0 or group size \u2264 small constant; cap depth (e.g., 4\u20136) and candidate columns per node (e.g., top-k by cheap statistic); fall back to the global ordering for the tail \u2014 deterministic and bounded on wide tables.\n- **Tie-breaking and determinism:** stable sorts on (score, column index) so repeated runs pick identical orderings; avoids nondeterministic runtime and score.\n- **Runtime budget:** measure total construction+scoring time; if datasets are large, cap candidate columns and skip the third alternative rather than risk the 12 s average \u2014 the 0.05 term never justifies losing a hit-rate candidate's evaluation to a timeout.\n- **Output correctness polish:** build the reordered frame once via `np.take` along axis=1 per row group (group rows sharing an ordering to vectorize), object dtype, verify per-row ordering lists match returned data before returning; cheap insurance against the hard all-datasets-must-succeed constraint.",
+  "strategy_guidance_attempted": true,
+  "strategy_guidance_cost": 0.007943,
+  "strategies": [
+    {
+      "index": 1,
+      "title": "[bounded-construction-selection] Global frequency-ranked ordering selected by ex",
+      "plan": "Mechanism family: bounded-construction-selection (global frequency ordering + exact sorted-string LCP scorer)\nReplacement scope: Replace the entire recursive machinery \u2014 `recursive_reorder`, `recursive_split_and_reorder`, `column_recursion`, `reorder_columns_for_value`, `find_max_group_value`, and the sorting tail of `reorder` \u2014 with a single-pass construction: serialize all cells once, factorize once, build a global column ordering, score it with the exact Trie objective, and return it. Keep only the `col_merge` handling, one-way-dep stub, and the public `reorder` signature.\nCompute budget: One whole-table construction plus exactly one LCP scoring pass: O(n\u00b7m) serialization, O(n log n \u00b7 L) sort with C-level slice comparisons, \u22643 candidate scores total across all strategies in the wrapper. Expected evaluation time well under 1 s per dataset (vs the incumbent's unbounded recursive `stack()`/`Counter` loops that currently fail or time out); runtime term saturates near its 0.05 maximum.\nGain mechanism: The incumbent optimizes squared field lengths and adjacent-row overlap \u2014 quantities the evaluator does not score \u2014 and never produces per-row column orderings at all (it returns `[]`), so it scores 0. The new degree of freedom is the per-row column permutation chosen by `sum(len(v)\u00b7cnt(v)\u00b7(cnt(v)\u22121))` ranking, which places long repetitive columns first so many rows share long character prefixes in the Trie. Plan: (1) serialize each cell to its scoring string via `fillna(\"\")`/`str` into an object-dtype numpy matrix (never altering stored values; serialization is scoring-only); (2) per column, `pd.factorize` values once and compute `len\u00b7cnt\u00b7(cnt\u22121)` per value, sum per column, order columns descending with deterministic tie-break on column index; (3) all rows share this single ordering \u2192 `column_orderings = [ordering]\u00b7n`; (4) build the output frame once with `df.loc[:, ordering]` cast to object dtype; (5) score the resulting row strings with the exact objective: deduplicate identical strings, sort uniques, sum adjacent LCPs via binary search on prefix-slice equality; keep this score for wrapper-level comparison. Hard constraints: shape, rows, columns, and cell values are untouched (only column permutation, which is the API's contract); missing/mixed values round-trip through object dtype; `col_merge` groups are kept internally adjacent in the ordering. This candidate alone is the wrapper's guaranteed baseline.\nExpected-gain check: The incumbent scores combined_score 0.000000 because it returns empty orderings and its final row sort is order-independent for the Trie; this construction yields a strictly positive hit rate (any shared column prefix across duplicate values gives LCP > 0, e.g. a repeated constant column of length L over n rows contributes \u2265 (n\u22121)\u00b7L matched characters), so predicted combined_score \u2265 0.95\u00b7(positive hit rate) > 0 strictly exceeds the incumbent's 0.",
+      "cost": 0.005223800000000001,
+      "best_score": 0.1145082353841661,
+      "baseline_score": 0.0,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 1,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.1145082353841661,
+      "cumulative_relative_gain": 1.0,
+      "productive_rounds": 1,
+      "barren_rounds": 0,
+      "implementation_spend": 0.001674751666666666,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 2,
+      "failure_feedback": []
+    },
+    {
+      "index": 2,
+      "title": "[conditional-partition-tree] Recursive group-conditional prefix partition with p",
+      "plan": "Mechanism family: conditional-partition-tree (mesoscopic subsystem replacement)\nReplacement scope: Replace the incumbent's value-centric recursion (`find_max_group_value` + `column_recursion` + `recursive_reorder`) with a column-centric conditional partition tree operating on integer factorization codes; the top-level `reorder` keeps its signature, `col_merge` handling, and the Strategy-1 global ordering as the leaf/tail fallback.\nCompute budget: Tree depth \u2264 5, branch only on groups with \u2265 8 rows, \u2264 8 candidate columns per node ranked by a precomputed cheap statistic, one `np.bincount` per (node, candidate); no LCP scoring inside the tree \u2014 the whole tree is scored once by the exact objective at the end. Expected runtime \u2264 ~2 s on the widest dataset; well within the 12 s cap.\nGain mechanism: The new degree of freedom is *row-cluster-specific column orderings*: different row clusters (e.g., distinct post types or path prefixes) can have different beneficial leading columns, which no single global ordering can express. Plan: (1) factorize every column once into integer codes and serialized lengths (shared with Strategy 1's pass); (2) at each node, for each candidate column c compute group-level savings `\u03a3_v len(v)\u00b7cnt_group(v)\u00b7(cnt_group(v)\u22121)` via `np.bincount` on the group's codes, pick the max with tie-break on column index; if savings \u2264 0 or bounds hit, assign the global ordering to the whole group and stop; (3) otherwise partition rows by that column's value codes and recurse on each child with the chosen column fixed first; (4) each row's ordering = path of chosen columns + global ordering of remaining columns; (5) assemble the output by grouping rows with identical orderings and applying one `np.take` per group along axis=1, object dtype; (6) score the full row-string collection once with the exact sorted-LCP objective and let the wrapper pick versus the other candidates. Hard constraints: every original cell value is preserved (only per-row column permutation changes, and the returned `column_orderings` lists exactly those permutations); no pandas statistics inside node loops; deterministic tie-breaks make the result reproducible.\nExpected-gain check: On any dataset where two row clusters have different repetitive columns (a structure the incumbent's single global order cannot exploit), the Trie's total reuse strictly increases by the shared prefix characters within each cluster that the global ordering leaves unmatched, so measured hit rate strictly exceeds Strategy 1's on such datasets while never falling below it (wrapper selects by exact LCP score), giving a falsifiable threshold: per-dataset hit rate \u2265 Strategy-1 hit rate, with strict improvement whenever the best partition column's node savings > 0.",
+      "cost": 0.005223800000000001,
+      "best_score": null,
+      "baseline_score": 0.0,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 0,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.001674751666666666,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 2,
+      "failure_feedback": [
+        "AssertionError:"
+      ]
+    },
+    {
+      "index": 3,
+      "title": "[prefix-alignment-ordering] Stable predecessor-prefix alignment with length/freq",
+      "plan": "Mechanism family: prefix-alignment-ordering (structural exploration, distinct ranking function)\nReplacement scope: Replace the incumbent's column scoring (`calculate_length` squared-length heuristic and the `column_stats` ranking in `reorder`) with a third whole-table candidate: a greedy prefix-alignment construction that orders columns by immediate savings `len(v)\u00b7(cnt(v)\u22121)` and aligns each row's next column to the longest value-prefix continuing the previous column's value, then is scored once and compared by the exact LCP objective in the wrapper.\nCompute budget: One whole-table construction: O(n\u00b7m) factorization reuse, one greedy sweep with a per-row next-column choice computed from a value-prefix map (dict from value prefix \u2192 column, built once per column), one exact LCP score. Expected runtime \u2264 ~2 s; total wrapper cost of all three candidates \u2264 ~5 s average, comfortably under the 12 s runtime cap so the 0.05 runtime term stays near maximum.\nGain mechanism: The new degree of freedom is *cross-field prefix continuation*: the evaluator rewards matches that cross field boundaries, so placing, for each row, the column whose serialized value shares the longest character prefix with the row's previously placed value can join partial-field tails into longer Trie paths \u2014 a mechanism neither the global frequency ordering (Strategy 1) nor the pure value-partition tree (Strategy 2) optimizes, since both rank columns only by within-column repetition. Plan: (1) reuse the shared factorization; (2) rank columns by `\u03a3 len(v)\u00b7cnt(v)\u00b7(cnt(v)\u22121)`'s tradeoff variant `\u03a3 len(v)\u00b7cnt(v)\u00b7(cnt(v)\u22121)/ (1+avg_len)` \u2014 a genuinely different length/frequency tradeoff \u2014 to pick each row's leading column deterministically; (3) for each subsequent position, for each row choose among remaining columns the one whose value has the longest common prefix with the row's current serialized tail (precomputed per column as a sorted value list enabling binary-search LCP, C-level slice comparisons), with deterministic tie-break on column index; (4) rows sharing an ordering are grouped and the frame is rebuilt with one `np.take` per group, object dtype; (5) the exact LCP score decides whether this candidate wins. Hard constraints: only per-row column permutations are produced and returned in `column_orderings`; no cell values, rows, or columns are altered; `col_merge` groups stay internally adjacent; all statistics come from the single shared factorization pass.\nExpected-gain check: On datasets where distinct columns share value prefixes (e.g., timestamp-like or path-like fields across columns), this construction adds cross-boundary matched characters that Strategies 1\u20132 cannot realize (their rankings ignore inter-column prefix overlap), giving the falsifiable threshold: wrapper-selected hit rate \u2265 max(Strategy 1, Strategy 2) per dataset, with strict gain whenever any row's best cross-column prefix continuation exceeds its within-column alternative \u2014 and since the wrapper always returns the best exact-LCP candidate, the portfolio's combined_score is at least Strategy 1's strictly-positive value.",
+      "cost": 0.005223800000000001,
+      "best_score": null,
+      "baseline_score": 0.0,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 0,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.001674751666666666,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 2,
+      "failure_feedback": [
+        "NameError: name 'o' is not defined"
+      ]
+    },
+    {
+      "index": 4,
+      "title": "ordered attempt [bounded-construction-selection] Global frequency-ranked ordering selected by ex",
+      "plan": "Mechanism family: bounded-construction-selection (global frequency ordering + exact sorted-string LCP scorer)\nReplacement scope: Replace the entire recursive machinery \u2014 `recursive_reorder`, `recursive_split_and_reorder`, `column_recursion`, `reorder_columns_for_value`, `find_max_group_value`, and the sorting tail of `reorder` \u2014 with a single-pass construction: serialize all cells once, factorize once, build a global column ordering, score it with the exact Trie objective, and return it. Keep only the `col_merge` handling, one-way-dep stub, and the public `reorder` signature.\nCompute budget: One whole-table construction plus exactly one LCP scoring pass: O(n\u00b7m) serialization, O(n log n \u00b7 L) sort with C-level slice comparisons, \u22643 candidate scores total across all strategies in the wrapper. Expected evaluation time well under 1 s per dataset (vs the incumbent's unbounded recursive `stack()`/`Counter` loops that currently fail or time out); runtime term saturates near its 0.05 maximum.\nGain mechanism: The incumbent optimizes squared field lengths and adjacent-row overlap \u2014 quantities the evaluator does not score \u2014 and never produces per-row column orderings at all (it returns `[]`), so it scores 0. The new degree of freedom is the per-row column permutation chosen by `sum(len(v)\u00b7cnt(v)\u00b7(cnt(v)\u22121))` ranking, which places long repetitive columns first so many rows share long character prefixes in the Trie. Plan: (1) serialize each cell to its scoring string via `fillna(\"\")`/`str` into an object-dtype numpy matrix (never altering stored values; serialization is scoring-only); (2) per column, `pd.factorize` values once and compute `len\u00b7cnt\u00b7(cnt\u22121)` per value, sum per column, order columns descending with deterministic tie-break on column index; (3) all rows share this single ordering \u2192 `column_orderings = [ordering]\u00b7n`; (4) build the output frame once with `df.loc[:, ordering]` cast to object dtype; (5) score the resulting row strings with the exact objective: deduplicate identical strings, sort uniques, sum adjacent LCPs via binary search on prefix-slice equality; keep this score for wrapper-level comparison. Hard constraints: shape, rows, columns, and cell values are untouched (only column permutation, which is the API's contract); missing/mixed values round-trip through object dtype; `col_merge` groups are kept internally adjacent in the ordering. This candidate alone is the wrapper's guaranteed baseline.\nExpected-gain check: The incumbent scores combined_score 0.000000 because it returns empty orderings and its final row sort is order-independent for the Trie; this construction yields a strictly positive hit rate (any shared column prefix across duplicate values gives LCP > 0, e.g. a repeated constant column of length L over n rows contributes \u2265 (n\u22121)\u00b7L matched characters), so predicted combined_score \u2265 0.95\u00b7(positive hit rate) > 0 strictly exceeds the incumbent's 0.",
+      "cost": 0.0,
+      "best_score": 0.7255787889378273,
+      "baseline_score": 0.1145082353841661,
+      "improvement_epsilon": 1e-07,
+      "rounds": 3,
+      "attempts": 6,
+      "implementations": 5,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": 1,
+      "cumulative_gain": 0.6110705535536612,
+      "cumulative_relative_gain": 0.8477605909774955,
+      "productive_rounds": 2,
+      "barren_rounds": 1,
+      "implementation_spend": 0.009350465000000002,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 5,
+      "failure_feedback": [
+        "IndexError: list index out of range"
+      ]
+    }
+  ],
+  "active_strategy": 4,
+  "strategy_queue": [],
+  "ordered_portfolio_roots": [
+    1,
+    2,
+    3
+  ],
+  "ordered_exploitation_queue": [
+    2,
+    3
+  ],
+  "ordered_active_root": null,
+  "ordered_pilot_scores": {
+    "1": 0.1145082353841661,
+    "2": null,
+    "3": null
+  },
+  "ordered_phase": "exploit",
+  "ordered_reference_feedback": [],
+  "strategy_reference_failure_streak": 0,
+  "strategy_reference_disabled": false,
+  "strategy_costs": [
+    0.015671400000000002
+  ],
+  "implementation_costs": [
+    0.0011822225,
+    0.001674751666666666,
+    0.0015411749999999988,
+    0.0015535275000000022,
+    0.0015674116666666664
+  ],
+  "guide_implementation_costs": [],
+  "guide_implementation_due": false,
+  "guide_implementation_due_reason": null,
+  "guide_implementation_unguided": false,
+  "strategy_call_count": 1,
+  "anchor_next_cheap_to_incumbent": false,
+  "opening_cheap_probe_done": true,
+  "opening_failure_retries_used": 0,
+  "opening_guide_hedge_done": false,
+  "success_achieved": false,
+  "barren_rounds": 1,
+  "stagnation": 1,
+  "next_strategy_escalation": 32,
+  "strategy_escalation_gap": 32,
+  "seen_solutions": [
+    "91411e44685499905bd638d2bd09d763cd550c72",
+    "9f194908003472cac95f40a0e3a34dfcd5660eed",
+    "c1e70995d719a8500a7de427f721a8d405f7adc6",
+    "c39729c09ec6efc7b824c595df05f748692bcd4d",
+    "cf6f9403873edcf9653a3662ec288f59f9d0467f",
+    "dc6dbaa568886ea18d3a50da6ed4ce530a97bd7b"
+  ],
+  "score_ledger": [
+    [
+      0.114508235,
+      1
+    ],
+    [
+      0.720767941,
+      1
+    ],
+    [
+      0.725578789,
+      1
+    ],
+    [
+      0.714283842,
+      1
+    ],
+    [
+      0.725528513,
+      1
+    ],
+    [
+      0.713904778,
+      1
+    ]
+  ],
+  "cost_samples": [
+    [
+      2,
+      0.002364445
+    ],
+    [
+      3,
+      0.028638655
+    ],
+    [
+      1,
+      0.0015411749999999988
+    ],
+    [
+      2,
+      0.0031070550000000044
+    ],
+    [
+      3,
+      0.004702234999999999
+    ]
+  ],
+  "exploring": false
+}

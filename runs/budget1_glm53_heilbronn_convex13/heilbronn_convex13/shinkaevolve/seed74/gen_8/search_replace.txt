@@ -1,0 +1,116 @@
+<NAME>
+heilbronn_13_softmin_multistart</NAME>
+<DESCRIPTION>
+The previous SEARCH block didn't match the actual file contents. This edit targets the exact code shown in the editable region (the `rng.random` placeholder implementation) and replaces it with a deterministic multi-start optimizer: a LogSumExp softmin of squared triangle areas over all 286 triples, gradient ascent with a beta continuation schedule and decaying step, points clamped to the unit square (convex, area 1), followed by a finite-difference polish on the exact minimum triangle area. Fixed seeds ensure reproducibility.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        rng = np.random.default_rng(seed=42)
+        points = rng.random((n, 2))
+        return points
+=======
+        N = n
+        # Precompute all C(13,3) = 286 index triples
+        TRIP = np.array(
+            [(i, j, k) for i in range(N) for j in range(i + 1, N) for k in range(j + 1, N)],
+            dtype=np.int64,
+        )
+        IA, IB, IC = TRIP[:, 0], TRIP[:, 1], TRIP[:, 2]
+
+        def true_min_area(P):
+            ax, ay = P[IA, 0], P[IA, 1]
+            bx, by = P[IB, 0], P[IB, 1]
+            cx, cy = P[IC, 0], P[IC, 1]
+            d = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay)
+            return 0.5 * float(np.min(np.abs(d)))
+
+        def softmin_grad(P, beta):
+            ax, ay = P[IA, 0], P[IA, 1]
+            bx, by = P[IB, 0], P[IB, 1]
+            cx, cy = P[IC, 0], P[IC, 1]
+            d = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay)
+            s = 0.25 * d * d
+            w = np.exp(-beta * (s - s.min()))
+            w /= w.sum()
+            coef = w * d * 0.5
+            g = np.zeros_like(P)
+            np.add.at(g, IA, np.stack([coef * (by - cy), coef * (cx - bx)], axis=1))
+            np.add.at(g, IB, np.stack([coef * (cy - ay), coef * (ax - cx)], axis=1))
+            np.add.at(g, IC, np.stack([coef * (ay - by), coef * (bx - ax)], axis=1))
+            return float(s.min()), g
+
+        rng = np.random.default_rng(20240517)
+
+        def triangular_init():
+            pts = []
+            rows = 4
+            for r in range(rows):
+                y = min(max((r + 0.5) / rows, 0.02), 0.98)
+                cols = 4 if r % 2 == 0 else 3
+                for c in range(cols):
+                    x = (c + 0.5) / cols + (0.5 / cols if r % 2 else 0.0)
+                    pts.append([min(max(x, 0.02), 0.98), y])
+            while len(pts) < N:
+                pts.append([rng.uniform(0.1, 0.9), rng.uniform(0.1, 0.9)])
+            return np.array(pts[:N], dtype=float)
+
+        seeds = [triangular_init()]
+        for _ in range(23):
+            seeds.append(np.column_stack(
+                [rng.uniform(0.02, 0.98, N), rng.uniform(0.02, 0.98, N)]
+            ))
+
+        best_P, best_val = None, -1.0
+        for P0 in seeds:
+            P = P0.copy()
+            step = 0.02
+            for beta in (20.0, 80.0, 300.0, 1200.0, 4000.0):
+                for _ in range(120):
+                    _, g = softmin_grad(P, beta)
+                    P = P + step * g
+                    np.clip(P, 0.0, 1.0, out=P)
+                    step *= 0.998
+                step = max(step * 0.5, 0.002)
+            val = true_min_area(P)
+            if val > best_val:
+                best_val, best_P = val, P.copy()
+
+        # Polish best candidate: gradient ascent + finite-difference on exact min area
+        P = best_P.copy()
+        h = 1e-4
+        for beta in (2000.0, 20000.0):
+            for it in range(300):
+                _, g = softmin_grad(P, beta)
+                gnorm = float(np.linalg.norm(g))
+                if gnorm < 1e-12:
+                    break
+                step = 0.003 / (1.0 + 0.01 * it)
+                Q = P + step * g / gnorm
+                np.clip(Q, 0.0, 1.0, out=Q)
+                if true_min_area(Q) >= true_min_area(P) - 1e-12:
+                    P = Q
+            improved = True
+            fd_iters = 0
+            while improved and fd_iters < 200:
+                improved = False
+                fd_iters += 1
+                base = true_min_area(P)
+                for i in range(N):
+                    for c in range(2):
+                        for sgn in (+1, -1):
+                            Q = P.copy()
+                            Q[i, c] = min(max(Q[i, c] + sgn * h, 0.0), 1.0)
+                            v = true_min_area(Q)
+                            if v > base + 1e-12:
+                                P, base, improved = Q, v, True
+                                break
+                    if improved:
+                        break
+        if true_min_area(P) > best_val:
+            best_P, best_val = P.copy(), true_min_area(P)
+
+        points = [[float(x), float(y)] for x, y in best_P]
+        assert len(points) == N
+        assert all(np.isfinite(x) and np.isfinite(y) for x, y in points)
+        return points
+>>>>>>> REPLACE

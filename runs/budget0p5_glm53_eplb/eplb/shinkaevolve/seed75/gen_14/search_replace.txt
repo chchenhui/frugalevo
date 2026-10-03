@@ -1,0 +1,64 @@
+<NAME>
+gpu_swap_refinement_pass
+</NAME>
+<DESCRIPTION>
+Add a greedy local-search refinement pass after Step 3 of the hierarchical algorithm. After `balanced_packing` assigns physical experts to GPUs, per-GPU loads may still be unbalanced (GPU balancedness is only 0.66). Since each GPU holds a fixed number of physical experts, we can swap experts between the most-loaded and least-loaded GPU within each node (keeping pack sizes constant), choosing the pair whose weight difference best halves the load gap. This is fully vectorized across all (layer, node) rows, iterated at most 20 times, and stops early when no swap reduces the global max load. It reuses the existing `pack_index`/`rank_in_pack` plumbing so the downstream `phy2pphy` construction is unchanged. This should substantially improve GPU balancedness at negligible runtime cost (a few vectorized ops per iteration, versus the expensive Python loops in `balanced_packing`).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    pack_index, rank_in_pack = balanced_packing(tokens_per_phy,
+                                                num_gpus // num_nodes)
+    phy2pphy = pack_index * phy_experts_per_gpu + rank_in_pack
+=======
+    pack_index, rank_in_pack = balanced_packing(tokens_per_phy,
+                                                num_gpus // num_nodes)
+
+    # Step 3.5: greedy refinement - swap physical experts between the
+    # most-loaded and least-loaded GPU within each node to reduce the
+    # maximum per-GPU load. Pack sizes stay constant under swaps.
+    num_packs = num_gpus // num_nodes
+    num_rows = tokens_per_phy.size(0)
+    row_idx = torch.arange(num_rows, dtype=torch.int64)
+    for _ in range(20):
+        loads = torch.zeros(num_rows,
+                            num_packs,
+                            dtype=tokens_per_phy.dtype,
+                            device=tokens_per_phy.device)
+        loads.scatter_add_(-1, pack_index, tokens_per_phy)
+        max_pack = loads.argmax(-1)
+        min_pack = loads.argmin(-1)
+        cur_max = loads.max(-1).values
+        in_max = pack_index == max_pack.unsqueeze(-1)
+        in_min = pack_index == min_pack.unsqueeze(-1)
+        neg_inf = float("-inf")
+        pos_inf = float("inf")
+        # lightest expert on the least-loaded GPU
+        w_min = torch.where(in_min, tokens_per_phy, pos_inf)
+        b = w_min.argmin(-1)
+        wb = tokens_per_phy[row_idx, b]
+        # expert on the most-loaded GPU whose weight best halves the gap
+        load_gap = (loads[row_idx, max_pack] - loads[row_idx, min_pack]) / 2
+        target = wb + load_gap
+        diff = torch.where(in_max, (tokens_per_phy - target.unsqueeze(-1)).abs(),
+                           pos_inf)
+        a = diff.argmin(-1)
+        wa = tokens_per_phy[row_idx, a]
+        new_max_load = loads[row_idx, max_pack] - wa + wb
+        new_min_load = loads[row_idx, min_pack] + wa - wb
+        improved = (wa > wb) & (torch.maximum(new_max_load, new_min_load) <
+                                cur_max)
+        if not improved.any():
+            break
+        rows = row_idx[improved]
+        pa = pack_index[rows, a[improved]]
+        pb = pack_index[rows, b[improved]]
+        ra = rank_in_pack[rows, a[improved]]
+        rb = rank_in_pack[rows, b[improved]]
+        pack_index[rows, a[improved]] = pb
+        rank_in_pack[rows, a[improved]] = rb
+        pack_index[rows, b[improved]] = pa
+        rank_in_pack[rows, b[improved]] = ra
+
+    phy2pphy = pack_index * phy_experts_per_gpu + rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

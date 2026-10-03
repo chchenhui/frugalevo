@@ -1,0 +1,189 @@
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles"""
+import numpy as np
+
+
+def construct_packing():
+    """
+    Construct a specific arrangement of 26 circles in a unit square
+    that attempts to maximize the sum of their radii.
+
+    Returns:
+        Tuple of (centers, radii, sum_of_radii)
+        centers: np.array of shape (26, 2) with (x, y) coordinates
+        radii: np.array of shape (26) with radius of each circle
+        sum_of_radii: Sum of all radii
+    """
+    # Initialize arrays for 26 circles
+    n = 26
+    centers = np.zeros((n, 2))
+
+    # Staggered-row starting layout: rows of 5, 4, 5, 4, 5, 3 = 26 circles.
+    # Spacing is wider than the uniform-radius optimum so that circles in
+    # the 4- and 3-circle rows (and near walls) have room to grow larger
+    # than the uniform cap once radii are allowed to differ per circle.
+    s = 0.2
+    row_counts = [5, 4, 5, 4, 5, 3]
+    row_spacings = [s, s, s, s, s, 0.3]
+    y0 = 0.1
+    gap = (1.0 - 2.0 * y0) / 5.0
+    idx = 0
+    for row, count in enumerate(row_counts):
+        sp = row_spacings[row]
+        y = y0 + row * gap
+        for j in range(count):
+            centers[idx] = [0.5 + (j - (count - 1) / 2.0) * sp, y]
+            idx += 1
+
+    # Deterministic refinement: grow per-circle radii, then nudge each
+    # center away from its currently active constraints (touching
+    # neighbors and walls), and repeat with a decreasing step size.
+    radii = compute_max_radii(centers)
+    n_iter = 400
+    for it in range(n_iter):
+        step = 0.02 * (1.0 - it / n_iter) + 0.0005
+        for i in range(n):
+            xi, yi = centers[i]
+            ri = radii[i]
+            fx = 0.0
+            fy = 0.0
+            for j in range(n):
+                if j == i:
+                    continue
+                dx = xi - centers[j, 0]
+                dy = yi - centers[j, 1]
+                dist = np.sqrt(dx * dx + dy * dy)
+                overlap = ri + radii[j] - dist
+                if overlap > 0.0 and dist > 1e-12:
+                    fx += overlap * dx / dist
+                    fy += overlap * dy / dist
+            # Wall pushes
+            if xi - ri < 0.0:
+                fx += (ri - xi)
+            if xi + ri > 1.0:
+                fx -= (xi + ri - 1.0)
+            if yi - ri < 0.0:
+                fy += (ri - yi)
+            if yi + ri > 1.0:
+                fy -= (yi + ri - 1.0)
+            norm = np.sqrt(fx * fx + fy * fy)
+            if norm > 1e-12:
+                centers[i, 0] = min(max(xi + step * fx / norm, 1e-9), 1.0 - 1e-9)
+                centers[i, 1] = min(max(yi + step * fy / norm, 1e-9), 1.0 - 1e-9)
+        if it % 20 == 19:
+            radii = compute_max_radii(centers)
+
+    # Final per-circle radii for the refined layout
+    radii = compute_max_radii(centers)
+
+    # Calculate the sum of radii
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+
+
+def compute_max_radii(centers):
+    """
+    Compute per-circle radii via Gauss-Seidel "water filling": each
+    circle grows up to the largest radius allowed by its wall distances
+    and its neighbors' current radii. Iterated to (near) convergence,
+    then a monotone repair pass (which only ever shrinks radii)
+    guarantees the final radii are feasible: inside the square and
+    pairwise non-overlapping.
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+
+    Returns:
+        np.array of shape (n) with radius of each circle
+    """
+    n = centers.shape[0]
+
+    # Precompute pairwise distances and wall-distance caps
+    D = np.zeros((n, n))
+    wall = np.zeros(n)
+    for i in range(n):
+        x, y = centers[i]
+        wall[i] = min(x, y, 1.0 - x, 1.0 - y)
+        for j in range(i + 1, n):
+            d = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            D[i, j] = d
+            D[j, i] = d
+
+    # Gauss-Seidel growth
+    r = np.zeros(n)
+    for _ in range(300):
+        changed = False
+        for i in range(n):
+            cap = wall[i]
+            for j in range(n):
+                if j != i and D[i, j] - r[j] < cap:
+                    cap = D[i, j] - r[j]
+            if cap < 0.0:
+                cap = 0.0
+            if abs(cap - r[i]) > 1e-12:
+                changed = True
+            r[i] = cap
+        if not changed:
+            break
+
+    # Monotone feasibility repair: clamp to walls, then shrink pairs.
+    # Both operations only reduce radii, so the result is guaranteed valid.
+    r = np.minimum(r, wall)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if r[i] + r[j] > D[i, j]:
+                scale = D[i, j] / (r[i] + r[j])
+                r[i] *= scale
+                r[j] *= scale
+    r = np.minimum(r, wall)
+
+    return r
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

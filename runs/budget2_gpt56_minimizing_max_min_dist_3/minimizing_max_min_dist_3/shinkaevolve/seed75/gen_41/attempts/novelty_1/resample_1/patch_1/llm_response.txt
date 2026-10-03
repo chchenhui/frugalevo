@@ -1,0 +1,297 @@
+<NAME>
+contact_homotopy_pack
+</NAME>
+
+<DESCRIPTION>
+This version uses a contact-homotopy search rather than relying primarily on a fixed family of highly symmetric starts. It combines free-radial cube/axis seeds, perturbed antipodal seeds, twisted rings, and unrestricted random configurations. Each seed is evolved by a deterministic contact-force flow whose emphasis gradually shifts from broad pairwise separation toward the currently limiting minimum-distance and diameter contacts. The best geometrically diverse candidates are then polished with the exact diameter-packing constrained formulation using analytic SLSQP derivatives.
+
+The main insight is that the best 14-point configuration is likely near, but not exactly inside, cube/octahedral or antipodal families. Therefore those structures are used only as broad basin generators, with independently perturbed radii and offsets before unrestricted optimization.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Deterministically construct fourteen points in R^3 with a large squared
+    minimum-distance / squared-diameter ratio.
+
+    The search uses broad structured-but-nonrigid seeds, a contact-homotopy
+    force flow, and an exact constrained SLSQP polish.
+    """
+    n = 14
+    ii, jj = np.triu_indices(n, 1)
+    m = len(ii)
+    rng = np.random.default_rng(918273645)
+
+    def d2(x: np.ndarray) -> np.ndarray:
+        delta = x[ii] - x[jj]
+        return np.einsum("ij,ij->i", delta, delta)
+
+    def score(x: np.ndarray) -> float:
+        q = d2(x)
+        return float(np.min(q) / np.max(q))
+
+    def rms_normalize(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=float).copy()
+        x -= np.mean(x, axis=0, keepdims=True)
+        r = np.sqrt(np.mean(np.sum(x * x, axis=1)))
+        return x / max(r, 1.0e-14)
+
+    def diameter_normalize(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=float).copy()
+        x -= x[0]
+        q = d2(x)
+        diameter2 = float(np.max(q))
+        if np.isfinite(diameter2) and diameter2 > 0.0:
+            x /= np.sqrt(diameter2)
+        return x
+
+    def contact_flow(seed: np.ndarray, steps: int = 580) -> np.ndarray:
+        """
+        Homotopy between broad logarithmic pair separation and concentrated
+        active-contact forces.  RMS normalization removes the scale mode.
+        """
+        x = rms_normalize(seed)
+        momentum = np.zeros_like(x)
+        low_memory = np.zeros(m)
+        high_memory = np.zeros(m)
+
+        for k in range(steps):
+            u = k / max(steps - 1, 1)
+
+            delta = x[ii] - x[jj]
+            q = np.einsum("ij,ij->i", delta, delta)
+            q = np.maximum(q, 1.0e-12)
+            z = np.log(q)
+
+            sharp = 4.0 + 135.0 * u * u
+
+            low_logits = -sharp * z
+            low_logits -= np.max(low_logits)
+            low = np.exp(low_logits)
+            low /= np.sum(low)
+
+            high_logits = sharp * z
+            high_logits -= np.max(high_logits)
+            high = np.exp(high_logits)
+            high /= np.sum(high)
+
+            qmin = float(np.min(q))
+            qmax = float(np.max(q))
+
+            # Persistent active-contact estimates reduce instability caused by
+            # rapidly changing softmax leaders.
+            width = 0.36 - 0.27 * u
+            low_band = np.exp(
+                -np.minimum(q / qmin - 1.0, 25.0) / max(width, 0.055)
+            )
+            high_band = np.exp(
+                -np.minimum(qmax / q - 1.0, 25.0) / max(width, 0.055)
+            )
+
+            memory = 0.77 + 0.18 * u
+            low_memory = memory * low_memory + (1.0 - memory) * low_band
+            high_memory = memory * high_memory + (1.0 - memory) * high_band
+
+            low *= 0.18 + low_memory
+            high *= 0.18 + high_memory
+            low /= np.sum(low)
+            high /= np.sum(high)
+
+            pair_force = 2.0 * (low - high)[:, None] * delta / q[:, None]
+            force = np.zeros_like(x)
+            np.add.at(force, ii, pair_force)
+            np.add.at(force, jj, -pair_force)
+            force -= np.mean(force, axis=0, keepdims=True)
+
+            momentum = 0.70 * momentum + force
+            momentum -= np.mean(momentum, axis=0, keepdims=True)
+
+            # Prevent a handful of transient contacts from causing a large
+            # displacement of a single point.
+            norms = np.linalg.norm(momentum, axis=1, keepdims=True)
+            momentum *= np.minimum(1.0, 3.2 / np.maximum(norms, 1.0e-12))
+
+            step = 0.035 * (1.0 - 0.76 * u)
+            x = rms_normalize(x + step * momentum)
+
+            # Very early deterministic thermal mixing helps structured seeds
+            # escape exact symmetry while retaining their useful contact graph.
+            if k < 180 and k % 30 == 0:
+                noise = rng.normal(size=x.shape)
+                noise -= np.mean(noise, axis=0, keepdims=True)
+                x = rms_normalize(x + (0.020 * (1.0 - k / 180.0)) * noise)
+
+        return diameter_normalize(x)
+
+    # Cube vertices plus axial points are useful, but their radii and axial
+    # offsets are independently released before the unrestricted flow.
+    cube_signs = np.array(
+        [[a, b, c]
+         for a in (-1.0, 1.0)
+         for b in (-1.0, 1.0)
+         for c in (-1.0, 1.0)],
+        dtype=float,
+    )
+    axial_signs = np.vstack((np.eye(3), -np.eye(3)))
+
+    seeds = []
+    for perturb in (0.0, 0.025, 0.060, 0.105, 0.150, 0.210):
+        cube_radii = 1.0 + perturb * rng.normal(size=(8, 1))
+        axis_radii = np.sqrt(3.0) * (1.0 + perturb * rng.normal(size=(6, 1)))
+        cube = cube_signs * cube_radii
+        axes = axial_signs * axis_radii
+        candidate = np.vstack((cube, axes))
+        candidate += perturb * rng.normal(size=candidate.shape)
+        seeds.append(candidate)
+
+    # Twisted seven-point layers produce a substantially different contact
+    # topology from cube-axis configurations.
+    theta = 2.0 * np.pi * np.arange(7) / 7.0
+    for twist in (0.0, np.pi / 21.0, np.pi / 14.0, np.pi / 9.0):
+        for height in (0.42, 0.54):
+            radius = np.sqrt(max(1.0 - height * height, 0.1))
+            upper = np.column_stack((
+                radius * np.cos(theta),
+                radius * np.sin(theta),
+                np.full(7, height),
+            ))
+            lower = np.column_stack((
+                radius * np.cos(theta + twist),
+                radius * np.sin(theta + twist),
+                np.full(7, -height),
+            ))
+            seeds.append(np.vstack((upper, lower)))
+
+    # Perturbed line-packing seeds preserve useful angular spacing without
+    # forcing the final solution to remain antipodal.
+    for _ in range(12):
+        unit = rng.normal(size=(7, 3))
+        unit /= np.linalg.norm(unit, axis=1, keepdims=True)
+        seed = np.vstack((unit, -unit))
+        seed *= 1.0 + 0.12 * rng.normal(size=(n, 1))
+        seed += 0.10 * rng.normal(size=(n, 3))
+        seeds.append(seed)
+
+    # Fully unrestricted seeds provide access to asymmetric basins.
+    for _ in range(20):
+        seeds.append(rng.normal(size=(n, 3)))
+
+    screened = []
+    for seed in seeds:
+        candidate = contact_flow(seed)
+        screened.append((score(candidate), candidate))
+
+    screened.sort(key=lambda item: item[0], reverse=True)
+
+    # Retain candidates from genuinely different coordinate basins.  The
+    # initial point ordering is retained by the flow, so this is sufficient
+    # as a cheap diversity filter before expensive exact polishing.
+    chosen = []
+    for _, candidate in screened:
+        if not chosen:
+            chosen.append(candidate)
+        else:
+            separation = min(
+                np.mean((candidate - previous) ** 2) for previous in chosen
+            )
+            if separation > 1.5e-4 or len(chosen) < 5:
+                chosen.append(candidate)
+        if len(chosen) >= 12:
+            break
+
+    best = diameter_normalize(screened[0][1])
+    best_value = score(best)
+
+    try:
+        from scipy.optimize import minimize
+
+        def unpack(y: np.ndarray) -> np.ndarray:
+            return np.vstack((
+                np.zeros((1, 3)),
+                y[:-1].reshape(n - 1, 3),
+            ))
+
+        def inequalities(y: np.ndarray) -> np.ndarray:
+            q = d2(unpack(y))
+            return np.concatenate((q - y[-1], 1.0 - q))
+
+        def inequality_jacobian(y: np.ndarray) -> np.ndarray:
+            x = unpack(y)
+            delta = 2.0 * (x[ii] - x[jj])
+
+            jac = np.zeros((2 * m, 3 * (n - 1) + 1), dtype=float)
+
+            for coordinate in range(3):
+                left = ii != 0
+                rows = np.nonzero(left)[0]
+                cols = 3 * (ii[left] - 1) + coordinate
+                jac[rows, cols] += delta[left, coordinate]
+                jac[m + rows, cols] -= delta[left, coordinate]
+
+                right = jj != 0
+                rows = np.nonzero(right)[0]
+                cols = 3 * (jj[right] - 1) + coordinate
+                jac[rows, cols] -= delta[right, coordinate]
+                jac[m + rows, cols] += delta[right, coordinate]
+
+            jac[:m, -1] = -1.0
+            return jac
+
+        objective_gradient = np.zeros(3 * (n - 1) + 1)
+        objective_gradient[-1] = -1.0
+
+        constraints = {
+            "type": "ineq",
+            "fun": inequalities,
+            "jac": inequality_jacobian,
+        }
+        bounds = [(-1.10, 1.10)] * (3 * (n - 1)) + [(0.0, 1.0)]
+
+        for candidate in chosen:
+            candidate = diameter_normalize(candidate)
+            q = d2(candidate)
+            y0 = np.concatenate((
+                candidate[1:].ravel(),
+                [0.997 * float(np.min(q))],
+            ))
+
+            result = minimize(
+                fun=lambda y: -y[-1],
+                x0=y0,
+                jac=lambda y: objective_gradient,
+                method="SLSQP",
+                bounds=bounds,
+                constraints=constraints,
+                options={
+                    "maxiter": 850,
+                    "ftol": 1.0e-12,
+                    "disp": False,
+                },
+            )
+
+            if result.x is None or not np.all(np.isfinite(result.x)):
+                continue
+
+            refined = diameter_normalize(unpack(result.x))
+            q = d2(refined)
+            if np.min(q) <= 0.0 or not np.all(np.isfinite(q)):
+                continue
+
+            refined_value = float(np.min(q) / np.max(q))
+            if refined_value > best_value:
+                best = refined
+                best_value = refined_value
+
+    except Exception:
+        pass
+
+    return np.asarray(diameter_normalize(best), dtype=float)
+
+
+# EVOLVE-BLOCK-END
+```

@@ -1,0 +1,342 @@
+--- a/original.py
++++ b/original.py
+@@ -1,155 +1,219 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def min_max_dist_dim3_14() -> np.ndarray:
+     """
+-    Construct 14 points in R^3 with a large minimum pairwise distance
+-    relative to their diameter.
+-
+-    Returns
+-    -------
+-    np.ndarray
+-        Finite array of shape (14, 3).
++    Deterministically construct a 14 point Euclidean diameter packing.
++
++    A population-based smooth feasibility search is used to generate
++    asymmetric candidates, followed by constrained active-set polishing of
++    the exact formulation:
++        maximize t
++        subject to t <= ||x_i-x_j||^2 <= 1.
+     """
+-
+     n = 14
+-    pair_i, pair_j = np.triu_indices(n, 1)
+-    m = len(pair_i)
+-
+-    def pairwise_squared(points: np.ndarray) -> np.ndarray:
+-        delta = points[pair_i] - points[pair_j]
+-        return np.einsum("ij,ij->i", delta, delta)
+-
+-    def normalized(points: np.ndarray) -> np.ndarray:
+-        points = np.asarray(points, dtype=float)
+-        points = points - points[0]
+-        d2 = pairwise_squared(points)
+-        diameter = np.sqrt(np.max(d2))
+-        if not np.isfinite(diameter) or diameter <= 0.0:
+-            return points
+-        return points / diameter
+-
+-    # A symmetric, already fairly good starting configuration:
+-    # eight cube vertices and six coordinate-axis vertices.
++    pi, pj = np.triu_indices(n, 1)
++    pairs = len(pi)
++    rng = np.random.default_rng(7301941)
++
++    def dist2(x: np.ndarray) -> np.ndarray:
++        d = x[pi] - x[pj]
++        return np.einsum("ij,ij->i", d, d)
++
++    def value(x: np.ndarray) -> float:
++        q = dist2(x)
++        return float(q.min() / q.max())
++
++    def diameter_normalize(x: np.ndarray) -> np.ndarray:
++        x = np.asarray(x, dtype=float).copy()
++        x -= x[0]
++        q = dist2(x)
++        mx = float(q.max())
++        if mx > 0.0 and np.isfinite(mx):
++            x /= np.sqrt(mx)
++        return x
++
++    def rms_normalize(x: np.ndarray) -> np.ndarray:
++        x = x - x.mean(axis=0, keepdims=True)
++        s = np.sqrt(np.mean(np.sum(x * x, axis=1)))
++        return x / max(s, 1e-12)
++
++    def anneal(seed: np.ndarray, steps: int = 520) -> np.ndarray:
++        """
++        Smooth log-diameter force flow.  Low-distance pairs receive
++        repulsion and high-distance pairs receive attraction.  RMS
++        normalization removes the irrelevant scale direction.
++        """
++        x = rms_normalize(seed)
++        velocity = np.zeros_like(x)
++
++        for it in range(steps):
++            u = it / max(steps - 1, 1)
++            sharp = 5.0 + 115.0 * u * u
++
++            d = x[pi] - x[pj]
++            q = np.einsum("ij,ij->i", d, d)
++            q = np.maximum(q, 1e-10)
++            z = np.log(q)
++
++            a = -sharp * z
++            a -= a.max()
++            low = np.exp(a)
++            low /= low.sum()
++
++            b = sharp * z
++            b -= b.max()
++            high = np.exp(b)
++            high /= high.sum()
++
++            # Gradient of soft-min(log q) - soft-max(log q).
++            force_pair = 2.0 * (low - high)[:, None] * d / q[:, None]
++            force = np.zeros_like(x)
++            np.add.at(force, pi, force_pair)
++            np.add.at(force, pj, -force_pair)
++
++            force -= force.mean(axis=0, keepdims=True)
++            velocity = 0.67 * velocity + force
++            velocity -= velocity.mean(axis=0, keepdims=True)
++
++            limit = 3.0
++            vn = np.linalg.norm(velocity, axis=1, keepdims=True)
++            velocity *= np.minimum(1.0, limit / np.maximum(vn, 1e-12))
++
++            step = 0.030 * (1.0 - 0.72 * u)
++            x = rms_normalize(x + step * velocity)
++
++        return diameter_normalize(x)
++
++    # Several geometrically distinct deterministic seeds.
+     cube = np.array(
+-        [[sx, sy, sz]
+-         for sx in (-1.0, 1.0)
+-         for sy in (-1.0, 1.0)
+-         for sz in (-1.0, 1.0)],
++        [[a, b, c]
++         for a in (-1.0, 1.0)
++         for b in (-1.0, 1.0)
++         for c in (-1.0, 1.0)],
+         dtype=float,
+     )
+-    axes = np.array(
+-        [
+-            [np.sqrt(3.0), 0.0, 0.0],
+-            [-np.sqrt(3.0), 0.0, 0.0],
+-            [0.0, np.sqrt(3.0), 0.0],
+-            [0.0, -np.sqrt(3.0), 0.0],
+-            [0.0, 0.0, np.sqrt(3.0)],
+-            [0.0, 0.0, -np.sqrt(3.0)],
+-        ],
+-        dtype=float,
+-    )
+-    base = normalized(np.vstack((cube, axes)))
+-
+-    best = base.copy()
+-    best_ratio2 = float(np.min(pairwise_squared(best)) / np.max(pairwise_squared(best)))
++    axes = np.vstack((np.eye(3), -np.eye(3))) * np.sqrt(3.0)
++    seeds = [np.vstack((cube, axes))]
++
++    # Twisted two-ring configurations are useful asymmetric alternatives.
++    for twist in (0.0, np.pi / 14.0, np.pi / 7.0):
++        theta = 2.0 * np.pi * np.arange(7) / 7.0
++        ring1 = np.column_stack((np.cos(theta), np.sin(theta), np.full(7, 0.52)))
++        ring2 = np.column_stack((
++            np.cos(theta + twist),
++            np.sin(theta + twist),
++            np.full(7, -0.52),
++        ))
++        seeds.append(np.vstack((ring1, ring2)))
++
++    # Random full-dimensional seeds deliberately permit non-antipodal optima.
++    for _ in range(26):
++        seeds.append(rng.normal(size=(n, 3)))
++
++    # Include some line-packings but perturb them so that antipodality is not
++    # imposed during the subsequent full point optimization.
++    for _ in range(10):
++        u = rng.normal(size=(7, 3))
++        u /= np.linalg.norm(u, axis=1, keepdims=True)
++        x = np.vstack((u, -u))
++        x += 0.075 * rng.normal(size=x.shape)
++        seeds.append(x)
++
++    screened = []
++    for seed in seeds:
++        candidate = anneal(seed)
++        screened.append((value(candidate), candidate))
++
++    screened.sort(key=lambda item: item[0], reverse=True)
++
++    # Keep candidates from separate rank positions, rather than only nearly
++    # identical variants of the currently best basin.
++    selected = []
++    for _, candidate in screened:
++        if not selected:
++            selected.append(candidate)
++            continue
++        separation = min(np.mean((candidate - old) ** 2) for old in selected)
++        if separation > 2.0e-4 or len(selected) < 4:
++            selected.append(candidate)
++        if len(selected) == 11:
++            break
++
++    best = diameter_normalize(screened[0][1])
++    best_score = value(best)
+ 
+     try:
+         from scipy.optimize import minimize
+ 
+-        # Point zero is fixed at the origin.  This removes the translation
+-        # invariance and makes the constrained optimization better conditioned.
+-        def unpack(x: np.ndarray) -> np.ndarray:
+-            return np.vstack((np.zeros((1, 3)), x[: 3 * (n - 1)].reshape(n - 1, 3)))
+-
+-        def constraint_values(x: np.ndarray) -> np.ndarray:
+-            points = unpack(x)
+-            d2 = pairwise_squared(points)
+-            t = x[-1]
+-            # d_ij^2 >= t and d_ij^2 <= 1.
+-            return np.concatenate((d2 - t, 1.0 - d2))
+-
+-        def constraint_jacobian(x: np.ndarray) -> np.ndarray:
+-            points = unpack(x)
+-            jac = np.zeros((2 * m, 3 * (n - 1) + 1), dtype=float)
+-
+-            for k, (a, b) in enumerate(zip(pair_i, pair_j)):
+-                diff = 2.0 * (points[a] - points[b])
+-
+-                if a != 0:
+-                    aa = 3 * (a - 1)
+-                    jac[k, aa:aa + 3] += diff
+-                    jac[m + k, aa:aa + 3] -= diff
+-
+-                if b != 0:
+-                    bb = 3 * (b - 1)
+-                    jac[k, bb:bb + 3] -= diff
+-                    jac[m + k, bb:bb + 3] += diff
+-
+-                jac[k, -1] = -1.0
+-
++        def unpack(y: np.ndarray) -> np.ndarray:
++            return np.vstack((np.zeros((1, 3)), y[:-1].reshape(n - 1, 3)))
++
++        def constraints(y: np.ndarray) -> np.ndarray:
++            q = dist2(unpack(y))
++            return np.concatenate((q - y[-1], 1.0 - q))
++
++        def jacobian(y: np.ndarray) -> np.ndarray:
++            x = unpack(y)
++            d = 2.0 * (x[pi] - x[pj])
++            jac = np.zeros((2 * pairs, 3 * (n - 1) + 1), dtype=float)
++
++            mask_i = pi != 0
++            rows_i = np.nonzero(mask_i)[0]
++            cols_i = 3 * (pi[mask_i] - 1)
++            for coordinate in range(3):
++                jac[rows_i, cols_i + coordinate] = d[mask_i, coordinate]
++                jac[pairs + rows_i, cols_i + coordinate] = -d[mask_i, coordinate]
++
++            mask_j = pj != 0
++            rows_j = np.nonzero(mask_j)[0]
++            cols_j = 3 * (pj[mask_j] - 1)
++            for coordinate in range(3):
++                jac[rows_j, cols_j + coordinate] = -d[mask_j, coordinate]
++                jac[pairs + rows_j, cols_j + coordinate] = d[mask_j, coordinate]
++
++            jac[:pairs, -1] = -1.0
+             return jac
+ 
+-        # Fixed perturbations avoid dependence on ambient random state while
+-        # helping the optimizer escape the highly symmetric initial point.
+-        rng = np.random.default_rng(20240517)
+-        starts = [base]
+-        for scale in (0.015, 0.035, 0.070):
+-            perturbation = rng.standard_normal((n, 3))
+-            perturbation[0] = 0.0
+-            starts.append(normalized(base + scale * perturbation))
+-
+-        bounds = [(-1.25, 1.25)] * (3 * (n - 1)) + [(0.0, 1.0)]
+-        constraints = {
+-            "type": "ineq",
+-            "fun": constraint_values,
+-            "jac": constraint_jacobian,
+-        }
+-
+-        for start in starts:
+-            start = normalized(start)
+-            initial_d2 = pairwise_squared(start)
+-            x0 = np.concatenate(
+-                (
+-                    start[1:].reshape(-1),
+-                    [0.995 * float(np.min(initial_d2))],
+-                )
+-            )
++        objective_gradient = np.zeros(3 * (n - 1) + 1)
++        objective_gradient[-1] = -1.0
++        bounds = [(-1.05, 1.05)] * (3 * (n - 1)) + [(0.0, 1.0)]
++        cons = {"type": "ineq", "fun": constraints, "jac": jacobian}
++
++        # Exact constrained polish of each globally screened candidate.
++        for candidate in selected:
++            candidate = diameter_normalize(candidate)
++            q = dist2(candidate)
++            initial_t = 0.992 * float(q.min())
++            y0 = np.concatenate((candidate[1:].ravel(), [initial_t]))
+ 
+             result = minimize(
+-                fun=lambda x: -x[-1],
+-                x0=x0,
+-                jac=lambda x: np.r_[np.zeros(3 * (n - 1)), -1.0],
++                lambda y: -y[-1],
++                y0,
++                jac=lambda y: objective_gradient,
+                 method="SLSQP",
+                 bounds=bounds,
+-                constraints=constraints,
+-                options={
+-                    "maxiter": 450,
+-                    "ftol": 1.0e-11,
+-                    "disp": False,
+-                },
++                constraints=cons,
++                options={"maxiter": 700, "ftol": 2.0e-12, "disp": False},
+             )
+ 
+             if result.x is None or not np.all(np.isfinite(result.x)):
+                 continue
+ 
+-            candidate = normalized(unpack(result.x))
+-            d2 = pairwise_squared(candidate)
+-            if np.min(d2) <= 0.0 or np.max(d2) <= 0.0:
++            candidate = diameter_normalize(unpack(result.x))
++            q = dist2(candidate)
++            if q.min() <= 0.0:
+                 continue
+-
+-            ratio2 = float(np.min(d2) / np.max(d2))
+-            if ratio2 > best_ratio2:
++            candidate_score = float(q.min() / q.max())
++            if candidate_score > best_score:
++                best_score = candidate_score
+                 best = candidate
+-                best_ratio2 = ratio2
+ 
+     except Exception:
+-        # The structured normalized configuration remains a valid deterministic
+-        # fallback when SciPy is not installed or an optimizer is unavailable.
+         pass
+ 
+-    return np.asarray(normalized(best), dtype=float)
++    return np.asarray(diameter_normalize(best), dtype=float)
+ 
+ 
+ # EVOLVE-BLOCK-END

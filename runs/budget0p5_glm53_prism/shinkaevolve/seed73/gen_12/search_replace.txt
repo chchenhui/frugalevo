@@ -1,0 +1,97 @@
+<NAME>
+add_local_search_refinement
+
+</NAME>
+<DESCRIPTION>
+Keep the greedy construction (which achieves 100% success rate) but add a local search refinement phase that tries moves and pairwise swaps between GPUs to reduce the maximum KVPR. The earlier failed version crashed because `gpu_kvpr` divided by zero when a GPU's free memory hit exactly 0; this version guards with `free > 0` checks (treating empty/zero-free GPUs carefully) and uses a bounded number of improvement passes to guarantee termination. Swapping models between GPUs can reduce max KVPR when simple moves cannot (e.g., all GPUs are heavily loaded).
+
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    return placement
+=======
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    # 4) Local search: moves and swaps to reduce the maximum KVPR
+    def kvpr_of(i):
+        free = shared_kv[i]
+        if free <= 0:
+            return float('inf') if weighted_req_rate[i] > 0 else 0.0
+        return weighted_req_rate[i] / free
+
+    for _ in range(200):  # bounded passes to guarantee termination
+        max_gpu = max(range(gpu_num), key=lambda i: (kvpr_of(i), -shared_kv[i]))
+        max_kvpr = kvpr_of(max_gpu)
+        improved = False
+
+        # Try moving a model off the worst GPU
+        for m in list(placement[max_gpu]):
+            for g in range(gpu_num):
+                if g == max_gpu or m.model_size > shared_kv[g]:
+                    continue
+                # simulate move
+                weighted_req_rate[max_gpu] -= m.req_rate / m.slo
+                shared_kv[max_gpu] += m.model_size
+                weighted_req_rate[g] += m.req_rate / m.slo
+                shared_kv[g] -= m.model_size
+                new_max = max(kvpr_of(x) for x in range(gpu_num))
+                if new_max < max_kvpr - 1e-12:
+                    placement[max_gpu].remove(m)
+                    placement[g].append(m)
+                    improved = True
+                    break
+                # revert
+                weighted_req_rate[max_gpu] += m.req_rate / m.slo
+                shared_kv[max_gpu] -= m.model_size
+                weighted_req_rate[g] -= m.req_rate / m.slo
+                shared_kv[g] += m.model_size
+            if improved:
+                break
+        if improved:
+            continue
+
+        # Try swapping a model on the worst GPU with a model elsewhere
+        for m1 in list(placement[max_gpu]):
+            for g in range(gpu_num):
+                if g == max_gpu:
+                    continue
+                for m2 in list(placement[g]):
+                    # check sizes fit after swap
+                    if (m1.model_size - m2.model_size) > shared_kv[g]:
+                        continue
+                    if (m2.model_size - m1.model_size) > shared_kv[max_gpu]:
+                        continue
+                    # simulate swap
+                    weighted_req_rate[max_gpu] += m2.req_rate / m2.slo - m1.req_rate / m1.slo
+                    shared_kv[max_gpu] += m1.model_size - m2.model_size
+                    weighted_req_rate[g] += m1.req_rate / m1.slo - m2.req_rate / m2.slo
+                    shared_kv[g] += m2.model_size - m1.model_size
+                    new_max = max(kvpr_of(x) for x in range(gpu_num))
+                    if new_max < max_kvpr - 1e-12:
+                        placement[max_gpu].remove(m1)
+                        placement[g].append(m1)
+                        placement[g].remove(m2)
+                        placement[max_gpu].append(m2)
+                        improved = True
+                        break
+                    # revert
+                    weighted_req_rate[max_gpu] -= m2.req_rate / m2.slo - m1.req_rate / m1.slo
+                    shared_kv[max_gpu] -= m1.model_size - m2.model_size
+                    weighted_req_rate[g] -= m1.req_rate / m1.slo - m2.req_rate / m2.slo
+                    shared_kv[g] -= m2.model_size - m1.model_size
+                if improved:
+                    break
+            if improved:
+                break
+        if not improved:
+            break
+
+    return placement
+>>>>>>> REPLACE
+</DIFF>

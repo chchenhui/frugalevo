@@ -1,0 +1,207 @@
+--- a/original.py
++++ b/original.py
+@@ -1,106 +1,123 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+-    Construct an arrangement of n points on or inside a convex region in order to maximize the area of the
+-    smallest triangle formed by these points. Here n = 11.
++    Construct an arrangement of 11 points inside/on an equilateral triangle maximizing
++    the minimum triangle area over all C(11,3)=165 triplets.
+ 
+-    Uses a deterministic softmin-annealed gradient ascent (Adam) on the minimum
+-    triangle area over all C(11,3) triplets, with exact analytic gradients and a
+-    barycentric projection to keep all points inside the equilateral triangle.
++    Strategy: multi-start deterministic optimization with
++      (1) global coordinated perturbation phase (move all points at once),
++      (2) single-point pattern search (12 directions, shrinking steps),
++    evaluated with the exact minimum triangle area.
+ 
+     Returns:
+-        points: np.ndarray of shape (11,2) with the x,y coordinates of the points.
++        points: np.ndarray of shape (11,2)
+     """
+     n = 11
+     H = np.sqrt(3) / 2.0
+     V = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, H]])
+ 
++    def clip_to_tri(P):
++        # barycentric coordinates -> clip -> renormalize
++        lam3 = P[:, 1] / H
++        lam2 = P[:, 0] - 0.5 * lam3
++        lam1 = 1.0 - lam2 - lam3
++        L = np.stack([lam1, lam2, lam3], axis=1)
++        L = np.clip(L, 0.0, 1.0)
++        s = L.sum(axis=1, keepdims=True)
++        s[s == 0] = 1.0
++        L = L / s
++        return L @ V
++
++    def min_area(P):
++        d = P[:, 0][:, None] * P[:, 1][None, :] - P[:, 1][:, None] * P[:, 0][None, :]
++        # area of triangle (i,j,k) = 0.5*|d_ij + d_jk + d_ki|
++        best = np.inf
++        for i in range(n - 2):
++            for j in range(i + 1, n - 1):
++                dij = d[i, j]
++                for k in range(j + 1, n):
++                    a = 0.5 * abs(dij + d[j, k] + d[k, i])
++                    if a < best:
++                        best = a
++        return best
++
++    def init_config(seed):
++        rng = np.random.default_rng(seed)
++        lam = rng.dirichlet(np.ones(3) * 0.55, size=n)
++        P = lam @ V
++        # jitter to break symmetry
++        P = clip_to_tri(P + rng.normal(0, 0.02, P.shape))
++        return P
++
++    def refine(P, rng, rounds=3):
++        """Global coordinated moves then single-point pattern search, repeated."""
++        cur = P.copy()
++        cur_a = min_area(cur)
++        for _ in range(rounds):
++            # ---- Phase A: global coordinated perturbations ----
++            improved = True
++            sigma = 0.015
++            tries = 0
++            while improved and tries < 400:
++                improved = False
++                tries += 1
++                for _ in range(6):
++                    cand = clip_to_tri(cur + rng.normal(0, sigma, cur.shape))
++                    ca = min_area(cand)
++                    if ca > cur_a + 1e-12:
++                        cur, cur_a = cand, ca
++                        improved = True
++                if not improved and sigma > 0.002:
++                    sigma *= 0.5
++                    improved = True  # retry with smaller sigma
++            # ---- Phase B: single-point pattern search ----
++            step = 0.02
++            dirs = []
++            for ang in np.linspace(0, 2 * np.pi, 13)[:-1]:
++                dirs.append((np.cos(ang), np.sin(ang)))
++            dirs = np.array(dirs)
++            while step > 1e-5:
++                improved_any = False
++                for i in range(n):
++                    for dvec in dirs:
++                        cand = cur.copy()
++                        cand[i] += step * dvec
++                        cand = clip_to_tri(cand)
++                        ca = min_area(cand)
++                        if ca > cur_a + 1e-12:
++                            cur, cur_a = cand, ca
++                            improved_any = True
++                if not improved_any:
++                    step *= 0.5
++        return cur, cur_a
++
+     try:
+-        from itertools import combinations
++        best_P = None
++        best_a = -1.0
++        for seed in range(6):
++            rng = np.random.default_rng(1000 + seed)
++            P0 = init_config(7 * seed + 3)
++            P, a = refine(P0, rng)
++            if a > best_a:
++                best_a = a
++                best_P = P
++        return best_P
+ 
+-        idx = np.array(list(combinations(range(n), 3)))
+-        I, J, K = idx[:, 0], idx[:, 1], idx[:, 2]
+-
+-        # Deterministic initialization: the 3 vertices + 8 seeded interior points
+-        rng = np.random.default_rng(20240611)
+-        u = rng.random((8, 3)) + 0.35
+-        u = u / u.sum(axis=1, keepdims=True)
++    except Exception:
++        # Fallback: deterministic feasible configuration
+         lam = np.zeros((n, 3))
+         lam[0] = [1.0, 0.0, 0.0]
+         lam[1] = [0.0, 1.0, 0.0]
+         lam[2] = [0.0, 0.0, 1.0]
++        k = 3
++        rng = np.random.default_rng(42)
++        u = rng.random((n - 3, 3))
++        u = u / u.sum(axis=1, keepdims=True)
+         lam[3:] = u
+-        pts = lam @ V
+-
+-        # Adam state
+-        m = np.zeros_like(pts)
+-        v = np.zeros_like(pts)
+-        lr, b1, b2, eps = 0.02, 0.9, 0.999, 1e-8
+-
+-        for it in range(1, 1201):
+-            # Anneal the softmin temperature
+-            tau = max(0.0004, 0.02 * np.exp(-it / 300.0))
+-
+-            x, y = pts[:, 0], pts[:, 1]
+-            xi, yi = x[I], y[I]
+-            xj, yj = x[J], y[J]
+-            xk, yk = x[K], y[K]
+-
+-            # Signed doubled areas of all triplets
+-            c = (xj - xi) * (yk - yi) - (yj - yi) * (xk - xi)
+-            a = 0.5 * np.abs(c)
+-            s = np.sign(c)
+-
+-            # Softmin weights (numerically stable)
+-            z = np.exp(-(a - a.min()) / tau)
+-            w = z / z.sum()
+-
+-            # df/dc = -w * 0.5 * sign(c) for f = tau*log(sum(exp(-a/tau)))
+-            coef = -0.5 * w * s
+-
+-            g = np.zeros_like(pts)
+-            # Exact partials of c w.r.t. each vertex of each triplet
+-            np.add.at(g, I, np.stack([coef * (yj - yk), coef * (xk - xj)], axis=1))
+-            np.add.at(g, J, np.stack([coef * (yk - yi), coef * (xi - xk)], axis=1))
+-            np.add.at(g, K, np.stack([coef * (yi - yj), coef * (xj - xi)], axis=1))
+-
+-            # Adam descent on f (i.e., ascent on min area)
+-            m = b1 * m + (1 - b1) * g
+-            v = b2 * v + (1 - b2) * (g * g)
+-            mh = m / (1 - b1 ** it)
+-            vh = v / (1 - b2 ** it)
+-            pts = pts - lr * mh / (np.sqrt(vh) + eps)
+-
+-            # Project back into the triangle via barycentric clipping
+-            lam3 = pts[:, 1] / H
+-            lam2 = pts[:, 0] - 0.5 * lam3
+-            lam1 = 1.0 - lam2 - lam3
+-            L = np.stack([lam1, lam2, lam3], axis=1)
+-            L = np.clip(L, 1e-9, 1.0)
+-            L = L / L.sum(axis=1, keepdims=True)
+-            pts = L @ V
+-
+-        return pts
+-
+-    except Exception:
+-        # Fallback: simple deterministic feasible configuration
+-        lam = np.zeros((n, 3))
+-        lam[0] = [1.0, 0.0, 0.0]
+-        lam[1] = [0.0, 1.0, 0.0]
+-        lam[2] = [0.0, 0.0, 1.0]
+-        k = 0
+-        for i in range(3):
+-            for j in range(3):
+-                if i + j <= 2 and k < n:
+-                    a_, b_ = 0.25 + 0.25 * i, 0.25 + 0.25 * j
+-                    cc = 1.0 - a_ - b_
+-                    if cc >= 0.25:
+-                        lam[k] = [cc, a_, b_]
+-                        k += 1
+         return lam @ V
+ 
+ 
+ # EVOLVE-BLOCK-END

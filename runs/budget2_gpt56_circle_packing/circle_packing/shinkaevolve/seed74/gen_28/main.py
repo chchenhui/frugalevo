@@ -1,0 +1,349 @@
+# EVOLVE-BLOCK-START
+"""Portfolio nonlinear/LP constructor for 26 circles in a unit square."""
+
+import numpy as np
+
+
+class _PackingModel:
+    """Reusable geometry, LP, and nonlinear-program data for 26 circles."""
+
+    def __init__(self, n=26):
+        self.n = n
+        self.pi, self.pj = np.triu_indices(n, 1)
+        self.m = len(self.pi)
+
+        # Static matrix for the fixed-center radius LP.
+        self.lp_pairs = np.zeros((self.m, n), dtype=float)
+        rows = np.arange(self.m)
+        self.lp_pairs[rows, self.pi] = 1.0
+        self.lp_pairs[rows, self.pj] = 1.0
+
+        # Constant portion of the nonlinear constraint Jacobian.
+        self.wall_jac = np.zeros((4 * n, 3 * n), dtype=float)
+        for i in range(n):
+            xcol = 2 * i
+            ycol = xcol + 1
+            rcol = 2 * n + i
+
+            self.wall_jac[4 * i + 0, xcol] = 1.0
+            self.wall_jac[4 * i + 0, rcol] = -1.0
+
+            self.wall_jac[4 * i + 1, xcol] = -1.0
+            self.wall_jac[4 * i + 1, rcol] = -1.0
+
+            self.wall_jac[4 * i + 2, ycol] = 1.0
+            self.wall_jac[4 * i + 2, rcol] = -1.0
+
+            self.wall_jac[4 * i + 3, ycol] = -1.0
+            self.wall_jac[4 * i + 3, rcol] = -1.0
+
+    @staticmethod
+    def wall_clearance(centers):
+        return np.minimum(
+            np.minimum(centers[:, 0], centers[:, 1]),
+            np.minimum(1.0 - centers[:, 0], 1.0 - centers[:, 1]),
+        )
+
+    def radius_lp(self, centers):
+        """Find optimal radii for supplied centers using an exact LP."""
+        centers = np.asarray(centers, dtype=float)
+        wall = np.maximum(self.wall_clearance(centers), 0.0)
+        delta = centers[self.pi] - centers[self.pj]
+        distances = np.sqrt(np.sum(delta * delta, axis=1))
+
+        try:
+            from scipy.optimize import linprog
+
+            result = linprog(
+                c=-np.ones(self.n),
+                A_ub=self.lp_pairs,
+                b_ub=distances,
+                bounds=[(0.0, float(w)) for w in wall],
+                method="highs",
+            )
+            if result.success and np.all(np.isfinite(result.x)):
+                return np.maximum(result.x, 0.0)
+        except Exception:
+            pass
+
+        # Feasible fallback if scipy's LP implementation is unavailable.
+        radii = wall.copy()
+        for _ in range(16):
+            totals = radii[self.pi] + radii[self.pj]
+            bad = totals > distances
+            if not np.any(bad):
+                break
+            for k in np.flatnonzero(bad):
+                total = radii[self.pi[k]] + radii[self.pj[k]]
+                if total > 0.0:
+                    factor = distances[k] / total
+                    radii[self.pi[k]] *= factor
+                    radii[self.pj[k]] *= factor
+        return radii
+
+    def safe_radii(self, centers, radii):
+        """Use a single global safety scale without distorting LP radii."""
+        centers = np.asarray(centers, dtype=float)
+        radii = np.maximum(np.asarray(radii, dtype=float), 0.0).copy()
+        wall = np.maximum(self.wall_clearance(centers), 0.0)
+
+        factor = 1.0
+        positive = radii > 0.0
+        if np.any(positive):
+            factor = min(factor, float(np.min(wall[positive] / radii[positive])))
+
+        delta = centers[self.pi] - centers[self.pj]
+        distances = np.sqrt(np.sum(delta * delta, axis=1))
+        sums = radii[self.pi] + radii[self.pj]
+        active = sums > 0.0
+        if np.any(active):
+            factor = min(factor, float(np.min(distances[active] / sums[active])))
+
+        factor = max(0.0, min(1.0, factor))
+        return radii * factor * (1.0 - 3e-10)
+
+    def optimize_centers(self, initial_centers, maxiter):
+        """Joint center/radius SLSQP phase; radii are LP-polished afterward."""
+        try:
+            from scipy.optimize import minimize
+        except Exception:
+            return np.asarray(initial_centers, dtype=float).copy()
+
+        centers0 = np.clip(np.asarray(initial_centers, dtype=float), 1e-5, 1.0 - 1e-5)
+        radii0 = 0.93 * self.radius_lp(centers0)
+        z0 = np.concatenate((centers0.ravel(), radii0))
+        n = self.n
+        pi, pj = self.pi, self.pj
+        m = self.m
+        wall_jac = self.wall_jac
+
+        def fun(z):
+            return -float(np.sum(z[2 * n:]))
+
+        def fun_jac(z):
+            gradient = np.zeros_like(z)
+            gradient[2 * n:] = -1.0
+            return gradient
+
+        def con(z):
+            c = z[:2 * n].reshape(n, 2)
+            r = z[2 * n:]
+
+            walls = np.empty(4 * n, dtype=float)
+            walls[0::4] = c[:, 0] - r
+            walls[1::4] = 1.0 - c[:, 0] - r
+            walls[2::4] = c[:, 1] - r
+            walls[3::4] = 1.0 - c[:, 1] - r
+
+            d = c[pi] - c[pj]
+            pair = np.sum(d * d, axis=1) - (r[pi] + r[pj]) ** 2
+            return np.concatenate((walls, pair))
+
+        def con_jac(z):
+            c = z[:2 * n].reshape(n, 2)
+            r = z[2 * n:]
+            jac = np.zeros((4 * n + m, 3 * n), dtype=float)
+            jac[:4 * n] = wall_jac
+
+            d = c[pi] - c[pj]
+            s = r[pi] + r[pj]
+            pair_rows = 4 * n + np.arange(m)
+
+            jac[pair_rows, 2 * pi] = 2.0 * d[:, 0]
+            jac[pair_rows, 2 * pi + 1] = 2.0 * d[:, 1]
+            jac[pair_rows, 2 * pj] = -2.0 * d[:, 0]
+            jac[pair_rows, 2 * pj + 1] = -2.0 * d[:, 1]
+            jac[pair_rows, 2 * n + pi] = -2.0 * s
+            jac[pair_rows, 2 * n + pj] = -2.0 * s
+            return jac
+
+        bounds = (
+            [(1e-6, 1.0 - 1e-6)] * (2 * n)
+            + [(0.0, 0.5)] * n
+        )
+
+        try:
+            result = minimize(
+                fun,
+                z0,
+                method="SLSQP",
+                jac=fun_jac,
+                bounds=bounds,
+                constraints={"type": "ineq", "fun": con, "jac": con_jac},
+                options={"maxiter": maxiter, "ftol": 2e-11, "disp": False},
+            )
+            if result.x is not None and np.all(np.isfinite(result.x)):
+                return np.clip(
+                    result.x[:2 * n].reshape(n, 2),
+                    1e-7,
+                    1.0 - 1e-7,
+                )
+        except Exception:
+            pass
+
+        return centers0
+
+
+def _square_seed(extra_cell, seed, jitter):
+    """Twenty-five square-grid positions plus one interstitial circle."""
+    rng = np.random.default_rng(seed)
+    grid = np.array(
+        [[0.1 + 0.2 * col, 0.1 + 0.2 * row]
+         for row in range(5) for col in range(5)],
+        dtype=float,
+    )
+
+    # These points are centers of the grid cells rather than grid vertices.
+    cells = np.array(
+        [[0.2 + 0.2 * col, 0.2 + 0.2 * row]
+         for row in range(4) for col in range(4)],
+        dtype=float,
+    )
+    centers = np.vstack((grid, cells[extra_cell % len(cells)]))
+
+    if jitter:
+        centers += rng.normal(0.0, jitter, centers.shape)
+    return np.clip(centers, 0.025, 0.975)
+
+
+def _hex_seed(counts, seed, jitter):
+    """Staggered triangular-lattice seed with deliberately uneven rows."""
+    rng = np.random.default_rng(seed)
+    spacing = 0.158
+    dy = np.sqrt(3.0) * spacing / 2.0
+    rows = len(counts)
+    y0 = 0.5 - 0.5 * (rows - 1) * dy
+
+    points = []
+    for row, count in enumerate(counts):
+        y = y0 + row * dy
+        offset = 0.5 * spacing if (row & 1) else 0.0
+        xs = 0.5 + offset + spacing * (np.arange(count) - 0.5 * (count - 1))
+        for x in xs:
+            points.append((x, y))
+
+    centers = np.asarray(points[:26], dtype=float)
+    if jitter:
+        centers += rng.normal(0.0, jitter, centers.shape)
+    return np.clip(centers, 0.025, 0.975)
+
+
+def _layered_seed(counts, seed, jitter):
+    """Wide staggered rows tailored to the square's boundary contacts."""
+    rng = np.random.default_rng(seed)
+    rows = len(counts)
+    points = []
+
+    for row, count in enumerate(counts):
+        # Five rows leave enough vertical room for unequal boundary disks.
+        y = (row + 0.5) / rows
+        # Alternating phases approximate triangular contacts while allowing
+        # each row's outer disks to approach the vertical walls.
+        phase = 0.48 if (row & 1) == 0 else 0.32
+        xs = (np.arange(count, dtype=float) + phase) / count
+        points.extend((x, y) for x in xs)
+
+    centers = np.asarray(points, dtype=float)
+    if jitter:
+        centers += rng.normal(0.0, jitter, centers.shape)
+        # A coherent wave prevents all reflected starts from sharing one
+        # artificial symmetric contact graph.
+        k = np.arange(len(centers), dtype=float)
+        centers[:, 0] += 0.0025 * np.sin(1.73 * k + seed)
+        centers[:, 1] += 0.0020 * np.cos(1.31 * k + seed)
+    return np.clip(centers, 0.025, 0.975)
+
+
+def compute_max_radii(centers):
+    """Compatibility helper returning maximum LP radii for fixed centers."""
+    centers = np.asarray(centers, dtype=float)
+    return _PackingModel(len(centers)).radius_lp(centers)
+
+
+def construct_packing():
+    """
+    Construct 26 valid circles in the unit square.
+
+    Returns:
+        centers, radii, sum_of_radii
+    """
+    model = _PackingModel(26)
+
+    # Different seed families produce different boundary contact graphs.
+    seeds = [
+        _square_seed(0, 17, 0.000),
+        _square_seed(3, 31, 0.010),
+        _square_seed(5, 47, 0.018),
+        _square_seed(7, 59, 0.028),
+        _square_seed(10, 71, 0.040),
+        _square_seed(13, 83, 0.052),
+        _hex_seed([4, 5, 4, 5, 4, 4], 101, 0.005),
+        _layered_seed([5, 5, 6, 5, 5], 103, 0.004),
+        _layered_seed([5, 6, 5, 6, 4], 107, 0.010),
+        _layered_seed([5, 6, 5, 5, 5], 109, 0.018),
+    ]
+
+    scored = []
+    for seed in seeds:
+        first = model.optimize_centers(seed, maxiter=650)
+        for centers in (seed, first):
+            radii = model.safe_radii(centers, model.radius_lp(centers))
+            scored.append((float(np.sum(radii)), centers.copy(), radii))
+
+    # Continue only the most promising topologies, avoiding unnecessary work.
+    scored.sort(key=lambda item: item[0], reverse=True)
+    for _, centers, _ in scored[:5]:
+        refined = model.optimize_centers(centers, maxiter=900)
+        radii = model.safe_radii(refined, model.radius_lp(refined))
+        scored.append((float(np.sum(radii)), refined, radii))
+
+    best_score, best_centers, best_radii = max(scored, key=lambda item: item[0])
+    return best_centers, best_radii, float(best_score)
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

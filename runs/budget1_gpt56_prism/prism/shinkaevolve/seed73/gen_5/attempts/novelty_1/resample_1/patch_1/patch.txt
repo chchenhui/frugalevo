@@ -1,0 +1,202 @@
+--- a/original.py
++++ b/original.py
+@@ -1,75 +1,171 @@
+ GPU_MEM_SIZE = 80 # GB
+ 
+ # EVOLVE-BLOCK-START
+ 
+ def compute_model_placement(gpu_num, models):
+-    """
+-    Compute a model placement that minimizes the maximum KVPR across all GPUs.
++    """Place models while minimizing the maximum memory-aware KVPR."""
+ 
+-    Args:
+-        gpu_num: Number of GPUs
+-        models: List of models to place
++    def model_pressure(model):
++        return model.req_rate / model.slo
+ 
+-    Returns:
+-        A placement of models to GPUs
+-    """
++    def kvpr(load, remaining):
++        return load / remaining if remaining > 0 else float("inf")
+ 
+-    # Greedy KVPR-minimizing placement based on Algorithm 1 (without τ check)
+-    # 1) Sort models by r_j / s_j in descending order
+-    sorted_models = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
++    # Place high-pressure and large models first to reduce later packing failures.
++    sorted_models = sorted(
++        models,
++        key=lambda m: (model_pressure(m), m.model_size),
++        reverse=True,
++    )
+ 
+-    # 2) Initialize per-GPU states
+     placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+-    shared_kv = [GPU_MEM_SIZE for _ in range(gpu_num)]  # remaining memory per GPU
+-    weighted_req_rate = [0.0 for _ in range(gpu_num)]   # sum of r_j / s_j per GPU
++    remaining = [GPU_MEM_SIZE for _ in range(gpu_num)]
++    loads = [0.0 for _ in range(gpu_num)]
+ 
+-    # 3) Assign each model to the GPU that minimizes current KVPR while fitting in memory
++    # Select the GPU with the best maximum KVPR *after* this placement.
+     for model in sorted_models:
+-        best_idx = None
+-        best_ratio = float('inf')
++        pressure = model_pressure(model)
++        best_gpu = None
++        best_score = None
+ 
+         for gpu_id in range(gpu_num):
+-            if model.model_size <= shared_kv[gpu_id] and shared_kv[gpu_id] > 0:
+-                current_ratio = weighted_req_rate[gpu_id] / shared_kv[gpu_id]
+-                if current_ratio < best_ratio:
+-                    best_ratio = current_ratio
+-                    best_idx = gpu_id
++            if model.model_size > remaining[gpu_id]:
++                continue
+ 
+-        # Failure: if no GPU can fit, raise an error instead of overcommitting
+-        if best_idx is None:
++            projected_remaining = remaining[gpu_id] - model.model_size
++            projected_load = loads[gpu_id] + pressure
++            projected_max = max(
++                kvpr(
++                    loads[other] + (pressure if other == gpu_id else 0.0),
++                    remaining[other] - (model.model_size if other == gpu_id else 0.0),
++                )
++                for other in range(gpu_num)
++            )
++            score = (projected_max, kvpr(projected_load, projected_remaining),
++                     -projected_remaining)
++
++            if best_score is None or score < best_score:
++                best_score = score
++                best_gpu = gpu_id
++
++        if best_gpu is None:
+             raise ValueError(
+                 f"Unable to place model of size {model.model_size} GB on any GPU. "
+-                f"Remaining per-GPU memory: {shared_kv}"
++                f"Remaining per-GPU memory: {remaining}"
+             )
+ 
+-        placement[best_idx].append(model)
+-        weighted_req_rate[best_idx] += model.req_rate / model.slo
+-        shared_kv[best_idx] -= model.model_size
++        placement[best_gpu].append(model)
++        loads[best_gpu] += pressure
++        remaining[best_gpu] -= model.model_size
++
++    # Strict local improvements correct greedy decisions without risking cycles.
++    while True:
++        current_max = max(kvpr(loads[gpu], remaining[gpu]) for gpu in range(gpu_num))
++        improved = False
++
++        for source in range(gpu_num):
++            for model in list(placement[source]):
++                pressure = model_pressure(model)
++                for target in range(gpu_num):
++                    if source == target or model.model_size > remaining[target]:
++                        continue
++
++                    candidate_loads = loads[:]
++                    candidate_remaining = remaining[:]
++                    candidate_loads[source] -= pressure
++                    candidate_remaining[source] += model.model_size
++                    candidate_loads[target] += pressure
++                    candidate_remaining[target] -= model.model_size
++                    candidate_max = max(
++                        kvpr(candidate_loads[gpu], candidate_remaining[gpu])
++                        for gpu in range(gpu_num)
++                    )
++
++                    if candidate_max < current_max - 1e-12:
++                        placement[source].remove(model)
++                        placement[target].append(model)
++                        loads = candidate_loads
++                        remaining = candidate_remaining
++                        improved = True
++                        break
++                if improved:
++                    break
++            if improved:
++                break
++
++        if improved:
++            continue
++
++        # Swaps resolve memory fragmentation that prevents a useful direct move.
++        for left in range(gpu_num):
++            for right in range(left + 1, gpu_num):
++                for left_model in list(placement[left]):
++                    for right_model in list(placement[right]):
++                        left_pressure = model_pressure(left_model)
++                        right_pressure = model_pressure(right_model)
++                        new_left_remaining = (
++                            remaining[left] + left_model.model_size - right_model.model_size
++                        )
++                        new_right_remaining = (
++                            remaining[right] + right_model.model_size - left_model.model_size
++                        )
++                        if new_left_remaining < 0 or new_right_remaining < 0:
++                            continue
++
++                        candidate_loads = loads[:]
++                        candidate_remaining = remaining[:]
++                        candidate_loads[left] += right_pressure - left_pressure
++                        candidate_loads[right] += left_pressure - right_pressure
++                        candidate_remaining[left] = new_left_remaining
++                        candidate_remaining[right] = new_right_remaining
++                        candidate_max = max(
++                            kvpr(candidate_loads[gpu], candidate_remaining[gpu])
++                            for gpu in range(gpu_num)
++                        )
++
++                        if candidate_max < current_max - 1e-12:
++                            placement[left].remove(left_model)
++                            placement[right].remove(right_model)
++                            placement[left].append(right_model)
++                            placement[right].append(left_model)
++                            loads = candidate_loads
++                            remaining = candidate_remaining
++                            improved = True
++                            break
++                    if improved:
++                        break
++                if improved:
++                    break
++            if improved:
++                break
++
++        if not improved:
++            break
+ 
+     return placement
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ if __name__ == "__main__":
+     # Test the algorithm
+ 
+     from evaluator import generate_test_gpu_models
+     from evaluator import calculate_kvcache_pressure
+     from evaluator import safe_float
+     import numpy as np
+ 
+     test_cases = generate_test_gpu_models()
+     all_kvpr = []
+     for i, (gpu_num, gpu_models) in enumerate(test_cases):
+ 
+         results = compute_model_placement(gpu_num, gpu_models)
+         max_kvpr = calculate_kvcache_pressure(results)
+         all_kvpr.append(safe_float(max_kvpr))
+ 
+     avg_kvpr = np.mean(all_kvpr)
+     if avg_kvpr != 0:
+         avg_kvpr = 1.0 / avg_kvpr
+ 
+ 
+     print(f"Max KVPR: {avg_kvpr:.3f}")

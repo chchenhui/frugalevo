@@ -1,0 +1,293 @@
+<NAME>
+cell_homotopy_polish
+</NAME>
+
+<DESCRIPTION>
+This implementation replaces long annealing with an orientation-cell homotopy strategy. It uses deterministic geometric seeds based on perturbed triangular lattices, quickly improves them with batched lower-tail mutations, and then performs repeated epigraph SLSQP polishing inside the currently discovered determinant-sign cell. The sign-cell approach turns the absolute-area maximin objective into smooth constrained subproblems while periodically refreshing signs to allow transitions to better combinatorial arrangements. A cached result keeps repeated API calls inexpensive, and a deterministic valid fallback is retained.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+_HEIGHT = np.sqrt(3.0) * 0.5
+_N = 11
+_CORNERS = np.array(
+    [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+    dtype=float,
+)
+_TRIPLES = np.array(
+    [
+        (i, j, k)
+        for i in range(_N - 2)
+        for j in range(i + 1, _N - 1)
+        for k in range(j + 1, _N)
+    ],
+    dtype=np.intp,
+)
+_CACHED_POINTS = None
+
+
+def _project_simplex(x: np.ndarray) -> np.ndarray:
+    """Project affine (u,v) coordinates to u>=0, v>=0, u+v<=1."""
+    y = np.asarray(x, dtype=float).copy()
+    y = np.maximum(y, 0.0)
+    s = y[..., 0] + y[..., 1]
+    outside = s > 1.0
+    if np.any(outside):
+        y[outside] /= s[outside, None]
+    return y
+
+
+def _determinants(interior: np.ndarray) -> np.ndarray:
+    """Normalized signed areas for all 165 triples."""
+    p = np.vstack((_CORNERS, interior))
+    q = p[_TRIPLES]
+    return (
+        (q[:, 1, 0] - q[:, 0, 0]) * (q[:, 2, 1] - q[:, 0, 1])
+        - (q[:, 1, 1] - q[:, 0, 1]) * (q[:, 2, 0] - q[:, 0, 0])
+    )
+
+
+def _values(population: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Strict maximin values plus a lower-tail tie-break score."""
+    full = np.concatenate(
+        (
+            np.broadcast_to(_CORNERS, (len(population), 3, 2)),
+            population,
+        ),
+        axis=1,
+    )
+    q = full[:, _TRIPLES]
+    areas = np.abs(
+        (q[:, :, 1, 0] - q[:, :, 0, 0]) *
+        (q[:, :, 2, 1] - q[:, :, 0, 1])
+        - (q[:, :, 1, 1] - q[:, :, 0, 1]) *
+        (q[:, :, 2, 0] - q[:, :, 0, 0])
+    )
+    low = np.partition(areas, 11, axis=1)[:, :12]
+    minimum = low[:, 0]
+    return minimum, minimum + 0.035 * np.mean(low[:, 1:], axis=1)
+
+
+def _lattice_seeds(rng: np.random.Generator) -> list[np.ndarray]:
+    """
+    Produce several non-equivalent perturbations of a triangular four-level
+    lattice.  Such layouts begin close to the useful boundary-support pattern,
+    but the perturbations remove its many exact collinearities.
+    """
+    base = np.array(
+        [
+            [0.24, 0.015],
+            [0.51, 0.020],
+            [0.76, 0.015],
+            [0.015, 0.255],
+            [0.315, 0.245],
+            [0.615, 0.235],
+            [0.020, 0.525],
+            [0.310, 0.500],
+        ],
+        dtype=float,
+    )
+    seeds = []
+    for scale in (0.030, 0.050, 0.075, 0.105, 0.135, 0.165):
+        for _ in range(2):
+            seeds.append(_project_simplex(base + rng.normal(0.0, scale, (8, 2))))
+
+    # A few uniform simplex samples cover configurations not lattice-like.
+    for _ in range(5):
+        r = rng.exponential(1.0, size=(8, 3))
+        r /= np.sum(r, axis=1, keepdims=True)
+        seeds.append(r[:, 1:3])
+    return seeds
+
+
+def _batched_lower_tail_search(
+    start: np.ndarray, rng: np.random.Generator
+) -> np.ndarray:
+    """
+    Short deterministic threshold search.  Each batch tests single, pair, and
+    coordinated moves; acceptance is lexicographic in the lower area tail.
+    """
+    current = start.copy()
+    current_min, current_score = _values(current[None, ...])
+    current_min = float(current_min[0])
+    current_score = float(current_score[0])
+
+    for scale, rounds in (
+        (0.080, 32),
+        (0.040, 42),
+        (0.018, 55),
+        (0.007, 60),
+    ):
+        for _ in range(rounds):
+            batch = np.broadcast_to(current, (36, 8, 2)).copy()
+
+            # Point moves.
+            ids = rng.integers(0, 8, size=24)
+            batch[np.arange(24), ids] += rng.normal(0.0, scale, (24, 2))
+
+            # Pair moves are valuable for adjacent active constraints.
+            ia = rng.integers(0, 8, size=8)
+            ib = rng.integers(0, 8, size=8)
+            batch[24:32, ia] += rng.normal(0.0, scale * 0.72, (8, 2))
+            batch[24:32, ib] += rng.normal(0.0, scale * 0.72, (8, 2))
+
+            # Small globally correlated displacements escape sign-cell corners.
+            batch[32:] += rng.normal(0.0, scale * 0.30, (4, 1, 2))
+            batch = _project_simplex(batch)
+
+            mins, scores = _values(batch)
+            order = np.lexsort((scores, mins))
+            winner = int(order[-1])
+            if (
+                mins[winner] > current_min + 1.0e-10
+                or (
+                    mins[winner] >= current_min - 2.0e-7
+                    and scores[winner] > current_score + 1.0e-9
+                )
+            ):
+                current = batch[winner]
+                current_min = float(mins[winner])
+                current_score = float(scores[winner])
+
+    return current
+
+
+def _cell_polish(start: np.ndarray) -> np.ndarray:
+    """
+    Repeated smooth epigraph solves.  Signs are frozen only for one solve,
+    then recomputed; this is a deterministic homotopy across orientation cells.
+    """
+    try:
+        from scipy.optimize import minimize
+    except Exception:
+        return start
+
+    best = start.copy()
+    best_value = float(np.min(np.abs(_determinants(best))))
+
+    for phase in range(4):
+        det = _determinants(best)
+        signs = np.where(det >= 0.0, 1.0, -1.0)
+        initial = np.concatenate((best.ravel(), [best_value]))
+
+        def constraints(w: np.ndarray) -> np.ndarray:
+            tail = w[:-1].reshape(8, 2)
+            d = _determinants(tail)
+            return np.concatenate(
+                (
+                    signs * d - w[-1],
+                    tail.ravel(),
+                    1.0 - np.sum(tail, axis=1),
+                )
+            )
+
+        try:
+            result = minimize(
+                lambda w: -w[-1],
+                initial,
+                method="SLSQP",
+                bounds=[(0.0, 1.0)] * 16 + [(0.0, 0.2)],
+                constraints={"type": "ineq", "fun": constraints},
+                options={
+                    "maxiter": 850 + phase * 250,
+                    "ftol": 2.0e-13,
+                    "disp": False,
+                },
+            )
+            if result.success and np.all(np.isfinite(result.x)):
+                candidate = _project_simplex(result.x[:-1].reshape(8, 2))
+                value = float(np.min(np.abs(_determinants(candidate))))
+                if value > best_value + 1.0e-10:
+                    best = candidate
+                    best_value = value
+                else:
+                    break
+            else:
+                break
+        except Exception:
+            break
+
+    return best
+
+
+def _fallback() -> np.ndarray:
+    affine = np.vstack(
+        (
+            _CORNERS,
+            np.array(
+                [
+                    [0.23, 0.03],
+                    [0.51, 0.02],
+                    [0.77, 0.03],
+                    [0.03, 0.28],
+                    [0.33, 0.26],
+                    [0.63, 0.23],
+                    [0.04, 0.56],
+                    [0.34, 0.49],
+                ]
+            ),
+        )
+    )
+    return _to_cartesian(affine)
+
+
+def _to_cartesian(uv: np.ndarray) -> np.ndarray:
+    out = np.empty_like(uv)
+    out[:, 0] = uv[:, 0] + 0.5 * uv[:, 1]
+    out[:, 1] = _HEIGHT * uv[:, 1]
+    return out
+
+
+def _construct() -> np.ndarray:
+    rng = np.random.default_rng(11031987)
+    best = None
+    best_value = -1.0
+
+    # Search many inexpensive basins, retaining a small deterministic archive.
+    archive = []
+    for seed in _lattice_seeds(rng):
+        candidate = _batched_lower_tail_search(seed, rng)
+        value = float(np.min(np.abs(_determinants(candidate))))
+        archive.append((value, candidate))
+
+    archive.sort(key=lambda item: item[0], reverse=True)
+
+    # Exact optimization is spent only on the strongest distinct basins.
+    for _, seed in archive[:7]:
+        candidate = _cell_polish(seed)
+        candidate = _batched_lower_tail_search(candidate, rng)
+        candidate = _cell_polish(candidate)
+        value = float(np.min(np.abs(_determinants(candidate))))
+        if value > best_value:
+            best_value = value
+            best = candidate
+
+    if best is None or not np.all(np.isfinite(best)):
+        return _fallback()
+
+    result = _to_cartesian(np.vstack((_CORNERS, best)))
+    if result.shape != (11, 2) or not np.all(np.isfinite(result)):
+        return _fallback()
+    return result
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Return eleven deterministic points in or on the prescribed equilateral
+    triangle.  Coordinates are Cartesian and the returned array is a copy.
+    """
+    global _CACHED_POINTS
+    if _CACHED_POINTS is None:
+        try:
+            _CACHED_POINTS = _construct()
+        except Exception:
+            _CACHED_POINTS = _fallback()
+    return _CACHED_POINTS.copy()
+
+
+# EVOLVE-BLOCK-END
+```

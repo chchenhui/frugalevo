@@ -1,0 +1,167 @@
+<NAME>
+lpt_swap_refinement_balancer</NAME>
+<DESCRIPTION>
+Structural redesign around a reusable "pack-and-refine" kernel architecture:
+
+1. **Modular packing pipeline**: The packing logic is decomposed into three small, composable primitives — `_lpt_packing` (vectorized batched LPT seed), `_refine_packing` (vectorized local-search swap refinement), and `_rank_from_pack_index` (rank recovery from an arbitrary pack assignment). `balanced_packing` is now an orchestrator of these stages instead of a monolithic loop.
+
+2. **Local-search refinement stage (new)**: After the greedy LPT seed, a fully vectorized refinement repeatedly swaps items between the currently heaviest and lightest pack of each row. Each round evaluates two swap candidates (the "large move": heaviest item in max-pack ↔ lightest item in min-pack, and the "small move": lightest item in max-pack ↔ heaviest item in min-pack) and applies whichever best reduces the max-min spread. Because swaps strictly and monotonically decrease the spread per row, it converges quickly and never worsens balance. This directly targets the GPU balancedness metric, since step 3 (physical experts → GPUs) and step 1 (groups → nodes) both use this kernel.
+
+3. **Rank decoupling**: Ranks within a pack are no longer coupled to insertion order but derived from the final pack assignment via a stable sort. This makes any pack permutation (e.g., from the refinement stage) a valid first-class result, since within-pack ordering is semantically arbitrary downstream.
+
+4. **Faster, fully tensorized seed**: The LPT loop operates entirely on stacked tensors (no per-row Python iteration, no `.cpu()` sync inside the loop), and explicit guards for degenerate `num_packs == 1` / capacity-1 cases avoid wasted work.
+
+The hierarchical three-stage data flow (groups→nodes, replication within node, physical→GPUs) and the public `rebalance_experts` contract (inputs/outputs, shapes, semantics) are unchanged.
+</DESCRIPTION>
+<CODE>
+```python
+# SPDX-License-Identifier: Apache-2.0
+"""
+Expert parallelism load balancer (EPLB) for vLLM.
+
+This module implements the core rearrangement algorithm.
+
+The rearrangement algorithm is adapted from
+[DeepSeek EPLB](https://github.com/deepseek-ai/eplb).
+
+Please find at [#12](https://github.com/deepseek-ai/EPLB/issues/12) an example
+on how the EPLB algorithm works.
+"""
+
+# EVOLVE-BLOCK-START
+
+import torch
+
+_EPS = 1e-9
+_INF = float("inf")
+
+
+def _lpt_packing(w: torch.Tensor, num_packs: int, cap: int,
+                 order: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Batched greedy LPT seed: insert items (given in `order`, heaviest first)
+    into the least-loaded pack that still has capacity.
+
+    Parameters:
+        w: [X, n] item weights (float)
+        num_packs: number of packs
+        cap: exact number of items each pack must contain
+        order: [X, n] item indices in descending weight order
+
+    Returns:
+        pack_index: [X, n] pack of each item
+        pack_weight: [X, num_packs] total weight of each pack
+    """
+    x, n = w.shape
+    rows = torch.arange(x)
+    pack_index = torch.zeros(x, n, dtype=torch.int64)
+    pack_weight = torch.zeros(x, num_packs, dtype=w.dtype)
+    pack_items = torch.zeros(x, num_packs, dtype=torch.int64)
+    for t in range(n):
+        item = order[:, t]
+        cand = pack_weight.masked_fill(pack_items >= cap, _INF)
+        pack = cand.argmin(-1)
+        pack_index[rows, item] = pack
+        pack_items[rows, pack] += 1
+        pack_weight[rows, pack] += w[rows, item]
+    return pack_index, pack_weight
+
+
+def _refine_packing(w: torch.Tensor, pack_index: torch.Tensor,
+                    pack_weight: torch.Tensor,
+                    max_rounds: int = 64
+                    ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Vectorized local-search refinement of a cardinality-constrained packing.
+
+    Each round, for every row independently, considers swapping one item of
+    the heaviest pack with one item of the lightest pack. Two candidate swaps
+    are evaluated (the "coarse" swap of the heaviest/lightest items and the
+    "fine" swap of the lightest/heaviest items) and the one minimizing the
+    resulting spread is applied. Swaps strictly decrease the max-min spread,
+    so the procedure monotonically converges.
+
+    Parameters:
+        w: [X, n] item weights
+        pack_index: [X, n] current pack assignment (mutated in-place copy)
+        pack_weight: [X, m] current pack loads
+        max_rounds: safety bound on refinement iterations
+
+    Returns:
+        pack_index, pack_weight after refinement
+    """
+    x, n = w.shape
+    m = pack_weight.size(1)
+    if m <= 1 or n <= 1:
+        return pack_index, pack_weight
+    rows = torch.arange(x)
+    pack_index = pack_index.clone()
+    pack_weight = pack_weight.clone()
+    for _ in range(max_rounds):
+        h = pack_weight.argmax(-1)
+        l = pack_weight.argmin(-1)
+        wh = pack_weight[rows, h]
+        wl = pack_weight[rows, l]
+        spread = wh - wl
+        if bool((spread <= _EPS).all()):
+            break
+        in_h = pack_index == h.unsqueeze(1)
+        in_l = pack_index == l.unsqueeze(1)
+        # Coarse candidate: heaviest item of h vs lightest item of l.
+        ha = w.masked_fill(~in_h, -_INF).argmax(-1)
+        lb = w.masked_fill(~in_l, _INF).argmin(-1)
+        # Fine candidate: lightest item of h vs heaviest item of l.
+        hb = w.masked_fill(~in_h, _INF).argmin(-1)
+        la = w.masked_fill(~in_l, -_INF).argmax(-1)
+        d_coarse = w[rows, ha] - w[rows, lb]
+        d_fine = w[rows, hb] - w[rows, la]
+        ok_coarse = (d_coarse > _EPS) & (d_coarse < spread)
+        ok_fine = (d_fine > _EPS) & (d_fine < spread)
+        new_coarse = (spread - 2 * d_coarse).abs()
+        new_fine = (spread - 2 * d_fine).abs()
+        take_coarse = ok_coarse & (~ok_fine | (new_coarse < new_fine))
+        take_fine = ok_fine & (~take_coarse)
+        moved = take_coarse | take_fine
+        if not bool(moved.any()):
+            break
+        a = torch.where(take_coarse, ha, hb)
+        b = torch.where(take_coarse, lb, la)
+        d = torch.where(take_coarse, d_coarse, d_fine)
+        idx = moved.nonzero(as_tuple=True)[0]
+        hi = h[idx]
+        li = l[idx]
+        ai = a[idx]
+        bi = b[idx]
+        di = d[idx]
+        pack_index[idx, ai] = li
+        pack_index[idx, bi] = hi
+        pack_weight[idx, hi] -= di
+        pack_weight[idx, li] += di
+    return pack_index, pack_weight
+
+
+def _rank_from_pack_index(pack_index: torch.Tensor) -> torch.Tensor:
+    """
+    Derive the slot rank of each item within its pack via a stable sort of
+    the pack assignment. Any within-pack permutation is valid downstream, so
+    this decouples ranks from insertion order and supports refined packings.
+
+    Parameters:
+        pack_index: [X, n] pack of each item
+
+    Returns:
+        rank_in_pack: [X, n] slot index of each item within its pack
+    """
+    x, n = pack_index.shape
+    order = torch.argsort(pack_index, dim=-1, stable=True)
+    sorted_packs = pack_index.gather(-1, order)
+    pos = torch.arange(n, dtype=torch.int64).unsqueeze(0).expand(x, n)
+    is_start = torch.zeros(x, n, dtype=torch.int64)
+    is_start[:, 0] = 1
+    if n > 1:
+        is_start[:, 1:] = (sorted_packs[:, 1:] !=
+                          sorted_packs[:, :-1]).to(torch.int64)
+    run_start = torch.cummax(pos * is_start, dim=-1).values
+    rank_sorted = pos - run_start
+    rank = torch.empty_like(pack_index)
+    rank.scatter_(-

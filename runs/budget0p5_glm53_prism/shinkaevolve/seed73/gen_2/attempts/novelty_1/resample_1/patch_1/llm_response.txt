@@ -1,0 +1,92 @@
+<NAME>
+local_search_refinement</NAME>
+<DESCRIPTION>
+The greedy assignment places each model on the GPU minimizing KVPR at the time, but it can be trapped in poor local choices. Adding a cheap local-search refinement pass after the greedy step—repeatedly moving or swapping models if it reduces the maximum KVPR across GPUs—typically yields a noticeably lower max KVPR with negligible runtime, since test instances are small. The objective for a move/swap is the resulting maximum KVPR over all GPUs, which directly matches the metric being minimized.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    return placement
+=======
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    # 4) Local search refinement: move/swap models to reduce the max KVPR
+    def gpu_kvpr(gpu_id):
+        mem_left = GPU_MEM_SIZE - sum(m.model_size for m in placement[gpu_id])
+        if mem_left <= 0:
+            return float('inf')
+        return weighted_req_rate[gpu_id] / mem_left
+
+    def max_kvpr():
+        return max(gpu_kvpr(g) for g in range(gpu_num))
+
+    improved = True
+    while improved:
+        improved = False
+        best_max = max_kvpr()
+        # Try moving a single model to another GPU
+        for src in range(gpu_num):
+            for model in list(placement[src]):
+                for dst in range(gpu_num):
+                    if dst == src:
+                        continue
+                    if model.model_size > shared_kv[dst]:
+                        continue
+                    # Apply move tentatively
+                    placement[src].remove(model)
+                    placement[dst].append(model)
+                    weighted_req_rate[src] -= model.req_rate / model.slo
+                    weighted_req_rate[dst] += model.req_rate / model.slo
+                    shared_kv[src] += model.model_size
+                    shared_kv[dst] -= model.model_size
+                    if max_kvpr() < best_max - 1e-12:
+                        best_max = max_kvpr()
+                        improved = True
+                    else:
+                        # Revert
+                        placement[dst].remove(model)
+                        placement[src].append(model)
+                        weighted_req_rate[dst] -= model.req_rate / model.slo
+                        weighted_req_rate[src] += model.req_rate / model.slo
+                        shared_kv[dst] += model.model_size
+                        shared_kv[src] -= model.model_size
+        if improved:
+            continue
+        # Try swapping pairs of models between GPUs
+        for src in range(gpu_num):
+            for dst in range(src + 1, gpu_num):
+                for m1 in list(placement[src]):
+                    for m2 in list(placement[dst]):
+                        delta_mem = m2.model_size - m1.model_size
+                        if shared_kv[dst] + delta_mem < 0 or shared_kv[src] - delta_mem < 0:
+                            continue
+                        # Apply swap tentatively
+                        placement[src].remove(m1); placement[dst].remove(m2)
+                        placement[src].append(m2); placement[dst].append(m1)
+                        weighted_req_rate[src] += m2.req_rate / m2.slo - m1.req_rate / m1.slo
+                        weighted_req_rate[dst] += m1.req_rate / m1.slo - m2.req_rate / m2.slo
+                        shared_kv[src] += delta_mem
+                        shared_kv[dst] -= delta_mem
+                        if max_kvpr() < best_max - 1e-12:
+                            best_max = max_kvpr()
+                            improved = True
+                        else:
+                            # Revert
+                            placement[src].remove(m2); placement[dst].remove(m1)
+                            placement[src].append(m1); placement[dst].append(m2)
+                            weighted_req_rate[src] += m1.req_rate / m1.slo - m2.req_rate / m2.slo
+                            weighted_req_rate[dst] += m2.req_rate / m2.slo - m1.req_rate / m1.slo
+                            shared_kv[src] -= delta_mem
+                            shared_kv[dst] += delta_mem
+                if improved:
+                    break
+            if improved:
+                break
+
+    return placement
+>>>>>>> REPLACE
+</DIFF>

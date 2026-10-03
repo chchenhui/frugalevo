@@ -1,0 +1,156 @@
+<NAME>
+multi_row_layout_seed_screen</NAME>
+<DESCRIPTION>
+The current program fixes a single row layout [5,4,5,4,5,3] with one hardcoded horizontal-offset heuristic. Since the LP radii solve is exact and fast (the whole eval was 0.52s), we can cheaply screen many candidate layouts — different row-count patterns and horizontal scales — solve the LP for each, and keep the arrangement with the largest radii sum. AlphaEvolve-quality packings favor clustered boundary rows and slightly stretched interior rows, so including denser edge rows (e.g. [6,4,5,4,6], [5,5,4,5,5], [6,5,4,5,6]) and scale variations (0.96–1.02) around the baseline improves the chance of hitting a better geometry. This converts the constructor from a single guess into a small deterministic argmax over explicit templates, still with no iterative search over centers.
+</DIFF>
+<<<<<<< SEARCH
+    # Hexagonal (triangular) lattice layout: rows of 5,4,5,4,5,3 circles.
+    # This is the densest local arrangement; alternating row offsets create
+    # near-equilateral triangles between neighboring circles, which is the
+    # hallmark of optimal equal-circle packings.
+    rows = [5, 4, 5, 4, 5, 3]
+    dy = 1.0 / (len(rows) + 1)  # vertical spacing between row centers
+    idx = 0
+    for r, count in enumerate(rows):
+        y = (r + 1) * dy
+        # Horizontal spacing scaled so each row's circles spread across square
+        dx = 1.0 / (count + 1)
+        offset = 0.0
+        if count % 2 == 0:
+            # Even rows are offset by half a spacing (staggered lattice)
+            offset = 0.5 * (1.0 / 5) - 0.5 * dx
+        for c in range(count):
+            x = (c + 1) * dx + offset
+            x = min(max(x, 0.02), 0.98)
+            centers[idx] = [x, y]
+            idx += 1
+    assert idx == n
+
+    # Compute optimal radii for the fixed centers exactly via linear
+    # programming: maximize sum(r) s.t. r_i + r_j <= d_ij, r_i <= border dist.
+    radii = compute_max_radii(centers)
+    try:
+        from scipy.optimize import linprog
+
+        m = np.zeros((n, n))
+        A_ub = []
+        b_ub = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                row = np.zeros(n)
+                row[i] = 1.0
+                row[j] = 1.0
+                A_ub.append(row)
+                b_ub.append(d)
+        # Border constraints: r_i <= min(x, y, 1-x, 1-y)
+        for i in range(n):
+            x, y = centers[i]
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(min(x, y, 1 - x, 1 - y))
+        res = linprog(c=-np.ones(n), A_ub=np.array(A_ub), b_ub=np.array(b_ub),
+                      bounds=[(0, None)] * n, method="highs")
+        if res.success:
+            radii = res.x
+    except Exception:
+        pass
+
+    # Calculate the sum of radii
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+=======
+    # Screen several explicit hex-style row layouts (and horizontal scales)
+    # with the exact LP radius solver, keeping the best-scoring arrangement.
+    candidates = [
+        [5, 4, 5, 4, 5, 3],
+        [6, 4, 5, 4, 6],
+        [5, 5, 4, 5, 5],
+        [6, 5, 4, 5, 6],
+        [4, 4, 5, 4, 5, 4],
+        [3, 4, 5, 4, 5, 5],
+        [6, 5, 5, 5, 5],
+        [7, 4, 4, 4, 7],
+    ]
+    scales = [1.0, 0.96, 1.02]
+
+    best_centers = None
+    best_radii = None
+    best_sum = -1.0
+    for rows in candidates:
+        if sum(rows) != n:
+            continue
+        for sc in scales:
+            centers_c = _build_layout(rows, sc)
+            radii_c = _lp_radii(centers_c)
+            s = float(np.sum(radii_c))
+            if s > best_sum:
+                best_sum = s
+                best_centers = centers_c
+                best_radii = radii_c
+
+    centers = best_centers
+    radii = best_radii
+
+    # Calculate the sum of radii
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+
+
+def _build_layout(rows, scale=1.0, vpad=0.5):
+    """Build staggered hex-like centers for a given row-count pattern."""
+    n_rows = len(rows)
+    dy = 1.0 / (n_rows + 1)
+    centers = []
+    for r, count in enumerate(rows):
+        y = (r + 1) * dy
+        dx = 1.0 / (count + 1)
+        offset = 0.0
+        if r % 2 == 1:
+            offset = 0.5 * dx
+        for c in range(count):
+            # scale spreads rows slightly wider/narrower than the square
+            x = 0.5 + ((c + 1) * dx + offset - 0.5) * scale
+            x = min(max(x, 0.02), 0.98)
+            centers.append([x, y])
+    return np.array(centers)
+
+
+def _lp_radii(centers):
+    """Maximize sum(r) s.t. r_i + r_j <= d_ij, r_i <= border distance.
+
+    Exact linear program; falls back to the iterative shrink solver.
+    """
+    n = centers.shape[0]
+    radii = compute_max_radii(centers)
+    try:
+        from scipy.optimize import linprog
+
+        A_ub = []
+        b_ub = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                row = np.zeros(n)
+                row[i] = 1.0
+                row[j] = 1.0
+                A_ub.append(row)
+                b_ub.append(d)
+        for i in range(n):
+            x, y = centers[i]
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(min(x, y, 1 - x, 1 - y))
+        res = linprog(c=-np.ones(n), A_ub=np.array(A_ub), b_ub=np.array(b_ub),
+                      bounds=[(0, None)] * n, method="highs")
+        if res.success:
+            radii = res.x
+    except Exception:
+        pass
+    return radii
+>>>>>>> REPLACE
+</DIFF>

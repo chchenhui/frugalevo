@@ -1,0 +1,113 @@
+<NAME>
+deflated_center_relaxation
+</NAME>
+
+<DESCRIPTION>
+Add a dedicated fixed-radius center-relaxation phase between LP certification and the final joint nonlinear solve. A nearly jammed joint solve often cannot change its contact graph because every center displacement immediately violates a contact. Deflating the LP radii slightly creates geometric room; maximizing a common clearance variable then moves centers away from walls and active pair contacts in a coordinated way. Restarting the existing joint center/radius optimizer from this repositioned configuration can recover the radii while reaching a different, potentially better boundary-adapted contact graph. This is especially useful for 26 disks, where the best configurations are slightly asymmetric and can be inaccessible from a locked layered local optimum.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def optimize(self, initial_centers, maxiter=1000):
+=======
+    def relax_centers(self, initial_centers, fixed_radii, maxiter=450):
+        """
+        With radii slightly deflated, maximize a common geometric clearance.
+        This is a center-only escape step: it can alter a locked contact graph
+        before the subsequent joint radius expansion.
+        """
+        try:
+            from scipy.optimize import minimize
+        except Exception:
+            return np.asarray(initial_centers, dtype=float).copy()
+
+        n, pi, pj, m = self.n, self.pi, self.pj, self.m
+        centers0 = np.clip(np.asarray(initial_centers, dtype=float), 1.e-6, 1.0 - 1.e-6)
+        radii = np.asarray(fixed_radii, dtype=float)
+        z0 = np.r_[centers0.ravel(), 0.0]
+
+        def constraints(z):
+            c = z[:2 * n].reshape(n, 2)
+            clearance = z[-1]
+            walls = np.empty(4 * n, dtype=float)
+            walls[0::4] = c[:, 0] - radii - clearance
+            walls[1::4] = 1.0 - c[:, 0] - radii - clearance
+            walls[2::4] = c[:, 1] - radii - clearance
+            walls[3::4] = 1.0 - c[:, 1] - radii - clearance
+            delta = c[pi] - c[pj]
+            distance = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+            return np.r_[walls, distance - radii[pi] - radii[pj] - clearance]
+
+        def jacobian(z):
+            c = z[:2 * n].reshape(n, 2)
+            jac = np.zeros((4 * n + m, 2 * n + 1), dtype=float)
+            disk = np.arange(n)
+            jac[4 * disk + 0, 2 * disk] = 1.0
+            jac[4 * disk + 1, 2 * disk] = -1.0
+            jac[4 * disk + 2, 2 * disk + 1] = 1.0
+            jac[4 * disk + 3, 2 * disk + 1] = -1.0
+            jac[:4 * n, -1] = -1.0
+
+            delta = c[pi] - c[pj]
+            distance = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+            unit = delta / np.maximum(distance[:, None], 1.e-12)
+            rows = 4 * n + np.arange(m)
+            jac[rows, 2 * pi] = unit[:, 0]
+            jac[rows, 2 * pi + 1] = unit[:, 1]
+            jac[rows, 2 * pj] = -unit[:, 0]
+            jac[rows, 2 * pj + 1] = -unit[:, 1]
+            jac[rows, -1] = -1.0
+            return jac
+
+        try:
+            result = minimize(
+                lambda z: -z[-1],
+                z0,
+                jac=lambda z: np.r_[np.zeros(2 * n), -1.0],
+                method="SLSQP",
+                bounds=[(1.e-6, 1.0 - 1.e-6)] * (2 * n) + [(0.0, 0.25)],
+                constraints={"type": "ineq", "fun": constraints, "jac": jacobian},
+                options={"maxiter": maxiter, "ftol": 2.e-11, "disp": False},
+            )
+            if result.x is not None and np.all(np.isfinite(result.x)):
+                return np.clip(result.x[:2 * n].reshape(n, 2), 1.e-7, 1.0 - 1.e-7)
+        except Exception:
+            pass
+        return centers0
+
+    def optimize(self, initial_centers, maxiter=1000):
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    for _, centers, _ in candidates[:4]:
+        for noise in (0.0, 0.004):
+            start = centers.copy()
+            if noise:
+                start += rng.normal(0.0, noise, start.shape)
+                start = np.clip(start, 0.015, 0.985)
+            refined = model.optimize(start, 1250)
+            radii = model.safe_radii(refined, model.radius_lp(refined))
+            candidates.append((float(np.sum(radii)), refined, radii))
+=======
+    for _, centers, radii0 in candidates[:4]:
+        for noise in (0.0, 0.004):
+            start = centers.copy()
+            if noise:
+                start += rng.normal(0.0, noise, start.shape)
+                start = np.clip(start, 0.015, 0.985)
+            refined = model.optimize(start, 1250)
+            radii = model.safe_radii(refined, model.radius_lp(refined))
+            candidates.append((float(np.sum(radii)), refined, radii))
+
+        # Deflation makes room for a center-only max-clearance displacement.
+        # The following full solve restores radii and exploits its new contact
+        # graph rather than merely polishing the original locked arrangement.
+        for deflation in (0.978, 0.962):
+            relaxed = model.relax_centers(centers, radii0 * deflation, 450)
+            refined = model.optimize(relaxed, 1250)
+            radii = model.safe_radii(refined, model.radius_lp(refined))
+            candidates.append((float(np.sum(radii)), refined, radii))
+>>>>>>> REPLACE
+</DIFF>

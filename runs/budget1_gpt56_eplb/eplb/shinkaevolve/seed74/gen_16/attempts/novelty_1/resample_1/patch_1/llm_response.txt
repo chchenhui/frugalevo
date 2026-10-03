@@ -1,0 +1,115 @@
+<NAME>
+adaptive_batched_replica_waterfilling
+</NAME>
+
+<DESCRIPTION>
+Replace the per-redundant-expert Python greedy loop with batched discrete water-filling. For a logical expert with load `w`, its successive replica candidates have priorities `w / 2`, `w / 3`, and so on; selecting the highest `num_redundant` priorities gives the same minimax replica allocation as repeatedly assigning the next replica to the current highest-loaded expert.
+
+The candidate rank is initially bounded near the average number of extra copies per logical expert. It doubles only when the selected top-k boundary could still be affected by an omitted candidate. This substantially reduces tensor allocation and top-k work for normal load distributions, while retaining exact allocation for highly skewed cases by expanding up to the required rank. The implementation also handles zero-load experts with ordered negative tie-break priorities so selected replica ranks remain contiguous.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def replicate_experts(
+        weight: torch.Tensor,
+        num_phy: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Replicate `num_log` experts to `num_phy` replicas, such that the maximum
+    load of all replicas is minimized.
+
+    Parameters:
+        weight: [X, num_log]
+        num_phy: total number of experts after replication
+
+    Returns:
+        phy2log: [X, num_phy], logical expert id of each physical expert
+        rank: [X, num_phy], the replica rank
+        logcnt: [X, num_log], number of replicas for each logical expert
+    """
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+=======
+def replicate_experts(
+        weight: torch.Tensor,
+        num_phy: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Replicate `num_log` experts to `num_phy` replicas, such that the maximum
+    load of all replicas is minimized.
+
+    Parameters:
+        weight: [X, num_log]
+        num_phy: total number of experts after replication
+
+    Returns:
+        phy2log: [X, num_phy], logical expert id of each physical expert
+        rank: [X, num_phy], the replica rank
+        logcnt: [X, num_log], number of replicas for each logical expert
+    """
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    if num_redundant == 0:
+        return phy2log, rank, logcnt
+
+    # Giving an expert its kth extra copy changes its load to weight / (k + 1).
+    # Therefore the greedy water-filling allocation is equivalent to selecting
+    # the largest `num_redundant` values from these decreasing sequences.
+    #
+    # Most experts need only a few useful candidates. Start near the average
+    # copy count and grow only if an omitted candidate can cross the top-k
+    # boundary. This avoids materializing [n, num_log, num_redundant] for the
+    # common, non-pathological case.
+    candidate_count = min(
+        num_redundant,
+        max(1, (num_redundant + num_log - 1) // num_log),
+    )
+    max_weight = weight.max(dim=-1).values
+    while True:
+        copy_rank = torch.arange(1,
+                                 candidate_count + 1,
+                                 dtype=torch.int64,
+                                 device=device)
+        candidate_load = weight.unsqueeze(-1) / (copy_rank + 1)
+        # Zero-load copies do not affect the objective. Prefer lower ranks so
+        # ranks selected for any zero-load expert remain contiguous.
+        candidate_score = torch.where(
+            weight.unsqueeze(-1) == 0,
+            -copy_rank.to(weight.dtype),
+            candidate_load,
+        )
+        values, selected = torch.topk(
+            candidate_score.flatten(1), num_redundant, dim=-1)
+        omitted_upper_bound = max_weight / (candidate_count + 2)
+        if bool(
+                ((values[:, -1] >= omitted_upper_bound)
+                 | (max_weight == 0)).all()):
+            break
+        candidate_count = min(num_redundant, candidate_count * 2)
+
+    selected_expert = selected // candidate_count
+    selected_rank = selected.remainder(candidate_count) + 1
+    phy2log[:, num_log:] = selected_expert
+    rank[:, num_log:] = selected_rank
+    logcnt.scatter_add_(1, selected_expert,
+                        torch.ones_like(selected_expert, dtype=torch.int64))
+    return phy2log, rank, logcnt
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,262 @@
+--- a/original.py
++++ b/original.py
+@@ -1,133 +1,173 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_convex13() -> np.ndarray:
+     """
+-    Construct 13 points in the unit square using deterministic maximin search.
++    Construct a deterministic 13-point maximin configuration in the unit
++    square.  The four square corners are fixed, so the convex hull has unit
++    area and the minimum triangle area is already normalized.
++    """
++    rng = np.random.default_rng(seed=13051957)
+ 
+-    Four points are fixed at the square corners, so the convex hull has area
+-    exactly one.  Consequently the smallest Euclidean triangle area is also
+-    the normalized objective used by the evaluator.
+-    """
+-    rng = np.random.default_rng(seed=137)
+     corners = np.array(
+         [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+         dtype=float,
+     )
+-    triangles = np.array(
++    triples = np.array(
+         [(i, j, k) for i in range(13) for j in range(i + 1, 13)
+          for k in range(j + 1, 13)],
+         dtype=np.intp,
+     )
+ 
+-    def minimum_triangle_areas(interior: np.ndarray) -> np.ndarray:
+-        """Evaluate all 286 unsigned triangle areas for a batch of layouts."""
++    def triangle_areas_batch(interior: np.ndarray) -> np.ndarray:
++        """Return all triangle areas for a batch of nine-point interiors."""
+         count = interior.shape[0]
+         layouts = np.empty((count, 13, 2), dtype=float)
+-        layouts[:, :4, :] = corners
+-        layouts[:, 4:, :] = interior
+-        u = layouts[:, triangles[:, 1]] - layouts[:, triangles[:, 0]]
+-        v = layouts[:, triangles[:, 2]] - layouts[:, triangles[:, 0]]
+-        areas = 0.5 * np.abs(u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0])
+-        return areas.min(axis=1)
++        layouts[:, :4] = corners
++        layouts[:, 4:] = interior
+ 
+-    population_size = 96
+-    generations = 700
++        a = layouts[:, triples[:, 0]]
++        b = layouts[:, triples[:, 1]]
++        c = layouts[:, triples[:, 2]]
++        return 0.5 * np.abs(
++            (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
++            - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
++        )
++
++    def score_batch(interior: np.ndarray, blend: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
++        values = triangle_areas_batch(interior)
++        minima = values.min(axis=1)
++        if blend <= 0.0:
++            return minima, minima
++
++        tight = np.partition(values, 11, axis=1)[:, :12]
++        merit = minima + blend * tight.mean(axis=1)
++        return merit, minima
++
++    population_size = 112
++    generations = 760
+     population = rng.uniform(0.025, 0.975, size=(population_size, 9, 2))
+ 
+-    # A mildly perturbed regular seed gives the population a useful initial
+-    # length scale without retaining the lattice's collinear triples.
+     grid = np.array(
+-        [[x, y] for y in (0.2, 0.5, 0.8) for x in (0.2, 0.5, 0.8)],
++        [[x, y] for y in (0.18, 0.50, 0.82) for x in (0.18, 0.50, 0.82)],
+         dtype=float,
+     )
+-    # Seed several distinct perturbations of the useful 3-by-3 spacing pattern.
+-    # Independent noise scales populate nearby maximin basins without preserving
+-    # the grid's many degenerate collinear triples.
+-    for seed_index in range(20):
+-        perturbation = 0.014 + 0.0035 * seed_index
+-        population[seed_index] = np.clip(
+-            grid + rng.normal(0.0, perturbation, size=(9, 2)),
++    for index in range(28):
++        scale = 0.014 + 0.0024 * index
++        population[index] = np.clip(
++            grid + rng.normal(0.0, scale, size=(9, 2)),
+             0.008,
+             0.992,
+         )
+-    scores = minimum_triangle_areas(population)
+-    best_index = int(np.argmax(scores))
++
++    _, minima = score_batch(population)
++    best_index = int(np.argmax(minima))
+     best = population[best_index].copy()
+-    best_score = float(scores[best_index])
++    best_score = float(minima[best_index])
+ 
+     for generation in range(generations):
+-        fraction = generation / (generations - 1)
+-        step = 0.11 * (0.035 / 0.11) ** fraction
++        fraction = generation / float(generations - 1)
++        blend = 0.075 * (1.0 - fraction) ** 1.6
++        step = 0.105 * (0.018 / 0.105) ** fraction
+ 
+-        # Local moves refine incumbent basins; a differential proposal retains
+-        # population-scale directions that can escape a nonsmooth maximin trap.
+         noise = rng.normal(0.0, step, size=(population_size, 2, 9, 2))
+-        pull = (
+-            rng.uniform(0.0, 0.16, size=(population_size, 2, 1, 1))
+-            * (best[None, None, :, :] - population[:, None, :, :])
++        attraction = rng.uniform(
++            0.0, 0.14 * (1.0 - 0.45 * fraction),
++            size=(population_size, 2, 1, 1),
+         )
+-        local_proposals = np.clip(
+-            population[:, None, :, :] + noise + pull, 0.0, 1.0
+-        )
+-        donor_a = rng.integers(0, population_size, size=population_size)
+-        donor_b = rng.integers(0, population_size, size=population_size)
+-        # Differential evolution is most useful for broad moves initially.
+-        # Cooling its scale prevents late proposals from being dominated by
+-        # clipping at the square boundary, while the best-directed component
+-        # transfers successful global geometry between population members.
+-        differential_scale = 0.56 - 0.34 * fraction
+-        differential_proposal = np.clip(
+-            population
+-            + differential_scale * (population[donor_a] - population[donor_b])
+-            + rng.uniform(0.0, 0.18, size=(population_size, 1, 1))
+-            * (best[None, :, :] - population),
++        local = np.clip(
++            population[:, None] + noise
++            + attraction * (best[None, None] - population[:, None]),
+             0.0,
+             1.0,
+         )
+-        proposals = np.concatenate(
+-            (local_proposals, differential_proposal[:, None, :, :]), axis=1
++
++        donor_a = rng.integers(0, population_size, size=population_size)
++        donor_b = rng.integers(0, population_size, size=population_size)
++        differential = np.clip(
++            population
++            + (0.62 - 0.39 * fraction)
++            * (population[donor_a] - population[donor_b])
++            + rng.uniform(0.0, 0.12, size=(population_size, 1, 1))
++            * (best[None] - population),
++            0.0,
++            1.0,
+         )
+-        candidates = np.concatenate((population[:, None, :, :], proposals), axis=1)
+-        candidate_scores = minimum_triangle_areas(candidates.reshape(-1, 9, 2))
+-        candidate_scores = candidate_scores.reshape(population_size, 4)
+ 
+-        choices = np.argmax(candidate_scores, axis=1)
+-        population = candidates[np.arange(population_size), choices]
+-        scores = candidate_scores[np.arange(population_size), choices]
++        candidates = np.concatenate(
++            (population[:, None], local, differential[:, None]),
++            axis=1,
++        )
++        flat = candidates.reshape(-1, 9, 2)
++        merits, candidate_minima = score_batch(flat, blend)
++        merits = merits.reshape(population_size, 4)
++        candidate_minima = candidate_minima.reshape(population_size, 4)
+ 
+-        current_index = int(np.argmax(scores))
+-        if scores[current_index] > best_score:
+-            best_score = float(scores[current_index])
+-            best = population[current_index].copy()
++        selected = np.argmax(merits, axis=1)
++        population = candidates[np.arange(population_size), selected]
++        minima = candidate_minima[np.arange(population_size), selected]
+ 
+-        # Controlled deterministic restarts preserve global-search diversity.
+-        if generation in (220, 440):
+-            worst = np.argsort(scores)[: population_size // 4]
+-            population[worst] = rng.uniform(0.02, 0.98, size=(len(worst), 9, 2))
+-            scores[worst] = minimum_triangle_areas(population[worst])
++        current = int(np.argmax(minima))
++        if minima[current] > best_score:
++            best_score = float(minima[current])
++            best = population[current].copy()
+ 
+-    # At this scale, moving only a few points is much less likely to spoil an
+-    # unrelated active triangle than a full-layout perturbation.
+-    for iteration in range(450):
+-        fraction = iteration / 449.0
+-        polish_step = 0.035 * (0.0025 / 0.035) ** fraction
+-        trial_count = 48
+-        trials = np.repeat(best[None, :, :], trial_count, axis=0)
+-        move_mask = rng.random((trial_count, 9, 1)) < 0.18
+-        move_mask[0, rng.integers(0, 9), 0] = True
+-        trials += move_mask * rng.normal(
+-            0.0, polish_step, size=(trial_count, 9, 2)
++        if generation in (250, 500):
++            worst = np.argsort(minima)[: population_size // 5]
++            population[worst] = rng.uniform(
++                0.02, 0.98, size=(len(worst), 9, 2)
++            )
++
++    # Small stochastic moves selectively perturb points, preserving most
++    # non-active triangle constraints during fine maximin refinement.
++    for iteration in range(360):
++        fraction = iteration / 359.0
++        step = 0.028 * (0.0018 / 0.028) ** fraction
++        trial_count = 40
++        trials = np.repeat(best[None], trial_count, axis=0)
++        mask = rng.random((trial_count, 9, 1)) < 0.17
++        mask[0, rng.integers(0, 9), 0] = True
++        trials = np.clip(
++            trials + mask * rng.normal(0.0, step, size=(trial_count, 9, 2)),
++            0.0,
++            1.0,
+         )
+-        trials = np.clip(trials, 0.0, 1.0)
+-        trial_scores = minimum_triangle_areas(trials)
+-        trial_index = int(np.argmax(trial_scores))
+-        if trial_scores[trial_index] > best_score:
+-            best_score = float(trial_scores[trial_index])
+-            best = trials[trial_index].copy()
++        _, values = score_batch(trials)
++        index = int(np.argmax(values))
++        if values[index] > best_score:
++            best_score = float(values[index])
++            best = trials[index].copy()
++
++    # Deterministic pattern search removes residual random-search noise.
++    directions = np.array(
++        [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
++         [1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0]],
++        dtype=float,
++    )
++    directions[4:] /= np.sqrt(2.0)
++
++    step = 0.010
++    for _ in range(6):
++        improved = True
++        while improved:
++            improved = False
++            for point_index in range(9):
++                trials = np.repeat(best[None], 8, axis=0)
++                trials[:, point_index] = np.clip(
++                    trials[:, point_index] + step * directions,
++                    0.0,
++                    1.0,
++                )
++                _, values = score_batch(trials)
++                index = int(np.argmax(values))
++                if values[index] > best_score + 1e-14:
++                    best_score = float(values[index])
++                    best = trials[index].copy()
++                    improved = True
++        step *= 0.52
+ 
+     return np.vstack((corners, best))
+ 
+ 
+ # EVOLVE-BLOCK-END

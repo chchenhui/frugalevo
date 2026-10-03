@@ -1,0 +1,212 @@
+<NAME>
+bottleneck_weighted_anneal_crossover
+</NAME>
+<DESCRIPTION>
+Crossover combining the current program's fast vectorized geometry kernel and diverse seed generator (lattice, golden-ratio, repulsion layouts) with the best-performing prior annealer (score 0.70): membership-weighted bottleneck point selection, correlated two-point moves, occasional global jitter, simulated annealing with exponential cooling, and a multi-scale 8-directional coordinate polish. I extend the polish to iterate over the top bottleneck points rather than only the single worst one, and add a short greedy fine-polish pass at the end. The seed set is trimmed to the most promising families to keep total runtime near 1-2 seconds while maximizing min area.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+_SQRT3 = float(np.sqrt(3.0))
+
+
+def _to_xy(b):
+    b = np.asarray(b, dtype=float)
+    u, v = b[:, 0], b[:, 1]
+    return np.column_stack([u + 0.5 * v, 0.5 * _SQRT3 * v])
+
+
+def _project(b):
+    b = np.clip(b, 0.0, 1.0)
+    s = b.sum(axis=1)
+    over = s > 1.0
+    if np.any(over):
+        b[over] *= (1.0 - 1e-9) / s[over, None]
+    return b
+
+
+def _make_triples(n):
+    return np.array([(i, j, k) for i in range(n) for j in range(i + 1, n)
+                     for k in range(j + 1, n)])
+
+
+def _areas(xy, tri):
+    p, q, r = xy[tri[:, 0]], xy[tri[:, 1]], xy[tri[:, 2]]
+    return 0.5 * np.abs((q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1])
+                        - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0]))
+
+
+def _repulsion_seed(rng, n=11, iters=200, eps=1e-3):
+    """Electrostatic-style repulsion inside the simplex (barycentric coords)."""
+    b = rng.random((n, 2)) * 0.6 + 0.05
+    b[:3] = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    for t in range(iters):
+        d = b[:, None, :] - b[None, :, :]
+        dist2 = (d ** 2).sum(axis=2) + 1e-6
+        np.fill_diagonal(dist2, np.inf)
+        f = (d / (dist2 ** 2)[:, :, None]).sum(axis=1)
+        step = 0.02 * (0.995 ** t)
+        b[3:] += step * f[3:]
+        b = _project(b)
+    return b
+
+
+def _golden_seed(n=11):
+    """Deterministic golden-ratio jittered layout, vertices pinned."""
+    g = (np.sqrt(5.0) - 1.0) / 2.0
+    pts = []
+    for k in range(3, n):
+        u = ((k * g) % 1.0) * 0.8 + 0.05
+        v = ((k * g * g) % 1.0) * (0.9 - u) + 0.02
+        pts.append([u, v])
+    b = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]] + pts)
+    return _project(b)
+
+
+class _Annealer:
+    """Annealer with membership-weighted bottleneck moves + local polish."""
+
+    def __init__(self, tri, seed):
+        self.tri = tri
+        self.n_pts = int(tri.max()) + 1
+        self.rng = np.random.default_rng(seed)
+        self.member = np.zeros((self.n_pts, len(tri)), dtype=bool)
+        for c in range(3):
+            self.member[tri[:, c], np.arange(len(tri))] = True
+
+    def score(self, b):
+        return float(_areas(_to_xy(b), self.tri).min())
+
+    def bottleneck_counts(self, b, mult=1.5):
+        a = _areas(_to_xy(b), self.tri)
+        tight = a <= a.min() * mult + 1e-12
+        cnt = self.member[:, tight].sum(axis=1)
+        return cnt
+
+    def _weighted_pick(self, cnt, k):
+        w = cnt.astype(float) + 1e-12
+        chosen = []
+        for _ in range(k):
+            if w.sum() <= 0:
+                break
+            p = w / w.sum()
+            idx = int(self.rng.choice(len(w), p=p))
+            chosen.append(idx)
+            w[idx] = 0.0
+        return chosen
+
+    def anneal(self, b, iters=2500, T0=0.015, T1=1e-4):
+        b = _project(b.copy())
+        cur = self.score(b)
+        best, best_b = cur, b.copy()
+        rng = self.rng
+        for it in range(iters):
+            T = T0 * (T1 / T0) ** (it / iters)
+            # adaptive threshold: wide early, narrow late
+            frac = it / iters
+            mult = 3.0 + (1.3 - 3.0) * frac
+            cnt = self.bottleneck_counts(b, mult)
+            cand = b.copy()
+            if rng.random() < 0.25:
+                # correlated move: shift top-2 bottleneck points together
+                top = np.argsort(-cnt)[:2]
+                d = rng.normal(0.0, T * 3.0, 2)
+                for pt in top:
+                    cand[pt] += d
+            else:
+                k = int(rng.integers(1, 4))
+                for pt in self._weighted_pick(cnt, k):
+                    cand[pt] += rng.normal(0.0, T * 3.0, 2)
+            if rng.random() < 0.15:
+                cand += rng.normal(0.0, T * 0.4, cand.shape)
+            cand = _project(cand)
+            v = self.score(cand)
+            if v >= cur or rng.random() < np.exp((v - cur) / max(T * 1e-3, 1e-15)):
+                b, cur = cand, v
+                if v > best:
+                    best, best_b = v, b.copy()
+        # multi-round polish over top bottleneck points (8 directions)
+        for _round in range(60):
+            improved = False
+            cnt = self.bottleneck_counts(best_b, 1.3)
+            for pt in np.argsort(-cnt)[:2]:
+                for sc in (0.004, 0.001, 0.0003):
+                    for du, dv in ((sc, 0), (-sc, 0), (0, sc), (0, -sc),
+                                   (sc, sc), (-sc, -sc), (sc, -sc), (-sc, sc)):
+                        cand = best_b.copy()
+                        cand[pt] += np.array([du, dv])
+                        cand = _project(cand)
+                        v = self.score(cand)
+                        if v > best + 1e-15:
+                            best_b, best = cand, v
+                            improved = True
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+            if not improved:
+                break
+        return best_b, best
+
+
+def _seeds():
+    s = []
+    # lattice seeds (strong priors for Heilbronn configurations)
+    s.append(np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+        [1/3, 0.0], [2/3, 0.0], [0.0, 1/3], [0.0, 2/3],
+        [1/3, 1/3], [2/3, 1/3], [1/3, 2/3], [0.5, 1/6],
+    ]))
+    s.append(np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+        [0.5, 0.0], [0.25, 0.25], [0.0, 0.5],
+        [0.5, 0.5], [0.25, 0.0], [0.0, 0.25],
+        [0.5, 0.25], [0.25, 0.5],
+    ]))
+    # golden-ratio asymmetric layout
+    s.append(_golden_seed())
+    # repulsion layouts (deterministic)
+    for rs in (11, 202):
+        s.append(_repulsion_seed(np.random.default_rng(rs)))
+    # jittered lattice variants
+    rng = np.random.default_rng(2024)
+    for base in list(s[:2]):
+        j = base + rng.normal(0.0, 0.03, base.shape)
+        j[:3] = base[:3]
+        s.append(_project(j))
+    return s
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """Construct 11 points in the equilateral triangle maximizing the
+    smallest triangle area. Returns an (11,2) array of xy coordinates."""
+    n = 11
+    fallback_b = np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+        [1/3, 0.0], [2/3, 0.0], [0.0, 1/3], [0.0, 2/3],
+        [1/3, 1/3], [2/3, 1/3], [1/3, 2/3], [0.5, 1/6],
+    ])
+    try:
+        tri = _make_triples(n)
+        fb_val = float(_areas(_to_xy(fallback_b), tri).min())
+        best_xy, best_val = None, -1.0
+        for si, seed in enumerate(_seeds()):
+            ann = _Annealer(tri, seed=777 + 13 * si)
+            b, val = ann.anneal(seed)
+            if val > best_val:
+                best_val, best_xy = val, _to_xy(b)
+        if best_xy is None or not np.all(np.isfinite(best_xy)):
+            raise RuntimeError("optimization failed")
+        if best_val < fb_val:
+            best_xy = _to_xy(fallback_b)
+        return np.ascontiguousarray(best_xy, dtype=float)
+    except Exception:
+        return np.ascontiguousarray(_to_xy(fallback_b), dtype=float)
+
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

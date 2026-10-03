@@ -1,0 +1,139 @@
+<NAME>
+steepest_ascent_vectorized_climb</NAME>
+<DESCRIPTION>
+The current hill-climb evaluates candidates one at a time in a Python loop and accepts the *first* improving move. Two weaknesses follow: (1) it is slow (each candidate pays a fresh Python-level distance computation, dominating the 12.9s runtime), and (2) first-improvement can pick a poor direction when several moves improve the ratio, wasting step budget on weak moves.
+
+The fix: build all candidate point-sets as a single stacked numpy array (pair-separation moves, max-pair contraction moves, single-coordinate nudges, plus new perpendicular moves for the closest pair that increase the separating distance indirectly — often the actual gradient direction when the pair already sits at a symmetry-constrained optimum along u), evaluate their ratios in one vectorized batch, and take the *steepest* ascent move (argmax). This both speeds up the inner loop (one vectorized distance computation over all ~50 candidates) and improves move quality. To keep runtime bounded while gaining precision, the acceptance counts per step are also made adaptive (smaller at fine steps). The remaining pipeline (family grid search, polish, jittered restarts) is untouched and consistent with this change since `climb` keeps its signature `(P) -> (P, best_r)`.
+
+Since better moves at each step compound over thousands of accepted steps, this typically pushes the minimum/maximum ratio slightly above the plateau found by first-improvement, raising `combined_score`, while the vectorization cuts eval time.
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def climb(P, steps=(0.02, 0.006, 0.002, 6e-4, 2e-4, 8e-5, 3e-5)):
+    """Exact greedy hill-climb on the true ratio with coordinated pair moves.
+
+    Moves the min-distance pair apart along its separating direction
+    (both endpoints simultaneously, and each endpoint alone), pulls the
+    max-distance pair together, and tries single-coordinate nudges.
+    """
+    P = (P - P.mean(axis=0)).copy()
+    P = P / pair_dists(P).max()
+    best_r = ratio(P)
+    for step in steps:
+        n_acc = 0
+        while n_acc < 20000:
+            d = pair_dists(P)
+            imin = int(np.argmin(d))
+            imax = int(np.argmax(d))
+            i0, j0 = int(_IU[0][imin]), int(_IU[1][imin])
+            i1, j1 = int(_IU[0][imax]), int(_IU[1][imax])
+            cands = []
+            u = P[j0] - P[i0]
+            nu = np.linalg.norm(u)
+            if nu > 1e-12:
+                u = u / nu
+                Q = P.copy(); Q[i0] -= 0.5 * step * u; Q[j0] += 0.5 * step * u
+                cands.append(Q)
+                Q = P.copy(); Q[i0] -= step * u; cands.append(Q)
+                Q = P.copy(); Q[j0] += step * u; cands.append(Q)
+            v = P[j1] - P[i1]
+            nv = np.linalg.norm(v)
+            if nv > 1e-12:
+                v = v / nv
+                Q = P.copy(); Q[i1] += 0.5 * step * v; Q[j1] -= 0.5 * step * v
+                cands.append(Q)
+                Q = P.copy(); Q[i1] += step * v; cands.append(Q)
+                Q = P.copy(); Q[j1] -= step * v; cands.append(Q)
+            for a in range(N):
+                for c in range(D):
+                    for s in (step, -step):
+                        Q = P.copy(); Q[a, c] += s; cands.append(Q)
+            improved = False
+            for Q in cands:
+                r = ratio(Q)
+                if r > best_r + 1e-15:
+                    best_r = r
+                    P = Q
+                    improved = True
+                    break
+            if not improved:
+                break
+            n_acc += 1
+    return P, best_r
+=======
+def _batch_ratios(cands, dmax0):
+    """Ratios dmin/dmax for a stack of candidate point sets, vectorized."""
+    # cands: (m, N, D)
+    diff = cands[:, :, None, :] - cands[:, None, :, :]
+    D2 = (diff * diff).sum(-1)
+    m = D2.shape[0]
+    dd = np.sqrt(np.maximum(D2[:, _IU[0], _IU[1]], 1e-24))
+    return dd.min(axis=1) / dd.max(axis=1)
+
+
+def climb(P, steps=(0.02, 0.006, 0.002, 6e-4, 2e-4, 8e-5, 3e-5)):
+    """Steepest-ascent hill-climb on the true ratio with coordinated pair moves.
+
+    All candidate moves (min-pair separation along u, perpendicular shears
+    of the min pair, max-pair contraction, single-coordinate nudges) are
+    evaluated in one vectorized batch and the best-improving move is taken.
+    """
+    P = (P - P.mean(axis=0)).copy()
+    P = P / pair_dists(P).max()
+    best_r = ratio(P)
+    for step in steps:
+        max_acc = 4000 if step > 1e-3 else 1500
+        n_acc = 0
+        while n_acc < max_acc:
+            d = pair_dists(P)
+            imin = int(np.argmin(d))
+            imax = int(np.argmax(d))
+            i0, j0 = int(_IU[0][imin]), int(_IU[1][imin])
+            i1, j1 = int(_IU[0][imax]), int(_IU[1][imax])
+            cands = []
+            u = P[j0] - P[i0]
+            nu = np.linalg.norm(u)
+            if nu > 1e-12:
+                u = u / nu
+                for w in (0.5, 1.0):
+                    Q = P.copy(); Q[i0] -= w * step * u; Q[j0] += w * step * u
+                    cands.append(Q)
+                Q = P.copy(); Q[i0] -= step * u; cands.append(Q)
+                Q = P.copy(); Q[j0] += step * u; cands.append(Q)
+                # perpendicular shears of the min pair (rotate pair apart)
+                w1 = np.array([1.0, 0.0, 0.0])
+                if abs(u[0]) > 0.9:
+                    w1 = np.array([0.0, 1.0, 0.0])
+                p1 = np.cross(u, w1); p1 /= np.linalg.norm(p1)
+                p2 = np.cross(u, p1)
+                for pp in (p1, p2):
+                    for s in (step, -step):
+                        Q = P.copy()
+                        Q[i0] += 0.5 * s * pp
+                        Q[j0] -= 0.5 * s * pp
+                        cands.append(Q)
+            v = P[j1] - P[i1]
+            nv = np.linalg.norm(v)
+            if nv > 1e-12:
+                v = v / nv
+                for w in (0.5, 1.0):
+                    Q = P.copy(); Q[i1] += w * step * v; Q[j1] -= w * step * v
+                    cands.append(Q)
+                Q = P.copy(); Q[i1] += step * v; cands.append(Q)
+                Q = P.copy(); Q[j1] -= step * v; cands.append(Q)
+            for a in range(N):
+                for c in range(D):
+                    for s in (step, -step):
+                        Q = P.copy(); Q[a, c] += s; cands.append(Q)
+            C = np.stack(cands, axis=0)
+            rs = _batch_ratios(C, None)
+            k = int(np.argmax(rs))
+            if rs[k] > best_r + 1e-15:
+                best_r = float(rs[k])
+                P = C[k].copy()
+                n_acc += 1
+            else:
+                break
+    return P, best_r
+>>>>>>> REPLACE
+</DIFF>

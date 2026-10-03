@@ -1,0 +1,281 @@
+<NAME>
+sequential_lp_contact
+</NAME>
+
+<DESCRIPTION>
+This version uses a sequential linear-programming contact method rather than relying only on nonlinear local optimization from a few fixed lattice seeds. At each iteration, circle-separation constraints are replaced by supporting tangent half-planes to the distance disks, producing a linear program that jointly moves centers and increases radii while remaining feasible. Multiple staggered, boundary-adapted layer patterns are explored. The best certified LP packing is then polished with an analytic-Jacian SLSQP solve, followed by a final global feasibility scaling certificate.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""Sequential-LP and nonlinear-polishing constructor for 26 circles."""
+import numpy as np
+
+
+def construct_packing():
+    """
+    Construct 26 non-overlapping circles in the unit square.
+
+    The main search is a sequential linear program: every nonlinear
+    pair-distance constraint is replaced by its supporting tangent plane.
+    Such planes are conservative, so every LP iterate is feasible.  This
+    gives a robust contact-graph search before a final smooth local polish.
+    """
+    from scipy.optimize import linprog, minimize
+
+    n = 26
+    nv = 3 * n
+    pair_i, pair_j = np.triu_indices(n, 1)
+    npairs = len(pair_i)
+    rng = np.random.default_rng(26031991)
+
+    def make_seed(counts, jitter=0.0):
+        """Create a staggered layered seed with a deliberately irregular cut."""
+        rows = len(counts)
+        pts = []
+        for row, count in enumerate(counts):
+            y = (row + 1) / (rows + 1)
+            # Alternate horizontal shifts.  Even-row six-circle layers can
+            # exploit the side boundaries especially effectively.
+            shift = 0.0 if row % 2 == 0 else 0.5
+            if count == 6:
+                xs = (np.arange(count) + 0.5) / count
+            else:
+                xs = (np.arange(count) + 0.5 + 0.12 * shift) / count
+                xs = 0.08 + 0.84 * (xs - xs.min()) / (xs.max() - xs.min())
+            for x in xs:
+                pts.append((x, y))
+
+        c = np.asarray(pts, dtype=float)
+        if jitter:
+            c += rng.normal(0.0, jitter, c.shape)
+            c = np.clip(c, 0.025, 0.975)
+        return c
+
+    # Different layer cuts lead to genuinely different boundary contact graphs.
+    patterns = [
+        (5, 5, 6, 5, 5),
+        (5, 6, 5, 5, 5),
+        (5, 5, 5, 6, 5),
+        (4, 6, 6, 6, 4),
+        (5, 6, 5, 6, 4),
+        (4, 5, 6, 6, 5),
+    ]
+
+    def initial_radii(c):
+        wall = np.minimum.reduce((c[:, 0], c[:, 1], 1.0 - c[:, 0], 1.0 - c[:, 1]))
+        d = np.sqrt(np.sum((c[pair_i] - c[pair_j]) ** 2, axis=1))
+        r = np.minimum(wall, 0.45 * np.bincount(
+            np.concatenate((pair_i, pair_j)),
+            weights=np.concatenate((d, d)),
+            minlength=n
+        ) / (2 * (n - 1)))
+        # A small uniform radius is reliably feasible even for jittered seeds.
+        return np.minimum(r, 0.012)
+
+    def lp_step(z, noise):
+        """
+        Solve one conservative sequential LP.
+
+        For old pair vector d and unit normal u=d/|d|, imposing
+        u dot (new_ci-new_cj) >= new_ri+new_rj implies the true nonlinear
+        distance constraint because |v| >= u dot v.
+        """
+        c = z[:2 * n].reshape(n, 2)
+        d = c[pair_i] - c[pair_j]
+        lengths = np.sqrt(np.einsum("ij,ij->i", d, d))
+        unit = d / lengths[:, None]
+
+        # 4n wall constraints plus one tangent separation constraint per pair.
+        A = np.zeros((4 * n + npairs, nv))
+        b = np.zeros(4 * n + npairs)
+        row = 0
+        for k in range(n):
+            x, y, rr = 2 * k, 2 * k + 1, 2 * n + k
+
+            # x-r >= 0, y-r >= 0, x+r <= 1, y+r <= 1.
+            A[row, x], A[row, rr] = -1.0, 1.0
+            row += 1
+            A[row, y], A[row, rr] = -1.0, 1.0
+            row += 1
+            A[row, x], A[row, rr], b[row] = 1.0, 1.0, 1.0
+            row += 1
+            A[row, y], A[row, rr], b[row] = 1.0, 1.0, 1.0
+            row += 1
+
+        for p, (i, j) in enumerate(zip(pair_i, pair_j)):
+            ux, uy = unit[p]
+            # -u.(ci-cj)+ri+rj <= 0
+            A[row, 2 * i] = -ux
+            A[row, 2 * i + 1] = -uy
+            A[row, 2 * j] = ux
+            A[row, 2 * j + 1] = uy
+            A[row, 2 * n + i] = 1.0
+            A[row, 2 * n + j] = 1.0
+            row += 1
+
+        # Tiny changing center weights select varied vertices of otherwise
+        # degenerate LP faces, allowing contact graphs to rearrange.
+        objective = np.zeros(nv)
+        objective[2 * n:] = -1.0
+        objective[:2 * n] = noise * rng.normal(size=2 * n)
+
+        result = linprog(
+            objective,
+            A_ub=A,
+            b_ub=b,
+            bounds=[(0.0, 1.0)] * (2 * n) + [(1e-7, 0.5)] * n,
+            method="highs",
+        )
+        return result.x if result.success else z
+
+    def inequalities(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        walls = np.column_stack((
+            c[:, 0] - r, c[:, 1] - r,
+            1.0 - c[:, 0] - r, 1.0 - c[:, 1] - r
+        )).ravel()
+        delta = c[pair_i] - c[pair_j]
+        sep = np.einsum("ij,ij->i", delta, delta) - (r[pair_i] + r[pair_j]) ** 2
+        return np.concatenate((walls, sep))
+
+    def inequality_jacobian(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        jac = np.zeros((4 * n + npairs, nv))
+        row = 0
+        for k in range(n):
+            x, y, rr = 2 * k, 2 * k + 1, 2 * n + k
+            jac[row, x], jac[row, rr] = 1.0, -1.0
+            row += 1
+            jac[row, y], jac[row, rr] = 1.0, -1.0
+            row += 1
+            jac[row, x], jac[row, rr] = -1.0, -1.0
+            row += 1
+            jac[row, y], jac[row, rr] = -1.0, -1.0
+            row += 1
+
+        delta = c[pair_i] - c[pair_j]
+        sums = r[pair_i] + r[pair_j]
+        for p, (i, j) in enumerate(zip(pair_i, pair_j)):
+            dx, dy = delta[p]
+            jac[row, 2 * i] = 2.0 * dx
+            jac[row, 2 * i + 1] = 2.0 * dy
+            jac[row, 2 * j] = -2.0 * dx
+            jac[row, 2 * j + 1] = -2.0 * dy
+            jac[row, 2 * n + i] = -2.0 * sums[p]
+            jac[row, 2 * n + j] = -2.0 * sums[p]
+            row += 1
+        return jac
+
+    best = None
+    best_value = -np.inf
+
+    for trial, pattern in enumerate(patterns):
+        centers0 = make_seed(pattern, jitter=0.012 if trial else 0.0)
+        radii0 = initial_radii(centers0)
+        z = np.concatenate((centers0.ravel(), radii0))
+
+        # Sequential LP is inexpensive and explores a contact graph before
+        # nonlinear polishing.  Late iterations use smaller tie-breaking.
+        for it in range(52):
+            z_next = lp_step(z, 2e-5 / (1.0 + 0.04 * it))
+            if np.sum(z_next[2 * n:]) <= np.sum(z[2 * n:]) + 1e-10:
+                z = z_next
+                if it > 18:
+                    break
+            else:
+                z = z_next
+
+        # Smooth joint polishing, now beginning from a strong feasible graph.
+        result = minimize(
+            lambda q: -np.sum(q[2 * n:]),
+            z,
+            jac=lambda q: np.r_[np.zeros(2 * n), -np.ones(n)],
+            method="SLSQP",
+            bounds=[(1e-6, 1.0 - 1e-6)] * (2 * n) + [(1e-7, 0.5)] * n,
+            constraints={
+                "type": "ineq",
+                "fun": inequalities,
+                "jac": inequality_jacobian,
+            },
+            options={"maxiter": 1100, "ftol": 2e-12, "disp": False},
+        )
+        candidate = result.x if result.success else z
+        if np.min(inequalities(candidate)) >= -3e-7:
+            value = np.sum(candidate[2 * n:])
+            if value > best_value:
+                best_value = value
+                best = candidate
+
+    if best is None:
+        c = make_seed((5, 5, 6, 5, 5))
+        best = np.concatenate((c.ravel(), initial_radii(c)))
+
+    centers = best[:2 * n].reshape(n, 2)
+    radii = best[2 * n:].copy()
+
+    # Final global certificate against all numerical tolerance errors.
+    wall = np.minimum.reduce((
+        centers[:, 0], centers[:, 1], 1.0 - centers[:, 0], 1.0 - centers[:, 1]
+    ))
+    scale = np.min(wall / radii)
+    dist = np.sqrt(np.sum((centers[pair_i] - centers[pair_j]) ** 2, axis=1))
+    scale = min(scale, np.min(dist / (radii[pair_i] + radii[pair_j])))
+    radii *= min(1.0, 0.9999995 * scale)
+
+    return centers, radii, float(np.sum(radii))
+
+
+def compute_max_radii(centers):
+    """Compute conservative non-overlapping radii for supplied centers."""
+    n = centers.shape[0]
+    radii = np.minimum.reduce((
+        centers[:, 0], centers[:, 1],
+        1.0 - centers[:, 0], 1.0 - centers[:, 1]
+    )).astype(float)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if radii[i] + radii[j] > dist:
+                scale = dist / (radii[i] + radii[j])
+                radii[i] *= scale
+                radii[j] *= scale
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+def run_packing():
+    """Run the circle packing constructor for n=26."""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        ax.add_patch(Circle(center, radius, alpha=0.5))
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+```
+</CODE>

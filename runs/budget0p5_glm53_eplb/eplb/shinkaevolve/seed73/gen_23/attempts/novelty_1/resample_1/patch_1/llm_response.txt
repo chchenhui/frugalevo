@@ -1,0 +1,99 @@
+<NAME>
+joint_replication_packing_refinement
+</NAME>
+<DESCRIPTION>
+The current pipeline decides replication counts (Step 2) before GPU packing (Step 3), with no feedback between them. Per the recommendation, add a single tensorized refinement pass after Step 3: compute actual per-GPU loads, and when the hottest GPU exceeds the mean beyond a threshold, move one replica from the highest-contribution logical expert in the hottest pack to the lowest-contribution expert in the coldest pack by mutating `mlogcnt`/`phy2mlog` before re-running the packing. This jointly optimizes replication and packing, improving GPU balancedness without the expensive Python-loop swaps (keeping algorithm time low). Since after mutating replication we must recompute ranks and packing, we do the refinement on `mlogcnt` then rebuild `phy2mlog`, `phyrank`, and re-pack — all with vectorized torch ops, no Python loops over items.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        # ---- Stage 3: pack physical experts onto GPUs ----
+        tokens_per_phy = (tokens_per_mlog / mlogcnt).gather(-1, phy2mlog)
+        gpack_index, grank_in_pack = _LptPacker.pack(tokens_per_phy,
+                                                      n_gpus // n_nodes)
+        phy2pphy = gpack_index * phy_per_gpu + grank_in_pack
+        pphy2phy = _inverse_perm(phy2pphy)
+=======
+        # ---- Stage 3: pack physical experts onto GPUs ----
+        gpus_per_node = n_gpus // n_nodes
+        num_mlog = num_logical_experts // n_nodes
+        phy_per_node = n_phy // n_nodes
+
+        tokens_per_phy = (tokens_per_mlog / mlogcnt).gather(-1, phy2mlog)
+        gpack_index, grank_in_pack = _LptPacker.pack(tokens_per_phy,
+                                                      gpus_per_node)
+        phy2pphy = gpack_index * phy_per_gpu + grank_in_pack
+
+        # ---- Joint refinement: adjust replication based on GPU loads ----
+        # Compute actual per-GPU loads from the current packing.
+        gpu_load = torch.zeros(tokens_per_phy.shape[0], gpus_per_node,
+                                dtype=tokens_per_phy.dtype,
+                                device=tokens_per_phy.device)
+        gpu_load.scatter_add_(1, gpack_index, tokens_per_phy)
+        mean_load = gpu_load.mean(-1, keepdim=True)
+        hot_rows = (gpu_load.max(-1, keepdim=True).values >
+                   mean_load * (1.0 + 1e-3)).squeeze(-1)
+        if hot_rows.any():
+            arange_rows = torch.arange(tokens_per_phy.shape[0],
+                                       device=weight.device)
+            hot_gpu = gpu_load.argmax(-1)
+            cold_gpu = gpu_load.argmin(-1)
+            # contribution of each physical expert to its GPU load
+            # pick hottest physical expert in hot GPU, coldest in cold GPU
+            hot_mask = gpack_index == hot_gpu.unsqueeze(-1)
+            cold_mask = gpack_index == cold_gpu.unsqueeze(-1)
+            tpp = torch.where(hot_mask, tokens_per_phy,
+                              torch.full_like(tokens_per_phy, -1.0))
+            hot_phy = tpp.argmax(-1)
+            tpc = torch.where(cold_mask, tokens_per_phy,
+                              torch.full_like(tokens_per_phy, float("inf")))
+            cold_phy = tpc.argmin(-1)
+            hot_mlog = phy2mlog.gather(-1, hot_phy.unsqueeze(-1)).squeeze(-1)
+            cold_mlog = phy2mlog.gather(-1,
+                                        cold_phy.unsqueeze(-1)).squeeze(-1)
+            hot_cnt = mlogcnt[arange_rows, hot_mlog]
+            cold_cnt = mlogcnt[arange_rows, cold_mlog]
+            # valid move: hot expert has >1 replica, cold expert gains one,
+            # and the move reduces imbalance
+            hot_contrib = tokens_per_phy[arange_rows, hot_phy]
+            new_hot = hot_contrib * (hot_cnt - 1) / hot_cnt
+            new_cold = tokens_per_phy[arange_rows, cold_phy] * \
+                cold_cnt / (cold_cnt + 1)
+            delta_hot = (gpu_load[arange_rows, hot_gpu] - hot_contrib +
+                         new_hot) - mean_load.squeeze(-1)
+            delta_cold = (gpu_load[arange_rows, cold_gpu] + new_cold) - \
+                mean_load.squeeze(-1)
+            do_move = (hot_rows & (hot_cnt > 1) &
+                       ((gpu_load[arange_rows, hot_gpu] -
+                         gpu_load[arange_rows, cold_gpu]) >
+                        (hot_contrib - new_hot) + new_cold))
+            # Mutate replication counts before packing (never ranks after)
+            mlogcnt[arange_rows[do_move], hot_mlog[do_move]] -= 1
+            mlogcnt[arange_rows[do_move], cold_mlog[do_move]] += 1
+            # Rebuild phy2mlog and rank from the new counts (vectorized)
+            n_rows = tokens_per_mlog.shape[0]
+            sorted_mlog = (-tokens_per_mlog / mlogcnt).argsort(-1)
+            cum_slots = torch.arange(phy_per_node,
+                                     device=weight.device).unsqueeze(0)
+            # number of slots allocated to experts in sorted order
+            cnt_sorted = mlogcnt.gather(-1, sorted_mlog)
+            boundaries = cnt_sorted.cumsum(-1)
+            # slot j belongs to the first expert whose cumulative count > j
+            slot_owner = (cum_slots.expand(n_rows, -1) < boundaries).float(
+            ).argmax(-1)
+            phy2mlog = sorted_mlog.gather(-1, slot_owner)
+            # rank within the expert
+            prev_bnd = boundaries.gather(
+                -1, (slot_owner - 1).clamp(min=0)) - cnt_sorted.gather(
+                    -1, slot_owner)
+            start = torch.where(slot_owner > 0, prev_bnd,
+                                torch.zeros_like(prev_bnd))
+            phyrank = cum_slots.squeeze(0).expand(n_rows, -1).gather(
+                -1, slot_owner) - start
+            # Re-pack with updated per-replica loads
+            tokens_per_phy = (tokens_per_mlog / mlogcnt).gather(-1, phy2mlog)
+            gpack_index, grank_in_pack = _LptPacker.pack(tokens_per_phy,
+                                                          gpus_per_node)
+            phy2pphy = gpack_index * phy_per_gpu + grank_in_pack
+        pphy2phy = _inverse_perm(phy2pphy)
+>>>>>>> REPLACE
+</DIFF>

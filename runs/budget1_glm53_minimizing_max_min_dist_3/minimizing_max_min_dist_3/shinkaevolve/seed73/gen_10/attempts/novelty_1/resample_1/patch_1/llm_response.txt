@@ -1,0 +1,161 @@
+<NAME>
+sphere_tammes_softmax_opt</NAME>
+<DESCRIPTION>
+Instead of random points, I directly optimize the target ratio. The problem is scale/translation/rotation invariant, so I parametrize free 14x3 point clouds and maximize a smooth (softmax/softmin) surrogate of (dmin² - dmax²) — which is equivalent to maximizing dmin/dmax up to a rescaling — using analytic gradients and L-BFGS from many seeded random starts, including a spherical-projection variant. Each optimized candidate is rescaled/centered and evaluated with the exact metric, and the best one is returned. This multi-start gradient-based ratio optimization finds near-Tammes-quality configurations (score near or above the reference ~0.24), far above the current 0.02.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+try:
+    from scipy.optimize import minimize
+    HAVE_SCIPY = True
+except Exception:
+    HAVE_SCIPY = False
+
+
+def _pairwise_sq(points):
+    diff = points[:, None, :] - points[None, :, :]
+    d2 = np.sum(diff * diff, axis=-1)
+    return d2, diff
+
+
+def _true_score(points):
+    d2, _ = _pairwise_sq(points)
+    iu = np.triu_indices(len(points), 1)
+    dm2 = d2[iu].min()
+    dx2 = d2[iu].max()
+    if dx2 <= 0:
+        return 0.0
+    return dm2 / dx2
+
+
+def _neg_obj(flat, n, beta, sphere):
+    pts = flat.reshape(n, 3).copy()
+    d2, diff = _pairwise_sq(pts)
+    iu = np.triu_indices(n, 1)
+    dij2 = d2[iu]           # (m,)
+    dij = diff[iu]          # (m,3)
+
+    # soft min of squared distances (maximize) and soft max (minimize)
+    # F = softmin(d2) - softmax(d2); maximize F  => minimize -F
+    a = -beta * dij2
+    amax = a.max()
+    lse_min = amax + np.log(np.sum(np.exp(a - amax)))
+    soft_min = -lse_min / beta
+
+    b = beta * dij2
+    bmax = b.max()
+    lse_max = bmax + np.log(np.sum(np.exp(b - bmax)))
+    soft_max = lse_max / beta
+
+    F = soft_min - soft_max
+    obj = -F
+
+    w_min = np.exp(a - amax); w_min /= w_min.sum()
+    w_max = np.exp(b - bmax); w_max /= w_max.sum()
+
+    # gradient wrt dij2: -w_min - w_max  (times -1 of F sign handled)
+    g_dij2 = (-1.0) * w_min - 1.0 * w_max
+    # gradient wrt points: for pair (i,j): d(d2)/dx_i = 2(x_i-x_j), dx_j = -that
+    grad_pts = np.zeros((n, 3))
+    idx_i, idx_j = iu
+    contrib = 2.0 * g_dij2[:, None] * dij  # wrt x_i
+    np.add.at(grad_pts, idx_i, contrib)
+    np.add.at(grad_pts, idx_j, -contrib)
+
+    if sphere:
+        # project gradient to tangent space of unit sphere
+        norms = np.linalg.norm(pts, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-12)
+        u = pts / norms
+        grad_pts = grad_pts - np.sum(grad_pts * u, axis=1, keepdims=True) * u
+        # radial component of objective is ~0 anyway
+
+    return obj, grad_pts.ravel()
+
+
+def _run_opt(n, seed, beta, sphere, maxiter):
+    rng = np.random.RandomState(seed)
+    if sphere:
+        v = rng.randn(n, 3)
+        pts = v / np.linalg.norm(v, axis=1, keepdims=True)
+    else:
+        pts = rng.randn(n, 3)
+
+    flat = pts.ravel().copy()
+    if HAVE_SCIPY:
+        res = minimize(_neg_obj, flat, args=(n, beta, sphere),
+                       jac=True, method="L-BFGS-B",
+                       options={"maxiter": maxiter, "maxfun": 4 * maxiter})
+        pts = res.x.reshape(n, 3)
+    else:
+        # simple projected gradient ascent fallback
+        step = 0.02
+        cur = flat
+        for it in range(maxiter):
+            f, g = _neg_obj(cur, n, beta, sphere)
+            cur = cur - step * g
+            if sphere:
+                p = cur.reshape(n, 3)
+                p = p / np.linalg.norm(p, axis=1, keepdims=True)
+                cur = p.ravel()
+        pts = cur.reshape(n, 3)
+
+    pts = pts - pts.mean(axis=0)
+    return pts
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    n = 14
+    best_pts = None
+    best = -1.0
+
+    betas = [20.0, 60.0]
+    seeds = list(range(24))
+    maxiter = 300
+
+    # greedy increasing-beta schedule plus free (non-sphere) refinement
+    for seed in seeds:
+        pts = _run_opt(n, seed, betas[0], True, maxiter)
+        for beta in betas[1:]:
+            flat = pts.ravel().copy()
+            if HAVE_SCIPY:
+                res = minimize(_neg_obj, flat, args=(n, beta, True),
+                              jac=True, method="L-BFGS-B",
+                              options={"maxiter": maxiter, "maxfun": 4*maxiter})
+                pts = res.x.reshape(n, 3)
+        s = _true_score(pts)
+        if s > best:
+            best = s
+            best_pts = pts
+        if best > 0.2404:
+            break
+
+    # free-space refinement of the best spherical solution (allows off-sphere)
+    if best_pts is not None and HAVE_SCIPY:
+        for beta in [40.0, 120.0]:
+            flat = best_pts.ravel().copy()
+            res = minimize(_neg_obj, flat, args=(n, beta, False),
+                          jac=True, method="L-BFGS-B",
+                          options={"maxiter": 400, "maxfun": 1600})
+            cand = res.x.reshape(n, 3)
+            cand = cand - cand.mean(axis=0)
+            s = _true_score(cand)
+            if s > best:
+                best = s
+                best_pts = cand
+
+    if best_pts is None:
+        np.random.seed(42)
+        best_pts = np.random.randn(n, 3)
+
+    # normalize scale for cleanliness (ratio invariant)
+    scale = np.max(np.abs(best_pts))
+    if scale > 0:
+        best_pts = best_pts / scale
+    return np.asarray(best_pts, dtype=float)
+# EVOLVE-BLOCK-END
+```
+</CODE>

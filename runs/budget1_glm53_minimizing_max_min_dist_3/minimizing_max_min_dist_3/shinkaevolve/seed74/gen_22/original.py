@@ -1,0 +1,217 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
+
+    Returns
+        points: np.ndarray of shape (14,3) containing the (x,y) coordinates of the 14 points.
+
+    """
+
+    n = 14
+    d = 3
+
+    from scipy.optimize import minimize
+
+    def true_ratio(pts):
+        dists = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+        iu = np.triu_indices(n, k=1)
+        dd = dists[iu]
+        dmax = dd.max()
+        if dmax <= 0:
+            return 0.0
+        return dd.min() / dmax
+
+    def objective(flat):
+        pts = flat.reshape(n, d)
+        # center (translation invariance)
+        pts = pts - pts.mean(axis=0)
+        dists = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+        iu = np.triu_indices(n, k=1)
+        dd = dists[iu]
+        if np.any(dd <= 1e-12):
+            return 1e6
+        k = 50.0
+        # smooth min and max of squared-ish distances
+        smin = -np.log(np.sum(np.exp(-k * dd))) / k
+        smax = np.log(np.sum(np.exp(k * dd))) / k
+        return -(smin / smax)
+
+    def grad(flat):
+        pts = flat.reshape(n, d).copy()
+        pts_c = pts - pts.mean(axis=0)
+        diff = pts_c[:, None, :] - pts_c[None, :, :]
+        dists = np.linalg.norm(diff, axis=-1)
+        i, j = np.triu_indices(n, k=1)
+        dd = dists[i, j]
+        k = 50.0
+        w_min = np.exp(-k * dd)
+        w_max = np.exp(k * dd)
+        smin = -np.log(w_min.sum()) / k
+        smax = np.log(w_max.sum()) / k
+        # d(smin)/dp, d(smax)/dp
+        g = np.zeros_like(pts_c)
+        # smin grad: smin = -log(sum e^{-k dd})/k
+        # dsmin/dp_l = sum_m wmin_m/(k*W) * unit vector contribution
+        Wm = w_min.sum()
+        Wx = w_max.sum()
+        for a, b, wm, wx, dval in zip(i, j, w_min, w_max, dd):
+            if dval < 1e-12:
+                continue
+            u = (pts_c[a] - pts_c[b]) / dval
+            # dsmin/da = (wm/(k*Wm)) * k * u = wm/Wm * u ... sign:
+            # d/dd e^{-k dd} = -k e^{-k dd}; d smin/d dd = w/(W k)
+            # so d smin/d p_a = (w/(W k)) * k * u = w/W * u
+            coef_min = wm / Wm
+            coef_max = wx / Wx
+            g[a] += (coef_min - 0) * u * 0  # placeholder, computed below
+            g[a] += (coef_min / k) * k * u
+            g[b] -= (coef_min / k) * k * u
+            g[a] += (coef_max / k) * k * u
+            g[b] -= (coef_max / k) * k * u
+        # combine: f = -smin/smax, df/dp = -(dsmin*smax - smin*dsmax)/smax^2
+        return (-(g) / (smax ** 2) * smax).flatten()  # refined below
+
+    best_pts = None
+    best_r = -1.0
+
+    rng = np.random.default_rng(42)
+    i_arr, j_arr = np.triu_indices(n, k=1)
+
+    def true_ratio_pts(pts):
+        dd = np.linalg.norm(pts[i_arr] - pts[j_arr], axis=1)
+        mx = dd.max()
+        if mx <= 0:
+            return 0.0
+        return dd.min() / mx
+
+    # Scale-invariant soft-min objective (distances normalized by dmax),
+    # annealed over increasing sharpness k.
+    def soft_obj_factory(k):
+        def obj(flat):
+            pts = flat.reshape(n, d)
+            pts = pts - pts.mean(axis=0)
+            dd = np.linalg.norm(pts[i_arr] - pts[j_arr], axis=1)
+            mx = dd.max()
+            if mx <= 1e-12:
+                return 1e6
+            s = dd / mx
+            smin = -np.log(np.sum(np.exp(-k * s))) / k
+            return -smin
+        return obj
+
+    # Structured starts: icosahedron + 2 poles, Fibonacci sphere, jitters
+    phi = (1 + np.sqrt(5)) / 2
+    ico = []
+    for a in (-1, 1):
+        for b in (-phi, phi):
+            ico.append([a, b, 0])
+            ico.append([0, a, b])
+            ico.append([b, 0, a])
+    ico = np.array(ico[:12], dtype=float)
+    ico_poles = np.vstack([ico, [[0, 0, 2.0], [0, 0, -2.0]]])
+
+    kk = np.arange(n) + 0.5
+    ga = np.pi * (3 - np.sqrt(5))
+    fib = np.zeros((n, 3))
+    fib[:, 2] = 1 - 2 * kk / n
+    r_ = np.sqrt(np.maximum(0.0, 1 - fib[:, 2] ** 2))
+    fib[:, 0] = r_ * np.cos(ga * kk)
+    fib[:, 1] = r_ * np.sin(ga * kk)
+
+    starts = [ico_poles.copy(), fib.copy()]
+    for scale in (0.05, 0.2):
+        starts.append(ico_poles + scale * rng.standard_normal((n, d)))
+        starts.append(fib + scale * rng.standard_normal((n, d)))
+    for _ in range(8):
+        p = rng.standard_normal((n, d))
+        p = p / np.linalg.norm(p, axis=1, keepdims=True)
+        starts.append(p * (0.5 + rng.random()))
+    for _ in range(4):
+        starts.append(rng.standard_normal((n, d)))
+
+    ks = [8.0, 20.0, 50.0, 120.0]
+    for pts0 in starts:
+        x = pts0.flatten()
+        for k in ks:
+            res = minimize(soft_obj_factory(k), x, method="L-BFGS-B",
+                           options={"maxiter": 400})
+            x = res.x
+        pts = x.reshape(n, d)
+        r = true_ratio_pts(pts)
+        if r > best_r:
+            best_r = r
+            best_pts = pts.copy()
+
+    # Exact polish via SLSQP: maximize t s.t. t^2 <= ||pi-pj||^2 <= 1
+    def polish(pts):
+        P = pts - pts.mean(axis=0)
+        mx = np.linalg.norm(P[i_arr] - P[j_arr], axis=1).max()
+        if mx <= 1e-12:
+            return pts, true_ratio_pts(pts)
+        P = P / mx
+        t0 = np.linalg.norm(P[i_arr] - P[j_arr], axis=1).min()
+        x0 = np.concatenate([P.flatten(), [t0]])
+        m = len(i_arr)
+
+        def fobj(x):
+            return -x[-1]
+
+        def fjac(x):
+            J = np.zeros(43)
+            J[-1] = -1.0
+            return J
+
+        def cons(x):
+            P2 = x[:42].reshape(n, d)
+            dv = np.sum((P2[i_arr] - P2[j_arr]) ** 2, axis=1)
+            return np.concatenate([1.0 - dv, dv - x[-1] ** 2])
+
+        def cjac(x):
+            P2 = x[:42].reshape(n, d)
+            diff = P2[i_arr] - P2[j_arr]
+            J = np.zeros((2 * m, 43))
+            for idx in range(m):
+                a = i_arr[idx]
+                b = j_arr[idx]
+                J[idx, 3 * a:3 * a + 3] = -2 * diff[idx]
+                J[idx, 3 * b:3 * b + 3] = 2 * diff[idx]
+                J[m + idx, 3 * a:3 * a + 3] = 2 * diff[idx]
+                J[m + idx, 3 * b:3 * b + 3] = -2 * diff[idx]
+                J[m + idx, -1] = -2 * x[-1]
+            return J
+
+        res = minimize(fobj, x0, method="SLSQP",
+                       constraints=[{"type": "ineq", "fun": cons, "jac": cjac}],
+                       options={"maxiter": 400, "ftol": 1e-12})
+        P2 = res.x[:42].reshape(n, d)
+        P2 = P2 - P2.mean(axis=0)
+        return P2, true_ratio_pts(P2)
+
+    P2, r2 = polish(best_pts)
+    if r2 > best_r:
+        best_r = r2
+        best_pts = P2
+    for _ in range(3):
+        Pp = best_pts + 0.02 * rng.standard_normal((n, d))
+        P2, r2 = polish(Pp)
+        if r2 > best_r:
+            best_r = r2
+            best_pts = P2
+
+    best_pts = np.asarray(best_pts, dtype=float)
+
+    # Normalize: center and scale so max pairwise distance = 1 (convenience)
+    best_pts = best_pts - best_pts.mean(axis=0)
+    dists = np.linalg.norm(best_pts[:, None, :] - best_pts[None, :, :], axis=-1)
+    dmax = dists.max()
+    if dmax > 0:
+        best_pts = best_pts / dmax
+
+    return best_pts
+
+
+# EVOLVE-BLOCK-END

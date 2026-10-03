@@ -1,0 +1,392 @@
+<NAME>
+robust_slope_consensus
+</NAME>
+
+<DESCRIPTION>
+The current filter obtains strong accuracy and low lag, but its Kalman velocity update is highly reactive, producing excessive slope changes (162.6) and false reversals (128.2). This revision retains the causal constant-velocity tracker and low-lag endpoint behavior, but adds a robust exponentially weighted local-linear slope bank.
+
+Key changes:
+- **Robust local regression:** Each sliding window is MAD-clipped before weighted fitting, reducing outlier-driven trend reversals.
+- **Slope-informed velocity fusion:** The consensus velocity target combines realized accepted motion with a robust local slope. In noisy or flat regions, accepted motion has greater weight; during confident trends, the fitted local slope contributes more strongly.
+- **Residual-scaled acceleration cap:** Velocity changes are capped using the local residual scale, preventing a single innovation from injecting persistent oscillation.
+- **Stronger reversal hysteresis:** Reversals require two coherent samples unless both local slope and candidate displacement provide decisive support.
+- **Adaptive local-reference blend:** Endpoint regression is used more during coherent trends while disagreement with the Kalman state reduces the influence of potentially unstable local fits.
+
+Primary parameters are regression recency decay (`3.2`), outlier clipping (`3.5 * MAD`), local-reference weight (`0.16` to `0.38`), consensus gain (`0.66` to `0.84`), reversal evidence threshold (`2` samples), velocity fusion weighting, and residual-scaled acceleration limits.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""
+Robust real-time adaptive filter for volatile, non-stationary signals.
+
+The enhanced path combines a bounded constant-velocity tracker with robust causal
+endpoint regression and direction-aware consensus smoothing.
+"""
+import numpy as np
+
+
+def adaptive_filter(x, window_size=20):
+    """Efficient sliding-window moving-average baseline."""
+    x = np.asarray(x, dtype=float)
+    if x.ndim != 1:
+        raise ValueError("Input signal must be a 1D array")
+    if window_size < 1:
+        raise ValueError("window_size must be >= 1")
+    if len(x) < window_size:
+        raise ValueError(
+            f"Input signal length ({len(x)}) must be >= window_size ({window_size})"
+        )
+
+    cumulative = np.concatenate(([0.0], np.cumsum(x, dtype=float)))
+    return (cumulative[window_size:] - cumulative[:-window_size]) / float(window_size)
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Robust slope-consensus adaptive filter.
+
+    Output is causally aligned to x[window_size - 1:].  The algorithm uses:
+      1. bounded adaptive alpha-beta/Kalman-style tracking,
+      2. robust exponentially weighted endpoint regression,
+      3. residual-scaled acceleration limits,
+      4. persistent-evidence reversal confirmation.
+    """
+    x = np.asarray(x, dtype=float)
+    if x.ndim != 1:
+        raise ValueError("Input signal must be a 1D array")
+    if window_size < 1:
+        raise ValueError("window_size must be >= 1")
+    if len(x) < window_size:
+        raise ValueError(
+            f"Input signal length ({len(x)}) must be >= window_size ({window_size})"
+        )
+
+    n = len(x)
+    output_length = n - window_size + 1
+
+    if window_size == 1:
+        return x.copy()
+
+    # Robust causal local-linear endpoint estimates.  The endpoint level has
+    # negligible phase delay for sustained trends, while MAD clipping prevents
+    # a single spike from manufacturing a local directional reversal.
+    windows = np.lib.stride_tricks.sliding_window_view(x, window_size)
+    medians = np.median(windows, axis=1)
+    window_mad = np.median(np.abs(windows - medians[:, None]), axis=1)
+    window_scale = np.maximum(1.4826 * window_mad, 1e-8)
+    clipped_windows = np.clip(
+        windows,
+        (medians - 3.5 * window_scale)[:, None],
+        (medians + 3.5 * window_scale)[:, None],
+    )
+
+    time = np.arange(window_size, dtype=float) - (window_size - 1)
+    design = np.column_stack((np.ones(window_size), time))
+
+    # Recency decay 3.2 favors endpoint responsiveness without allowing the
+    # last one or two samples to dominate the fitted slope.
+    weights = np.exp(np.linspace(-3.2, 0.0, window_size))
+    regression_map = np.linalg.solve(
+        design.T @ (weights[:, None] * design),
+        design.T * weights,
+    )
+
+    coefficients = clipped_windows @ regression_map.T
+    endpoint_levels = coefficients[:, 0]
+    local_slopes = coefficients[:, 1]
+
+    fitted_windows = (
+        endpoint_levels[:, None] + local_slopes[:, None] * time[None, :]
+    )
+    residual_scale = np.maximum(
+        1.4826 * np.median(np.abs(clipped_windows - fitted_windows), axis=1),
+        0.12 * window_scale,
+    )
+    residual_scale = np.maximum(residual_scale, 1e-8)
+
+    initial_diff = np.diff(x[:window_size])
+    if initial_diff.size:
+        diff_center = np.median(initial_diff)
+        diff_scale = 1.4826 * np.median(np.abs(initial_diff - diff_center))
+    else:
+        diff_scale = 0.0
+
+    measurement_var = max(0.55 * diff_scale * diff_scale, 1e-8)
+    innovation_var = measurement_var
+    process_var = max(0.035 * measurement_var, 1e-10)
+
+    level = float(x[0])
+    velocity = float(local_slopes[0])
+    p00 = 4.0 * measurement_var
+    p01 = 0.0
+    p11 = measurement_var
+
+    consensus_level = float(x[0])
+    consensus_velocity = float(local_slopes[0])
+    output = np.empty(output_length, dtype=float)
+
+    previous_step = 0.0
+    pending_direction = 0.0
+    pending_count = 0
+
+    # Warm-up local reference before the first complete fitting window.
+    ema_decay = np.exp(-2.4 / max(window_size - 1, 1))
+    ema_level = float(x[0])
+
+    for index, sample in enumerate(x):
+        # Adaptive bounded constant-velocity tracker.
+        predicted_level = level + velocity
+        q = process_var
+
+        pp00 = p00 + 2.0 * p01 + p11 + 0.25 * q
+        pp01 = p01 + p11 + 0.5 * q
+        pp11 = p11 + q
+
+        innovation = sample - predicted_level
+        predicted_var = max(pp00 + measurement_var, 1e-12)
+        innovation_limit = 3.2 * np.sqrt(predicted_var)
+        bounded_innovation = np.clip(
+            innovation, -innovation_limit, innovation_limit
+        )
+
+        gain_level = pp00 / predicted_var
+        gain_velocity = pp01 / predicted_var
+        level = predicted_level + gain_level * bounded_innovation
+        velocity = velocity + gain_velocity * bounded_innovation
+
+        p00 = max(pp00 - gain_level * pp00, 1e-12)
+        p01 = pp01 - gain_level * pp01
+        p11 = max(pp11 - gain_velocity * pp01, 1e-12)
+
+        innovation_var = (
+            0.955 * innovation_var + 0.045 * bounded_innovation * bounded_innovation
+        )
+        measurement_var = max(
+            0.990 * measurement_var + 0.010 * innovation_var, 1e-8
+        )
+        process_var = max(
+            0.992 * process_var + 0.008 * innovation_var * 0.040, 1e-10
+        )
+
+        ema_level = ema_decay * ema_level + (1.0 - ema_decay) * sample
+
+        if index >= window_size - 1:
+            local_index = index - window_size + 1
+            local_level = endpoint_levels[local_index]
+            slope = local_slopes[local_index]
+            local_noise = residual_scale[local_index]
+
+            # Slope confidence is deliberately conservative: residual variance
+            # must be overcome before endpoint extrapolation gets strong weight.
+            trend_confidence = abs(slope) / (
+                abs(slope) + 0.48 * local_noise + 1e-12
+            )
+            scale = max(
+                np.sqrt(max(innovation_var, 1e-10)),
+                local_noise,
+            )
+        else:
+            local_level = ema_level
+            slope = velocity
+            trend_confidence = 0.0
+            scale = np.sqrt(max(innovation_var, 1e-10))
+
+        disagreement = abs(level - local_level)
+        agreement = 1.0 / (1.0 + (disagreement / (1.9 * scale + 1e-12)) ** 2)
+
+        # Favor the stable tracker during disagreement.  Under a coherent local
+        # trend, endpoint regression receives more influence to reduce lag.
+        local_weight = (0.16 + 0.22 * trend_confidence) * agreement
+        target = (1.0 - local_weight) * level + local_weight * local_level
+
+        previous_consensus = consensus_level
+        prediction = consensus_level + consensus_velocity
+        target_residual = target - prediction
+
+        alpha = 0.66 + 0.18 * min(
+            1.0, abs(target_residual) / (2.4 * scale + 1e-12)
+        )
+        candidate = prediction + alpha * target_residual
+        step = candidate - previous_consensus
+
+        prior_direction = np.sign(previous_step)
+        step_direction = np.sign(step)
+        opposing = (
+            prior_direction != 0.0
+            and step_direction != 0.0
+            and step_direction == -prior_direction
+        )
+
+        reversal_band = 0.18 * scale + 0.08 * abs(consensus_velocity)
+        slope_support = (
+            step_direction != 0.0
+            and np.sign(slope) == step_direction
+            and abs(slope) > 0.10 * scale
+        )
+        decisive_turn = (
+            slope_support
+            and abs(step) > 0.34 * scale
+            and abs(step) > reversal_band
+        )
+
+        # A weak opposing step is held.  Two coherent opposing samples release
+        # a genuine turn, preserving responsiveness at real extrema.
+        if opposing and not decisive_turn:
+            if abs(step) > reversal_band:
+                if step_direction == pending_direction:
+                    pending_count += 1
+                else:
+                    pending_direction = step_direction
+                    pending_count = 1
+            else:
+                pending_direction = 0.0
+                pending_count = 0
+
+            if pending_count < 2:
+                consensus_level = previous_consensus
+                step = 0.0
+            else:
+                consensus_level = candidate
+                pending_direction = 0.0
+                pending_count = 0
+        else:
+            consensus_level = candidate
+            pending_direction = 0.0
+            pending_count = 0
+
+        if step != 0.0:
+            previous_step = step
+
+        # Fuse accepted motion with robust local slope.  In flat/noisy regions
+        # accepted motion dominates; confident sustained trends preserve the
+        # fitted slope and therefore do not decay into lag.
+        slope_weight = 0.18 + 0.52 * trend_confidence
+        motion_weight = 1.0 - slope_weight
+        velocity_target = motion_weight * step + slope_weight * slope
+
+        acceleration_limit = (
+            0.075 * scale
+            + 0.16 * abs(slope)
+            + 0.020 * abs(consensus_velocity)
+        )
+        velocity_change = np.clip(
+            velocity_target - consensus_velocity,
+            -acceleration_limit,
+            acceleration_limit,
+        )
+        velocity_gain = 0.42 + 0.16 * trend_confidence
+        consensus_velocity += velocity_gain * velocity_change
+
+        deadband = 0.018 * scale
+        if abs(consensus_velocity) < deadband:
+            consensus_velocity = 0.0
+
+        if index >= window_size - 1:
+            output[index - window_size + 1] = consensus_level
+
+    return output
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """
+    Apply the selected filter.
+
+    Args:
+        input_signal: Input 1D time series.
+        window_size: Sliding-window length.
+        algorithm_type: "enhanced" or "basic".
+
+    Returns:
+        Filtered signal with length len(input_signal) - window_size + 1.
+    """
+    if algorithm_type == "enhanced":
+        return enhanced_filter_with_trend_preservation(input_signal, window_size)
+    return adaptive_filter(input_signal, window_size)
+
+
+# EVOLVE-BLOCK-END
+
+
+def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+    """Generate a non-stationary synthetic signal and noisy observation."""
+    np.random.seed(seed)
+    t = np.linspace(0, 10, length)
+
+    clean_signal = (
+        2 * np.sin(2 * np.pi * 0.5 * t)
+        + 1.5 * np.sin(2 * np.pi * 2 * t)
+        + 0.5 * np.sin(2 * np.pi * 5 * t)
+        + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)
+    )
+    clean_signal += 0.1 * t * np.sin(0.2 * t)
+    clean_signal += np.cumsum(np.random.randn(length) * 0.05)
+
+    noisy_signal = clean_signal + np.random.normal(0, noise_level, length)
+    return noisy_signal, clean_signal
+
+
+def run_signal_processing(
+    noisy_signal=None,
+    signal_length=1000,
+    noise_level=0.3,
+    window_size=20,
+):
+    """Run filtering and return the original compatibility result dictionary."""
+    if noisy_signal is None:
+        noisy_signal, clean_signal = generate_test_signal(
+            signal_length, noise_level
+        )
+    else:
+        clean_signal = None
+
+    filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+
+    if clean_signal is None:
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": None,
+            "noisy_signal": None,
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": len(filtered_signal),
+        }
+
+    delay = window_size - 1
+    aligned_clean = clean_signal[delay:]
+    aligned_noisy = noisy_signal[delay:]
+
+    count = min(len(filtered_signal), len(aligned_clean))
+    filtered_signal = filtered_signal[:count]
+    aligned_clean = aligned_clean[:count]
+    aligned_noisy = aligned_noisy[:count]
+
+    correlation = (
+        np.corrcoef(filtered_signal, aligned_clean)[0, 1]
+        if count > 1 else 0
+    )
+    noise_before = np.var(aligned_noisy - aligned_clean)
+    noise_after = np.var(filtered_signal - aligned_clean)
+    noise_reduction = (
+        (noise_before - noise_after) / noise_before
+        if noise_before > 0 else 0
+    )
+
+    return {
+        "filtered_signal": filtered_signal,
+        "clean_signal": aligned_clean,
+        "noisy_signal": aligned_noisy,
+        "correlation": correlation,
+        "noise_reduction": noise_reduction,
+        "signal_length": count,
+    }
+
+
+if __name__ == "__main__":
+    results = run_signal_processing()
+    print("Signal processing completed!")
+    print(f"Correlation with clean signal: {results['correlation']:.3f}")
+    print(f"Noise reduction: {results['noise_reduction']:.3f}")
+    print(f"Processed signal length: {results['signal_length']}")
+```

@@ -1,0 +1,77 @@
+# EVOLVE-BLOCK-START
+#include <iostream>
+#include <vector>
+#include <algorithm>
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int n, m;
+    if (!(std::cin >> n >> m)) return 0;
+
+    const int h = n / m;
+    std::vector<std::vector<int>> stacks(m);
+
+    for (int i = 0; i < m; ++i) {
+        stacks[i].resize(h);
+        for (int j = 0; j < h; ++j) {
+            std::cin >> stacks[i][j];
+        }
+    }
+
+    std::vector<std::pair<int, int>> operations;
+    operations.reserve(2 * n);
+
+    for (int target = 1; target <= n; ++target) {
+        int src = -1;
+        int pos = -1;
+
+        for (int s = 0; s < m && src == -1; ++s) {
+            for (int j = 0; j < (int)stacks[s].size(); ++j) {
+                if (stacks[s][j] == target) {
+                    src = s;
+                    pos = j;
+                    break;
+                }
+            }
+        }
+
+        // Under valid input, every not-yet-carried box must be present.
+        if (src == -1) return 0;
+
+        if (pos + 1 < (int)stacks[src].size()) {
+            int dest = -1;
+            for (int s = 0; s < m; ++s) {
+                if (s == src) continue;
+                if (dest == -1 || stacks[s].size() < stacks[dest].size()) {
+                    dest = s;
+                }
+            }
+
+            // The official constraints have m = 10, so a different stack exists.
+            if (dest == -1) return 0;
+
+            int first_moved_box = stacks[src][pos + 1];
+            std::vector<int> block(stacks[src].begin() + pos + 1, stacks[src].end());
+
+            operations.push_back({first_moved_box, dest + 1});
+
+            stacks[src].erase(stacks[src].begin() + pos + 1, stacks[src].end());
+            stacks[dest].insert(stacks[dest].end(), block.begin(), block.end());
+        }
+
+        // The target is now guaranteed to be the top box of its stack.
+        if (stacks[src].empty() || stacks[src].back() != target) return 0;
+
+        operations.push_back({target, 0});
+        stacks[src].pop_back();
+    }
+
+    for (const auto& op : operations) {
+        std::cout << op.first << ' ' << op.second << '\n';
+    }
+
+    return 0;
+}
+# EVOLVE-BLOCK-END

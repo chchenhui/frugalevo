@@ -1,0 +1,169 @@
+--- a/original.py
++++ b/original.py
+@@ -1,87 +1,106 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+-from itertools import combinations
+-from scipy.optimize import minimize
+ 
+ N = 14
+ D = 3
++IU = np.triu_indices(N, 1)
+ 
+ 
+-def pair_indices():
+-    return np.array(list(combinations(range(N), 2)))
++def pdist(P):
++    diff = P[:, None, :] - P[None, :, :]
++    return np.sqrt((diff * diff).sum(-1))
+ 
+ 
+-def pairwise_sq_dists(X, IJ):
+-    diff = X[IJ[:, 0]] - X[IJ[:, 1]]
+-    return np.sum(diff * diff, axis=1)
++def score(P):
++    d = pdist(P)[IU]
++    return d.min() / d.max()
+ 
+ 
+-def normalize(X):
+-    X = X - X.mean(axis=0)
+-    dm = np.sqrt(pairwise_sq_dists(X, pair_indices()).max())
+-    return X / dm
++def normalize(P):
++    P = P - P.mean(axis=0)
++    dm = pdist(P)[IU].max()
++    return P / dm
+ 
+ 
+-def seed_candidates():
+-    cands = []
+-    rng = np.random.default_rng(12345)
+-    for _ in range(8):
+-        cands.append(rng.normal(size=(N, D)))
+-    # icosahedron + 2 poles
++def relax(P, iters=600, seed_rng=None):
++    """Repulsion relaxation under unit-diameter normalization."""
++    P = normalize(P)
++    best = P.copy()
++    best_s = score(P)
++    for it in range(iters):
++        frac = it / iters
++        alpha = 0.4 * (1.0 - frac) ** 1.5 + 0.01
++        diff = P[:, None, :] - P[None, :, :]
++        d = np.sqrt((diff * diff).sum(-1))
++        dd = d[IU]
++        dmin = dd.min()
++        # adaptive target: push just above current minimum, capped
++        t = min(dmin * 1.06 + 0.005, 0.75)
++        mask = dd < t
++        if mask.any():
++            I = IU[0][mask]
++            J = IU[1][mask]
++            dm_ = dd[mask][:, None]
++            dirs = diff[I, J] / np.maximum(dm_, 1e-12)
++            w = (alpha * (t - dd[mask]))[:, None]
++            step = w * dirs
++            np.add.at(P, I, step)
++            np.add.at(P, J, -step)
++        P = normalize(P)
++        s = score(P)
++        if s > best_s:
++            best_s = s
++            best = P.copy()
++    return best, best_s
++
++
++def perturb(P, rng, scale):
++    return normalize(P + rng.normal(scale=scale, size=P.shape))
++
++
++def min_max_dist_dim3_14() -> np.ndarray:
++    rng = np.random.default_rng(20240517)
++
++    seeds = []
++    for _ in range(24):
++        seeds.append(rng.normal(size=(N, D)))
++    # structured seeds: icosahedron + 2 poles, cubic lattice picks
+     p = (1 + np.sqrt(5)) / 2
+     ico = np.array([
+         [-1, p, 0], [1, p, 0], [-1, -p, 0], [1, -p, 0],
+         [0, -1, p], [0, 1, p], [0, -1, -p], [0, 1, -p],
+         [p, 0, -1], [p, 0, 1], [-p, 0, -1], [-p, 0, 1],
+     ], dtype=float)
+-    for s in (0.5, 0.7, 0.9):
+-        cands.append(np.vstack([ico * s, [[0, 0, 1.0], [0, 0, -1.0]]]))
+-    # small cubic-lattice-based start
++    for s in (0.3, 0.6, 0.9):
++        seeds.append(np.vstack([ico * s, [[0, 0, 1.0], [0, 0, -1.0]]]))
+     g = np.array(np.meshgrid([-1, 0, 1], [-1, 0, 1], [-1, 0, 1])).reshape(3, -1).T
+-    cands.append(g[rng.choice(len(g), size=N, replace=False)])
+-    return [normalize(c) for c in cands]
++    for _ in range(4):
++        seeds.append(g[rng.choice(len(g), size=N, replace=False)])
++    # two-cluster seeds encourage non-spherical (small-diameter) optima
++    for _ in range(6):
++        a = rng.normal(size=(7, D)) + np.array([1.5, 0, 0])
++        b = rng.normal(size=(7, D)) - np.array([1.5, 0, 0])
++        seeds.append(np.vstack([a, b]))
+ 
++    best, best_s = None, -1.0
++    for s0 in seeds:
++        P, s = relax(normalize(s0), iters=500)
++        if s > best_s:
++            best_s, best = s, P
++        # basin-hopping around current best occasionally
++        if s > best_s - 0.02:
++            for k in range(3):
++                Q, sq_ = relax(perturb(P, rng, 0.05 * (k + 1)), iters=300)
++                if sq_ > best_s:
++                    best_s, best = sq_, Q
+ 
+-def solve(X0, IJ):
+-    X0 = normalize(X0)
+-    d2 = pairwise_sq_dists(X0, IJ)
+-    t0 = np.sqrt(d2.min())
+-    z0 = np.concatenate([X0.ravel(), [t0]])
++    # final polish: tight relaxation restarts around best
++    for k in range(8):
++        Q, s = relax(perturb(best, rng, 0.02), iters=400)
++        if s > best_s:
++            best_s, best = s, Q
+ 
+-    def obj(z):
+-        return -z[-1]
+-
+-    def cons_f(z):
+-        X = z[:N * D].reshape(N, D)
+-        t2 = z[-1] ** 2
+-        d2 = pairwise_sq_dists(X, IJ)
+-        return np.concatenate([t2 - d2, d2 - 1.0])
+-
+-    res = minimize(obj, z0, method="SLSQP",
+-                   constraints=[{"type": "ineq", "fun": cons_f}],
+-                   options={"maxiter": 300, "ftol": 1e-12})
+-    X = res.x[:N * D].reshape(N, D)
+-    return X
+-
+-
+-def score(X):
+-    d2 = pairwise_sq_dists(X, pair_indices())
+-    return d2.min() / d2.max()
+-
+-
+-def min_max_dist_dim3_14() -> np.ndarray:
+-    IJ = pair_indices()
+-    best, best_s = None, -1.0
+-    for cand in seed_candidates():
+-        for rep in range(3):
+-            X = solve(cand, IJ)
+-            s = score(X)
+-            if s > best_s:
+-                best_s, best = s, X
+-            cand = normalize(X)
+-            if best_s > 0.2395:
+-                break
+     best = normalize(best)
+     assert np.isfinite(best).all() and best.shape == (N, D)
+     return best
+ # EVOLVE-BLOCK-END

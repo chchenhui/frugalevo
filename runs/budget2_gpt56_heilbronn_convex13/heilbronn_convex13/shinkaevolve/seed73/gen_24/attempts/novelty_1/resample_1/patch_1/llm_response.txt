@@ -1,0 +1,309 @@
+<NAME>
+active_stencil_anneal
+</NAME>
+
+<DESCRIPTION>
+This redesign separates geometry evaluation, stochastic exploration, survivor selection, and deterministic active-triangle polishing into dedicated components. It retains the successful unconstrained hull-normalized search, but adds a strict-improvement local stencil phase focused on vertices participating in the lowest-area triangles. The final configuration is normalized so its convex hull has unit area, satisfying the unit-area-region requirement without changing the normalized objective.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+_N = 13
+_TRIANGLES = np.array(
+    [(i, j, k)
+     for i in range(_N - 2)
+     for j in range(i + 1, _N - 1)
+     for k in range(j + 1, _N)],
+    dtype=np.intp,
+)
+
+
+class _Geometry:
+    """Centralized exact geometric evaluation for the 13-point search."""
+
+    def __init__(self) -> None:
+        self.triangles = _TRIANGLES
+
+    @staticmethod
+    def hull_area(points: np.ndarray) -> float:
+        """Return convex hull area through a monotone-chain construction."""
+        order = np.lexsort((points[:, 1], points[:, 0]))
+        hull: list[int] = []
+
+        def cross(i: int, j: int, k: int) -> float:
+            return (
+                (points[j, 0] - points[i, 0]) *
+                (points[k, 1] - points[i, 1])
+                - (points[j, 1] - points[i, 1]) *
+                (points[k, 0] - points[i, 0])
+            )
+
+        for q in order:
+            q = int(q)
+            while len(hull) >= 2 and cross(hull[-2], hull[-1], q) <= 0.0:
+                hull.pop()
+            hull.append(q)
+
+        lower_end = len(hull)
+        for q in order[-2::-1]:
+            q = int(q)
+            while len(hull) > lower_end and cross(hull[-2], hull[-1], q) <= 0.0:
+                hull.pop()
+            hull.append(q)
+
+        vertices = points[np.asarray(hull[:-1], dtype=np.intp)]
+        if len(vertices) < 3:
+            return 0.0
+
+        return 0.5 * abs(
+            float(np.dot(vertices[:, 0], np.roll(vertices[:, 1], -1))
+                  - np.dot(vertices[:, 1], np.roll(vertices[:, 0], -1)))
+        )
+
+    def double_areas(self, points: np.ndarray) -> np.ndarray:
+        tri = points[self.triangles]
+        return np.abs(
+            (tri[:, 1, 0] - tri[:, 0, 0]) *
+            (tri[:, 2, 1] - tri[:, 0, 1])
+            - (tri[:, 1, 1] - tri[:, 0, 1]) *
+            (tri[:, 2, 0] - tri[:, 0, 0])
+        )
+
+    def evaluate(self, points: np.ndarray) -> tuple[float, int, np.ndarray]:
+        """
+        Return normalized minimum area, its triangle index, and all normalized
+        double-area values.  Since min triangle area is determinant / 2 and
+        hull area is H, the normalized objective is determinant / (2 H).
+        """
+        determinants = self.double_areas(points)
+        worst = int(np.argmin(determinants))
+        area = self.hull_area(points)
+
+        if not np.isfinite(area) or area <= 1.0e-14:
+            return -np.inf, worst, determinants
+
+        normalized = determinants / (2.0 * area)
+        return float(normalized[worst]), worst, normalized
+
+    def normalize_to_unit_hull(self, points: np.ndarray) -> np.ndarray:
+        """Translate and uniformly scale the returned hull to exactly unit area."""
+        area = self.hull_area(points)
+        if not np.isfinite(area) or area <= 1.0e-14:
+            raise RuntimeError("degenerate configuration cannot be normalized")
+
+        result = points.copy()
+        result -= np.mean(result, axis=0)
+        result /= np.sqrt(area)
+        return result
+
+
+class _Search:
+    """
+    Two-stage deterministic search.
+
+    The first stage discovers useful combinatorial hull/sign structures using
+    annealing.  The second stage applies a strict active-set stencil polish to
+    points occurring in the lowest-area triangles.
+    """
+
+    def __init__(self, geometry: _Geometry, seed: int = 91723) -> None:
+        self.geometry = geometry
+        self.rng = np.random.default_rng(seed)
+
+    def ring_seed(self, restart: int) -> np.ndarray:
+        """Construct a perturbed four-ring, approximately threefold seed."""
+        radii0 = np.array([0.31, 0.55, 0.79, 1.00], dtype=float)
+        phases0 = np.array([0.03, 0.29, 0.57, 0.84], dtype=float)
+
+        points = np.zeros((_N, 2), dtype=float)
+        radii = radii0 + self.rng.normal(0.0, 0.035, 4)
+        phases = phases0 + self.rng.normal(0.0, 0.045, 4)
+        phases += 0.011 * restart
+
+        points[0] = self.rng.normal(0.0, 0.018, 2)
+        position = 1
+        for radius, phase in zip(radii, phases):
+            angles = phase + 2.0 * np.pi * np.arange(3) / 3.0
+            points[position:position + 3] = radius * np.column_stack(
+                (np.cos(angles), np.sin(angles))
+            )
+            position += 3
+
+        points += self.rng.normal(0.0, 0.012, points.shape)
+        return points
+
+    def anneal(
+        self,
+        points: np.ndarray,
+        score: float,
+        worst: int,
+        iterations: int,
+        initial_step: float,
+        initial_temperature: float,
+    ) -> tuple[np.ndarray, float, int]:
+        """Targeted Metropolis search with cooling and occasional global moves."""
+        for iteration in range(iterations):
+            progress = iteration / max(1, iterations - 1)
+            step = initial_step * (1.0 - progress) ** 1.7 + 0.0018
+            temperature = (
+                initial_temperature * (1.0 - progress) ** 2.05 + 0.000010
+            )
+
+            candidate = points.copy()
+            if self.rng.random() < 0.83:
+                moved = int(_TRIANGLES[worst, self.rng.integers(0, 3)])
+            else:
+                moved = int(self.rng.integers(_N))
+
+            candidate[moved] += self.rng.normal(0.0, step, 2)
+            candidate_score, candidate_worst, _ = self.geometry.evaluate(candidate)
+            delta = candidate_score - score
+
+            if delta >= 0.0:
+                points, score, worst = candidate, candidate_score, candidate_worst
+            elif self.rng.random() < np.exp(max(-700.0, delta / temperature)):
+                points, score, worst = candidate, candidate_score, candidate_worst
+
+        return points, score, worst
+
+    def active_polish(
+        self,
+        points: np.ndarray,
+        score: float,
+        rounds: int = 7,
+    ) -> tuple[np.ndarray, float]:
+        """
+        Strict-improvement local polish.
+
+        At every scale, vertices involved in the lowest twenty triangles are
+        probed along cardinal, diagonal, radial, and tangential directions.
+        Only improvements to the primary normalized min-area objective are
+        accepted, making this stage deterministic and safe.
+        """
+        base_directions = np.array(
+            [
+                [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
+                [1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0],
+            ],
+            dtype=float,
+        )
+        base_directions /= np.linalg.norm(base_directions, axis=1)[:, None]
+
+        extent = max(
+            float(np.ptp(points[:, 0])),
+            float(np.ptp(points[:, 1])),
+            1.0e-8,
+        )
+        radius = 0.032 * extent
+
+        for _ in range(rounds):
+            _, _, normalized = self.geometry.evaluate(points)
+            active_faces = np.argsort(normalized)[:20]
+            active_vertices = np.unique(_TRIANGLES[active_faces].ravel())
+            centre = np.mean(points, axis=0)
+
+            improved = True
+            while improved:
+                improved = False
+                for vertex in active_vertices:
+                    vertex = int(vertex)
+                    radial = points[vertex] - centre
+                    norm = float(np.linalg.norm(radial))
+
+                    if norm > 1.0e-12:
+                        radial /= norm
+                        tangent = np.array([-radial[1], radial[0]])
+                        directions = np.vstack(
+                            (base_directions, radial, -radial, tangent, -tangent)
+                        )
+                    else:
+                        directions = base_directions
+
+                    best_candidate = None
+                    best_score = score
+
+                    for direction in directions:
+                        candidate = points.copy()
+                        candidate[vertex] += radius * direction
+                        candidate_score, _, _ = self.geometry.evaluate(candidate)
+
+                        if candidate_score > best_score + 1.0e-12:
+                            best_score = candidate_score
+                            best_candidate = candidate
+
+                    if best_candidate is not None:
+                        points = best_candidate
+                        score = best_score
+                        centre = np.mean(points, axis=0)
+                        improved = True
+
+            radius *= 0.42
+
+        return points, score
+
+    def run(self) -> np.ndarray:
+        best_points = None
+        best_score = -np.inf
+        survivors: list[tuple[float, np.ndarray, int]] = []
+
+        # Broad deterministic discovery phase.
+        for restart in range(10):
+            points = self.ring_seed(restart)
+            score, worst, _ = self.geometry.evaluate(points)
+
+            points, score, worst = self.anneal(
+                points, score, worst,
+                iterations=3000,
+                initial_step=0.115,
+                initial_temperature=0.0022,
+            )
+            survivors.append((score, points.copy(), worst))
+
+            if score > best_score:
+                best_score = score
+                best_points = points.copy()
+
+        # Refine only the strongest distinct search trajectories.
+        survivors.sort(key=lambda item: item[0], reverse=True)
+        for _, points, worst in survivors[:4]:
+            score, worst, _ = self.geometry.evaluate(points)
+
+            points, score, worst = self.anneal(
+                points, score, worst,
+                iterations=21000,
+                initial_step=0.062,
+                initial_temperature=0.0011,
+            )
+            points, score = self.active_polish(points, score)
+
+            if score > best_score:
+                best_score = score
+                best_points = points.copy()
+
+        if best_points is None or not np.all(np.isfinite(best_points)):
+            raise RuntimeError(
+                "deterministic Heilbronn search failed to produce a configuration"
+            )
+
+        return self.geometry.normalize_to_unit_hull(best_points)
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Return a deterministic arrangement of exactly thirteen points.
+
+    The convex hull of the returned points is a convex containing region with
+    unit area.  All returned coordinates are finite, distinct in practice, and
+    the objective is optimized as the minimum triangle area divided by hull
+    area.
+    """
+    geometry = _Geometry()
+    return _Search(geometry, seed=91723).run()
+
+
+# EVOLVE-BLOCK-END
+```

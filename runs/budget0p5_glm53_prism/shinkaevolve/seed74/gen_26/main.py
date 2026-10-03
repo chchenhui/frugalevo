@@ -1,0 +1,222 @@
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Pipeline:
+      Stage 1: bounds — analytic lower bound on optimal KVPR, greedy upper bound.
+      Stage 2: warm-started binary search on target KVPR (lambda) using
+               lambda-constrained greedy packing with multiple orderings.
+      Stage 3: move + swap local search refinement of the best packing.
+    """
+    if gpu_num <= 0 or not models:
+        raise ValueError("gpu_num must be positive and models non-empty")
+
+    total_size = sum(m.model_size for m in models)
+    if total_size > gpu_num * GPU_MEM_SIZE:
+        raise ValueError("Models cannot fit into GPU memory")
+
+    INF = float('inf')
+
+    def kvpr(load, free):
+        if free <= 0:
+            return INF if load > 0 else 0.0
+        return load / free
+
+    def max_kvpr(pl):
+        worst = 0.0
+        for g in pl:
+            free = GPU_MEM_SIZE - sum(m.model_size for m in pl[g])
+            load = sum(m.req_rate / m.slo for m in pl[g])
+            v = kvpr(load, free)
+            if v == INF:
+                return INF
+            worst = max(worst, v)
+        return worst
+
+    # ---------- Stage 1: bounds ----------
+    lo = 0.0
+    for m in models:
+        free = GPU_MEM_SIZE - m.model_size
+        if free > 0:
+            lo = max(lo, (m.req_rate / m.slo) / free)
+
+    def greedy_pack(order):
+        pl = {g: [] for g in range(gpu_num)}
+        rem = [GPU_MEM_SIZE] * gpu_num
+        load = [0.0] * gpu_num
+        for m in order:
+            w = m.req_rate / m.slo
+            bg, br = None, INF
+            for g in range(gpu_num):
+                free = rem[g] - m.model_size
+                if free > 0:
+                    r = (load[g] + w) / free
+                    if r < br:
+                        br, bg = r, g
+            if bg is None:
+                for g in range(gpu_num):
+                    if m.model_size <= rem[g]:
+                        bg = g
+                        break
+            if bg is None:
+                return None
+            pl[bg].append(m)
+            load[bg] += w
+            rem[bg] -= m.model_size
+        return pl
+
+    orders = [
+        sorted(models, key=lambda m: m.req_rate / m.slo, reverse=True),
+        sorted(models, key=lambda m: m.model_size, reverse=True),
+        sorted(models, key=lambda m: -(m.req_rate / m.slo) / max(m.model_size, 1e-12)),
+        sorted(models, key=lambda m: m.model_size),
+    ]
+
+    best_pl, best_val = None, INF
+    for order in orders:
+        pl = greedy_pack(order)
+        if pl is not None:
+            v = max_kvpr(pl)
+            if v < best_val:
+                best_val, best_pl = pl, v
+    if best_pl is None:
+        raise ValueError("Unable to place all models in GPU memory")
+    hi = best_val
+    lo = min(lo, hi)
+
+    # ---------- Stage 2: binary search on lambda ----------
+    def try_pack(lam, order):
+        pl = {g: [] for g in range(gpu_num)}
+        rem = [GPU_MEM_SIZE] * gpu_num
+        load = [0.0] * gpu_num
+        for m in order:
+            w = m.req_rate / m.slo
+            bg, br = None, INF
+            for g in range(gpu_num):
+                free = rem[g] - m.model_size
+                if free <= 0:
+                    continue
+                nl = load[g] + w
+                if nl > lam * free + 1e-12:
+                    continue
+                r = nl / free
+                if r < br:
+                    br, bg = r, g
+            if bg is None:
+                # allow exact memory fill as last resort
+                for g in range(gpu_num):
+                    if m.model_size <= rem[g] and (load[g] + w) <= lam * max(rem[g] - m.model_size, 1e-12) + 1e-9:
+                        bg = g
+                        break
+            if bg is None:
+                return None
+            pl[bg].append(m)
+            load[bg] += w
+            rem[bg] -= m.model_size
+        return pl
+
+    for _ in range(50):
+        if hi - lo < 1e-12:
+            break
+        mid = (lo + hi) / 2.0
+        packed = None
+        for order in orders:
+            packed = try_pack(mid, order)
+            if packed is not None:
+                break
+        if packed is not None:
+            v = max_kvpr(packed)
+            if v < best_val:
+                best_val, best_pl = packed, v
+            hi = mid
+        else:
+            lo = mid
+
+    # ---------- Stage 3: local search (moves + swaps) ----------
+    def local_search(pl0):
+        best = {g: list(v) for g, v in pl0.items()}
+        best_val = max_kvpr(best)
+        for _ in range(40):
+            improved = False
+            gload = {g: sum(m.req_rate / m.slo for m in best[g]) for g in best}
+            gsize = {g: sum(m.model_size for m in best[g]) for g in best}
+            # move moves
+            for m in models:
+                src = next(g for g in best if m in best[g])
+                w = m.req_rate / m.slo
+                src_free = GPU_MEM_SIZE - (gsize[src] - m.model_size)
+                src_load = gload[src] - w
+                for g in best:
+                    if g == src:
+                        continue
+                    if m.model_size <= GPU_MEM_SIZE - gsize[g]:
+                        cand = max(kvpr(src_load, src_free),
+                                   kvpr(gload[g] + w, GPU_MEM_SIZE - gsize[g] - m.model_size))
+                        if cand < best_val - 1e-15:
+                            best[src].remove(m)
+                            best[g].append(m)
+                            best_val = max_kvpr(best)
+                            improved = True
+                            break
+                if improved:
+                    break
+            if not improved:
+                # swap moves
+                placed = [(m, g) for g in best for m in best[g]]
+                n = len(placed)
+                for i in range(n):
+                    if improved:
+                        break
+                    m1, g1 = placed[i]
+                    for j in range(i + 1, n):
+                        m2, g2 = placed[j]
+                        if g1 == g2:
+                            continue
+                        # memory feasibility after swapping
+                        if (gsize[g1] - m1.model_size + m2.model_size <= GPU_MEM_SIZE and
+                            gsize[g2] - m2.model_size + m1.model_size <= GPU_MEM_SIZE):
+                            cand = {g: list(v) for g, v in best.items()}
+                            cand[g1].remove(m1); cand[g1].append(m2)
+                            cand[g2].remove(m2); cand[g2].append(m1)
+                            val = max_kvpr(cand)
+                            if val < best_val - 1e-15:
+                                best = cand
+                                best_val = val
+                                improved = True
+                                break
+            if not improved:
+                break
+        return best
+
+    best_pl = local_search(best_pl)
+    return best_pl
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

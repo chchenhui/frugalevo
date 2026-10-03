@@ -1,0 +1,187 @@
+--- a/original.py
++++ b/original.py
+@@ -1,107 +1,155 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ import time
++from itertools import combinations
+ 
+ 
+ def _convex_hull_area(pts):
+-    """Monotone chain convex hull; returns hull area (0 if degenerate)."""
+     P = sorted(map(tuple, np.round(pts, 12)))
+     P = list(dict.fromkeys(P))
+     if len(P) < 3:
+         return 0.0
+     def cross(o, a, b):
+         return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+     lower = []
+     for p in P:
+         while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+             lower.pop()
+         lower.append(p)
+     upper = []
+     for p in reversed(P):
+         while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+             upper.pop()
+         upper.append(p)
+     hull = lower[:-1] + upper[:-1]
+     if len(hull) < 3:
+         return 0.0
+     H = np.array(hull)
+     x, y = H[:, 0], H[:, 1]
+     return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+ 
+ 
+ def _min_triangle_area(pts, tri_idx):
+-    p = pts[tri_idx]                      # (286, 3, 2)
++    p = pts[tri_idx]
+     a = p[:, 0]
+     v1 = p[:, 1] - a
+     v2 = p[:, 2] - a
+     cross = np.abs(v1[:, 0]*v2[:, 1] - v1[:, 1]*v2[:, 0])
+     return cross.min() * 0.5
+ 
+ 
+ def _score(pts, tri_idx):
+     ha = _convex_hull_area(pts)
+     if ha <= 1e-12:
+         return 0.0
+     return _min_triangle_area(pts, tri_idx) / ha
+ 
+ 
++def _rescale_unit_hull(pts):
++    ha = _convex_hull_area(pts)
++    if ha > 1e-12:
++        pts = pts / np.sqrt(ha)
++    return pts
++
++
++def _subgradient_step(pts, tri_idx):
++    """Gradient step increasing the area of the currently smallest triangle."""
++    p = pts[tri_idx]
++    a = p[:, 0]
++    v1 = p[:, 1] - a
++    v2 = p[:, 2] - a
++    cross_val = v1[:, 0]*v2[:, 1] - v1[:, 1]*v2[:, 0]
++    areas = np.abs(cross_val)
++    k = int(np.argmin(areas))
++    s = 1.0 if cross_val[k] > 0 else -1.0
++    i, j, l = tri_idx[k]
++    A, B, C = pts[i], pts[j], pts[l]
++    # area = 0.5 * s * ((B-A) x (C-A)); derivative wrt points:
++    u = C - A   # = v2
++    w = B - A   # = v1
++    # dB = 0.5*s*perp(u); dC = -0.5*s*perp(w); dA = -(dB+dC)
++    perp = lambda v: np.array([-v[1], v[0]])
++    gB = 0.5 * s * perp(u)
++    gC = -0.5 * s * perp(w)
++    gA = -(gB + gC)
++    return i, gA, j, gB, l, gC
++
++
+ def heilbronn_convex13() -> np.ndarray:
+     n = 13
+     rng = np.random.default_rng(seed=42)
+-    from itertools import combinations
+     tri_idx = np.array(list(combinations(range(n), 3)))
+ 
+-    # --- Boundary-biased initializations ---
+     t = np.linspace(0, 2*np.pi, n, endpoint=False)
+     seeds = []
+-    # 1: regular 13-gon on circle
+     seeds.append(np.column_stack([np.cos(t), np.sin(t)]))
+-    # 2: ellipse (stretched), boundary emphasis
+     seeds.append(np.column_stack([1.3*np.cos(t), 0.75*np.sin(t)]))
+-    # 3: polygon + slight interior perturbations
+     s = np.column_stack([np.cos(t), np.sin(t)])
+-    s += rng.normal(0, 0.08, s.shape)
++    s += rng.normal(0, 0.05, s.shape)
+     seeds.append(s)
+-    # 4: fully random
+     seeds.append(rng.random((n, 2)))
++    seeds.append(0.8*rng.random((n, 2)) + 0.1)
+ 
+-    best_pts, best_score = seeds[0], _score(seeds[0], tri_idx)
+-    time_limit = 2.0
+     t_start = time.time()
++    time_limit = 2.5
++    best_pts, best_score = None, -1.0
++
++    per_seed = time_limit / len(seeds)
+ 
+     for seed_pts in seeds:
+-        if time.time() - t_start > time_limit:
+-            break
+-        pts = seed_pts.copy()
++        t_seed = time.time()
++        pts = _rescale_unit_hull(np.asarray(seed_pts, dtype=float).copy())
+         sc = _score(pts, tri_idx)
+-        sigma = 0.15
+-        # adaptive single-point perturbation hill climb
+-        while time.time() - t_start < time_limit:
++        lr = 0.03
++        it = 0
++        local_best_pts, local_best_score = pts.copy(), sc
++
++        while time.time() - t_start < time_limit and time.time() - t_seed < per_seed:
++            it += 1
++            # several subgradient steps between checks
++            for _ in range(10):
++                i, gA, j, gB, l, gC = _subgradient_step(pts, tri_idx)
++                pts[i] += lr * gA
++                pts[j] += lr * gB
++                pts[l] += lr * gC
++                pts = _rescale_unit_hull(pts)
++            sc_new = _score(pts, tri_idx)
++            if sc_new > local_best_score + 1e-12:
++                local_best_score = sc_new
++                local_best_pts = pts.copy()
++            else:
++                pts = local_best_pts.copy()
++            lr *= 0.995
++            if lr < 1e-4:
++                break
++
++        # fine-tuning: small random multi-point perturbations
++        pts = local_best_pts.copy()
++        sc = local_best_score
++        sigma = 0.004
++        while time.time() - t_start < time_limit and time.time() - t_seed < per_seed * 1.3 and sigma > 1e-5:
+             improved = False
+-            for _ in range(200):
+-                i = rng.integers(n)
++            for _ in range(60):
+                 cand = pts.copy()
+-                cand[i] += rng.normal(0, sigma, 2)
++                k = int(rng.integers(1, 4))
++                idxs = rng.choice(n, size=k, replace=False)
++                cand[idxs] += rng.normal(0, sigma, (k, 2))
++                cand = _rescale_unit_hull(cand)
+                 csc = _score(cand, tri_idx)
+                 if csc > sc + 1e-12:
+                     pts, sc = cand, csc
+                     improved = True
+-            if improved:
+-                sigma *= 1.3
+-            else:
+-                sigma *= 0.6
+-            if sigma < 1e-5:
+-                break
++            sigma *= 0.6 if not improved else 1.2
++
+         if sc > best_score:
+-            best_score, best_pts = sc, pts.copy()
++            best_score = sc
++            best_pts = pts.copy()
+ 
+-    # Deterministic reprojection/clamp: nothing needed (points already valid),
+-    # but ensure finite values.
+     best_pts = np.asarray(best_pts, dtype=float)
+     if not np.all(np.isfinite(best_pts)):
+         t = np.linspace(0, 2*np.pi, n, endpoint=False)
+         best_pts = np.column_stack([np.cos(t), np.sin(t)])
+     return best_pts
+ 
+ 
+ # EVOLVE-BLOCK-END

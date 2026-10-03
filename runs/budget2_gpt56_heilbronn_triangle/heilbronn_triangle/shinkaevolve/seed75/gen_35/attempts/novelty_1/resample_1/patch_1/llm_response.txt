@@ -1,0 +1,311 @@
+<NAME>
+active_polish11
+</NAME>
+
+<DESCRIPTION>
+This rewrite uses a stronger deterministic hybrid search in reference-simplex coordinates. It combines active-constraint weighted coordinate moves, coordinated multi-point perturbations, and analytic gradient-guided moves for the smallest determinant triangles. The final phase uses lexicographic selection by true minimum area and lower-tail mean, followed by multiple SLSQP maximin polishing attempts from the best independently discovered layouts. Results are cached after the first evaluation for fast repeat calls, and a feasible fallback remains available for unexpected failures.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+_SQRT3 = float(np.sqrt(3.0))
+_HEIGHT = 0.5 * _SQRT3
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Deterministically construct eleven points in the unit equilateral triangle.
+
+    The search uses reference-simplex coordinates (u, v), with u >= 0,
+    v >= 0, u + v <= 1.  Determinants in these coordinates are equal to
+    triangle areas normalized by the area of the containing triangle.
+    """
+    try:
+        if hasattr(heilbronn_triangle11, "_cached"):
+            return heilbronn_triangle11._cached.copy()
+
+        rng = np.random.default_rng(11031987)
+        n = 11
+        free = 8
+        triples = np.asarray(
+            [
+                (i, j, k)
+                for i in range(n)
+                for j in range(i + 1, n)
+                for k in range(j + 1, n)
+            ],
+            dtype=np.intp,
+        )
+        fixed = np.array(
+            ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)),
+            dtype=float,
+        )
+
+        def project(z):
+            z = np.maximum(np.asarray(z, dtype=float).copy(), 0.0)
+            total = z[..., 0] + z[..., 1]
+            mask = total > 1.0
+            if np.any(mask):
+                z[mask] /= total[mask, None]
+            return z
+
+        def area_batch(batch):
+            count = len(batch)
+            points = np.empty((count, n, 2), dtype=float)
+            points[:, :3] = fixed
+            points[:, 3:] = batch
+            a = points[:, triples[:, 0]]
+            b = points[:, triples[:, 1]]
+            c = points[:, triples[:, 2]]
+            return np.abs(
+                (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
+                - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
+            )
+
+        def soft_tail(values, temperature):
+            low = np.min(values, axis=1)
+            return low - temperature * np.log(
+                np.exp(-(values - low[:, None]) / temperature).sum(axis=1)
+            )
+
+        def dispersed_start(pool_size):
+            pool = rng.dirichlet((1.06, 1.06, 1.06), size=pool_size)[:, 1:]
+            selected = [pool[rng.integers(pool_size)]]
+            while len(selected) < free:
+                old = np.asarray(selected)
+                distances = np.sum(
+                    (pool[:, None] - old[None, :]) ** 2,
+                    axis=2,
+                )
+                selected.append(pool[np.argmax(np.min(distances, axis=1))])
+            return np.asarray(selected)
+
+        def active_gradient(state, values, count=16):
+            """Gradient of a weighted collection of restrictive determinants."""
+            points = np.vstack((fixed, state))
+            ids = np.argpartition(values, count)[:count]
+            low = float(np.min(values))
+            grad = np.zeros((free, 2), dtype=float)
+
+            for index in ids:
+                ia, ib, ic = triples[index]
+                a, b, c = points[ia], points[ib], points[ic]
+                determinant = (
+                    (b[0] - a[0]) * (c[1] - a[1])
+                    - (b[1] - a[1]) * (c[0] - a[0])
+                )
+                sign = 1.0 if determinant >= 0.0 else -1.0
+                weight = np.exp(-(abs(determinant) - low) / 0.0035) * sign
+                derivatives = (
+                    np.array((b[1] - c[1], c[0] - b[0])),
+                    np.array((c[1] - a[1], a[0] - c[0])),
+                    np.array((a[1] - b[1], b[0] - a[0])),
+                )
+                for point, derivative in zip((ia, ib, ic), derivatives):
+                    if point >= 3:
+                        grad[point - 3] += weight * derivative
+
+            norm = float(np.max(np.linalg.norm(grad, axis=1)))
+            return grad / max(norm, 1.0e-14)
+
+        best_state = None
+        best_value = -1.0
+        finalists = []
+
+        restarts = 10
+        iterations = 1725
+        proposals = 48
+
+        hand_start = np.array(
+            [
+                (0.18, 0.08), (0.49, 0.07), (0.78, 0.08),
+                (0.10, 0.30), (0.40, 0.27), (0.68, 0.22),
+                (0.20, 0.56), (0.48, 0.44),
+            ],
+            dtype=float,
+        )
+
+        for restart in range(restarts):
+            state = hand_start.copy() if restart == 0 else dispersed_start(
+                180 + 25 * (restart % 4)
+            )
+            state = project(state)
+            current = area_batch(state[None])[0]
+            local_best = state.copy()
+            local_value = float(np.min(current))
+
+            for iteration in range(iterations):
+                fraction = iteration / float(iterations - 1)
+                sigma = 0.108 * (1.0 - fraction) ** 1.7 + 0.00125
+                temperature = 0.0050 * (1.0 - fraction) ** 1.8 + 0.000055
+                current_min = float(np.min(current))
+
+                cutoff = current_min + 0.0055 + 0.012 * (1.0 - fraction)
+                active = triples[current <= cutoff]
+                weights = np.zeros(free, dtype=float)
+                for point in range(free):
+                    weights[point] = np.count_nonzero(active == point + 3)
+
+                moving = (
+                    int(np.argmax(weights + 1.0e-7 * rng.random(free)))
+                    if weights.sum() > 0.0
+                    else int(rng.integers(free))
+                )
+
+                candidates = np.repeat(state[None], proposals, axis=0)
+
+                # Fine coordinate adjustments, including occasional long moves.
+                candidates[:24, moving] += rng.normal(
+                    0.0, sigma, size=(24, 2)
+                )
+                if iteration < iterations // 2:
+                    candidates[:4, moving] = rng.dirichlet(
+                        (1.05, 1.05, 1.05), size=4
+                    )[:, 1:]
+
+                # Joint perturbations allow active triangles to rebalance.
+                candidates[24:38] = state + rng.normal(
+                    0.0, 0.31 * sigma, size=(14, free, 2)
+                )
+
+                # Analytic active-set directions are especially useful after
+                # the configuration has entered a stable oriented-matroid cell.
+                direction = active_gradient(state, current)
+                guide_step = 0.018 * (1.0 - fraction) + 0.00065
+                candidates[38] = state + guide_step * direction
+                candidates[39] = state - 0.55 * guide_step * direction
+                candidates[40:44] = (
+                    state
+                    + guide_step * direction[None]
+                    + rng.normal(0.0, 0.11 * sigma, size=(4, free, 2))
+                )
+
+                # Include small focused adjustments for the most constrained
+                # movable points, and preserve the incumbent exactly.
+                candidates[44:47] = state
+                ranked = np.argsort(weights)[-3:]
+                for row, point in enumerate(ranked):
+                    candidates[44 + row, point] += rng.normal(
+                        0.0, 0.45 * sigma, size=2
+                    )
+                candidates[-1] = state
+                candidates = project(candidates)
+
+                candidate_areas = area_batch(candidates)
+                minima = np.min(candidate_areas, axis=1)
+
+                if fraction < 0.66:
+                    winner = int(
+                        np.argmax(soft_tail(candidate_areas, temperature))
+                    )
+                else:
+                    lower = np.mean(
+                        np.partition(candidate_areas, 16, axis=1)[:, :16],
+                        axis=1,
+                    )
+                    winner = int(np.lexsort((lower, minima))[-1])
+
+                state = candidates[winner]
+                current = candidate_areas[winner]
+                value = float(minima[winner])
+
+                if value > local_value:
+                    local_value = value
+                    local_best = state.copy()
+                if value > best_value:
+                    best_value = value
+                    best_state = state.copy()
+
+            finalists.append((local_value, local_best))
+
+        if best_state is None:
+            raise RuntimeError("search failed to produce a feasible state")
+
+        finalists.sort(key=lambda item: item[0], reverse=True)
+
+        try:
+            from scipy.optimize import minimize
+
+            def determinants(uv):
+                q = uv[triples]
+                return (
+                    (q[:, 1, 0] - q[:, 0, 0]) *
+                    (q[:, 2, 1] - q[:, 0, 1])
+                    - (q[:, 1, 1] - q[:, 0, 1]) *
+                    (q[:, 2, 0] - q[:, 0, 0])
+                )
+
+            polish_states = [best_state] + [
+                candidate for _, candidate in finalists[:7]
+            ]
+
+            for initial in polish_states:
+                initial = project(initial)
+                signed = determinants(np.vstack((fixed, initial)))
+                signs = np.where(signed >= 0.0, 1.0, -1.0)
+                start_t = float(np.min(np.abs(signed)))
+
+                def constraints(w):
+                    tail = w[:-1].reshape(free, 2)
+                    uv = np.vstack((fixed, tail))
+                    return np.concatenate((
+                        signs * determinants(uv) - w[-1],
+                        tail.ravel(),
+                        1.0 - tail.sum(axis=1),
+                    ))
+
+                result = minimize(
+                    lambda w: -w[-1],
+                    np.r_[initial.ravel(), start_t],
+                    method="SLSQP",
+                    bounds=[(0.0, 1.0)] * (2 * free) + [(0.0, 1.0)],
+                    constraints={"type": "ineq", "fun": constraints},
+                    options={"maxiter": 1400, "ftol": 5.0e-13, "disp": False},
+                )
+
+                if result.success and np.all(np.isfinite(result.x)):
+                    candidate = project(result.x[:-1].reshape(free, 2))
+                    value = float(np.min(area_batch(candidate[None])[0]))
+                    if value > best_value + 1.0e-12:
+                        best_value = value
+                        best_state = candidate.copy()
+        except Exception:
+            pass
+
+        output = np.empty((n, 2), dtype=float)
+        output[:3] = (
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (0.5, _HEIGHT),
+        )
+        output[3:, 0] = best_state[:, 0] + 0.5 * best_state[:, 1]
+        output[3:, 1] = _HEIGHT * best_state[:, 1]
+
+        heilbronn_triangle11._cached = output.copy()
+        return output
+
+    except Exception:
+        return np.array(
+            [
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (0.5, _HEIGHT),
+                (0.20, 0.12),
+                (0.50, 0.10),
+                (0.80, 0.12),
+                (0.14, 0.34),
+                (0.50, 0.31),
+                (0.86, 0.34),
+                (0.27, 0.57),
+                (0.73, 0.57),
+            ],
+            dtype=float,
+        )
+
+
+# EVOLVE-BLOCK-END
+```

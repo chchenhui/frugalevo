@@ -1,0 +1,268 @@
+<NAME>
+square_bundle13
+</NAME>
+
+<DESCRIPTION>
+This crossover retains the unit-square hull and fixed corners from the current program, preserving an exactly unit convex-hull area and the original function interface. It incorporates the stronger inspiration program’s bundle-style coordinate search, exact bottleneck-gradient proposals, batched incident-triangle evaluation, soft lower-tail tie-breaking, and targeted joint moves for tight triangles.
+
+The implementation is more efficient than repeatedly recomputing all triangle determinants for every single proposal: coordinate proposals update only triangles incident to the moved point. Full batch evaluation is used only for occasional two-point escape moves. Fixed seeding and a defensive fallback preserve deterministic, reproducible behavior.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Deterministically construct thirteen points in a unit square.
+
+    The four corners remain fixed, so the convex hull always has area one.
+    The search maximizes the smallest triangle area through batched local
+    bundle updates, lower-tail tie breaking, and occasional joint moves.
+    """
+    rng = np.random.default_rng(13031957)
+    n = 13
+    fixed_count = 4
+
+    corners = np.array(
+        ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        dtype=np.float64,
+    )
+    triples = np.asarray(
+        [(i, j, k) for i in range(n - 2) for j in range(i + 1, n - 1)
+         for k in range(j + 1, n)],
+        dtype=np.intp,
+    )
+    incident = tuple(
+        np.flatnonzero(np.any(triples == point, axis=1))
+        for point in range(n)
+    )
+    movable_indices = np.arange(fixed_count, n)
+    all_mask = np.ones(len(triples), dtype=bool)
+
+    base_grid = np.array(
+        (
+            (0.20, 0.20), (0.50, 0.20), (0.80, 0.20),
+            (0.20, 0.50), (0.50, 0.50), (0.80, 0.50),
+            (0.20, 0.80), (0.50, 0.80), (0.80, 0.80),
+        ),
+        dtype=np.float64,
+    )
+
+    def areas(points: np.ndarray) -> np.ndarray:
+        tri = points[triples]
+        u = tri[:, 1] - tri[:, 0]
+        v = tri[:, 2] - tri[:, 0]
+        return 0.5 * np.abs(u[:, 0] * v[:, 1] - u[:, 1] * v[:, 0])
+
+    def batch_areas(configurations: np.ndarray) -> np.ndarray:
+        tri = configurations[:, triples]
+        u = tri[:, :, 1] - tri[:, :, 0]
+        v = tri[:, :, 2] - tri[:, :, 0]
+        return 0.5 * np.abs(u[:, :, 0] * v[:, :, 1] - u[:, :, 1] * v[:, :, 0])
+
+    def lower_tail_key(values: np.ndarray, count: int = 14) -> np.ndarray:
+        low = np.partition(values, count - 1, axis=-1)[..., :count]
+        low.sort(axis=-1)
+        weights = np.linspace(1.0, 0.16, count)
+        return low @ weights
+
+    def incident_trials(
+        points: np.ndarray,
+        old_values: np.ndarray,
+        point_index: int,
+        candidates: np.ndarray,
+    ) -> np.ndarray:
+        """Return all triangle areas after each candidate point replacement."""
+        ids = incident[point_index]
+        local_triangles = triples[ids]
+        count = len(candidates)
+
+        coords = np.broadcast_to(
+            points[local_triangles], (count, len(ids), 3, 2)
+        ).copy()
+        positions = np.where(local_triangles == point_index)[1]
+        coords[:, np.arange(len(ids)), positions] = candidates[:, None, :]
+
+        u = coords[:, :, 1] - coords[:, :, 0]
+        v = coords[:, :, 2] - coords[:, :, 0]
+        local_values = 0.5 * np.abs(
+            u[:, :, 0] * v[:, :, 1] - u[:, :, 1] * v[:, :, 0]
+        )
+
+        result = np.broadcast_to(old_values, (count, len(old_values))).copy()
+        result[:, ids] = local_values
+        return result
+
+    def ascent_direction(
+        points: np.ndarray, values: np.ndarray, point_index: int
+    ) -> np.ndarray:
+        """Weighted signed-area ascent direction for tight local constraints."""
+        ids = incident[point_index]
+        local = values[ids]
+        count = min(16, len(ids))
+        chosen = ids[np.argpartition(local, count - 1)[:count]]
+        chosen_triangles = triples[chosen]
+
+        a = points[chosen_triangles[:, 0]]
+        b = points[chosen_triangles[:, 1]]
+        c = points[chosen_triangles[:, 2]]
+        determinant = (
+            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+        )
+        sign = np.where(determinant >= 0.0, 1.0, -1.0)
+        threshold = values[chosen].min()
+        weights = np.exp(-(values[chosen] - threshold) / 0.0055)
+
+        grad_a = np.column_stack((b[:, 1] - c[:, 1], c[:, 0] - b[:, 0]))
+        grad_b = np.column_stack((c[:, 1] - a[:, 1], a[:, 0] - c[:, 0]))
+        grad_c = np.column_stack((a[:, 1] - b[:, 1], b[:, 0] - a[:, 0]))
+
+        position = np.argmax(chosen_triangles == point_index, axis=1)
+        gradients = np.where(
+            (position == 0)[:, None], grad_a,
+            np.where((position == 1)[:, None], grad_b, grad_c),
+        )
+        direction = np.sum((weights * sign)[:, None] * gradients, axis=0)
+        norm = np.linalg.norm(direction)
+        return direction / norm if norm > 1.0e-13 else np.zeros(2)
+
+    best_points = None
+    best_value = -np.inf
+
+    try:
+        # Independent basins are important because active-triangle patterns
+        # change discontinuously across the maximin landscape.
+        for restart in range(9):
+            points = np.empty((n, 2), dtype=np.float64)
+            points[:fixed_count] = corners
+            points[fixed_count:] = np.clip(
+                base_grid + rng.uniform(-0.135, 0.135, size=(9, 2)),
+                0.035,
+                0.965,
+            )
+            values = areas(points)
+
+            for sweep in range(440):
+                progress = sweep / 439.0
+                step = 0.110 * (1.0 - progress) ** 1.58 + 0.0012
+                tail_slack = 2.0e-7 * (1.0 - progress) + 2.0e-9
+
+                for point_index in rng.permutation(movable_indices):
+                    current = points[point_index]
+                    proposals = np.empty((16, 2), dtype=np.float64)
+                    proposals[0] = current
+
+                    directions = rng.normal(size=(15, 2))
+                    directions /= np.maximum(
+                        np.linalg.norm(directions, axis=1, keepdims=True),
+                        1.0e-14,
+                    )
+                    radii = step * (0.20 + 1.25 * rng.random(15))
+                    proposals[1:] = current + directions * radii[:, None]
+
+                    # Exact area gradients make several proposals productive
+                    # rather than relying exclusively on random perturbations.
+                    direction = ascent_direction(points, values, point_index)
+                    if np.any(direction):
+                        proposals[1:5] = current + step * np.array(
+                            (0.30, 0.70, 1.15, 1.65)
+                        )[:, None] * direction
+
+                    if sweep < 130:
+                        proposals[-2:] = rng.uniform(0.055, 0.945, size=(2, 2))
+
+                    proposals = np.clip(proposals, 0.025, 0.975)
+                    trial_values = incident_trials(
+                        points, values, point_index, proposals
+                    )
+                    minima = trial_values.min(axis=1)
+                    top = float(minima.max())
+                    tied = minima >= top - tail_slack
+
+                    scores = lower_tail_key(trial_values)
+                    scores[~tied] = -np.inf
+                    choice = int(np.argmax(scores))
+
+                    points[point_index] = proposals[choice]
+                    values = trial_values[choice]
+
+                # Some bottlenecks need two vertices to move simultaneously.
+                if sweep % 11 == 10:
+                    worst = np.argpartition(values, 11)[:12]
+                    joint = np.broadcast_to(points, (17, n, 2)).copy()
+
+                    for proposal in range(1, len(joint)):
+                        triangle = triples[worst[(proposal - 1) % len(worst)]]
+                        movable = triangle[triangle >= fixed_count]
+                        if len(movable) < 2:
+                            continue
+
+                        p0, p1 = movable[:2]
+                        displacement = rng.normal(size=(2, 2))
+                        displacement /= np.maximum(
+                            np.linalg.norm(displacement, axis=1, keepdims=True),
+                            1.0e-14,
+                        )
+                        if proposal % 3 == 0:
+                            displacement[1] = displacement[0]
+                        radius = step * rng.uniform(0.45, 1.65, size=2)
+                        joint[proposal, p0] += radius[0] * displacement[0]
+                        joint[proposal, p1] += radius[1] * displacement[1]
+
+                    joint = np.clip(joint, 0.025, 0.975)
+                    joint_values = batch_areas(joint)
+                    minima = joint_values.min(axis=1)
+                    top = float(minima.max())
+                    scores = lower_tail_key(joint_values)
+                    scores[minima < top - tail_slack] = -np.inf
+                    choice = int(np.argmax(scores))
+
+                    if minima[choice] >= values.min() - 1.0e-14:
+                        points = joint[choice]
+                        values = joint_values[choice]
+
+            # Deterministic radial polishing resolves the final active bundle.
+            angles = np.linspace(0.0, 2.0 * np.pi, 40, endpoint=False)
+            unit_rays = np.column_stack((np.cos(angles), np.sin(angles)))
+            for radius in (0.007, 0.003, 0.0012, 0.00045):
+                for _ in range(3):
+                    for point_index in movable_indices:
+                        proposals = np.vstack((
+                            points[point_index],
+                            points[point_index] + radius * unit_rays,
+                        ))
+                        proposals = np.clip(proposals, 0.02, 0.98)
+                        trial_values = incident_trials(
+                            points, values, point_index, proposals
+                        )
+                        minima = trial_values.min(axis=1)
+                        top = float(minima.max())
+                        scores = lower_tail_key(trial_values)
+                        scores[minima < top - 1.0e-13] = -np.inf
+                        choice = int(np.argmax(scores))
+                        if minima[choice] >= values.min() - 1.0e-14:
+                            points[point_index] = proposals[choice]
+                            values = trial_values[choice]
+
+            value = float(values.min())
+            if value > best_value:
+                best_value = value
+                best_points = points.copy()
+
+    except (FloatingPointError, ValueError, RuntimeError, np.linalg.LinAlgError):
+        best_points = None
+
+    if best_points is None or best_points.shape != (13, 2) or not np.all(
+        np.isfinite(best_points)
+    ):
+        best_points = np.vstack((corners, base_grid))
+
+    return best_points
+
+
+# EVOLVE-BLOCK-END
+```

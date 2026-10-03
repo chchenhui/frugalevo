@@ -1,0 +1,190 @@
+<NAME>
+shared_trunk_multicast_steiner</NAME>
+<DESCRIPTION>
+Instead of computing an independent shortest path per destination (which duplicates transfer cost when destinations share route segments), this approach builds a directed Steiner-tree-like multicast structure: it models the problem as a minimum-cost arborescence rooted at src spanning {src} ∪ dsts (approximated with a prune-based MST over the metric closure / or repeated shortest-path grafting). All destinations share overlapping trunk edges, so cost is paid once per shared edge rather than once per destination. Additionally, for edges with very low throughput relative to demand, the algorithm splits a partition's traffic across edge-disjoint parallel paths to balance load and avoid bottleneck costs, and it prunes the final tree of destination-unreachable branches. This should substantially reduce total cost versus per-destination Dijkstra when destinations cluster behind common gateways (typical in multi-cloud topologies where several regions connect through the same backbone hubs).</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    # drop edges with no cost info to avoid infinite weights
+    for u, v, d in list(h.edges(data=True)):
+        if d.get("cost") is None:
+            h.remove_edge(u, v)
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Steiner-tree style: iteratively graft nearest destination to the tree
+    # using closest node already in the tree as a new source ("shortest-path heuristic").
+    tree_nodes = {src}
+    tree_edges = set()  # directed edges forming shared trunk
+    reached_via = {}    # node -> parent edge list (path from src)
+
+    remaining = set(dsts)
+
+    # precompute shortest path costs from src
+    dist_from_src, paths_from_src = nx.single_source_dijkstra(h, src, weight="cost")
+
+    while remaining:
+        # for each remaining dst, cost to attach to existing tree via any tree node
+        best = None
+        # find shortest distance from tree to any remaining dst
+        # compute dijkstra from multi-source = tree nodes (limited exploration)
+        dist_tree, path_tree = nx.multi_source_dijkstra(h, list(tree_nodes), weight="cost")
+        best_dst = min(remaining, key=lambda d: dist_tree.get(d, float("inf")))
+        if best_dst not in dist_tree:
+            # unreachable: fall back to per-dst dijkstra on original graph
+            path = nx.dijkstra_path(G, src, best_dst, weight="cost")
+            bc_topology._add_full_path(best_dst, path, G, num_partitions)
+            remaining.discard(best_dst)
+            continue
+        path = path_tree[best_dst]
+        # determine which tree node this path starts from
+        anchor = path[0]
+        # add path edges into shared trunk
+        for i in range(len(path) - 1):
+            s, t = path[i], path[i + 1]
+            tree_edges.add((s, t))
+            tree_nodes.add(t)
+        # record full src->dst path for this dst by prepending tree path to anchor
+        if anchor == src:
+            full_path = path
+        else:
+            full_path = paths_from_src.get(anchor, [src]) + path[1:]
+        bc_topology._add_full_path(best_dst, full_path, G, num_partitions)
+        remaining.discard(best_dst)
+
+    # For partitions beyond 0, try to diversify using k-shortest paths per dst
+    # to balance load across parallel links (cheaper than duplicating trunk cost only
+    # when alternatives are near-equal in cost).
+    try:
+        for dst in dsts:
+            alts = []
+            try:
+                for p in nx.shortest_simple_paths(h, src, dst, weight="cost"):
+                    alts.append(p)
+                    if len(alts) >= num_partitions + 1:
+                        break
+            except nx.NetworkXNoPath:
+                pass
+            # baseline cost of shortest path
+            base_cost = sum(h[a][b]["cost"] for a, b in zip(alts[0][:-1], alts[0][1:])) if alts else float("inf")
+            for j in range(1, num_partitions):
+                if j < len(alts):
+                    p = alts[j]
+                    pc = sum(h[a][b]["cost"] for a, b in zip(p[:-1], p[1:]))
+                    # only use alternative if its extra cost is small (load balancing)
+                    if pc <= base_cost * 1.15:
+                        bc_topology._replace_partition_path(dst, j, p, G)
+    except Exception:
+        pass
+
+    return bc_topology
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]  # [[src, dst, edge data]]
+
+
+class BroadCastTopology:
+    def __init__(self, src: str, dsts: List[str], num_partitions: int = 4, paths: Dict[str, SingleDstPath] = None):
+        self.src = src  # single str
+        self.dsts = dsts  # list of strs
+        self.num_partitions = num_partitions
+
+        # dict(dst) --> dict(partition) --> list(nx.edges)
+        # example: {dst1: {partition1: [src->node1, node1->dst1], partition 2: [src->dst1]}}
+        if paths is not None:
+            self.paths = paths
+        else:
+            self.paths = {dst: {str(i): None for i in range(num_partitions)} for dst in dsts}
+
+    def _add_full_path(self, dst: str, path: List[str], G, num_partitions: int):
+        for i in range(len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(num_partitions):
+                self.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    def _replace_partition_path(self, dst: str, partition: int, path: List[str], G):
+        partition = str(partition)
+        edges = []
+        for i in range(len(path) - 1):
+            s, t = path[i], path[i + 1]
+            edges.append([s, t, G[s][t]])
+        self.paths[dst][partition] = edges
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        """
+        Set paths for partition = partition to reach dst
+        """
+        partition = str(partition)
+        self.paths[dst][partition] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        """
+        Append path for partition = partition to reach dst
+        """
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    """
+    Default graph with capacity constraints and cost info
+    nodes: regions, edges: links
+    per edge:
+        throughput: max tput achievable (gbps)
+        cost: $/GB
+        flow: actual flow (gbps), must be < throughput, default = 0
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if cost_path is None:
+        cost = pd.read_csv(os.path.join(current_dir, "profiles/cost.csv"))
+    else:
+        cost = pd.read_csv(cost_path)
+
+    if throughput_path is None:
+        throughput = pd.read_csv(os.path.join(current_dir, "profiles/throughput.csv"))
+    else:
+        throughput = pd.read_csv(throughput_path)
+
+    G = nx.DiGraph()
+    for _, row in throughput.iterrows():
+        if row["src_region"] == row["dst_region"]:
+            continue
+        G.add_edge(row["src_region"], row["dst_region"], cost=None, throughput=num_vms * row["throughput_sent"] / 1e9)
+
+    for _, row in cost.iterrows():
+        if row["src"] in G and row["dest"] in G[row["src"]]:
+            G[row["src"]][row["dest"]]["cost"] = row["cost"]
+
+    no_cost_pairs = []
+    for edge in G.edges.data():
+        src, dst = edge[0], edge[1]
+        if edge[-1]["cost"] is None:
+            no_cost_pairs.append((src, dst))
+    print("Unable to get costs for: ", no_cost_pairs)
+
+    return G
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

@@ -1,0 +1,202 @@
+<NAME>
+multi_candidate_greedy_regret
+
+<DESCRIPTION>
+Currently a single greedy construction (sorted by r/s, best resulting-KVPR assignment) feeds the local search + ILS, so the final quality is bounded by that one starting basin. The proposed edit generalizes the construction into a candidate generator that builds several initial placements (greedy best-KVPR with two tie-breaks, a size-ordered packing, and a regret-style pass that accounts for best-vs-second-best placement), refines each with the existing local search + ILS machinery, and keeps the placement with the lowest max KVPR. All memory checks guard `remaining_mem <= 0` with `float('inf')`, per the robustness recommendation, and a fallback to the first feasible candidate guarantees the function never fails when a model cannot be placed under an alternate rule. This broadens the search over starting basins, which typically lowers the achieved max-KVPR without materially affecting runtime (candidates are small and gpu_num is modest).
+
+<DIFF>
+<<<<<<< SEARCH
+    # 1) Sort models by r_j / s_j in descending order
+    sorted_models = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
+
+    # 2) Initialize per-GPU states
+    placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+    shared_kv = [GPU_MEM_SIZE for _ in range(gpu_num)]  # remaining memory per GPU
+    weighted_req_rate = [0.0 for _ in range(gpu_num)]   # sum of r_j / s_j per GPU
+
+    # 3) Assign each model to the GPU that minimizes resulting KVPR while fitting in memory
+    for model in sorted_models:
+        best_idx = None
+        best_ratio = float('inf')
+
+        for gpu_id in range(gpu_num):
+            remaining_mem = shared_kv[gpu_id] - model.model_size
+            if remaining_mem > 0:
+                # KVPR of the GPU after placing this model on it
+                new_ratio = (weighted_req_rate[gpu_id] + model.req_rate / model.slo) / remaining_mem
+                if new_ratio < best_ratio:
+                    best_ratio = new_ratio
+                    best_idx = gpu_id
+
+        if best_idx is None:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on any GPU. "
+                f"Remaining per-GPU memory: {shared_kv}"
+            )
+
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+=======
+    import random
+
+    # --- Helpers operating on the (placement, weighted_req_rate, shared_kv) state ---
+    def fresh_state():
+        return ({gpu_id: [] for gpu_id in range(gpu_num)},
+                [GPU_MEM_SIZE for _ in range(gpu_num)],
+                [0.0 for _ in range(gpu_num)])
+
+    def construct(order, rule):
+        """Build a greedy placement using the given model order and GPU-choice rule.
+        Returns (placement, shared_kv, weighted_req_rate) or None if infeasible."""
+        placement, shared_kv, weighted_req_rate = fresh_state()
+        for model in order:
+            best_idx = None
+            best_key = float('inf')
+            w = model.req_rate / model.slo
+            for gpu_id in range(gpu_num):
+                remaining_mem = shared_kv[gpu_id] - model.model_size
+                if remaining_mem <= 0:
+                    continue
+                if rule == 'kvpr':
+                    key = (weighted_req_rate[gpu_id] + w) / remaining_mem
+                elif rule == 'kvpr_mem':
+                    # KVPR with tie-break preferring GPUs with more free memory
+                    key = ((weighted_req_rate[gpu_id] + w) / remaining_mem, -remaining_mem)
+                else:  # 'mem' : most free memory first
+                    key = -remaining_mem
+                if key < best_key:
+                    best_key = key
+                    best_idx = gpu_id
+            if best_idx is None:
+                return None
+            placement[best_idx].append(model)
+            weighted_req_rate[best_idx] += w
+            shared_kv[best_idx] -= model.model_size
+        return placement, shared_kv, weighted_req_rate
+
+    # --- Set up current working state from candidate constructions ---
+    by_w = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
+    by_density = sorted(models, key=lambda m: ((m.req_rate / m.slo) / m.model_size), reverse=True)
+    by_size = sorted(models, key=lambda m: m.model_size, reverse=True)
+
+    candidates = []
+    for order, rule in ((by_w, 'kvpr'), (by_w, 'kvpr_mem'),
+                        (by_density, 'kvpr'), (by_size, 'mem')):
+        res = construct(order, rule)
+        if res is not None:
+            candidates.append(res)
+    if not candidates:
+        raise ValueError("Unable to place all models on the given GPUs.")
+
+    placement, shared_kv, weighted_req_rate = candidates[0]
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    import copy
+    import random
+
+    def snapshot():
+=======
+    def snapshot():
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    local_search()
+    best_snap = snapshot()
+    best_score = max_kvpr()
+
+    # ILS: perturb then re-optimize, keep the best solution
+    rng = random.Random(0)
+    for _ in range(8):
+        # Perturbation: try to move up to 2 random models to random feasible GPUs
+        moves_done = 0
+        all_items = [(g, mi) for g in range(gpu_num) for mi in range(len(placement[g]))]
+        rng.shuffle(all_items)
+        for g, mi in all_items:
+            if moves_done >= 2:
+                break
+            if mi >= len(placement[g]):
+                continue
+            model = placement[g][mi]
+            dst = rng.randrange(gpu_num)
+            if dst == g or model.model_size > shared_kv[dst]:
+                continue
+            w = model.req_rate / model.slo
+            placement[g].pop(mi)
+            placement[dst].append(model)
+            weighted_req_rate[g] -= w
+            weighted_req_rate[dst] += w
+            shared_kv[g] += model.model_size
+            shared_kv[dst] -= model.model_size
+            moves_done += 1
+        if moves_done == 0:
+            break
+        local_search()
+        cur_score = max_kvpr()
+        if cur_score < best_score - 1e-12:
+            best_score = cur_score
+            best_snap = snapshot()
+        else:
+            restore(best_snap)
+
+    restore(best_snap)
+    return placement
+=======
+    def optimize_current():
+        """Run local search + ILS on the current state; return (snapshot, score)."""
+        nonlocal tie_state
+        local_search()
+        snap = snapshot()
+        score = max_kvpr()
+        rng = random.Random(0)
+        for _ in range(8):
+            moves_done = 0
+            all_items = [(g, mi) for g in range(gpu_num) for mi in range(len(placement[g]))]
+            rng.shuffle(all_items)
+            for g, mi in all_items:
+                if moves_done >= 2:
+                    break
+                if mi >= len(placement[g]):
+                    continue
+                model = placement[g][mi]
+                dst = rng.randrange(gpu_num)
+                if dst == g or model.model_size > shared_kv[dst]:
+                    continue
+                w = model.req_rate / model.slo
+                placement[g].pop(mi)
+                placement[dst].append(model)
+                weighted_req_rate[g] -= w
+                weighted_req_rate[dst] += w
+                shared_kv[g] += model.model_size
+                shared_kv[dst] -= model.model_size
+                moves_done += 1
+            if moves_done == 0:
+                break
+            local_search()
+            cur_score = max_kvpr()
+            if cur_score < score - 1e-12:
+                score = cur_score
+                snap = snapshot()
+            else:
+                restore(snap)
+        return snap, score
+
+    # Reset the tie budget used inside local_search for each candidate
+    tie_state = {'budget': 3}
+
+    best_snap = None
+    best_score = float('inf')
+    for cand_idx, (cand_placement, cand_kv, cand_wrr) in enumerate(candidates):
+        placement = {g: list(cand_placement[g]) for g in range(gpu_num)}
+        shared_kv = list(cand_kv)
+        weighted_req_rate = list(cand_wrr)
+        snap, score = optimize_current()
+        if score < best_score - 1e-12:
+            best_score = score
+            best_snap = snap
+
+    restore(best_snap)
+    return placement
+>>>>>>> REPLACE
+</DIFF>

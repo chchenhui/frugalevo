@@ -1,0 +1,173 @@
+import numpy as np
+
+# EVOLVE-BLOCK-START
+
+class FilterStage:
+    """Base interface for a pipeline stage."""
+    name = "base"
+
+    def apply(self, signal: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+
+class ZeroPhaseSavitzkyGolayStage(FilterStage):
+    """
+    Reflection-padded, zero-phase Savitzky-Golay smoother.
+    Kernel is precomputed once: row 0 of pinv(A^T A) A^T (evaluation
+    at the window center), applied forward + flipped for zero phase.
+    """
+
+    def __init__(self, half_width: int, poly_order: int = 2):
+        self.h = max(2, int(half_width))
+        self.p = poly_order
+        self._kernel = self._build_kernel()
+
+    def _build_kernel(self) -> np.ndarray:
+        h, p = self.h, self.p
+        idx = np.arange(-h, h + 1, dtype=float)
+        A = np.vander(idx, p + 1, increasing=True)
+        # row 0 of pinv(A^T A) A^T gives center-evaluation coefficients
+        return (np.linalg.pinv(A.T @ A) @ A.T)[0]
+
+    def apply(self, signal: np.ndarray) -> np.ndarray:
+        kernel = self._kernel
+        h = self.h
+        padded = np.concatenate([
+            signal[1:h + 1][::-1], signal, signal[-h - 1:-1][::-1]
+        ])
+        n = signal.shape[0]
+        out = np.empty(n, dtype=float)
+        # correlation with symmetric kernel == convolution (zero-phase)
+        for i in range(n):
+            out[i] = np.dot(padded[i:i + 2 * h + 1], kernel)
+        return out
+
+
+class SlopeStabilizationStage(FilterStage):
+    """
+    Suppress spurious directional reversals: estimate local slope on a
+    short window; where the slope sign flips relative to a majority vote
+    over a wider neighborhood, blend the sample toward the local trend.
+    """
+    def __init__(self, short_half: int = 3, wide_half: int = 8, blend: float = 0.5):
+        self.sh = max(1, short_half)
+        self.wh = max(self.sh + 1, wide_half)
+        self.blend = blend
+
+    def apply(self, signal: np.ndarray) -> np.ndarray:
+        n = signal.shape[0]
+        if n < 2 * self.wh + 1:
+            return signal
+        # local slopes
+        s_short = np.zeros(n)
+        s_wide = np.zeros(n)
+        for i in range(n):
+            a = max(0, i - self.sh)
+            b = min(n - 1, i + self.sh)
+            s_short[i] = (signal[b] - signal[a]) / max(1, b - a)
+            a2 = max(0, i - self.wh)
+            b2 = min(n - 1, i + self.wh)
+            s_wide[i] = (signal[b2] - signal[a2]) / max(1, b2 - a2)
+        out = signal.astype(float).copy()
+        # majority sign over wide window around each point
+        for i in range(n):
+            a = max(0, i - self.wh)
+            b = min(n, i + self.wh + 1)
+            votes = np.sign(s_short[a:b])
+            majority = np.sign(votes.sum())
+            if majority != 0 and np.sign(s_short[i]) != majority and s_wide[i] != 0:
+                # spurious micro-reversal: soften it
+                local_trend = signal[i - 1] + s_wide[i] if i > 0 else signal[i]
+                out[i] = (1 - self.blend) * signal[i] + self.blend * local_trend
+        return out
+
+
+class TrendLockStage(FilterStage):
+    """
+    Preserve genuine trends: local linear fit over a medium window;
+    where the smoothed signal deviates from the fitted trend beyond a
+    robust sigma threshold, snap partially back toward the trend line.
+    Prevents false trend changes without adding lag (fit is centered).
+    """
+    def __init__(self, half_width: int = 6, snap: float = 0.4, k_sigma: float = 2.0):
+        self.h = max(2, half_width)
+        self.snap = snap
+        self.k = k_sigma
+
+    def apply(self, signal: np.ndarray) -> np.ndarray:
+        n = signal.shape[0]
+        h = self.h
+        if n < 2 * h + 1:
+            return signal
+        trend = np.empty(n)
+        for i in range(n):
+            lo = max(0, i - h)
+            hi = min(n, i + h + 1)
+            x = np.arange(lo, hi, dtype=float) - i
+            y = signal[lo:hi]
+            # centered linear fit
+            slope = np.dot(x, y - y.mean()) / max(np.dot(x, x), 1e-12)
+            trend[i] = y.mean() + 0.0  # value of fit at center
+        resid = signal - trend
+        sigma = np.std(resid) + 1e-12
+        mask = np.abs(resid) > self.k * sigma
+        out = signal.astype(float).copy()
+        out[mask] = (1 - self.snap) * signal[mask] + self.snap * trend[mask]
+        return out
+
+
+class SignalPipeline:
+    """
+    Orchestrates stages. Core architecture: coarse-to-fine triple
+    zero-phase S-G passes (progressively narrower windows) for maximal
+    noise reduction, followed by slope stabilization and trend locking.
+    """
+
+    def __init__(self, base_half: int = 18):
+        sg_half = max(4, base_half)
+        h1 = sg_half
+        h2 = (2 * sg_half) // 3          # widened second pass
+        h3 = max(2, sg_half // 3)        # third pass: attack smoothness
+        self.stages = [
+            ZeroPhaseSavitzkyGolayStage(h1, poly_order=2),
+            ZeroPhaseSavitzkyGolayStage(h2, poly_order=2),
+            ZeroPhaseSavitzkyGolayStage(h3, poly_order=2),
+            SlopeStabilizationStage(short_half=max(2, sg_half // 6),
+                                    wide_half=max(4, sg_half // 2)),
+            TrendLockStage(half_width=max(3, sg_half // 3)),
+        ]
+
+    def process(self, signal: np.ndarray) -> np.ndarray:
+        x = np.asarray(signal, dtype=float)
+        if x.ndim != 1 or x.shape[0] < 8:
+            return x.copy()
+        # reflection-pad entire signal once at pipeline boundary
+        pad = max(st.h for st in self.stages if hasattr(st, 'h'))
+        padded = np.concatenate([x[1:pad + 1][::-1], x, x[-pad - 1:-1][::-1]])
+        y = padded
+        for stage in self.stages:
+            y = stage.apply(y)
+        # remove pipeline-level padding
+        return y[pad:pad + x.shape[0]]
+
+
+def filter_signal(signal, window_half: int = 18):
+    """
+    Public entry point. Maintains original inputs/outputs:
+    input: 1-D numpy array (or list) of raw samples
+    output: filtered 1-D numpy array, same length, minimal phase delay.
+    """
+    pipeline = SignalPipeline(base_half=window_half)
+    return pipeline.process(signal)
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    rng = np.random.default_rng(0)
+    t = np.linspace(0, 10, 500)
+    raw = np.sin(t) + 0.3 * np.sin(3 * t) + 0.05 * rng.standard_normal(t.shape[0])
+    out = filter_signal(raw, window_half=18)
+    print("in :", raw[:6])
+    print("out:", out[:6])
+    print("len:", len(raw), "->", len(out))

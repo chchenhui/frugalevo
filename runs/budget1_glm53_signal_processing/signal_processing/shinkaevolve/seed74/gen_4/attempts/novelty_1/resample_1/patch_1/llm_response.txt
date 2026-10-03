@@ -1,0 +1,254 @@
+<NAME>
+adaptive_kalman_trend_filter</NAME>
+
+<DESCRIPTION>
+The original program uses simple/exponentially-weighted moving averages, which introduce fixed lag proportional to window size and pass noise-induced slope reversals. My novel approach replaces fixed smoothing windows with a two-state (level + slope) Kalman filter running causally over the samples, then reports window-anchored outputs (same output length/alignment as the sliding-window baseline). Key insights: (1) an explicit slope state lets the filter *predict* the next sample from the current trend, drastically reducing lag error versus backward-looking averages; (2) adaptive process noise (innovation-based, like adaptive Kalman/Sage-Husa estimators) makes the filter automatically tighten smoothing in quiet regions and react fast during genuine regime changes; (3) a slope-hysteresis smoothing stage suppresses false reversals by requiring the estimated slope to persistently exceed a noise-scaled deadzone before contributing to the output. This combines Kalman trend tracking with a trend-detection/hysteresis paradigm — fundamentally different from the weighted-average approach while keeping identical interface (process_signal, run_signal_processing, etc.).
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""
+Adaptive Kalman Trend Filter for Non-Stationary Time Series
+
+Causal two-state Kalman filter (level + slope) with innovation-adaptive
+process noise and slope-hysteresis trend confirmation. Produces windowed
+outputs matching sliding-window semantics with far less lag and far fewer
+spurious reversals than moving-average approaches.
+"""
+import numpy as np
+
+
+def _akf_core(x, q_level=0.02, q_slope=0.002, r_scale=1.0):
+    """
+    Run adaptive two-state Kalman filter over x.
+
+    State: [level, slope]. Measurement: level only.
+    Process noise is adapted online from the normalized innovation,
+    so the filter smooths aggressively when predictions are good and
+    reacts quickly during genuine regime changes.
+
+    Returns:
+        levels:  filtered level estimates (len(x))
+        slopes:  filtered slope estimates (len(x))
+        resid_var: estimated measurement noise variance
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    levels = np.zeros(n)
+    slopes = np.zeros(n)
+
+    # Initialize from first samples
+    x0 = x[0] if n > 0 else 0.0
+    s0 = (x[1] - x[0]) if n > 1 else 0.0
+    level, slope = x0, s0
+    P = np.array([[1.0, 0.0], [0.0, 0.5]])
+
+    # Robust initial noise estimate (median absolute deviation of diffs)
+    if n > 2:
+        d = np.diff(x)
+        r_est = max(np.median(np.abs(d - np.median(d))) ** 2, 1e-8) * 0.5
+    else:
+        r_est = 1.0
+    r_est = max(r_est * r_scale, 1e-8)
+
+    # Innovation-variance EMA for adaptation
+    innov_ema = r_est
+    alpha_r = 0.05
+
+    F = np.array([[1.0, 1.0], [0.0, 1.0]])
+    H = np.array([[1.0, 0.0]])
+
+    for k in range(n):
+        # --- Predict ---
+        level_pred = level + slope
+        slope_pred = slope
+        P = F @ P @ F.T
+
+        # --- Adaptive process noise ---
+        # Scale process noise with recent innovation magnitude: large
+        # innovations => likely regime change => allow faster adaptation.
+        adapt = 1.0 + min(innov_ema / max(r_est, 1e-8), 8.0)
+        P[0, 0] += q_level * adapt
+        P[1, 1] += q_slope * adapt
+
+        # --- Update ---
+        innov = x[k] - level_pred
+        S = P[0, 0] + r_est
+        K = np.array([P[0, 0] / S, P[1, 0] / S])
+        level = level_pred + K[0] * innov
+        slope = slope_pred + K[1] * innov
+        P = (np.eye(2) - np.outer(K, H)) @ P
+        # Symmetrize for numerical stability
+        P = 0.5 * (P + P.T)
+
+        # Update innovation EMA & measurement noise estimate
+        innov_ema = (1 - alpha_r) * innov_ema + alpha_r * innov * innov
+        r_est = 0.9 * r_est + 0.1 * max(innov_ema, 1e-8)
+
+        levels[k] = level
+        slopes[k] = slope
+
+    return levels, slopes, r_est
+
+
+def _slope_hysteresis(levels, slopes, r_est, persistence=3, gain=0.6):
+    """
+    Suppress false reversals: only let slope changes through when they
+    persist and exceed a noise-scaled deadzone. Confirmed slope is used
+    to make a small forward-looking correction that further reduces lag.
+    """
+    n = len(levels)
+    out = np.empty(n)
+    slope_noise = max(np.std(slopes) * 0.3, np.sqrt(max(r_est, 1e-8)) * 0.15, 1e-12)
+    confirmed = 0.0
+    sign_run = 0
+    last_sign = 0
+    for k in range(n):
+        s = slopes[k]
+        sg = 1 if s > slope_noise else (-1 if s < -slope_noise else 0)
+        if sg == last_sign:
+            sign_run += 1
+        else:
+            sign_run = 1 if sg != 0 else 0
+            last_sign = sg
+        # Confirm slope direction after persistence
+        if sg != 0 and sign_run >= persistence:
+            confirmed = s
+        elif sg == 0 and sign_run >= persistence:
+            confirmed *= 0.5  # decay toward flat
+        # Lag-compensated output: level plus a fraction of confirmed slope
+        out[k] = levels[k] + gain * confirmed
+    return out
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Adaptive Kalman trend filter with windowed output semantics.
+
+    Args:
+        x: Input signal (1D array)
+        window_size: Window size (defines output alignment like SMA)
+
+    Returns:
+        y: Filtered signal, length = len(x) - window_size + 1
+    """
+    x = np.asarray(x, dtype=float)
+    if len(x) < window_size:
+        raise ValueError(
+            f"Input signal length ({len(x)}) must be >= window_size ({window_size})"
+        )
+
+    levels, slopes, r_est = _akf_core(x)
+    filtered = _slope_hysteresis(levels, slopes, r_est)
+
+    # Align to sliding-window semantics: sample i corresponds to window
+    # x[i : i+window_size], whose center of mass (causal) is its last
+    # sample index i + window_size - 1. Use the filtered estimate there,
+    # averaged with the window midpoint estimate to balance bias/variance.
+    output_length = len(x) - window_size + 1
+    anchor = np.arange(output_length) + window_size - 1
+    mid = np.arange(output_length) + max((window_size - 1) // 2, 0)
+    w_anchor = 0.65
+    y = w_anchor * filtered[anchor] + (1.0 - w_anchor) * filtered[mid]
+    return y
+
+
+def adaptive_filter(x, window_size=20):
+    """Baseline-compatible entry: same algorithm as enhanced."""
+    return enhanced_filter_with_trend_preservation(x, window_size)
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """
+    Main signal processing function (same interface as original).
+
+    Args:
+        input_signal: Input time series data
+        window_size: Window size for processing
+        algorithm_type: "basic" or "enhanced" (both use the new filter)
+
+    Returns:
+        Filtered signal
+    """
+    return enhanced_filter_with_trend_preservation(input_signal, window_size)
+
+# EVOLVE-BLOCK-END
+
+
+def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+    """Generate synthetic test signal with known characteristics."""
+    np.random.seed(seed)
+    t = np.linspace(0, 10, length)
+    clean_signal = (
+        2 * np.sin(2 * np.pi * 0.5 * t)
+        + 1.5 * np.sin(2 * np.pi * 2 * t)
+        + 0.5 * np.sin(2 * np.pi * 5 * t)
+        + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)
+    )
+    trend = 0.1 * t * np.sin(0.2 * t)
+    clean_signal += trend
+    random_walk = np.cumsum(np.random.randn(length) * 0.05)
+    clean_signal += random_walk
+    noise = np.random.normal(0, noise_level, length)
+    noisy_signal = clean_signal + noise
+    return noisy_signal, clean_signal
+
+
+def run_signal_processing(noisy_signal=None, signal_length=1000, noise_level=0.3, window_size=20):
+    """Run the signal processing algorithm on a test signal (same interface)."""
+    if noisy_signal is not None:
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+        clean_signal = None
+    else:
+        noisy_signal, clean_signal = generate_test_signal(signal_length, noise_level)
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+
+    if len(filtered_signal) > 0 and clean_signal is not None:
+        delay = window_size - 1
+        aligned_clean = clean_signal[delay:]
+        aligned_noisy = noisy_signal[delay:]
+        min_length = min(len(filtered_signal), len(aligned_clean))
+        filtered_signal = filtered_signal[:min_length]
+        aligned_clean = aligned_clean[:min_length]
+        aligned_noisy = aligned_noisy[:min_length]
+        correlation = np.corrcoef(filtered_signal, aligned_clean)[0, 1] if min_length > 1 else 0
+        noise_before = np.var(aligned_noisy - aligned_clean)
+        noise_after = np.var(filtered_signal - aligned_clean)
+        noise_reduction = (noise_before - noise_after) / noise_before if noise_before > 0 else 0
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": aligned_clean,
+            "noisy_signal": aligned_noisy,
+            "correlation": correlation,
+            "noise_reduction": noise_reduction,
+            "signal_length": min_length,
+        }
+    elif len(filtered_signal) > 0:
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": None,
+            "noisy_signal": None,
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": len(filtered_signal),
+        }
+    else:
+        return {
+            "filtered_signal": [],
+            "clean_signal": [],
+            "noisy_signal": [],
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": 0,
+        }
+
+
+if __name__ == "__main__":
+    results = run_signal_processing()
+    print("Signal processing completed!")
+    print(f"Correlation with clean signal: {results['correlation']:.3f}")
+    print(f"Noise reduction: {results['noise_reduction']:.3f}")
+    print(f"Processed signal length: {results['signal_length']}")
+```
+</CODE>

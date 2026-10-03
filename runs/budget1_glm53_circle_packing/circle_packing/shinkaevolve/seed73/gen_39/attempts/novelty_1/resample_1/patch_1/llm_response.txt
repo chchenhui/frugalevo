@@ -1,0 +1,329 @@
+<NAME>
+slsqp_trustconstr_multistart_refiner</NAME>
+<DESCRIPTION>
+Restructure the program into a modular pipeline: (1) seed builders produce diverse feasible starting configurations (hex lattice variants, corner-anchored layouts, jittered copies), (2) each seed is handed to a scipy nonlinear optimizer (`trust-constr` with analytic Jacobians, falling back to SLSQP) that jointly optimizes all 52 variables (26 centers × 2 coords + 26 radii) to maximize the radius sum subject to non-overlap and wall constraints, (3) a vectorized feasibility repair fixes any tiny violations from the solver, and (4) the best candidate is kept. This replaces the greedy grow/nudge heuristic with true constrained optimization, which per prior evidence dominates the achievable score, and modularizes seed generation, refinement, repair, and selection into separate functions.</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles.
+
+Pipeline: seed builders -> constrained refinement (trust-constr / SLSQP)
+-> feasibility repair -> best-candidate selection.
+"""
+import numpy as np
+
+N = 26
+SQRT3 = np.sqrt(3.0)
+
+
+# ---------------------------------------------------------------
+# Seed generation
+# ---------------------------------------------------------------
+def _hex_seed(counts, r0=None):
+    if r0 is None:
+        r0 = min(1.0 / (2.0 * max(counts)), 1.0 / (2.0 + (len(counts) - 1) * SQRT3))
+    dx, dy = 2.0 * r0, SQRT3 * r0
+    pts = []
+    for row, c in enumerate(counts):
+        y = r0 + row * dy
+        span = 2.0 * r0 + (c - 1) * dx
+        start = (1.0 - span) / 2.0 + r0
+        for k in range(c):
+            pts.append([start + k * dx, y])
+    return np.array(pts), r0
+
+
+def _corner_seed():
+    """Place circles along the boundary walls first (corners + edges),
+    then fill the interior with a coarse grid."""
+    pts = [[0.06, 0.06], [0.94, 0.06], [0.06, 0.94], [0.94, 0.94]]
+    # edge midpoints and extra edge slots
+    for t in np.linspace(0.15, 0.85, 6):
+        pts += [[t, 0.06], [t, 0.94], [0.06, t], [0.94, t]]
+    # interior coarse grid
+    g = np.linspace(0.22, 0.78, 4)
+    for x in g:
+        for y in g:
+            pts.append([x, y])
+    # trim/keep first N=26 interior points as needed
+    pts = pts[:N]
+    while len(pts) < N:
+        pts.append([0.5, 0.5])
+    return np.array(pts)
+
+
+def build_seeds():
+    seeds = []
+    for counts in ([5, 4, 5, 4, 5, 3], [5, 4, 5, 4, 4, 4], [4, 5, 4, 5, 4, 4],
+                    [5, 4, 4, 5, 4, 4], [3, 5, 4, 5, 4, 5], [6, 5, 5, 5, 5],
+                    [5, 5, 5, 5, 3, 3]):
+        c, r0 = _hex_seed(counts)
+        seeds.append((c, 0.5 * r0))
+    seeds.append((_corner_seed(), 0.05))
+    # deterministic jittered variants
+    for i in range(6):
+        c, r0 = seeds[i]
+        rng = np.random.default_rng(1000 + i)
+        jc = np.clip(c + rng.normal(0, 0.02, c.shape), 0.01, 0.99)
+        seeds.append((jc, 0.5 * r0))
+    return seeds
+
+
+# ---------------------------------------------------------------
+# Feasibility repair
+# ---------------------------------------------------------------
+def pairwise_dist(centers):
+    d = np.sqrt(((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1))
+    np.fill_diagonal(d, np.inf)
+    return d
+
+
+def repair(centers, radii):
+    """Vectorized feasibility repair: shrink any radius that violates
+    walls or overlaps another circle (using current radii)."""
+    for _ in range(50):
+        d = pairwise_dist(centers)
+        cap_wall = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                              np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+        cap_pair = np.min(d - radii[None, :], axis=1)
+        cap = np.minimum(cap_wall, cap_pair)
+        if np.all(radii <= cap + 1e-12):
+            break
+        radii = np.minimum(radii, np.maximum(cap, 1e-9))
+    radii = np.clip(radii, 1e-9, None)
+    return centers, radii
+
+
+def is_feasible(centers, radii, tol=1e-7):
+    d = pairwise_dist(centers)
+    if np.any(d - (radii[:, None] + radii[None, :]) < -tol):
+        return False
+    if np.any(radii > cap_walls(centers) + tol):
+        return False
+    return True
+
+
+def cap_walls(centers):
+    return np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+
+
+# ---------------------------------------------------------------
+# Constrained refinement (joint centers + radii optimization)
+# ---------------------------------------------------------------
+def refine(centers, r_init, maxiter=200):
+    """Optimize (x, y, r) jointly to maximize sum(r) subject to
+    non-overlap and wall constraints. Uses scipy trust-constr with
+    analytic Jacobians; falls back to SLSQP; repairs output."""
+    try:
+        from scipy.optimize import minimize, NonlinearConstraint
+    except Exception:
+        c, r, s = greedy_grow(centers, r_init)
+        return c, r, s
+
+    n = centers.shape[0]
+    x0 = np.concatenate([centers.ravel(), np.full(n, r_init)])
+
+    # constraint function: for each pair (i<j): d_ij - r_i - r_j >= 0
+    # for each i: wall cap_i - r_i >= 0
+    ii, jj = np.triu_indices(n, k=1)
+    diff = centers[ii] - centers[jj]
+
+    def cons(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        dv = np.linalg.norm(c[ii] - c[jj], axis=1)
+        wall = cap_walls(c)
+        return np.concatenate([dv - r[ii] - r[jj], wall - r])
+
+    def cons_jac(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        dv = np.linalg.norm(c[ii] - c[jj], axis=1) + 1e-12
+        J = np.zeros((len(ii) + n, 3 * n))
+        for k in range(len(ii)):
+            i, j = ii[k], jj[k]
+            u = (c[i] - c[j]) / dv[k]
+            J[k, 2 * i] = u[0]; J[k, 2 * i + 1] = u[1]
+            J[k, 2 * j] = -u[0]; J[k, 2 * j + 1] = -u[1]
+            J[k, 2 * n + i] = -1.0; J[k, 2 * n + j] = -1.0
+        for i in range(n):
+            row = len(ii) + i
+            J[row, 2 * i] = -1.0 if c[i, 0] < 0.5 else 1.0
+            J[row, 2 * i + 1] = -1.0 if c[i, 1] < 0.5 else 1.0
+            J[row, 2 * n + i] = -1.0
+        return J
+
+    def neg_sum(z):
+        return -np.sum(z[2 * n:])
+
+    def neg_sum_grad(z):
+        g = np.zeros(3 * n)
+        g[2 * n:] = -1.0
+        return g
+
+    bounds = [(0.0, 1.0)] * (2 * n) + [(1e-6, 0.5)] * n
+
+    results = []
+    nlc = NonlinearConstraint(cons, 0.0, np.inf, jac=cons_jac)
+    for method in ("trust-constr", "SLSQP"):
+        try:
+            if method == "trust-constr":
+                res = minimize(neg_sum, x0, jac=neg_sum_grad,
+                               constraints=[nlc], bounds=bounds,
+                               method="trust-constr",
+                               options={"maxiter": maxiter, "gtol": 1e-9,
+                                        "xtol": 1e-10, "verbose": 0})
+            else:
+                cons_d = {"type": "ineq",
+                          "fun": cons, "jac": cons_jac}
+                res = minimize(neg_sum, x0, jac=neg_sum_grad,
+                               constraints=[cons_d], bounds=bounds,
+                               method="SLSQP",
+                               options={"maxiter": maxiter, "ftol": 1e-10})
+            results.append(res)
+        except Exception:
+            continue
+        if len(results) >= 2:
+            break
+
+    best = None
+    for res in results:
+        z = np.asarray(res.x)
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        c, r = repair(c, r)
+        s = float(np.sum(r))
+        if best is None or s > best[2]:
+            best = (c, r, s)
+    if best is None:
+        best = greedy_grow(centers, r_init)
+    return best
+
+
+def greedy_grow(centers, r_init, iters=400):
+    """Fallback: Gauss-Seidel radius growth from a small feasible start."""
+    n = centers.shape[0]
+    b = cap_walls(centers)
+    d = pairwise_dist(centers)
+    radii = np.full(n, 0.25 * r_init)
+    for _ in range(iters):
+        cap = np.minimum(b, np.min(d - radii[None, :], axis=1))
+        if np.all(radii >= cap - 1e-12):
+            break
+        radii = np.maximum(radii, np.minimum(cap, radii + 0.05 * r_init))
+    return centers, radii, float(np.sum(radii))
+
+
+# ---------------------------------------------------------------
+# Void-filling insertion/removal pass
+# ---------------------------------------------------------------
+def find_largest_void(centers, radii, g=40):
+    xs = (np.arange(g) + 0.5) / g
+    pts = np.array([[x, y] for x in xs for y in xs])
+    d = np.sqrt(((pts[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2))
+    clear = np.min(d - radii[None, :], axis=1)
+    clear = np.minimum(clear, np.minimum(np.minimum(pts[:, 0], 1 - pts[:, 0]),
+                                         np.minimum(pts[:, 1], 1 - pts[:, 1])))
+    i = int(np.argmax(clear))
+    return pts[i], float(clear[i])
+
+
+def void_pass(centers, radii, sum_r):
+    improved = True
+    while improved:
+        improved = False
+        v, vr = find_largest_void(centers, radii)
+        if vr <= 0.03:
+            break
+        cand = np.vstack([centers, v.reshape(1, 2)])
+        r_init = float(np.median(radii))
+        c2, r2, s2 = refine(cand, r_init, maxiter=100)
+        k = int(np.argmin(r2))
+        keep = [i for i in range(c2.shape[0]) if i != k]
+        c3 = c2[keep]
+        c3, r3, s3 = refine(c3, float(np.max(r2)), maxiter=100)
+        if c3.shape[0] == N and s3 > sum_r + 1e-6:
+            centers, radii, sum_r = c3, r3, s3
+            improved = True
+    return centers, radii, sum_r
+
+
+# ---------------------------------------------------------------
+# Main constructor
+# ---------------------------------------------------------------
+def construct_packing():
+    best = None
+    for centers, r_init in build_seeds():
+        c, r, s = refine(centers, r_init, maxiter=250)
+        c, r, s = void_pass(c, r, s)
+        if best is None or s > best[2]:
+            best = (c, r, s)
+    centers, radii, sum_radii = best
+    return centers, radii, sum_radii
+
+
+def compute_max_radii(centers):
+    n = centers.shape[0]
+    radii = np.ones(n)
+    for i in range(n):
+        x, y = centers[i]
+        radii[i] = min(x, y, 1 - x, 1 - y)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.linalg.norm(centers[i] - centers[j])
+            if radii[i] + radii[j] > dist:
+                scale = dist / (radii[i] + radii[j])
+                radii[i] *= scale
+                radii[j] *= scale
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)
+```
+</CODE>

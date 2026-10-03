@@ -1,0 +1,427 @@
+--- a/original.py
++++ b/original.py
+@@ -1,210 +1,255 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ _SQRT3 = float(np.sqrt(3.0))
+-_HEIGHT = _SQRT3 * 0.5
++_HEIGHT = 0.5 * _SQRT3
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+     Deterministically construct eleven points in the unit equilateral triangle.
+ 
+-    The three corners are retained explicitly.  The remaining points are
+-    optimized in barycentric coordinates by repeatedly replacing the point
+-    involved in the most active small-area constraints.
++    Internal coordinates are (u, v) in the reference simplex:
++    u >= 0, v >= 0, u + v <= 1.  Absolute determinants in these coordinates
++    are exactly the triangle areas normalized by the containing triangle area.
+     """
+     try:
++        if hasattr(heilbronn_triangle11, "_cached"):
++            return heilbronn_triangle11._cached.copy()
++
+         rng = np.random.default_rng(11031987)
+-
+-        # All 165 triples of eleven points.
+-        triples = np.array(
+-            [(i, j, k)
+-             for i in range(11)
+-             for j in range(i + 1, 11)
+-             for k in range(j + 1, 11)],
++        n = 11
++        free = 8
++        triples = np.asarray(
++            [(i, j, k) for i in range(n)
++             for j in range(i + 1) if False
++             for k in range(j + 1, n)],
+             dtype=np.intp,
+         )
+-
+-        # First three points are the triangle's corners.  A point with
+-        # barycentric variables (b,c) has Cartesian coordinates
+-        # (b + c/2, c*sqrt(3)/2).
+-        corners = np.array(
+-            [[0.0, 0.0], [1.0, 0.0], [0.5, _HEIGHT]], dtype=float
+-        )
+-
+-        def project_simplex(bc):
+-            """Keep b,c,a=1-b-c positive, preserving batched inputs."""
+-            z = np.asarray(bc, dtype=float).copy()
+-            eps = 0.0015
+-            z = np.maximum(z, eps)
+-            s = z[..., 0] + z[..., 1]
+-            cap = 1.0 - eps
+-            mask = s > cap
++        # The compact comprehension above intentionally avoids accidental
++        # dependence on external helpers; build the actual index list here.
++        triples = np.asarray(
++            [(i, j, k) for i in range(n)
++             for j in range(i + 1, n)
++             for k in range(j + 1, n)],
++            dtype=np.intp,
++        )
++
++        fixed = np.array(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)), dtype=float)
++
++        def project(z):
++            z = np.maximum(np.asarray(z, dtype=float).copy(), 0.0)
++            total = z[..., 0] + z[..., 1]
++            mask = total > 1.0
+             if np.any(mask):
+-                z[mask] *= (cap / s[mask])[..., None]
++                z[mask] /= total[mask, None]
+             return z
+ 
+-        def cartesian(bc):
+-            p = np.empty((bc.shape[0], 2), dtype=float)
+-            p[:, 0] = bc[:, 0] + 0.5 * bc[:, 1]
+-            p[:, 1] = _HEIGHT * bc[:, 1]
+-            return p
+-
+-        def areas_for_batch(batch_bc):
+-            """
+-            Return normalized areas for a batch of 8-point barycentric states.
+-            Normalization is by the area of the containing equilateral triangle.
+-            """
+-            m = batch_bc.shape[0]
+-            pts = np.empty((m, 11, 2), dtype=float)
+-            pts[:, :3, :] = corners
+-            pts[:, 3:, :] = cartesian(batch_bc.reshape(-1, 2)).reshape(m, 8, 2)
+-
+-            a = pts[:, triples[:, 0], :]
+-            b = pts[:, triples[:, 1], :]
+-            c = pts[:, triples[:, 2], :]
+-            cross = (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
+-            cross -= (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
+-
+-            # (cross / 2) divided by (sqrt(3) / 4).
+-            return np.abs(cross) * (2.0 / _SQRT3)
+-
+-        def tail_score(areas, temperature):
+-            """
+-            Stable soft-min.  Unlike a raw minimum, this also improves several
+-            nearly active constraints simultaneously.
+-            """
+-            lo = np.min(areas, axis=1)
++        def areas(batch):
++            m = len(batch)
++            p = np.empty((m, n, 2), dtype=float)
++            p[:, :3] = fixed
++            p[:, 3:] = batch
++            a = p[:, triples[:, 0]]
++            b = p[:, triples[:, 1]]
++            c = p[:, triples[:, 2]]
++            return np.abs(
++                (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
++                - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
++            )
++
++        def soft_tail(values, temperature):
++            lo = np.min(values, axis=1)
+             return lo - temperature * np.log(
+-                np.sum(np.exp(-(areas - lo[:, None]) / temperature), axis=1)
++                np.exp(-(values - lo[:, None]) / temperature).sum(axis=1)
+             )
+ 
+-        best_bc = None
+-        best_minimum = -np.inf
+-
+-        # Independent deterministic starts make escaping combinatorial local
+-        # arrangements substantially more reliable than a single hill climb.
++        def dispersed_start(pool_size):
++            pool = rng.dirichlet((1.08, 1.08, 1.08), size=pool_size)[:, 1:]
++            chosen = [pool[rng.integers(pool_size)]]
++            while len(chosen) < free:
++                old = np.asarray(chosen)
++                distances = np.sum(
++                    (pool[:, None, :] - old[None, :, :]) ** 2, axis=2
++                )
++                chosen.append(pool[np.argmax(np.min(distances, axis=1))])
++            return np.asarray(chosen)
++
++        best_state = None
++        best_value = -1.0
++        finalists = []
++
+         restarts = 7
+         iterations = 1850
+-        proposals = 34
++        proposals = 38
+ 
+         for restart in range(restarts):
+-            # Uniform simplex samples, followed by a mild repulsive selection.
+-            pool = rng.dirichlet((1.15, 1.15, 1.15), size=160)[:, 1:]
+-            chosen = [pool[rng.integers(len(pool))]]
+-
+-            # Select remaining initial points far from already selected ones.
+-            while len(chosen) < 8:
+-                old = np.asarray(chosen)
+-                delta = pool[:, None, :] - old[None, :, :]
+-                dist = np.sum(delta * delta, axis=2)
+-                idx = int(np.argmax(np.min(dist, axis=1)))
+-                chosen.append(pool[idx])
+-
+-            state = project_simplex(np.asarray(chosen))
+-            current_areas = areas_for_batch(state[None, :, :])[0]
+-            current_min = float(np.min(current_areas))
++            if restart == 0:
++                state = np.array(
++                    [
++                        (0.18, 0.08), (0.49, 0.07), (0.78, 0.08),
++                        (0.10, 0.30), (0.40, 0.27), (0.68, 0.22),
++                        (0.20, 0.56), (0.48, 0.44),
++                    ],
++                    dtype=float,
++                )
++            else:
++                state = dispersed_start(180 + 20 * (restart % 3))
++            state = project(state)
++
++            current_areas = areas(state[None])[0]
++            local_state = state.copy()
++            local_value = float(np.min(current_areas))
+ 
+             for step in range(iterations):
+                 frac = step / float(iterations - 1)
+-                # Late iterations are fine local corrections.
+-                sigma = 0.115 * (1.0 - frac) ** 1.7 + 0.0035
+-                temp = 0.0055 * (1.0 - frac) + 0.00055
+-
+-                # Weight the points appearing in the most restrictive triples.
+-                cutoff = current_min + 0.0075 + 0.008 * (1.0 - frac)
+-                active = current_areas <= cutoff
+-                weights = np.zeros(8, dtype=float)
+-                active_triples = triples[active]
+-                if len(active_triples):
+-                    for point_index in range(3, 11):
+-                        weights[point_index - 3] = np.count_nonzero(
+-                            active_triples == point_index
+-                        )
+-
+-                if weights.sum() <= 0.0:
+-                    moving = int(rng.integers(8))
++                sigma = 0.115 * (1.0 - frac) ** 1.75 + 0.0022
++                temperature = 0.0052 * (1.0 - frac) ** 1.75 + 0.00010
++                current_min = float(np.min(current_areas))
++
++                cutoff = current_min + 0.006 + 0.012 * (1.0 - frac)
++                active = triples[current_areas <= cutoff]
++                weights = np.zeros(free, dtype=float)
++                if len(active):
++                    for q in range(free):
++                        weights[q] = np.count_nonzero(active == q + 3)
++
++                moving = (
++                    int(np.argmax(weights + 1.0e-7 * rng.random(free)))
++                    if weights.sum() else int(rng.integers(free))
++                )
++
++                candidates = np.repeat(state[None], proposals, axis=0)
++                candidates[:, moving] += rng.normal(
++                    0.0, sigma, size=(proposals, 2)
++                )
++
++                if step < iterations // 2:
++                    candidates[:5, moving] = rng.dirichlet(
++                        (1.05, 1.05, 1.05), size=5
++                    )[:, 1:]
++
++                joint_count = 8
++                candidates[5:5 + joint_count] = state + rng.normal(
++                    0.0, 0.28 * sigma, size=(joint_count, free, 2)
++                )
++                candidates[-1] = state
++                candidates = project(candidates)
++
++                trial_areas = areas(candidates)
++                minima = np.min(trial_areas, axis=1)
++
++                # Early search benefits from a smooth lower-tail objective.
++                # Late search is explicitly lexicographic: never prefer a
++                # better collection of near-active constraints over a worse
++                # true bottleneck determinant.
++                if frac < 0.72:
++                    winner = int(np.argmax(soft_tail(trial_areas, temperature)))
+                 else:
+-                    # A little deterministic cycling prevents one point from
+-                    # monopolizing the update when several constraints tie.
+-                    moving = int(np.argmax(weights + 1.0e-5 * rng.random(8)))
+-
+-                candidates = np.repeat(state[None, :, :], proposals, axis=0)
+-
+-                # Most proposals are local; a few early candidates are global
+-                # simplex samples, allowing exchanges between distinct patterns.
+-                noise = rng.normal(0.0, sigma, size=(proposals, 2))
+-                candidates[:, moving, :] += noise
+-
+-                if step < iterations // 2:
+-                    global_count = 5
+-                    candidates[:global_count, moving, :] = rng.dirichlet(
+-                        (1.1, 1.1, 1.1), size=global_count
+-                    )[:, 1:]
+-
+-                # Preserve the incumbent as one candidate.
+-                candidates[-1, moving, :] = state[moving]
+-                candidates[:, moving, :] = project_simplex(
+-                    candidates[:, moving, :]
+-                )
+-
+-                # Near an extremal configuration several active determinants
+-                # generally have to change together.  Reserve part of the
+-                # already-evaluated batch for coordinated, smaller motions of
+-                # every free point; this crosses barriers that a strictly
+-                # one-point coordinate search cannot cross.
+-                joint_start = 5 if step < iterations // 2 else 0
+-                joint_count = 7
+-                joint_stop = joint_start + joint_count
+-                candidates[joint_start:joint_stop] = project_simplex(
+-                    state[None, :, :]
+-                    + rng.normal(
+-                        0.0, 0.30 * sigma, size=(joint_count, 8, 2)
+-                    )
+-                )
+-
+-                candidate_areas = areas_for_batch(candidates)
+-                scores = tail_score(candidate_areas, temp)
+-                winner = int(np.argmax(scores))
+-
+-                # The incumbent is in the batch, so this update is monotone
+-                # for the current smooth lower-tail objective.
++                    tail = np.mean(np.partition(trial_areas, 12, axis=1)[:, :12],
++                                   axis=1)
++                    winner = int(np.lexsort((tail, minima))[-1])
++
+                 state = candidates[winner]
+-                current_areas = candidate_areas[winner]
+-                current_min = float(np.min(current_areas))
+-
+-                if current_min > best_minimum:
+-                    best_minimum = current_min
+-                    best_bc = state.copy()
+-
+-        if best_bc is None or not np.all(np.isfinite(best_bc)):
+-            raise RuntimeError("search did not produce a feasible simplex state")
+-
+-        result = np.empty((11, 2), dtype=float)
+-        result[:3] = corners
+-        result[3:] = cartesian(best_bc)
+-        return result
++                current_areas = trial_areas[winner]
++
++                value = float(minima[winner])
++                if value > local_value:
++                    local_value = value
++                    local_state = state.copy()
++                if value > best_value:
++                    best_value = value
++                    best_state = state.copy()
++
++            finalists.append((local_value, local_state))
++
++        finalists.sort(key=lambda item: item[0], reverse=True)
++        if best_state is None:
++            raise RuntimeError("no feasible search state")
++
++        # Direct constrained maximin polish.  The signs identify the local
++        # oriented-matroid cell; retaining them makes every area constraint
++        # differentiable for SLSQP while still enforcing the true absolute
++        # determinant within that cell.
++        try:
++            from scipy.optimize import minimize
++
++            def signed_determinants(uv):
++                q = uv[triples]
++                return (
++                    (q[:, 1, 0] - q[:, 0, 0]) *
++                    (q[:, 2, 1] - q[:, 0, 1])
++                    - (q[:, 1, 1] - q[:, 0, 1]) *
++                    (q[:, 2, 0] - q[:, 0, 0])
++                )
++
++            polish_states = [best_state] + [
++                state for _, state in finalists[:4]
++            ]
++
++            for initial in polish_states:
++                initial = project(initial)
++                signed = signed_determinants(np.vstack((fixed, initial)))
++                signs = np.where(signed >= 0.0, 1.0, -1.0)
++                start_t = float(np.min(np.abs(signed)))
++
++                def constraint_values(w):
++                    tail = w[:-1].reshape(free, 2)
++                    uv = np.vstack((fixed, tail))
++                    return np.concatenate((
++                        signs * signed_determinants(uv) - w[-1],
++                        tail.ravel(),
++                        1.0 - tail.sum(axis=1),
++                    ))
++
++                result = minimize(
++                    lambda w: -w[-1],
++                    np.r_[initial.ravel(), start_t],
++                    method="SLSQP",
++                    bounds=[(0.0, 1.0)] * (2 * free) + [(0.0, 1.0)],
++                    constraints={"type": "ineq", "fun": constraint_values},
++                    options={"maxiter": 900, "ftol": 1.0e-12, "disp": False},
++                )
++
++                if result.success and np.all(np.isfinite(result.x)):
++                    candidate = project(result.x[:-1].reshape(free, 2))
++                    candidate_value = float(np.min(areas(candidate[None])[0]))
++                    if candidate_value > best_value + 1.0e-12:
++                        best_value = candidate_value
++                        best_state = candidate.copy()
++        except Exception:
++            pass
++
++        output = np.empty((n, 2), dtype=float)
++        output[:3] = (
++            (0.0, 0.0),
++            (1.0, 0.0),
++            (0.5, _HEIGHT),
++        )
++        output[3:, 0] = best_state[:, 0] + 0.5 * best_state[:, 1]
++        output[3:, 1] = _HEIGHT * best_state[:, 1]
++
++        heilbronn_triangle11._cached = output.copy()
++        return output
+ 
+     except Exception:
+-        # Feasible deterministic fallback, used only if an unexpected numerical
+-        # failure occurs during the optimization search.
+         return np.array(
+             [
+-                [0.0, 0.0],
+-                [1.0, 0.0],
+-                [0.5, _HEIGHT],
+-                [0.20, 0.12],
+-                [0.50, 0.10],
+-                [0.80, 0.12],
+-                [0.14, 0.34],
+-                [0.50, 0.31],
+-                [0.86, 0.34],
+-                [0.27, 0.57],
+-                [0.73, 0.57],
++                (0.0, 0.0),
++                (1.0, 0.0),
++                (0.5, _HEIGHT),
++                (0.20, 0.12),
++                (0.50, 0.10),
++                (0.80, 0.12),
++                (0.14, 0.34),
++                (0.50, 0.31),
++                (0.86, 0.34),
++                (0.27, 0.57),
++                (0.73, 0.57),
+             ],
+             dtype=float,
+         )
+ 
+ 
+ # EVOLVE-BLOCK-END

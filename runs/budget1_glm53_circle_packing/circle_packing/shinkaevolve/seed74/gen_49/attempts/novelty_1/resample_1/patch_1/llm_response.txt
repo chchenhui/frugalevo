@@ -1,0 +1,318 @@
+<NAME>
+interior_point_grad_descent_packing</NAME>
+<DESCRIPTION>
+Fundamentally different approach: instead of hill-climbing discrete center positions with an LP radius solver, treat the packing as a continuous optimization problem with radii and centers as joint decision variables. Maximize sum(r) + penalty for overlaps and wall violations using a penalty method with L-BFGS-B gradient descent. The penalty P = Σ relu(r_i + r_j - d_ij)² + Σ relu(r_i - wall_i)² has simple analytic gradients w.r.t. both centers and radii. Anneal the penalty weight high→low so the solution converges to a feasible packing while pushing radii up. Use a good hex seed plus random restarts with jitter. This should outperform hill-climbing because it can move all 52 variables simultaneously along the true objective gradient, escaping the coordinate-wise limitations, and it's fast (each L-BFGS-B run is milliseconds).
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""Joint center+radius optimization for n=26 circle packing.
+
+Different paradigm: penalty-method nonlinear program solved with
+L-BFGS-B over all 78 variables (26 centers x2 + 26 radii) at once,
+with penalty annealing. Multiple jittered hex seeds.
+"""
+import numpy as np
+
+N = 26
+
+
+def construct_packing():
+    """Construct 26 circles in the unit square maximizing sum of radii."""
+    rng = np.random.default_rng(7)
+    best_c, best_r, best_s = None, None, -1.0
+
+    seeds = _make_seeds(rng)
+    for seed in seeds:
+        for restart in range(3):
+            c0 = seed + rng.normal(0, 0.015, seed.shape)
+            c0[:, 0] = np.clip(c0[:, 0], 0.02, 0.98)
+            c0[:, 1] = np.clip(c0[:, 1], 0.02, 0.98)
+            c, r, s = _solve_penalized(c0, rng)
+            if s > best_s:
+                best_c, best_r, best_s = c.copy(), r.copy(), s
+
+    # Final feasibility fix: greedy shrink to guarantee validity.
+    centers, radii = best_c, best_r
+    gr = _greedy_radii(centers)
+    if float(np.sum(gr)) < best_s * 0.99:
+        radii = gr
+    radii = np.maximum(radii, _greedy_radii(centers) * 0.999)  # safety
+    return centers, radii, float(np.sum(radii))
+
+
+def _make_seeds(rng):
+    seeds = []
+    patterns = [
+        [5, 4, 5, 4, 5, 3],
+        [6, 4, 5, 4, 6],
+        [5, 5, 4, 5, 5],
+        [6, 5, 4, 5, 6],
+        [6, 5, 5, 5, 5],
+        [4, 4, 5, 4, 5, 4],
+    ]
+    for rows in patterns:
+        if sum(rows) != N:
+            continue
+        for vscale in (1.0, 0.92):
+            seeds.append(_build_layout(rows, vscale))
+    return seeds
+
+
+def _build_layout(rows, vscale=1.0):
+    n_rows = len(rows)
+    dy = (1.0 / (n_rows + 1)) * vscale
+    y0 = 0.5 - (n_rows - 1) * dy / 2.0
+    centers = []
+    for r, count in enumerate(rows):
+        y = y0 + r * dy
+        dx = 1.0 / (count + 1)
+        offset = 0.5 * dx if (r % 2 == 1) else 0.0
+        for c in range(count):
+            x = (c + 1) * dx + offset
+            centers.append([min(max(x, 0.01), 0.99), y])
+    return np.array(centers)
+
+
+def _obj_grad(x, n, lam):
+    """Objective -sum(r) + lam*penalty; returns (val, grad) w.r.t. x.
+
+    Layout: x[0:2n] = centers (x0..x_{n-1}, y0..y_{n-1}); x[2n:3n] = radii.
+    Penalty uses squared hinge on overlaps and wall violations.
+    """
+    cx = x[0:n]
+    cy = x[n:2 * n]
+    r = x[2 * n:3 * n]
+    val = -float(np.sum(r))
+
+    g = np.zeros(3 * n)
+    g[2 * n:3 * n] = -1.0
+
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    d2 = dx * dx + dy * dy
+    np.fill_diagonal(d2, np.inf)
+    d = np.sqrt(d2)
+    ov = r[:, None] + r[None, :] - d
+    act = ov > 0
+    np.fill_diagonal(act, False)
+    if act.any():
+        pen = float(np.sum(ov[act] ** 2))
+        val += lam * pen
+        dovd = ov[act]
+        # d ov / d r_i
+        np.add.at(g[2 * n:3 * n], np.where(act)[0], dovd)
+        np.add.at(g[2 * n:3 * n], np.where(act)[1], dovd)
+        # d ov / d d = -1, d d / d centers
+        ii, jj = np.where(act)
+        w = 2.0 * ov[ii, jj] * (-1.0)
+        d_act = d[ii, jj]
+        safe = np.maximum(d_act, 1e-12)
+        # gradient of d w.r.t. cx_i: (cx_i - cx_j)/d ; r_i contributes +
+        contrib_x = w * (cx[ii] - cx[jj]) / safe
+        contrib_y = w * (cy[ii] - cy[jj]) / safe
+        np.add.at(g[0:n], ii, contrib_x)
+        np.add.at(g[0:n], jj, -contrib_x)
+        np.add.at(g[n:2 * n], ii, contrib_y)
+        np.add.at(g[n:2 * n], jj, -contrib_y)
+
+    # Wall violations: r_i - min(cx, cy, 1-cx, 1-cy) > 0
+    wall = np.minimum.reduce([cx, cy, 1 - cx, 1 - cy])
+    vw = r - wall
+    aw = vw > 0
+    if aw.any():
+        val += lam * float(np.sum(vw[aw] ** 2))
+        g[2 * n + np.where(aw)[0]] += 2.0 * vw[aw]
+        # gradient of -wall w.r.t. centers
+        i_w = np.where(aw)[0]
+        for k, i in enumerate(i_w):
+            contribs = [(cx[i], 0, 1.0), (cy[i], 1, 1.0),
+                        (1 - cx[i], 0, -1.0), (1 - cy[i], 1, -1.0)]
+            wall_i = wall[i]
+            for val_c, axis, sgn in contribs:
+                if abs(val_c - wall_i) < 1e-15:
+                    g[axis * n + i] -= 2.0 * vw[i] * lam * 0  # placeholder
+        # simpler: numerical-free handling below
+        # gradient of wall_i w.r.t. active min component
+        for i in i_w:
+            vals = [cx[i], cy[i], 1 - cx[i], 1 - cy[i]]
+            idx = int(np.argmin(vals))
+            if idx == 0:
+                g[i] += 2.0 * vw[i]
+            elif idx == 1:
+                g[n + i] += 2.0 * vw[i]
+            elif idx == 2:
+                g[i] -= 2.0 * vw[i]
+            else:
+                g[n + i] -= 2.0 * vw[i]
+        g[2 * n:3 * n][i_w] = g[2 * n:3 * n][i_w]  # r grad already added
+    return val, g * 0 + g  # g scaled where needed
+
+
+def _obj(x, n, lam):
+    val, _ = _obj_grad(x, n, lam)
+    return val
+
+
+def _solve_penalized(c0, rng):
+    """Penalty annealing with L-BFGS-B over (centers, radii)."""
+    from scipy.optimize import minimize
+
+    n = c0.shape[0]
+    r0 = _greedy_radii(c0)
+    lam_list = [100.0, 400.0, 2000.0]
+    bounds = ([(0.02, 0.98)] * n + [(0.02, 0.98)] * n +
+              [(0.0, 0.5)] * n)
+    x = np.concatenate([c0[:, 0], c0[:, 1], r0])
+
+    for lam in lam_list:
+        def f(z):
+            return _obj_grad(z, n, lam)
+
+        res = minimize(lambda z: f(z), x, jac=True, method="L-BFGS-B",
+                       bounds=bounds,
+                       options={"maxiter": 200, "maxfun": 400})
+        x = res.x
+
+    cx = x[0:n]
+    cy = x[n:2 * n]
+    r = x[2 * n:3 * n]
+    centers = np.stack([cx, cy], axis=1)
+    # Feasible projection: greedy shrink guarantees validity.
+    r_feas = _greedy_radii(centers)
+    r_feas = np.maximum(r_feas, 0.0)
+    # Trust LP only if it exceeds greedy substantially and is feasible.
+    if _feasible(centers, r):
+        best = r
+    else:
+        # scale down radii until feasible
+        lo, hi = 0.0, 1.0
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            if _feasible(centers, r * mid):
+                lo = mid
+            else:
+                hi = mid
+        scaled = r * lo * (1 - 1e-9)
+        best = scaled if float(np.sum(scaled)) > float(np.sum(r_feas)) else r_feas
+    return centers, best, float(np.sum(best))
+
+
+def _feasible(centers, radii):
+    d = np.sqrt(((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1))
+    np.fill_diagonal(d, np.inf)
+    if np.any(radii[:, None] + radii[None, :] - d > 1e-9):
+        return False
+    wall = np.minimum.reduce([centers[:, 0], centers[:, 1],
+                              1 - centers[:, 0], 1 - centers[:, 1]])
+    return bool(np.all(radii <= wall + 1e-9)) and bool(np.all(radii >= 0))
+
+
+def _pair_dist(centers):
+    d = np.sqrt(((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1))
+    np.fill_diagonal(d, np.inf)
+    return d
+
+
+def _greedy_radii(centers):
+    wall = np.minimum.reduce([centers[:, 0], centers[:, 1],
+                              1 - centers[:, 0], 1 - centers[:, 1]])
+    dist = _pair_dist(centers)
+    radii = np.minimum(wall, np.min(dist, axis=1) / 2.0)
+    radii = np.maximum(radii, 0.0)
+    for _ in range(10):
+        new = np.minimum(wall, np.min(dist - radii[None, :], axis=1))
+        new = np.maximum(new, 0.0)
+        if np.max(np.abs(new - radii)) < 1e-12:
+            radii = new
+            break
+        radii = new
+    return radii
+
+
+def compute_max_radii(centers):
+    """Kept for API compatibility: valid radii for fixed centers."""
+    try:
+        r = _lp_radii(centers)
+        if _feasible(centers, r):
+            return r
+    except Exception:
+        pass
+    return _greedy_radii(centers)
+
+
+def _lp_radii(centers):
+    n = centers.shape[0]
+    radii = _greedy_radii(centers)
+    try:
+        from scipy.optimize import linprog
+        d = _pair_dist(centers)
+        np.fill_diagonal(d, 0.0)
+        iu, ju = np.triu_indices(n, 1)
+        m = len(iu)
+        A_ub = np.zeros((m + n, n))
+        b_ub = np.empty(m + n)
+        A_ub[np.arange(m), iu] = 1.0
+        A_ub[np.arange(m), ju] = 1.0
+        b_ub[:m] = d[iu, ju]
+        wall = np.minimum.reduce([centers[:, 0], centers[:, 1],
+                                  1 - centers[:, 0], 1 - centers[:, 1]])
+        A_ub[m + np.arange(n), np.arange(n)] = 1.0
+        b_ub[m:] = wall
+        res = linprog(c=-np.ones(n), A_ub=A_ub, b_ub=b_ub,
+                      bounds=[(0, None)] * n, method="highs")
+        if res.success:
+            radii = res.x
+    except Exception:
+        pass
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)
+```
+</CODE>

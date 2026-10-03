@@ -1,0 +1,64 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _min_triangle_area_on_circle(angles: np.ndarray) -> float:
+    """Min area among all C(n,3) triangles of points on a unit circle.
+
+    For points on a unit circle, the triangle area with angles a<b<c is
+    0.5 * |sin(b-a) + sin(c-b) + sin(a-c)| (signed), which is exact.
+    """
+    a = np.sort(angles)
+    n = len(a)
+    i, j, k = np.triu_indices(n, k=1)
+    # pairs (i<j<k): build from combinations
+    area = 0.5 * np.abs(
+        np.sin(a[j] - a[i]) + np.sin(a[k] - a[j]) + np.sin(a[i] - a[k])
+    )
+    return float(np.min(area))
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct an arrangement of n points on or inside a convex region in order
+    to maximize the area of the smallest triangle formed by these points.
+
+    Strategy: place all 13 points on the boundary of a convex polygon (circle),
+    then deterministically optimize the angular positions with a seeded
+    stochastic local search maximizing the minimum triangle area. The result
+    is normalized to a unit-area circle for reproducibility (the metric is
+    scale-invariant via normalization by hull area).
+
+    Returns:
+        points: np.ndarray of shape (13,2) with the x,y coordinates.
+    """
+    n = 13
+    rng = np.random.default_rng(seed=42)
+
+    # Start from a regular 13-gon (good symmetric baseline)
+    best = 2.0 * np.pi * np.arange(n) / n
+    best_val = _min_triangle_area_on_circle(best)
+
+    # Deterministic stochastic local search over angular positions
+    step = 0.15
+    cur, cur_val = best.copy(), best_val
+    for it in range(4000):
+        if it > 0 and it % 500 == 0:
+            step *= 0.6  # anneal the perturbation scale
+        cand = cur + rng.normal(0.0, step, size=n)
+        cand_val = _min_triangle_area_on_circle(cand)
+        if cand_val >= cur_val:
+            cur, cur_val = cand, cand_val
+            if cand_val > best_val:
+                best, best_val = cand.copy(), cand_val
+
+    angles = np.sort(best)
+    pts = np.column_stack((np.cos(angles), np.sin(angles)))
+
+    # Normalize so the convex hull (here the circle) has unit area:
+    # circle radius 1 has area pi -> scale by 1/sqrt(pi)
+    pts = pts / np.sqrt(np.pi)
+    return pts
+
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,329 @@
+<NAME>
+island_maximin11
+</NAME>
+
+<DESCRIPTION>
+This redesign replaces the single-path evolutionary loop with a deterministic island-style maximin optimizer. It uses a population pipeline with diversified simplex sampling, vectorized differential mutations, survivor selection based on the true minimum triangle area, periodic elite migration, and a final local polishing phase. The arrangement is built once, validated, cached, and returned defensively, while retaining a deterministic fallback layout if optimization fails.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+# Points are optimized in affine coordinates (u, v):
+# Cartesian(u, v) = (u + v / 2, sqrt(3) * v / 2),
+# where u >= 0, v >= 0, and u + v <= 1.
+_N_POINTS = 11
+_N_FREE = 8
+_SQRT3_OVER_2 = np.sqrt(3.0) * 0.5
+
+_CORNERS = np.array(
+    [
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+
+_TRIPLES = np.array(
+    [
+        (i, j, k)
+        for i in range(_N_POINTS - 2)
+        for j in range(i + 1, _N_POINTS - 1)
+        for k in range(j + 1, _N_POINTS)
+    ],
+    dtype=np.intp,
+)
+
+
+def _simplex_project(points: np.ndarray) -> np.ndarray:
+    """Project arbitrary affine-coordinate points into the closed unit simplex."""
+    result = np.asarray(points, dtype=np.float64).copy()
+
+    # Reflection is less boundary-biased than absolute-value clamping.
+    result = np.abs(result)
+    total = result[..., 0] + result[..., 1]
+    outside = total > 1.0
+
+    if np.any(outside):
+        result[outside] /= total[outside, None]
+
+    return result
+
+
+def _triangle_areas(population: np.ndarray) -> np.ndarray:
+    """
+    Calculate all normalized triangle areas.
+
+    The determinant in affine coordinates is exactly the triangle area
+    normalized by the area of the enclosing equilateral triangle.
+    """
+    count = population.shape[0]
+    corners = np.broadcast_to(_CORNERS, (count, 3, 2))
+    points = np.concatenate((corners, population), axis=1)
+
+    a = points[:, _TRIPLES[:, 0]]
+    b = points[:, _TRIPLES[:, 1]]
+    c = points[:, _TRIPLES[:, 2]]
+
+    return np.abs(
+        (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
+        - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
+    )
+
+
+def _scores(population: np.ndarray) -> np.ndarray:
+    """
+    Produce a maximin score with a very small lower-tail tie breaker.
+
+    The minimum area remains overwhelmingly dominant.  The mean of the
+    subsequent small areas makes evolutionary selection more stable when
+    many candidates share nearly identical active constraints.
+    """
+    areas = _triangle_areas(population)
+    lower_tail = np.partition(areas, 11, axis=1)[:, :12]
+
+    minimum = lower_tail[:, 0]
+    support = np.mean(lower_tail[:, 1:], axis=1)
+
+    return minimum + 0.004 * support
+
+
+def _minimum_area(population: np.ndarray) -> np.ndarray:
+    """Return the strict primary objective without any tie-breaking term."""
+    return np.min(_triangle_areas(population), axis=1)
+
+
+def _sample_simplex(rng: np.random.Generator, count: int) -> np.ndarray:
+    """Sample points uniformly in the affine unit simplex."""
+    values = rng.random((count, _N_FREE, 2))
+    over = values.sum(axis=2) > 1.0
+    values[over] = 1.0 - values[over]
+    return values
+
+
+def _structured_seed(rng: np.random.Generator, count: int) -> np.ndarray:
+    """
+    Create a mixed initial population.
+
+    Half of the population is based on separated triangular patterns and
+    half is uniformly sampled.  This avoids relying on one fragile initial
+    geometry while giving the maximin search useful layouts immediately.
+    """
+    population = _sample_simplex(rng, count)
+
+    template = np.array(
+        [
+            [0.12, 0.10],
+            [0.39, 0.07],
+            [0.71, 0.10],
+            [0.08, 0.36],
+            [0.34, 0.28],
+            [0.62, 0.25],
+            [0.16, 0.63],
+            [0.42, 0.47],
+        ],
+        dtype=np.float64,
+    )
+
+    structured_count = count // 2
+    noise = rng.normal(0.0, 0.115, size=(structured_count, _N_FREE, 2))
+    population[:structured_count] = _simplex_project(template + noise)
+
+    # Permuting free point order preserves geometry but diversifies genome
+    # crossover positions in the subsequent differential evolution stage.
+    for index in range(structured_count):
+        population[index] = population[index, rng.permutation(_N_FREE)]
+
+    return population
+
+
+def _island_step(
+    rng: np.random.Generator,
+    population: np.ndarray,
+    score: np.ndarray,
+    progress: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Perform one vectorized differential-evolution survivor generation."""
+    size = population.shape[0]
+    ranking = np.argsort(score)[::-1]
+    elite_pool = population[ranking[: max(12, size // 7)]]
+
+    ia = rng.integers(0, size, size=size)
+    ib = rng.integers(0, size, size=size)
+    ic = rng.integers(0, size, size=size)
+
+    base = population[ia]
+    difference = population[ib] - population[ic]
+
+    scale = 0.62 - 0.28 * progress
+    mutant = base + scale * difference
+
+    # Current-to-elite motion improves convergence without losing the
+    # exploratory differential component.
+    elite_targets = elite_pool[rng.integers(0, elite_pool.shape[0], size=size)]
+    attraction = 0.18 * (1.0 - progress)
+    mutant += attraction * (elite_targets - population)
+
+    mutant = _simplex_project(mutant)
+
+    crossover_rate = 0.78 - 0.28 * progress
+    use_mutant = rng.random((size, _N_FREE, 1)) < crossover_rate
+
+    forced_point = rng.integers(0, _N_FREE, size=size)
+    use_mutant[np.arange(size), forced_point, 0] = True
+    use_mutant[np.arange(size), forced_point, 1] = True
+
+    trial = np.where(use_mutant, mutant, population)
+    trial = _simplex_project(trial)
+
+    trial_score = _scores(trial)
+    accepted = trial_score >= score
+
+    next_population = population.copy()
+    next_population[accepted] = trial[accepted]
+
+    next_score = score.copy()
+    next_score[accepted] = trial_score[accepted]
+
+    return next_population, next_score
+
+
+def _polish(
+    rng: np.random.Generator,
+    seed: np.ndarray,
+    rounds: int = 360,
+    batch_size: int = 224,
+) -> np.ndarray:
+    """
+    Apply deterministic local maximin polishing to the best island survivor.
+
+    Batch proposals permit several coordinate scales to compete cheaply,
+    which is more reliable for the non-smooth minimum-area objective than a
+    single-coordinate hill climb.
+    """
+    best = seed.copy()
+    best_score = float(_scores(best[None, ...])[0])
+
+    for iteration in range(rounds):
+        fraction = iteration / max(rounds - 1, 1)
+        sigma = 0.035 * (1.0 - fraction) ** 1.7 + 0.0012
+
+        candidates = np.broadcast_to(best, (batch_size, _N_FREE, 2)).copy()
+        changes = rng.random((batch_size, _N_FREE)) < 0.38
+        changes[:, rng.integers(0, _N_FREE, batch_size)] = True
+
+        perturbation = rng.normal(0.0, sigma, size=(batch_size, _N_FREE, 2))
+        candidates += perturbation * changes[..., None]
+        candidates = _simplex_project(candidates)
+
+        candidate_scores = _scores(candidates)
+        winner = int(np.argmax(candidate_scores))
+
+        if candidate_scores[winner] > best_score:
+            best = candidates[winner]
+            best_score = float(candidate_scores[winner])
+
+    return best
+
+
+def _affine_to_cartesian(points: np.ndarray) -> np.ndarray:
+    """Convert affine simplex coordinates to Cartesian coordinates."""
+    result = np.empty_like(points)
+    result[:, 0] = points[:, 0] + 0.5 * points[:, 1]
+    result[:, 1] = _SQRT3_OVER_2 * points[:, 1]
+    return result
+
+
+def _fallback() -> np.ndarray:
+    """Return a deterministic valid configuration if optimization fails."""
+    affine = np.array(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.12, 0.10],
+            [0.39, 0.07],
+            [0.71, 0.10],
+            [0.08, 0.36],
+            [0.34, 0.28],
+            [0.62, 0.25],
+            [0.16, 0.63],
+            [0.42, 0.47],
+        ],
+        dtype=np.float64,
+    )
+    return _affine_to_cartesian(affine)
+
+
+def _construct_layout() -> np.ndarray:
+    """
+    Run independent deterministic evolutionary islands, migrate their best
+    layouts into a final population, then polish the strongest survivor.
+    """
+    rng = np.random.default_rng(11031987)
+
+    island_count = 3
+    island_size = 176
+    generations = 720
+
+    island_best = []
+
+    for _ in range(island_count):
+        population = _structured_seed(rng, island_size)
+        score = _scores(population)
+
+        for generation in range(generations):
+            progress = generation / max(generations - 1, 1)
+            population, score = _island_step(rng, population, score, progress)
+
+            # Light deterministic restart injection prevents a whole island
+            # from remaining trapped after its diversity collapses.
+            if generation in (260, 470):
+                weakest = np.argsort(score)[: island_size // 8]
+                population[weakest] = _sample_simplex(rng, weakest.size)
+                score[weakest] = _scores(population[weakest])
+
+        island_best.append(population[int(np.argmax(score))].copy())
+
+    finalists = np.stack(island_best, axis=0)
+    finalist_scores = _minimum_area(finalists)
+    initial = finalists[int(np.argmax(finalist_scores))]
+
+    polished = _polish(rng, initial)
+
+    affine = np.vstack((_CORNERS, polished))
+    cartesian = _affine_to_cartesian(affine)
+
+    if (
+        cartesian.shape != (_N_POINTS, 2)
+        or not np.all(np.isfinite(cartesian))
+        or np.any(cartesian[:, 1] < -1e-12)
+    ):
+        return _fallback()
+
+    return cartesian
+
+
+try:
+    _CACHED_LAYOUT = _construct_layout()
+except Exception:
+    _CACHED_LAYOUT = _fallback()
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Return 11 deterministic points in or on the prescribed equilateral
+    triangle.
+
+    Returns:
+        np.ndarray: Cartesian coordinates with shape (11, 2).
+    """
+    return _CACHED_LAYOUT.copy()
+
+
+# EVOLVE-BLOCK-END
+```

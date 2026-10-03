@@ -1,0 +1,73 @@
+<NAME>
+k_shortest_paths_parallel_broadcast
+
+</NAME>
+<DESCRIPTION>
+The current algorithm routes every partition of every destination along a single Dijkstra shortest path. This (1) concentrates all traffic on one path, causing congestion/throughput bottlenecks, and (2) ignores parallel low-cost alternatives across multi-cloud networks. Improvement: for each (src, dst) pair, compute k shortest simple paths using `nx.shortest_simple_paths` (ranked by cumulative cost), then distribute the `num_partitions` across these paths using a greedy least-loaded assignment. This balances load across networks, exploits parallel links, and lowers effective transfer cost by avoiding saturated high-throughput edges. Since partition paths may share edges with other destinations, we also track per-edge assigned partition counts and prefer paths minimizing (path_cost / available_paths) weighted by current edge load, reducing redundant heavy usage of the same links.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions, k_paths=4):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Track how many partitions are already assigned to each edge so we can
+    # spread load across parallel network paths.
+    edge_load = {}
+
+    def path_cost(path):
+        return sum(h[path[i]][path[i + 1]].get("cost") or 0.0
+                   for i in range(len(path) - 1))
+
+    for dst in dsts:
+        try:
+            path_generator = nx.shortest_simple_paths(h, src, dst, weight="cost")
+            candidates = []
+            for p in path_generator:
+                candidates.append(p)
+                if len(candidates) >= k_paths:
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            candidates = [nx.dijkstra_path(h, src, dst, weight="cost")]
+
+        if not candidates:
+            candidates = [nx.dijkstra_path(h, src, dst, weight="cost")]
+
+        # Score each candidate path: cheap and lightly-loaded edges are better.
+        def score(path):
+            c = path_cost(path)
+            load_penalty = 0.0
+            for i in range(len(path) - 1):
+                load_penalty += edge_load.get((path[i], path[i + 1]), 0)
+            # avoid division by zero
+            return (c + 1e-9) / (1.0 + load_penalty)
+
+        candidates = sorted(candidates, key=score)
+
+        # Greedy round-robin assignment of partitions over the ranked paths,
+        # balancing load across the parallel routes.
+        for j in range(bc_topology.num_partitions):
+            path = candidates[j % len(candidates)]
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+                edge_load[(s, t)] = edge_load.get((s, t), 0) + 1
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

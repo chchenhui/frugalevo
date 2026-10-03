@@ -1,0 +1,119 @@
+<NAME>
+vectorized_local_search
+
+<DESCRIPTION>
+The current search perturbs one point at a time with 24 sequential candidate evaluations per accepted step, making it slow and greedy (only accepts the first improving candidate). Two improvements inspired by standard practice for Heilbronn-type optimizations:
+
+1. **Vectorized candidate evaluation**: generate all K perturbation candidates for a worst-triangle point at once, evaluate all their minimum areas in a batched manner, and take the *best* improving candidate rather than the first one. This both speeds up evaluation (fewer Python-level calls) and improves search quality (best-of-K instead of first-of-K).
+
+2. **Batch-capable projection**: generalize `_project` so it works on arbitrary leading shapes (K, n, 2), enabling the vectorized path.
+
+3. **More restarts with the same time budget**: since each step is now much cheaper, we can afford more random restarts, increasing the chance of finding a configuration whose minimum triangle area beats the 0.0365 benchmark (combined_score > 1.0).
+
+The result should be a higher `min_area_normalized` at comparable or lower `eval_time`.
+
+<DIFF>
+<<<<<<< SEARCH
+def _project(pts):
+    """Project points back into the unit equilateral triangle via barycentric clipping."""
+    A = np.array([0.0, 0.0])
+    B = np.array([1.0, 0.0])
+    C = np.array([0.5, np.sqrt(3.0) / 2.0])
+    v1 = B - A
+    v2 = C - A
+    det = v1[0] * v2[1] - v1[1] * v2[0]
+    rel = pts - A
+    b1 = (rel[:, 0] * v2[1] - rel[:, 1] * v2[0]) / det
+    b2 = (v1[0] * rel[:, 1] - v1[1] * rel[:, 0]) / det
+    b3 = 1.0 - b1 - b2
+    b = np.stack([b3, b1, b2], axis=1)  # weights for A, B, C
+    b = np.clip(b, 0.0, 1.0)
+    b /= b.sum(axis=1, keepdims=True)
+    verts = np.stack([A, B, C], axis=0)
+    return b @ verts
+=======
+def _project(pts):
+    """Project points back into the unit equilateral triangle via barycentric clipping.
+
+    Accepts any shape (..., 2); flattens internally and restores the shape.
+    """
+    orig_shape = pts.shape
+    flat = pts.reshape(-1, 2)
+    A = np.array([0.0, 0.0])
+    B = np.array([1.0, 0.0])
+    C = np.array([0.5, np.sqrt(3.0) / 2.0])
+    v1 = B - A
+    v2 = C - A
+    det = v1[0] * v2[1] - v1[1] * v2[0]
+    rel = flat - A
+    b1 = (rel[:, 0] * v2[1] - rel[:, 1] * v2[0]) / det
+    b2 = (v1[0] * rel[:, 1] - v1[1] * rel[:, 0]) / det
+    b3 = 1.0 - b1 - b2
+    b = np.stack([b3, b1, b2], axis=1)  # weights for A, B, C
+    b = np.clip(b, 0.0, 1.0)
+    b /= b.sum(axis=1, keepdims=True)
+    verts = np.stack([A, B, C], axis=0)
+    out = b @ verts
+    return out.reshape(orig_shape)
+
+
+def _min_area_batch(batch, triples):
+    """Compute the minimum triangle area for each configuration in a batch.
+
+    batch: np.ndarray of shape (K, n, 2). Returns array of K minimum areas.
+    """
+    p = batch[:, triples]  # (K, T, 3, 2)
+    a = p[:, :, 1] - p[:, :, 0]
+    b = p[:, :, 2] - p[:, :, 0]
+    areas = 0.5 * np.abs(a[:, :, 0] * b[:, :, 1] - a[:, :, 1] * b[:, :, 0])
+    return areas.min(axis=1)
+>>>>>>> REPLACE
+```
+
+<DIFF>
+<<<<<<< SEARCH
+    for restart in range(12):
+        pts = _init_points(rng, n)
+        step = 0.05
+        cur_val, _ = _min_area(pts, triples)
+        while step > 1e-7:
+            improved = False
+            _, widx = _min_area(pts, triples)
+            worst = triples[widx]
+            for pi in worst:
+                for _ in range(24):
+                    cand = pts.copy()
+                    cand[pi] = cand[pi] + rng.normal(0.0, step, size=2)
+                    cand = _project(cand)
+                    v, _ = _min_area(cand, triples)
+                    if v > cur_val + 1e-12:
+                        pts = cand
+                        cur_val = v
+                        improved = True
+                        break
+            if not improved:
+                step *= 0.6
+=======
+    K = 32  # candidates generated per point perturbation (best-of-K move)
+    for restart in range(25):
+        pts = _init_points(rng, n)
+        step = 0.05
+        cur_val, _ = _min_area(pts, triples)
+        while step > 1e-7:
+            improved = False
+            _, widx = _min_area(pts, triples)
+            worst = triples[widx]
+            for pi in worst:
+                cands = np.repeat(pts[None], K, axis=0)  # (K, n, 2)
+                cands[:, pi, :] += rng.normal(0.0, step, size=(K, 2))
+                cands = _project(cands)
+                vals = _min_area_batch(cands, triples)
+                j = int(np.argmax(vals))
+                if vals[j] > cur_val + 1e-12:
+                    pts = cands[j]
+                    cur_val = float(vals[j])
+                    improved = True
+            if not improved:
+                step *= 0.6
+>>>>>>> REPLACE
+```

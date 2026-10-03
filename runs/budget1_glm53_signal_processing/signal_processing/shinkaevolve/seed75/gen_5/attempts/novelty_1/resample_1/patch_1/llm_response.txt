@@ -1,0 +1,161 @@
+<NAME>
+kalman_adaptive_filter
+</NAME>
+<DESCRIPTION>
+Replace the weighted moving average with a zero-lag adaptive Kalman filter combined with adaptive process noise. A steady-state 1D Kalman filter has essentially zero phase delay (unlike the moving average which lags by ~(W-1)/2 samples), directly improving lag_error and tracking accuracy. The process noise Q is adapted online from the local signal variance so fast trends are tracked (responsiveness) while noise is suppressed when the signal is quiet — reducing slope changes and false reversals. Additionally, a two-pass forward/backward smoothing is avoided to keep it causal/real-time; instead the measurement noise R is estimated from local high-frequency residual variance. Output length must remain len(x)-window_size+1 for compatibility, so the filter runs over the full signal and the last (output_length) samples are returned, which minimizes alignment delay (delay becomes ~0 effectively).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Initialize output array
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+    # Simple moving average as baseline
+    for i in range(output_length):
+        window = x[i : i + window_size]
+
+        # Basic moving average filter
+        y[i] = np.mean(window)
+
+    return y
+=======
+    # Initialize output array (keep same output length contract)
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+    # Estimate measurement noise variance from high-frequency component
+    # (first-order difference, var(noise) ~ var(diff)/2)
+    if len(x) > 2:
+        diff_var = np.var(np.diff(x))
+        R = max(diff_var / 2.0, 1e-12)
+    else:
+        R = 1.0
+
+    # Steady-state Kalman gain for a constant-velocity local model
+    # Iterate the Riccati equation a few times to converge to steady state
+    P = 1.0
+    K = 0.5
+    Q_base = R * 0.05  # base process noise scaled to measurement noise
+    P_pred = P + Q_base
+    for _ in range(50):
+        K = P_pred / (P_pred + R)
+        P = (1.0 - K) ** 2 * P_pred
+        P_pred = P + Q_base
+
+    # Run causal Kalman filter with adaptive process noise:
+    # when local residuals grow (fast dynamics), increase Q to track trend.
+    est = float(x[0])
+    estimates = np.empty(len(x))
+    estimates[0] = est
+    resid_buf = 0.0
+    for i in range(1, len(x)):
+        # adaptive gain: grow with recent squared innovation (fast motion)
+        innov = x[i] - est
+        resid_buf = 0.9 * resid_buf + 0.1 * innov * innov
+        q_scale = 1.0 + min(resid_buf / (R + 1e-12), 10.0)
+        P_pred_i = P + Q_base * q_scale
+        K_i = P_pred_i / (P_pred_i + R)
+        est = est + K_i * innov
+        estimates[i] = est
+        P = (1.0 - K_i) * P_pred_i
+
+    # Return the last output_length samples (minimal effective delay)
+    y[:] = estimates[-output_length:]
+
+    return y
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+    # Create weights that emphasize recent samples
+    weights = np.exp(np.linspace(-2, 0, window_size))
+    weights = weights / np.sum(weights)
+
+    for i in range(output_length):
+        window = x[i : i + window_size]
+
+        # Weighted moving average with exponential weights
+        y[i] = np.sum(window * weights)
+
+    return y
+=======
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+    # Estimate measurement noise from first differences
+    if len(x) > 2:
+        diff_var = np.var(np.diff(x))
+        R = max(diff_var / 2.0, 1e-12)
+    else:
+        R = 1.0
+
+    # Steady-state Kalman gain (constant-position local model)
+    Q_base = R * 0.02
+    P = 1.0
+    P_pred = P + Q_base
+    for _ in range(50):
+        K = P_pred / (P_pred + R)
+        P = (1.0 - K) ** 2 * P_pred
+        P_pred = P + Q_base
+
+    # Kalman filter with trend (velocity) state for lag-free tracking
+    # State: [level, velocity]; measurement: level
+    est_level = float(x[0])
+    est_vel = 0.0
+    P2 = np.array([[R, 0.0], [0.0, R]])
+    Q2 = np.diag([R * 0.01, R * 0.005])
+    H = np.array([[1.0, 0.0]])
+    # Precompute identity
+    I2 = np.eye(2)
+
+    levels = np.empty(len(x))
+    levels[0] = est_level
+    resid_buf = 0.0
+    for i in range(1, len(x)):
+        # Predict
+        est_level = est_level + est_vel
+        # Covariance predict
+        P2[0, 0] += 2.0 * P2[0, 1] + P2[1, 1] + Q2[0, 0]
+        P2[0, 1] += P2[1, 1] + Q2[0, 1]
+        P2[1, 0] = P2[0, 1]
+        P2[1, 1] += Q2[1, 1]
+
+        # Adaptive process noise: boost tracking when innovations grow
+        innov0 = x[i] - est_level
+        resid_buf = 0.9 * resid_buf + 0.1 * innov0 * innov0
+        if resid_buf > R:
+            boost = 1.0 + min(resid_buf / R, 20.0)
+            P2[0, 0] += R * 0.05 * boost
+            P2[1, 1] += R * 0.02 * boost
+
+        # Update
+        S = P2[0, 0] + R
+        K0 = P2[0, 0] / S
+        K1 = P2[0, 1] / S
+        est_level = est_level + K0 * (x[i] - est_level)
+        est_vel = est_vel + K1 * (x[i] - est_level - est_vel * 0.0) if False else est_vel + K1 * (x[i] - (est_level - K0 * (x[i] - est_level)))
+
+        # Simplified velocity update using gain K1
+        est_vel = est_vel + K1 * (x[i] - est_level)
+
+        # Covariance update (Joseph-free, standard form)
+        P00_new = (1.0 - K0) * P2[0, 0]
+        P01_new = (1.0 - K0) * P2[0, 1]
+        P10_new = P2[1, 0] - K1 * P2[0, 0]
+        P11_new = P2[1, 1] - K1 * P2[0, 1]
+        P2[0, 0] = P00_new
+        P2[0, 1] = P01_new
+        P2[1, 0] = P10_new
+        P2[1, 1] = P11_new
+
+        levels[i] = est_level
+
+    # Return the last output_length samples (minimal effective delay)
+    y[:] = levels[-output_length:]
+
+    return y
+>>>>>>> REPLACE
+</DIFF>

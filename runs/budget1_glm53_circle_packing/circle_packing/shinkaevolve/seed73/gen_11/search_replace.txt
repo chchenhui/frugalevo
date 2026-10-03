@@ -1,0 +1,95 @@
+<NAME>
+relax_positions_grow_radii</NAME>
+<DESCRIPTION>
+The current lattice gives sum 2.37 but leaves wasted space near corners and between staggered rows. Instead of a single fixed grow pass, alternate (a) fully vectorized radius growth to the true feasibility limit for current centers, and (b) a center-relaxation step that pushes each circle away from its most binding constraint (wall or neighbor), with a decaying step size plus tiny deterministic jitter. Keeping the best valid configuration found gives a monotone improvement over the current constructor while remaining a short refinement of an explicit layout, pushing the sum toward the 2.635 target.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Greedy expansion: sweep repeatedly, growing each circle to the
+    # largest radius allowed by the walls and current neighbor radii.
+    # This exploits leftover space near the square's corners that a
+    # pure hex lattice leaves empty. Each step keeps the packing valid.
+    radii = np.full(n, 0.5 * r0)
+    d = np.sqrt(((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1))
+    for _ in range(60):
+        for i in range(n):
+            # Wall limit
+            x, y = centers[i]
+            r_max = min(x, y, 1.0 - x, 1.0 - y)
+            # Neighbor limits
+            for j in range(n):
+                if j != i:
+                    r_max = min(r_max, d[i, j] - radii[j])
+            radii[i] = max(0.5 * r0, r_max)
+
+    # Calculate the sum of radii
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+=======
+    # Alternate vectorized radius growth with center relaxation:
+    # 1) grow every radius to the largest value allowed by walls and the
+    #    other circles' current radii (damped, then a final valid pass),
+    # 2) nudge each center away from its most binding constraint
+    #    (nearest wall or nearest crowded neighbor) with a decaying step,
+    #    so circles drift into the corner/edge gaps the pure hex lattice
+    #    leaves empty. Keep the best valid configuration found.
+    rng = np.random.default_rng(0)
+
+    def grow(c):
+        """Damped growth to (near) feasibility limit, then a validity pass."""
+        dd = np.sqrt(((c[:, None, :] - c[None, :, :]) ** 2).sum(-1))
+        np.fill_diagonal(dd, np.inf)
+        wall = np.minimum(c.min(axis=1), (1.0 - c).min(axis=1))
+        rad = np.full(len(c), 1e-6)
+        for _ in range(120):
+            nb = (dd - rad[None, :]).min(axis=1)
+            lim = np.minimum(wall, nb)
+            # damped growth so the fixed point is a balanced configuration
+            rad = np.minimum(lim, rad * 1.4 + 1e-5)
+        # one simultaneous pass back to strict feasibility
+        nb = (dd - rad[None, :]).min(axis=1)
+        rad = np.clip(np.minimum(rad, np.minimum(wall, nb)) - 1e-9, 1e-9, None)
+        return rad, dd, wall
+
+    rad, d, wall = grow(centers)
+    best_sum = rad.sum()
+    best_c, best_r = centers.copy(), rad.copy()
+
+    for it in range(250):
+        step = 0.012 * (1.0 - it / 250.0) + 0.0005
+        # binding constraint for each circle: wall vs nearest neighbor slack
+        nb_lim = (d - rad[None, :]).min(axis=1)
+        j_min = (d - rad[None, :]).argmin(axis=1)
+        for i in range(n):
+            if wall[i] <= nb_lim[i]:
+                # wall-limited: move away from the nearest wall(s)
+                x, y = centers[i]
+                dx = step if x < 0.5 else -step
+                dy = step if y < 0.5 else -step
+                if wall[i] == min(x, 1 - x):
+                    dy = 0.0
+                else:
+                    dx = 0.0
+                centers[i] += np.array([dx, dy])
+            else:
+                # neighbor-limited: slide directly away from that neighbor
+                vec = centers[i] - centers[j_min[i]]
+                nrm = np.linalg.norm(vec)
+                if nrm > 1e-12:
+                    centers[i] += (vec / nrm) * step
+        # tiny deterministic jitter for exploration
+        centers += rng.normal(0.0, 0.25 * step, centers.shape)
+        centers = np.clip(centers, 0.005, 0.995)
+        rad, d, wall = grow(centers)
+        s = rad.sum()
+        if s > best_sum:
+            best_sum = s
+            best_c, best_r = centers.copy(), rad.copy()
+        else:
+            centers = best_c.copy()
+            rad, d, wall = grow(centers)
+
+    return best_c, best_r, float(best_r.sum())
+>>>>>>> REPLACE
+</DIFF>

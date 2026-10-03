@@ -1,0 +1,224 @@
+<NAME>
+force_relaxed_multistart_lp</NAME>
+<DESCRIPTION>
+Instead of enumerating rigid hex-row templates, this approach uses a physical relaxation search: multiple starting configurations (hex grids with random jitter plus fully random starts), then an iterative force-based refinement. Each iteration (1) solves the exact LP for optimal radii given the current centers, (2) computes repulsion forces between circle pairs whose distance constraint is nearly tight and inward forces from nearly-tight walls, (3) moves centers accordingly. This lets the packing deform away from rigid templates toward the true optimum (where variable radii let circles of different sizes interlock), while the LP guarantees exact optimal radii at every step. The LP assembly is vectorized with a sparse matrix for speed, enabling hundreds of relaxation steps within budget. Best (centers, radii) found across all starts and all iterations is returned.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles.
+
+Strategy: multistart force relaxation with exact LP radii.
+"""
+import time
+
+import numpy as np
+
+
+def construct_packing():
+    n = 26
+    t0 = time.time()
+    time_budget = 18.0
+    rng = np.random.default_rng(12345)
+
+    best_c, best_r, best_s = None, None, -1.0
+
+    starts = []
+    # Hex-grid starts with various row patterns and jitter
+    for rows in ([5, 4, 5, 4, 5, 3], [5, 5, 4, 5, 5], [4, 5, 5, 5, 4, 3],
+                 [6, 5, 4, 5, 6], [5, 4, 6, 4, 5, 2], [4, 4, 5, 5, 4, 4]):
+        if sum(rows) != n:
+            continue
+        base = _build_layout(rows)
+        starts.append(base.copy())
+        for _ in range(2):
+            j = base + rng.normal(0, 0.02, base.shape)
+            starts.append(np.clip(j, 0.02, 0.98))
+    # Random starts
+    for _ in range(8):
+        c = rng.uniform(0.05, 0.95, (n, 2))
+        starts.append(c)
+
+    for si, c0 in enumerate(starts):
+        if time.time() - t0 > time_budget:
+            break
+        c, r, s = _relax(c0, t0, time_budget)
+        if s > best_s:
+            best_c, best_r, best_s = c, r, s
+
+    return best_c, best_r, float(best_s)
+
+
+def _relax(centers, t0, time_budget, max_iters=200):
+    """Force-based relaxation: LP radii + repulsion from tight contacts."""
+    n = centers.shape[0]
+    cur = centers.copy()
+    r = _lp_radii(cur)
+    s = float(np.sum(r))
+    best_c, best_r, best_s = cur.copy(), r.copy(), s
+
+    step = 0.012
+    for it in range(max_iters):
+        if time.time() - t0 > time_budget:
+            break
+        delta = np.zeros_like(cur)
+        diff = cur[:, None, :] - cur[None, :, :]
+        d = np.sqrt((diff ** 2).sum(-1))
+        np.fill_diagonal(d, 1e9)
+        # Pairwise forces where contact is (nearly) tight
+        slack = d - (r[:, None] + r[None, :])
+        mask = slack < 0.02
+        if mask.any():
+            inv = 1.0 / np.where(d < 1e-9, 1e-9, d)
+            unit = diff * inv[..., None]
+            push = np.where(mask, (0.02 - slack) * 0.5, 0.0)
+            delta += (unit * push[..., None]).sum(axis=1)
+            delta -= (unit * push[..., None]).sum(axis=0)
+        # Wall forces where wall constraint nearly tight
+        wall = np.minimum.reduce(
+            [cur[:, 0], cur[:, 1], 1 - cur[:, 0], 1 - cur[:, 1]])
+        wall_slack = wall - r
+        wm = wall_slack < 0.02
+        if wm.any():
+            wdir = np.zeros_like(cur)
+            x, y = cur[:, 0], cur[:, 1]
+            wdir[:, 0] += np.where(wm & (x < 0.5) & (r >= x - 0.02), 1, 0)
+            wdir[:, 0] -= np.where(wm & (x > 0.5) & (r >= 1 - x - 0.02), 1, 0)
+            wdir[:, 1] += np.where(wm & (y < 0.5) & (r >= y - 0.02), 1, 0)
+            wdir[:, 1] -= np.where(wm & (y > 0.5) & (r >= 1 - y - 0.02), 1, 0)
+            mag = np.where(wm, 0.02 - wall_slack, 0.0)
+            delta += wdir * mag[:, None]
+        # Random jitter to escape plateaus
+        delta += rng_jit(cur.shape) * 0.002
+        cur = np.clip(cur + step * delta, 0.01, 0.99)
+        r = _lp_radii(cur)
+        s = float(np.sum(r))
+        if s > best_s + 1e-10:
+            best_c, best_r, best_s = cur.copy(), r.copy(), s
+        # Anneal the step
+        if it % 40 == 39:
+            step *= 0.6
+
+    return best_c, best_r, best_s
+
+
+_JRNG = np.random.default_rng(7)
+
+
+def rng_jit(shape):
+    return _JRNG.normal(0, 1, shape)
+
+
+def _build_layout(rows):
+    n_rows = len(rows)
+    dy = 1.0 / n_rows
+    y0 = dy / 2.0
+    centers = []
+    for ri, count in enumerate(rows):
+        y = y0 + ri * dy
+        dx = 1.0 / count
+        offset = 0.5 * dx if ri % 2 == 1 else 0.0
+        for c in range(count):
+            x = (c + 0.5) * dx + offset
+            x = min(max(x, 0.02), 0.98)
+            centers.append([x, y])
+    return np.array(centers)
+
+
+def _lp_radii(centers):
+    """Exact LP: maximize sum(r) s.t. r_i+r_j <= d_ij, r_i <= wall dist.
+
+    Uses sparse assembly; falls back to iterative shrink solver.
+    """
+    n = centers.shape[0]
+    radii = compute_max_radii(centers)
+    try:
+        from scipy.optimize import linprog
+        from scipy.sparse import coo_matrix
+
+        diff = centers[:, None, :] - centers[None, :, :]
+        d = np.sqrt((diff ** 2).sum(-1))
+        iu, ju = np.triu_indices(n, 1)
+        m = len(iu)
+        rows_ = np.concatenate([np.arange(m), np.arange(m), n + np.arange(n)])
+        cols_ = np.concatenate([iu, ju, np.arange(n)])
+        data = np.concatenate([np.ones(m), np.ones(m), np.ones(n)])
+        wall = np.minimum.reduce([centers[:, 0], centers[:, 1],
+                                  1 - centers[:, 0], 1 - centers[:, 1]])
+        b_ub = np.concatenate([d[iu, ju], wall])
+        A_ub = coo_matrix((data, (rows_, cols_)),
+                          shape=(m + n, n)).tocsr()
+        res = linprog(c=-np.ones(n), A_ub=A_ub, b_ub=b_ub,
+                      bounds=(0, None), method="highs")
+        if res.success:
+            radii = res.x
+    except Exception:
+        pass
+    return radii
+
+
+def compute_max_radii(centers):
+    """Iterative shrink fallback: valid, non-overlapping, in-square radii."""
+    n = centers.shape[0]
+    radii = np.array([min(x, y, 1 - x, 1 - y) for x, y in centers])
+    diff = centers[:, None, :] - centers[None, :, :]
+    dist = np.sqrt((diff ** 2).sum(-1))
+    for _ in range(300):
+        max_change = 0.0
+        for i in range(n):
+            new_r = min(centers[i, 0], centers[i, 1],
+                        1 - centers[i, 0], 1 - centers[i, 1])
+            if n > 1:
+                new_r = min(new_r, (dist[i] - radii).min())
+            new_r = max(new_r, 0.0)
+            max_change = max(max_change, radii[i] - new_r)
+            radii[i] = new_r
+        if max_change < 1e-12:
+            break
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (26, 2) with (x, y) coordinates
+        radii: np.array of shape (26) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+    # visualize(centers, radii)
+```
+</CODE>

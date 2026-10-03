@@ -1,0 +1,146 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+N, D = 14, 3
+
+
+def _score(pts):
+    d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+    iu = np.triu_indices(N, 1)
+    du = d[iu]
+    if du.max() <= 0:
+        return 0.0
+    return (du.min() / du.max()) ** 2
+
+
+def _d2_all(pts):
+    diff = pts[:, None, :] - pts[None, :, :]
+    return (diff ** 2).sum(-1)
+
+
+def _force_relax(pts, iters=350):
+    """Force-directed relaxation on the unit sphere with adaptive cutoff."""
+    p = pts / np.linalg.norm(pts, axis=1, keepdims=True)
+    for it in range(iters):
+        diff = p[:, None, :] - p[None, :, :]
+        d = np.sqrt((diff ** 2).sum(-1) + 1e-12)
+        iu = np.triu_indices(N, 1)
+        du = d[iu]
+        target = du.min()
+        cutoff = min(target * 1.15, du.max() * 0.99)
+        grad = np.zeros_like(p)
+        close = du < cutoff
+        ii, jj = iu[0][close], iu[1][close]
+        w = ((cutoff - du[close]) / cutoff) / du[close]
+        push = w[:, None] * diff[ii, jj]
+        np.add.at(grad, ii, push)
+        np.add.at(grad, jj, -push)
+        # mild global repulsion
+        wall = 1.0 / (du ** 2 + 1e-3)
+        pall = (wall / du)[:, None] * diff[iu[0], iu[1]]
+        np.add.at(grad, iu[0], pall * 0.002)
+        np.add.at(grad, iu[1], -pall * 0.002)
+        step = 0.05 / (1.0 + it * 0.01)
+        p = p + step * grad
+        p /= np.linalg.norm(p, axis=1, keepdims=True)
+    return p
+
+
+def _candidates(rng):
+    cands = []
+    for _ in range(7):
+        p = rng.standard_normal((N, D))
+        cands.append(p / np.linalg.norm(p, axis=1, keepdims=True))
+    # Fibonacci spiral
+    g = np.pi * (3 - np.sqrt(5))
+    t = (np.arange(N) + 0.5) / N
+    z = 1 - 2 * t
+    r = np.sqrt(np.maximum(0.0, 1 - z ** 2))
+    phi = g * np.arange(N)
+    cands.append(np.stack([r * np.cos(phi), r * np.sin(phi), z], axis=1))
+    # icosahedron + 2 poles (known-good seed family for N=14)
+    phi_c = (1 + np.sqrt(5)) / 2
+    ico = np.array([
+        [-1, phi_c, 0], [1, phi_c, 0], [-1, -phi_c, 0], [1, -phi_c, 0],
+        [0, -1, phi_c], [0, 1, phi_c], [0, -1, -phi_c], [0, 1, -phi_c],
+        [phi_c, 0, -1], [phi_c, 0, 1], [-phi_c, 0, -1], [-phi_c, 0, 1],
+    ], dtype=float)
+    ico /= np.linalg.norm(ico, axis=1, keepdims=True)
+    for rot_seed in range(3):
+        rr = np.random.default_rng(500 + rot_seed).standard_normal((3, 3))
+        q, _ = np.linalg.qr(rr)
+        c = (ico @ q.T)
+        cands.append(np.vstack([c, [[0, 0, 1.0], [0, 0, -1.0]]]))
+    return cands
+
+
+def _slsqp_polish(X):
+    """Direct maximin polish in free space: max t s.t. d^2 >= t^2, d^2 <= 1."""
+    from scipy.optimize import minimize
+    X = X - X.mean(axis=0)
+    dm = np.sqrt(_d2_all(X)[np.triu_indices(N, 1)].max())
+    X = X / dm
+    IJ = np.array([(i, j) for i in range(N) for j in range(i + 1, N)])
+
+    def d2(X):
+        return ((X[IJ[:, 0]] - X[IJ[:, 1]]) ** 2).sum(1)
+
+    t0 = np.sqrt(d2(X).min())
+    z0 = np.concatenate([X.ravel(), [t0]])
+
+    def cons(z):
+        Xz = z[:N * D].reshape(N, D)
+        dd = d2(Xz)
+        return np.concatenate([z[-1] ** 2 - dd, dd - 1.0])
+
+    res = minimize(lambda z: -z[-1], z0, method="SLSQP",
+                   constraints=[{"type": "ineq", "fun": cons}],
+                   options={"maxiter": 300, "ftol": 1e-12})
+    Xp = res.x[:N * D].reshape(N, D)
+    if not np.isfinite(Xp).all():
+        return X
+    return Xp
+
+
+def _fallback():
+    rng = np.random.default_rng(0)
+    p = rng.standard_normal((N, D))
+    return p / np.linalg.norm(p, axis=1, keepdims=True)
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    try:
+        rng = np.random.default_rng(12345)
+        best, best_s = None, -1.0
+        for cand in _candidates(rng):
+            p = _force_relax(cand)
+            s = _score(p)
+            if s > best_s:
+                best_s, best = s, p.copy()
+        # polish top spherical config with SLSQP in free space
+        try:
+            pol = _slsqp_polish(best)
+            if _score(pol) > best_s:
+                best_s, best = _score(pol), pol.copy()
+        except Exception:
+            pass
+        # second relaxation round from polished point, re-polish
+        for rep in range(2):
+            p2 = _force_relax(best + 0.02 * np.random.default_rng(7 + rep).standard_normal(best.shape))
+            try:
+                p2 = _slsqp_polish(p2)
+            except Exception:
+                pass
+            s2 = _score(p2)
+            if s2 > best_s:
+                best_s, best = s2, p2.copy()
+        if best is None or not np.isfinite(best).all() or best.shape != (N, D):
+            return _fallback()
+        # normalize so dmax = 1 (pure convenience; ratio invariant)
+        dmx = np.sqrt(_d2_all(best)[np.triu_indices(N, 1)].max())
+        if dmx > 0:
+            best = best / dmx
+        return np.asarray(best, dtype=float)
+    except Exception:
+        return _fallback()
+# EVOLVE-BLOCK-END

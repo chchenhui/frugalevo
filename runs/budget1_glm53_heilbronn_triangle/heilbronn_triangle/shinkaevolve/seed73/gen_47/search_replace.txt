@@ -1,0 +1,122 @@
+<NAME>
+multi_seed_startup_and_validation
+
+</NAME>
+<DESCRIPTION>
+Two targeted improvements:
+
+1. **Multi-seed initialization.** The current heuristic hand-crafted seed can start the annealing in a poor basin. Known good Heilbronn configurations for n=11 place most points on the triangle boundary (vertices and edge subdivisions) with a few interior points. We add several structured candidate seeds (boundary-heavy layouts with different subdivisions and interior placements), evaluate each with the exact hard-min objective, and start the optimizer from the best one. This costs microseconds at module-call time but can shift the whole search into a better basin, directly raising min_area.
+
+2. **Validation harness before return.** Following the recommendation from prior generations (Gen 35's syntax-error 0.00, Gen 7/27 exceptions), we add a lightweight self-check that the output has shape (11,2), finite values, distinct points, and lies within the triangle, falling back to a safe clipped configuration otherwise. Correctness dominates algorithmic gains; this guards the score against regressions.
+
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Heuristic starting layout: vertices + edge points + interior spread
+    pts = np.array([
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [0.5, h],
+        [1.0 / 3.0, 0.0],
+        [2.0 / 3.0, 0.0],
+        [1.0 / 6.0, h / 3.0],
+        [5.0 / 6.0, h / 3.0],
+        [1.0 / 3.0, 2.0 * h / 3.0],
+        [2.0 / 3.0, 2.0 * h / 3.0],
+        [0.5, h / 3.0],
+        [0.5, 0.0],
+    ])
+
+    rng = np.random.default_rng(12345)
+    best = _clip_to_triangle(pts)
+    best_val = _min_area(best)
+=======
+    # --- Multi-seed initialization: boundary-heavy layouts are known to be
+    # --- strong for Heilbronn-type problems; try several structured seeds
+    # --- and start the annealing from the best basin.
+    h3 = h / 3.0
+    seeds = [
+        np.array([
+            [0.0, 0.0], [1.0, 0.0], [0.5, h],
+            [1.0 / 3.0, 0.0], [2.0 / 3.0, 0.0],
+            [1.0 / 6.0, h3], [5.0 / 6.0, h3],
+            [1.0 / 3.0, 2.0 * h3], [2.0 / 3.0, 2.0 * h3],
+            [0.5, h3], [0.5, 0.0],
+        ]),
+        # Boundary-dominant: 3 vertices + 2 interior points on each edge
+        np.array([
+            [0.0, 0.0], [1.0, 0.0], [0.5, h],
+            [1.0 / 3.0, 0.0], [2.0 / 3.0, 0.0],
+            [0.25, h / 2.0], [0.75, h / 2.0],
+            [2.0 / 3.0, h / 3.0], [1.0 / 3.0, h / 3.0],
+            [0.5, 2.0 * h / 3.0], [0.5, h / 3.0],
+        ]),
+        # Near-uniform 11-point lattice (rows of 1..4 scaled)
+        np.array([
+            [0.0, 0.0], [1.0, 0.0], [0.5, h],
+            [0.5, 0.0],
+            [0.25, h / 4.0], [0.75, h / 4.0],
+            [1.0 / 6.0, h / 2.0], [0.5, h / 2.0], [5.0 / 6.0, h / 2.0],
+            [1.0 / 3.0, 3.0 * h / 4.0], [2.0 / 3.0, 3.0 * h / 4.0],
+        ]),
+        # Edge-subdivision seed: 3 vertices + 2 extra points per edge
+        np.array([
+            [0.0, 0.0], [1.0, 0.0], [0.5, h],
+            [1.0 / 3.0, 0.0], [2.0 / 3.0, 0.0],
+            [1.0 / 3.0, h / 3.0], [2.0 / 3.0, 2.0 * h / 3.0],
+            [1.0 / 6.0, 2.0 * h / 3.0], [5.0 / 6.0, h / 3.0],
+            [0.5, h / 6.0], [0.5, 5.0 * h / 6.0],
+        ]),
+    ]
+
+    rng = np.random.default_rng(12345)
+    best = None
+    best_val = -np.inf
+    try:
+        for sd in seeds:
+            cand = _clip_to_triangle(np.asarray(sd, dtype=float))
+            v = _min_area(cand)
+            if v > best_val:
+                best, best_val = cand, v
+    except Exception:
+        # Fallback to the original heuristic seed on any failure
+        best = _clip_to_triangle(seeds[0])
+        best_val = _min_area(best)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Guarantee validity of output even if optimization failed somehow
+    if best is None or not np.all(np.isfinite(best)):
+        best = _clip_to_triangle(np.zeros((n, 2)) + np.array([0.4, 0.3]))
+
+    return best
+=======
+    # Guarantee validity of output even if optimization failed somehow:
+    # shape, finiteness, distinctness, and containment are all checked.
+    valid = (
+        best is not None
+        and isinstance(best, np.ndarray)
+        and best.shape == (n, 2)
+        and np.all(np.isfinite(best))
+    )
+    if valid:
+        # distinctness of points
+        d2 = np.sum((best[:, None, :] - best[None, :, :]) ** 2, axis=-1)
+        np.fill_diagonal(d2, np.inf)
+        if d2.min() <= 1e-18:
+            valid = False
+        # containment: barycentric weights all non-negative (up to tolerance)
+        w = np.stack([
+            1.0 - best[:, 0] - best[:, 1] / h * 0.0,  # placeholder
+        ], axis=-1)
+        # proper barycentric check
+        bary_b = best[:, 0] - best[:, 1] / np.sqrt(3.0)
+        bary_c = 2.0 * best[:, 1] / np.sqrt(3.0)
+        bary_a = 1.0 - bary_b - bary_c
+        if np.min([bary_a.min(), bary_b.min(), bary_c.min()]) < -1e-9:
+            valid = False
+    if not valid:
+        best = _clip_to_triangle(np.zeros((n, 2)) + np.array([0.4, 0.3]))
+
+    return best
+>>>>>>> REPLACE
+</DIFF>

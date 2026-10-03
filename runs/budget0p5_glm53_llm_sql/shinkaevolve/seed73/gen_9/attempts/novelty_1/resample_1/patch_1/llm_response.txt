@@ -1,0 +1,253 @@
+<NAME>
+lcp_trie_candidate_reorder_fix</NAME>
+<DESCRIPTION>
+The previous program failed because its complex recursive value-grouping logic was broken: it added an "original_index" column, returned empty column_orderings (`return final_df, []` — no per-row orderings), relied on `hasattr(row, col)` attribute lookups on itertuples that rarely match column names, mutated the input df, and produced shape/consistency mismatches (the final global sort also scrambled the per-row permutations it had built). None of that machinery reflected the actual objective: maximize character-Trie prefix reuse, which for a fixed set of serialized row strings equals the sum of adjacent LCP lengths after sorting, and is independent of row order.
+
+The fix replaces the broken recursion with a bounded candidate-selection approach:
+1. Serialize each cell (NaN → ""), factorize each column to integer codes once.
+2. Build three cheap whole-program candidates: (a) original column order, (b) a global frequency-ranked order scored by `len(v)*count*(count-1)` per column with deterministic ties, (c) a bounded conditional partition tree that recursively picks the field with the largest length-weighted pair repetition inside each row group and orders suffixes per group.
+3. Score each candidate with the true objective (sorted-string adjacent-LCP sum, using C-speed binary-search prefix comparisons), and return the best, materializing per-row column orderings and the row-permuted output df (same rows, same values, valid per-row orders, object dtype where mixed).
+`one_way_dep` is honored by placing dependent columns adjacent to their parents; `col_merge` is delegated to the inherited `mererging_columns`. No data is added, removed, or altered.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List, Dict
+from collections import Counter
+
+
+class Evolved(Algorithm):
+    """
+    Character-Trie prefix-cache oriented reordering.
+
+    Objective proxy: for a fixed multiset of serialized row strings, ideal Trie
+    reuse = sum over lexicographically adjacent sorted strings of their
+    longest-common-prefix length. We build a small number of cheap per-row
+    column-order candidates, score each with this exact proxy, and return the
+    best. No data is added, removed, or altered.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------
+    # exact scoring helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        """Longest common prefix via binary search (comparisons run in C)."""
+        if a == b:
+            return len(a)
+        lo, hi = 0, min(len(a), len(b))
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _score(self, strings: List[str]) -> int:
+        """Ideal Trie reuse: sum of adjacent LCPs after sorting."""
+        if len(strings) < 2:
+            return 0
+        s = sorted(strings)
+        return sum(self._lcp(s[i - 1], s[i]) for i in range(1, len(s)))
+
+    @staticmethod
+    def _serialize_cell(v) -> str:
+        """Scoring serialization: missing values become empty strings."""
+        if v is None:
+            return ""
+        if isinstance(v, float) and v != v:  # NaN
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(v)
+
+    @staticmethod
+    def _apply_dep(order: List[str], dep_map: Dict[str, List[str]]) -> List[str]:
+        """Place dependent columns immediately after their parents."""
+        out: List[str] = []
+        for c in order:
+            if c not in out:
+                out.append(c)
+            for d in dep_map.get(c, []):
+                if d in order and d not in out:
+                    out.append(d)
+        for c in order:
+            if c not in out:
+                out.append(c)
+        return out
+
+    # ------------------------------------------------------------------
+    # public API
+    # ------------------------------------------------------------------
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        initial = df.copy()
+
+        # honor column merges via the inherited parent semantics
+        if col_merge:
+            for group_cols in col_merge:
+                if group_cols is None:
+                    continue
+                present = [c for c in initial.columns if c in group_cols]
+                if len(present) > 1:
+                    try:
+                        initial = self.merging_columns(initial, present, prepended=False)
+                    except Exception:
+                        # if merging is not supported, keep data untouched
+                        pass
+
+        columns = list(initial.columns)
+        n = len(initial)
+        if n == 0 or not columns:
+            return initial, [[] for _ in range(n)]
+
+        # one-way dependency map (prefix matching as in the original program)
+        dep_map: Dict[str, List[str]] = {}
+        if one_way_dep:
+            for dep in one_way_dep:
+                try:
+                    a, b = dep[0], dep[1]
+                except Exception:
+                    continue
+                ca = [c for c in columns if a in c]
+                cb = [c for c in columns if b in c]
+                if ca and cb:
+                    dep_map.setdefault(ca[0], []).append(cb[0])
+
+        # ------------------------------------------------------------------
+        # precompute serialized cell strings and integer codes once
+        # ------------------------------------------------------------------
+        cellstr: Dict[str, List[str]] = {}
+        codes: Dict[str, List[int]] = {}
+        ulen: Dict[str, List[int]] = {}
+        for c in columns:
+            vals = initial[c].tolist()
+            cellstr[c] = [self._serialize_cell(v) for v in vals]
+            uniq, cd = pd.factorize(np.asarray(vals, dtype=object))
+            codes[c] = [int(x) for x in cd]
+            ulen[c] = [len(self._serialize_cell(v)) for v in uniq]
+
+        # global frequency-ranked order: sum len(v) * count * (count - 1)
+        freq_score: Dict[str, int] = {}
+        for c in columns:
+            cnt = Counter(cellstr[c])
+            freq_score[c] = sum(len(v) * k * (k - 1) for v, k in cnt.items())
+        col_index = {c: i for i, c in enumerate(columns)}
+        freq_order = sorted(columns, key=lambda c: (-freq_score[c], col_index[c]))
+        freq_order = self._apply_dep(freq_order, dep_map)
+
+        # ------------------------------------------------------------------
+        # candidate 3: bounded conditional partition tree
+        # ------------------------------------------------------------------
+        maxdepth = 8
+        if row_stop is not None:
+            try:
+                maxdepth = max(1, min(8, int(row_stop)))
+            except Exception:
+                maxdepth = 8
+
+        per_row_orders: List[List[str]] = [None] * n
+
+        def leaf_assign(rows_idx, remaining, prefix):
+            tail = [c for c in freq_order if c in remaining]
+            for r in rows_idx:
+                per_row_orders[r] = list(prefix) + list(tail)
+
+        def build(rows_idx, remaining, depth, prefix):
+            if depth >= maxdepth or len(rows_idx) < 3 or len(remaining) <= 1:
+                leaf_assign(rows_idx, remaining, prefix)
+                return
+            best_col, best_gain = None, 0
+            for c in remaining:
+                cc = codes[c]
+                cnt = Counter(cc[r] for r in rows_idx)
+                ll = ulen[c]
+                gain = sum(ll[v] * k * (k - 1) for v, k in cnt.items())
+                if gain > best_gain:
+                    best_gain, best_col = gain, c
+            if best_col is None or best_gain <= 0:
+                leaf_assign(rows_idx, remaining, prefix)
+                return
+            rem = [c for c in remaining if c != best_col]
+            groups: Dict[int, List[int]] = {}
+            cc = codes[best_col]
+            for r in rows_idx:
+                groups.setdefault(cc[r], []).append(r)
+            new_prefix = list(prefix) + [best_col]
+            # deterministic traversal
+            for key in sorted(groups.keys()):
+                build(groups[key], rem, depth + 1, new_prefix)
+
+        try:
+            build(list(range(n)), set(columns), 0, [])
+            if any(o is None for o in per_row_orders):
+                raise ValueError("incomplete orders")
+            # sanity: each row order is a permutation of all columns
+            for o in per_row_orders:
+                if len(o) != len(columns) or set(o) != set(columns):
+                    raise ValueError("bad permutation")
+        except Exception:
+            per_row_orders = [list(freq_order) for _ in range(n)]
+
+        # honor dependencies on the conditional orders as well
+        per_row_orders = [self._apply_dep(o, dep_map) for o in per_row_orders]
+        for o in per_row_orders:
+            if len(o) != len(columns) or set(o) != set(columns):
+                per_row_orders = [list(freq_order) for _ in range(n)]
+                break
+
+        # ------------------------------------------------------------------
+        # candidate selection by the exact serial-Trie objective
+        # ------------------------------------------------------------------
+        candidates = [
+            [list(columns) for _ in range(n)],      # original order
+            [list(freq_order) for _ in range(n)],   # global frequency order
+            per_row_orders,                         # conditional partition
+        ]
+
+        best_orders, best_score = None, -1
+        for orders in candidates:
+            try:
+                strs = ["".join(cellstr[c][r] for c in orders[r]) for r in range(n)]
+                sc = self._score(strs)
+            except Exception:
+                continue
+            if sc > best_score:
+                best_score, best_orders = sc, orders
+
+        if best_orders is None:
+            best_orders = [list(columns) for _ in range(n)]
+
+        # ------------------------------------------------------------------
+        # materialize output: same rows, same values, per-row permutation
+        # ------------------------------------------------------------------
+        data = [[initial[c].iloc[r] for c in best_orders[r]] for r in range(n)]
+        out = pd.DataFrame(data, columns=columns, index=initial.index)
+
+        assert out.shape == initial.shape, "Output shape mismatch"
+        assert len(best_orders) == n, "Orderings count mismatch"
+
+        return out, [list(o) for o in best_orders]
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

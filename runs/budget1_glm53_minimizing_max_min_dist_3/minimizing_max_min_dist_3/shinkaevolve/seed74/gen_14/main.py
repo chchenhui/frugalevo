@@ -1,0 +1,75 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _softmin_ratio_grad(X, t):
+    """Value and gradient of -t*log(sum exp(-d_ij/t)) / dmax (smooth lower bound of dmin/dmax).
+
+    Simpler: maximize sum over pairs of -exp(-d_ij/t) approximated via softmax on -d_ij/t.
+    Returns grad of (smooth min distance) w.r.t. X.
+    """
+    n = X.shape[0]
+    diff = X[:, None, :] - X[None, :, :]
+    dist = np.sqrt(np.sum(diff ** 2, axis=-1) + 1e-12)
+    iu = np.triu_indices(n, 1)
+    d = dist[iu]
+    w = np.exp(-(d - d.min()) / t)
+    w /= w.sum()
+    # gradient of weighted-sum distance d (smooth min) wrt X
+    # d_k for pair (i,j): grad wrt X_i = (X_i - X_j)/d_k, X_j opposite
+    pairs_i, pairs_j = iu
+    u = (X[pairs_i] - X[pairs_j]) / d[:, None]
+    G = np.zeros_like(X)
+    contrib = (w[:, None] * u)
+    np.add.at(G, pairs_i, contrib)
+    np.add.at(G, pairs_j, -contrib)
+    sm = float((w * d).sum())
+    return sm, G
+
+
+def _optimize(X0, steps=400, lr=0.03, t0=0.3, t1=0.04):
+    X = X0.copy()
+    n = X.shape[0]
+    iu = np.triu_indices(n, 1)
+    for k in range(steps):
+        t = t0 + (t1 - t0) * k / steps
+        sm, G = _softmin_ratio_grad(X, t)
+        # scale-aware step: normalize gradient
+        gn = np.sqrt((G ** 2).sum())
+        if gn < 1e-12:
+            break
+        # repulsion also from max distance: penalize pairs near dmax slightly
+        # (skip; scale-free enough)
+        X = X + lr * (t / 0.1) * G / gn * np.sqrt((X ** 2).sum() / n)
+    return X
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    n, d = 14, 3
+    rng = np.random.default_rng(12345)
+    best_pts, best_ratio = None, -1.0
+    for trial in range(12):
+        X0 = rng.standard_normal((n, d))
+        # quick preprocessing: spread out via simple gradient on softmin
+        X = _optimize(X0, steps=350)
+        # evaluate true ratio
+        D = np.linalg.norm(X[:, None] - X[None, :], axis=-1)
+        iu = np.triu_indices(n, 1)
+        dmin = D[iu].min()
+        dmax = D[iu].max()
+        if dmax <= 0:
+            continue
+        r = dmin / dmax
+        if r > best_ratio:
+            best_ratio = r
+            best_pts = X
+    # normalize: center and scale so max pairwise distance = 1
+    P = best_pts - best_pts.mean(axis=0)
+    Dm = np.linalg.norm(P[:, None] - P[None, :], axis=-1)
+    diam = Dm.max()
+    if diam > 0:
+        P = P / diam
+    return P
+
+
+# EVOLVE-BLOCK-END

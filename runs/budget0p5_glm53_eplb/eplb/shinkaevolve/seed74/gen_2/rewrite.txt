@@ -1,0 +1,148 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Expert parallelism load balancer (EPLB) for vLLM.
+
+Global two-phase greedy balancer:
+  Phase 1: replica allocation via highest per-replica load rule.
+  Phase 2: LPT (longest-processing-time) packing of replicas onto GPUs.
+"""
+
+# EVOLVE-BLOCK-START
+
+import numpy as np
+import torch
+
+
+def _replicate_experts_np(weight: np.ndarray,
+                          num_phy: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Assign redundant expert slots to highest per-replica-load experts.
+
+    weight: [n, num_log]
+    Returns phy2log [n, num_phy], rank [n, num_phy], logcnt [n, num_log]
+    """
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    logcnt = np.ones((n, num_log), dtype=np.int64)
+    phy2log = np.tile(np.arange(num_phy, dtype=np.int64), (n, 1))
+    rank = np.zeros((n, num_phy), dtype=np.int64)
+
+    # Iteratively give extra slots to the expert with max weight/cnt.
+    # Vectorized across layers using argmax per step; number of steps is
+    # num_redundant which is typically small.
+    per_replica = weight / logcnt  # [n, num_log]
+    for i in range(num_log, num_phy):
+        best = np.argmax(per_replica, axis=1)  # [n]
+        phy2log[:, i] = best
+        rank[:, i] = logcnt[np.arange(n), best]
+        logcnt[np.arange(n), best] += 1
+        # only update the changed column(s) for efficiency
+        per_replica[np.arange(n), best] = weight[np.arange(n), best] / logcnt[
+            np.arange(n), best]
+    return phy2log, rank, logcnt
+
+
+def _lpt_pack_np(weight: np.ndarray, num_packs: int) -> tuple[np.ndarray, np.ndarray]:
+    """LPT packing: each pack holds exactly n/m items, loads balanced.
+
+    weight: [X, n] float
+    Returns pack_index [X, n], rank_in_pack [X, n]
+    """
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    if groups_per_pack == 1:
+        pack_index = np.tile(np.arange(num_groups, dtype=np.int64), (num_layers, 1))
+        rank_in_pack = np.zeros((num_layers, num_groups), dtype=np.int64)
+        return pack_index, rank_in_pack
+
+    order = np.argsort(-weight, axis=1, kind="stable")  # [X, n] descending
+    pack_index = np.empty((num_layers, num_groups), dtype=np.int64)
+    rank_in_pack = np.empty((num_layers, num_groups), dtype=np.int64)
+
+    for i in range(num_layers):
+        pack_loads = np.zeros(num_packs, dtype=weight.dtype)
+        pack_items = np.zeros(num_packs, dtype=np.int64)
+        loads = weight[i]
+        for g in order[i]:
+            # candidate packs with remaining capacity
+            avail = pack_items < groups_per_pack
+            # pick min-load among available packs
+            masked = np.where(avail, pack_loads, np.inf)
+            p = int(np.argmin(masked))
+            pack_index[i, g] = p
+            rank_in_pack[i, g] = pack_items[p]
+            pack_loads[p] += loads[g]
+            pack_items[p] += 1
+    return pack_index, rank_in_pack
+
+
+def rebalance_experts(
+    weight: torch.Tensor,
+    num_replicas: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Entry point for expert-parallelism load balancer.
+
+    Parameters:
+        weight: [layers, num_logical_experts], the load statistics for all
+            logical experts
+        num_replicas: number of physical experts, must be a multiple of
+            `num_gpus`
+        num_groups: number of expert groups
+        num_nodes: number of server nodes
+        num_gpus: number of GPUs, must be a multiple of `num_nodes`
+
+    Returns:
+        physical_to_logical_map: [layers, num_replicas]
+        logical_to_physical_map: [layers, num_logical_experts, X]
+        expert_count: [layers, num_logical_experts]
+    """
+    num_layers, num_logical_experts = weight.shape
+    w = weight.float().cpu().numpy()
+
+    phy2log, rank, logcnt = _replicate_experts_np(w, num_replicas)
+
+    # per-replica load for packing onto GPUs
+    per_replica_load = w / logcnt  # [layers, num_log]
+    replica_load = np.take_along_axis(per_replica_load, phy2log, axis=1)  # [layers, num_phy]
+
+    phy_experts_per_gpu = num_replicas // num_gpus
+    pack_index, rank_in_pack = _lpt_pack_np(replica_load, num_gpus)
+    phy2pphy = pack_index * phy_experts_per_gpu + rank_in_pack
+
+    # physical_to_logical_map for each layer: slot s holds expert phy2log[layer, phy2pphy inverse]
+    # Build inverse of phy2pphy per layer
+    physical_to_logical = np.empty((num_layers, num_replicas), dtype=np.int64)
+    physical_rank = np.empty((num_layers, num_replicas), dtype=np.int64)
+    rows = np.arange(num_layers)[:, None]
+    inverse = np.argsort(phy2pphy, axis=1, kind="stable")  # phy index sorted by slot
+    # phy2pphy[layer, inverse[layer, s]] == s
+    physical_to_logical = np.take_along_axis(phy2log, inverse, axis=1)
+    physical_rank = np.take_along_axis(rank, inverse, axis=1)
+
+    num_redundant_experts = num_replicas - num_logical_experts
+    maxlogcnt = num_redundant_experts + 1
+    logical_to_physical = np.full((num_layers, num_logical_experts, maxlogcnt),
+                                  -1, dtype=np.int64)
+    # scatter: slot index for (layer, expert e, replica r)
+    np.put_along_axis(
+        None, None, None, axis=0)  # placeholder no-op
+    tgt = physical_to_logical * maxlogcnt + physical_rank  # [layers, num_replicas]
+    src = np.tile(np.arange(num_replicas, dtype=np.int64), (num_layers, 1))
+    # flatten scatter
+    flat_idx = (np.arange(num_layers)[:, None] * (num_logical_experts * maxlogcnt)
+                + tgt)
+    logical_to_physical.reshape(-1)[flat_idx.reshape(-1)] = src.reshape(-1)
+
+    return (torch.from_numpy(physical_to_logical),
+            torch.from_numpy(logical_to_physical),
+            torch.from_numpy(logcnt))
+
+
+# EVOLVE-BLOCK-END
+
+__all__ = ["rebalance_experts"]

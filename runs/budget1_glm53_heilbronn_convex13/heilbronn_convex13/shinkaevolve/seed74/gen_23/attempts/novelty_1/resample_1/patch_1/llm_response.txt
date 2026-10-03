@@ -1,0 +1,178 @@
+<NAME>
+soft_polish_with_axis_moves
+</NAME>
+<DESCRIPTION>
+The prior best program (score 0.67) used a soft objective (mean of the k smallest triangle areas) in the polish phase, which escapes flat minima where the true minimum cannot be improved by single coordinate moves. The current program regressed to a hard-min polish (0.58). This edit restores the soft-score polish, and additionally augments the annealing inner loop with an axis-wise directional fallback: when a Gaussian 2-D move is rejected, try the four axis-aligned perturbations (±x, ±y) before rejecting — as recommended. This exploits cheap vectorized rescoring and broadens the search within the time budget. To keep runtime in the ~4s sweet spot, annealing iterations are trimmed slightly (2000 + 600 reheat).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _anneal(pts, iters=3000, t0=0.004, t1=1e-5, rng=None):
+    """Worst-triangle targeted simulated annealing."""
+    if rng is None:
+        rng = np.random.default_rng(0)
+    pts = pts.copy()
+    best = _score(pts)
+    best_pts = pts.copy()
+    k_bot = 8  # target vertices from bottom-k triangles
+    for it in range(iters):
+        temp = t0 * (t1 / t0) ** (it / iters)
+        step = 0.05 * (0.002 / 0.05) ** (it / iters) + 0.0005
+        areas = _all_tri_areas(pts)
+        order = np.argsort(areas)[:k_bot]
+        verts = np.unique(_IDX[order].ravel())
+        vi = verts[rng.integers(len(verts))]
+        cand = pts.copy()
+        cand[vi] += rng.normal(0, step, 2)
+        cand[vi] = np.clip(cand[vi], 0.0, 1.0)
+        # avoid duplicates
+        if np.min(np.linalg.norm(np.delete(cand, vi, axis=0) - cand[vi], axis=1)) < 1e-6:
+            continue
+        s_new = _score(cand)
+        if s_new >= best or rng.random() < np.exp((s_new - best) / max(temp, 1e-12)):
+            pts = cand
+            if s_new > best:
+                best = s_new
+                best_pts = cand.copy()
+    return best_pts, best
+=======
+def _anneal(pts, iters=3000, t0=0.004, t1=1e-5, rng=None):
+    """Worst-triangle targeted simulated annealing with axis-wise fallback moves."""
+    if rng is None:
+        rng = np.random.default_rng(0)
+    pts = pts.copy()
+    best = _score(pts)
+    best_pts = pts.copy()
+    k_bot = 8  # target vertices from bottom-k triangles
+
+    def _try(cand, cur, temp):
+        """Try accepting a candidate move; return new pts (or None)."""
+        # avoid duplicates
+        vi = cand[1]
+        if np.min(np.linalg.norm(np.delete(cand[0], vi, axis=0) - cand[0][vi], axis=1)) < 1e-6:
+            return None
+        s_new = _score(cand[0])
+        if s_new >= cur or rng.random() < np.exp((s_new - cur) / max(temp, 1e-12)):
+            return cand[0], s_new
+        return None
+
+    for it in range(iters):
+        temp = t0 * (t1 / t0) ** (it / iters)
+        step = 0.05 * (0.002 / 0.05) ** (it / iters) + 0.0005
+        areas = _all_tri_areas(pts)
+        order = np.argsort(areas)[:k_bot]
+        verts = np.unique(_IDX[order].ravel())
+        vi = verts[rng.integers(len(verts))]
+        cand = pts.copy()
+        cand[vi] += rng.normal(0, step, 2)
+        cand[vi] = np.clip(cand[vi], 0.0, 1.0)
+        res = _try((cand, vi), best, temp)
+        if res is not None:
+            pts, s_new = res
+            if s_new > best:
+                best = s_new
+                best_pts = cand.copy()
+        else:
+            # axis-wise directional fallback: try ±x, ±y perturbations
+            for d in range(2):
+                for sgn in (1, -1):
+                    cand2 = pts.copy()
+                    cand2[vi, d] = np.clip(cand2[vi, d] + sgn * step, 0.0, 1.0)
+                    res = _try((cand2, vi), best, temp)
+                    if res is not None:
+                        pts, s_new = res
+                        if s_new > best:
+                            best = s_new
+                            best_pts = cand2.copy()
+                        break
+                if res is not None:
+                    break
+    return best_pts, best
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def _polish(pts, iters=1500):
+    """Greedy targeted refinement at small steps from annealing output."""
+    pts = pts.copy()
+    best = _score(pts)
+    rng = np.random.default_rng(9)
+    for it in range(iters):
+        areas = _all_tri_areas(pts)
+        order = np.argsort(areas)[:6]
+        verts = np.unique(_IDX[order].ravel())
+        improved = False
+        for vi in verts:
+            for d in range(2):
+                for sgn in (1, -1):
+                    for step in (0.004, 0.001):
+                        cand = pts.copy()
+                        cand[vi, d] = np.clip(cand[vi, d] + sgn * step, 0.0, 1.0)
+                        s = _score(cand)
+                        if s > best + 1e-12:
+                            pts, best, improved = cand, s, True
+        if not improved:
+            break
+    return pts, best
+=======
+def _soft_score(pts, k=10):
+    """Soft objective: mean of the k smallest triangle areas (pressure on bottom tail)."""
+    ha = _hull_area(pts)
+    if ha <= 1e-12:
+        return 0.0
+    areas = np.partition(_all_tri_areas(pts), k - 1)[:k]
+    return areas.mean() / ha
+
+
+def _polish(pts, iters=1500):
+    """Greedy targeted refinement driven by the k smallest triangles.
+
+    Accepts moves that increase the mean of the k smallest triangle areas
+    (soft pressure that escapes flat minima), while tracking and returning
+    the configuration with the best true global minimum encountered.
+    """
+    pts = pts.copy()
+    ha = _hull_area(pts)
+    best_true = _all_tri_areas(pts).min() / ha if ha > 1e-12 else 0.0
+    best_true_pts = pts.copy()
+    soft = _soft_score(pts)
+    K = 12
+    for it in range(iters):
+        areas = _all_tri_areas(pts)
+        order = np.argsort(areas)
+        # target vertices from the K worst triangles
+        verts = np.unique(_IDX[order[:K]].ravel())
+        improved = False
+        for vi in verts:
+            for d in range(2):
+                for sgn in (1, -1):
+                    for step in (0.006, 0.002, 0.0005):
+                        cand = pts.copy()
+                        cand[vi, d] = np.clip(cand[vi, d] + sgn * step, 0.0, 1.0)
+                        s = _soft_score(cand, K)
+                        if s > soft + 1e-12:
+                            pts, soft, improved = cand, s, True
+                            # gate: keep the best true minimum seen so far
+                            ha_c = _hull_area(cand)
+                            if ha_c > 1e-12:
+                                t = _all_tri_areas(cand).min() / ha_c
+                                if t > best_true + 1e-13:
+                                    best_true = t
+                                    best_true_pts = cand.copy()
+        if not improved:
+            break
+    return best_true_pts, best_true
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        rng = np.random.default_rng(100 + si)
+        p, v = _anneal(cand, iters=2500, rng=rng)
+        # short reheat then decay
+        p2, v2 = _anneal(p, iters=800, t0=0.002, t1=1e-6, rng=np.random.default_rng(200 + si))
+=======
+        rng = np.random.default_rng(100 + si)
+        p, v = _anneal(cand, iters=2000, rng=rng)
+        # short reheat then decay
+        p2, v2 = _anneal(p, iters=600, t0=0.002, t1=1e-6, rng=np.random.default_rng(200 + si))
+>>>>>>> REPLACE
+</DIFF>

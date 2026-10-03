@@ -1,0 +1,104 @@
+<NAME>
+steiner_tree_broadcast_paths
+</NAME>
+<DESCRIPTION>
+Replace per-destination independent shortest paths with a shared Steiner tree approach. Broadcast data can be split across parallel paths: instead of sending all partitions of every destination along the same Dijkstra path (which duplicates transfers on shared links), we compute a low-cost Steiner tree connecting src to all dsts. Shared edges only need to be traversed once per partition, drastically reducing redundant transfers. For each partition, we use k-shortest-path candidates on the Steiner tree / residual graph to spread load and use parallel paths, balancing throughput. This reduces total cost (fewer redundant edge traversals) and improves load balance.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Build a Steiner-like tree over src + dsts so shared edges are
+    # traversed once instead of duplicated per destination.
+    steiner_tree = _build_steiner_tree(h, src, dsts)
+
+    for dst in dsts:
+        # Get up to `num_partitions` simple shortest paths to spread
+        # partition traffic over parallel routes (load balancing).
+        try:
+            paths = list(
+                nx.shortest_simple_paths(h, src, dst, weight="cost")
+            )[:num_partitions]
+        except nx.NetworkXNoPath:
+            paths = []
+
+        if paths:
+            for j in range(bc_topology.num_partitions):
+                path = paths[j % len(paths)]
+                for i in range(0, len(path) - 1):
+                    s, t = path[i], path[i + 1]
+                    bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+        else:
+            # Fall back to Steiner tree path if simple paths search failed
+            try:
+                path = nx.shortest_path(steiner_tree, src, dst, weight="cost")
+                for j in range(bc_topology.num_partitions):
+                    for i in range(0, len(path) - 1):
+                        s, t = path[i], path[i + 1]
+                        if steiner_tree.has_edge(s, t):
+                            bc_topology.append_dst_partition_path(
+                                dst, j, [s, t, G[s][t]]
+                            )
+            except nx.NetworkXNoPath:
+                continue
+
+    return bc_topology
+
+
+def _build_steiner_tree(h, src, dsts):
+    """
+    Approximate Steiner tree via shortest-path heuristic:
+    grow a tree T from src, repeatedly attach the closest
+    remaining destination to T using Dijkstra.
+    """
+    T = nx.DiGraph()
+    T.add_node(src)
+    tree_nodes = {src}
+    remaining = [d for d in dsts if d != src]
+
+    while remaining:
+        best_cost = None
+        best_path = None
+        best_dst = None
+        for d in remaining:
+            try:
+                cost, path = nx.multi_source_dijkstra(h, tree_nodes, d, weight="cost")
+            except nx.NetworkXNoPath:
+                continue
+            if best_cost is None or cost < best_cost:
+                best_cost, best_path, best_dst = cost, path, d
+        if best_dst is None:
+            remaining = [d for d in remaining if d not in tree_nodes]
+            if not remaining:
+                break
+            continue
+        for i in range(0, len(best_path) - 1):
+            s, t = best_path[i], best_path[i + 1]
+            if h.has_edge(s, t):
+                edge_data = dict(h[s][t])
+                if not T.has_edge(s, t):
+                    T.add_edge(s, t, **edge_data)
+        tree_nodes.update(best_path)
+        remaining.remove(best_dst)
+
+    return T
+>>>>>>> REPLACE
+</DIFF>

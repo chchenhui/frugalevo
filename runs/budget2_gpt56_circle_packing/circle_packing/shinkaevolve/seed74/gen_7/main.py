@@ -1,0 +1,185 @@
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles"""
+import numpy as np
+
+
+def construct_packing():
+    """Numerically refine a layered, approximately hexagonal packing."""
+    from scipy.optimize import minimize
+
+    n = 26
+    pair_i, pair_j = np.triu_indices(n, 1)
+    pair_count = len(pair_i)
+
+    def make_start(row_sizes, radius=0.052):
+        """A feasible centered triangular-lattice seed."""
+        points = []
+        dy = 2.0 * radius * np.sqrt(3.0) / 2.0
+        for row, count in enumerate(row_sizes):
+            xs = 0.5 + (np.arange(count) - (count - 1) / 2.0) * (2.0 * radius)
+            y = 0.5 + (row - (len(row_sizes) - 1) / 2.0) * dy
+            points.extend((x, y) for x in xs)
+        return np.r_[np.asarray(points).ravel(), np.full(n, radius)]
+
+    def constraints(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        delta = c[pair_i] - c[pair_j]
+        distances = np.sqrt(np.sum(delta * delta, axis=1))
+        # Four walls per circle, followed by the 325 circle contacts.
+        return np.r_[c[:, 0] - r, 1.0 - c[:, 0] - r,
+                     c[:, 1] - r, 1.0 - c[:, 1] - r,
+                     distances - r[pair_i] - r[pair_j]]
+
+    def constraint_jacobian(z):
+        c = z[:2 * n].reshape(n, 2)
+        jac = np.zeros((4 * n + pair_count, 3 * n))
+        for k in range(n):
+            xcol, ycol, rcol = 2 * k, 2 * k + 1, 2 * n + k
+            jac[k, xcol], jac[k, rcol] = 1.0, -1.0
+            jac[n + k, xcol], jac[n + k, rcol] = -1.0, -1.0
+            jac[2 * n + k, ycol], jac[2 * n + k, rcol] = 1.0, -1.0
+            jac[3 * n + k, ycol], jac[3 * n + k, rcol] = -1.0, -1.0
+
+        delta = c[pair_i] - c[pair_j]
+        dist = np.sqrt(np.sum(delta * delta, axis=1))
+        unit = delta / np.maximum(dist[:, None], 1.e-12)
+        base = 4 * n
+        for q, (i, j) in enumerate(zip(pair_i, pair_j)):
+            row = base + q
+            jac[row, 2 * i:2 * i + 2] = unit[q]
+            jac[row, 2 * j:2 * j + 2] = -unit[q]
+            jac[row, 2 * n + i] = -1.0
+            jac[row, 2 * n + j] = -1.0
+        return jac
+
+    objective_jacobian = np.zeros(3 * n)
+    objective_jacobian[2 * n:] = -1.0
+    problem = {
+        "type": "ineq",
+        "fun": constraints,
+        "jac": constraint_jacobian,
+    }
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.001, 0.30)] * n
+
+    # Different row counts expose different useful boundary contacts.
+    starts = [
+        make_start([5, 6, 5, 6, 4]),
+        make_start([4, 5, 4, 5, 4, 4]),
+    ]
+    best = starts[0]
+    best_value = -np.inf
+    for start in starts:
+        result = minimize(
+            lambda z: -np.sum(z[2 * n:]), start, jac=lambda z: objective_jacobian,
+            method="SLSQP", bounds=bounds, constraints=problem,
+            options={"maxiter": 900, "ftol": 1.e-11, "disp": False},
+        )
+        candidate = result.x
+        if np.all(np.isfinite(candidate)):
+            value = np.sum(candidate[2 * n:])
+            if value > best_value:
+                best, best_value = candidate, value
+
+    centers = best[:2 * n].reshape(n, 2)
+    radii = best[2 * n:].copy()
+
+    # SLSQP is tolerance based; apply one common microscopic scale factor
+    # so the returned geometric object is valid under strict checking.
+    limits = [
+        np.min(centers[:, 0] / radii),
+        np.min((1.0 - centers[:, 0]) / radii),
+        np.min(centers[:, 1] / radii),
+        np.min((1.0 - centers[:, 1]) / radii),
+    ]
+    delta = centers[pair_i] - centers[pair_j]
+    distance = np.sqrt(np.sum(delta * delta, axis=1))
+    limits.append(np.min(distance / (radii[pair_i] + radii[pair_j])))
+    radii *= min(1.0, min(limits)) * (1.0 - 1.e-9)
+
+    return centers, radii, np.sum(radii)
+
+
+def compute_max_radii(centers):
+    """
+    Compute the maximum possible radii for each circle position
+    such that they don't overlap and stay within the unit square.
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+
+    Returns:
+        np.array of shape (n) with radius of each circle
+    """
+    n = centers.shape[0]
+    radii = np.ones(n)
+
+    # First, limit by distance to square borders
+    for i in range(n):
+        x, y = centers[i]
+        # Distance to borders
+        radii[i] = min(x, y, 1 - x, 1 - y)
+
+    # Then, limit by distance to other circles
+    # Each pair of circles with centers at distance d can have
+    # sum of radii at most d to avoid overlap
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+
+            # If current radii would cause overlap
+            if radii[i] + radii[j] > dist:
+                # Scale both radii proportionally
+                scale = dist / (radii[i] + radii[j])
+                radii[i] *= scale
+                radii[j] *= scale
+
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

@@ -1,0 +1,224 @@
+--- a/original.py
++++ b/original.py
+@@ -1,170 +1,199 @@
+ # EVOLVE-BLOCK-START
+ """Constructor-based circle packing for n=26 circles"""
+ import numpy as np
+ 
+ 
+ def construct_packing():
+     """
+     Construct a specific arrangement of 26 circles in a unit square
+     that attempts to maximize the sum of their radii.
+ 
+     Returns:
+         Tuple of (centers, radii, sum_of_radii)
+         centers: np.array of shape (26, 2) with (x, y) coordinates
+         radii: np.array of shape (26) with radius of each circle
+         sum_of_radii: Sum of all radii
+     """
+-    # A staggered lattice is a much better finite-square starting point than
+-    # concentric rings.  The central row has six circles; the other rows have
+-    # five, giving exactly 26 circles while retaining hexagonal neighbours.
+-    row_sizes = (5, 6, 5, 5, 5)
+-    seed_centers = []
+-    for row, count in enumerate(row_sizes):
+-        y = (row + 0.5) / len(row_sizes)
+-        for col in range(count):
+-            seed_centers.append(((col + 0.5) / count, y))
+-    seed_centers = np.asarray(seed_centers, dtype=float)
++    # Boundary contacts break the symmetry of an infinite hexagonal lattice.
++    # Try several placements of the row containing six circles, as well as
++    # lightly perturbed versions which can settle into asymmetric optima.
++    row_layouts = (
++        (5, 6, 5, 5, 5),
++        (5, 6, 5, 6, 4),
++        (6, 5, 5, 5, 5),
++        (5, 5, 6, 5, 5),
++    )
++
++    def make_seed(row_sizes):
++        points = []
++        for row, count in enumerate(row_sizes):
++            y = (row + 0.5) / len(row_sizes)
++            for col in range(count):
++                points.append(((col + 0.5) / count, y))
++        return np.asarray(points, dtype=float)
++
++    seed_centers = make_seed(row_layouts[0])
+     n = len(seed_centers)
+ 
+     # Optimize centers and radii simultaneously.  In contrast to successively
+     # shrinking radii, these are the actual geometric packing constraints.
+     ii, jj = np.triu_indices(n, 1)
+ 
+     def inequalities(z):
+         points = z[:2 * n].reshape(n, 2)
+         rs = z[2 * n:]
+         dx = points[ii, 0] - points[jj, 0]
+         dy = points[ii, 1] - points[jj, 1]
+         separations = np.sqrt(dx * dx + dy * dy) - rs[ii] - rs[jj]
+         return np.concatenate((
+             points[:, 0] - rs,
+             points[:, 1] - rs,
+             1.0 - points[:, 0] - rs,
+             1.0 - points[:, 1] - rs,
+             separations,
+         ))
+ 
+-    initial_radii = np.full(n, 0.035)
++    # These small initial circles make every lattice and perturbation feasible.
++    initial_radii = np.full(n, 0.025)
+     initial = np.concatenate((seed_centers.ravel(), initial_radii))
+ 
+     try:
+         from scipy.optimize import minimize
+ 
+-        result = minimize(
+-            lambda z: -np.sum(z[2 * n:]),
+-            initial,
+-            method="SLSQP",
+-            bounds=[(0.0, 1.0)] * (2 * n) + [(1e-6, 0.5)] * n,
+-            constraints={"type": "ineq", "fun": inequalities},
+-            options={"maxiter": 1800, "ftol": 1e-11, "disp": False},
+-        )
+-        candidate = result.x if np.all(np.isfinite(result.x)) else initial
++        rng = np.random.default_rng(26031991)
++        starts = []
++        for layout in row_layouts:
++            base = make_seed(layout)
++            starts.append(base)
++            for _ in range(2):
++                starts.append(base + rng.uniform(-0.012, 0.012, base.shape))
++
++        candidate = initial
++        best_value = float(np.sum(initial_radii))
++        for points in starts:
++            trial = np.concatenate((points.ravel(), initial_radii))
++            result = minimize(
++                lambda z: -np.sum(z[2 * n:]),
++                trial,
++                method="SLSQP",
++                bounds=[(0.0, 1.0)] * (2 * n) + [(1e-6, 0.5)] * n,
++                constraints={"type": "ineq", "fun": inequalities},
++                options={"maxiter": 2200, "ftol": 1e-11, "disp": False},
++            )
++            proposal = result.x
++            # Reject unfinished SLSQP iterates rather than allowing a
++            # subsequent global scale-down to hide constraint violations.
++            if (np.all(np.isfinite(proposal))
++                    and np.min(inequalities(proposal)) >= -1e-7):
++                value = float(np.sum(proposal[2 * n:]))
++                if value > best_value:
++                    candidate = proposal
++                    best_value = value
+     except Exception:
+-        # The seed itself is feasible, so this also provides a safe fallback
+-        # on installations without SciPy.
++        # The unperturbed first lattice seed is feasible without SciPy.
+         candidate = initial
+ 
+     centers = np.clip(candidate[:2 * n].reshape(n, 2), 0.0, 1.0)
+     radii = np.maximum(candidate[2 * n:], 0.0)
+ 
+     # SLSQP normally satisfies constraints to much better precision than this,
+     # but scale once more to guarantee strict validity after floating point
+     # rounding and any bound clipping above.
+     border_limits = np.minimum.reduce((
+         centers[:, 0], centers[:, 1],
+         1.0 - centers[:, 0], 1.0 - centers[:, 1],
+     ))
+     scale = np.min(border_limits / np.maximum(radii, 1e-15))
+     dx = centers[ii, 0] - centers[jj, 0]
+     dy = centers[ii, 1] - centers[jj, 1]
+     distances = np.sqrt(dx * dx + dy * dy)
+     pair_scale = distances / np.maximum(radii[ii] + radii[jj], 1e-15)
+     scale = min(1.0, scale, np.min(pair_scale)) * (1.0 - 1e-10)
+     radii *= max(0.0, scale)
+ 
+     return centers, radii, float(np.sum(radii))
+ 
+ 
+ def compute_max_radii(centers):
+     """
+     Compute the maximum possible radii for each circle position
+     such that they don't overlap and stay within the unit square.
+ 
+     Args:
+         centers: np.array of shape (n, 2) with (x, y) coordinates
+ 
+     Returns:
+         np.array of shape (n) with radius of each circle
+     """
+     n = centers.shape[0]
+     radii = np.ones(n)
+ 
+     # First, limit by distance to square borders
+     for i in range(n):
+         x, y = centers[i]
+         # Distance to borders
+         radii[i] = min(x, y, 1 - x, 1 - y)
+ 
+     # Then, limit by distance to other circles
+     # Each pair of circles with centers at distance d can have
+     # sum of radii at most d to avoid overlap
+     for i in range(n):
+         for j in range(i + 1, n):
+             dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+ 
+             # If current radii would cause overlap
+             if radii[i] + radii[j] > dist:
+                 # Scale both radii proportionally
+                 scale = dist / (radii[i] + radii[j])
+                 radii[i] *= scale
+                 radii[j] *= scale
+ 
+     return radii
+ 
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ # This part remains fixed (not evolved)
+ def run_packing():
+     """Run the circle packing constructor for n=26"""
+     centers, radii, sum_radii = construct_packing()
+     return centers, radii, sum_radii
+ 
+ 
+ def visualize(centers, radii):
+     """
+     Visualize the circle packing
+ 
+     Args:
+         centers: np.array of shape (n, 2) with (x, y) coordinates
+         radii: np.array of shape (n) with radius of each circle
+     """
+     import matplotlib.pyplot as plt
+     from matplotlib.patches import Circle
+ 
+     fig, ax = plt.subplots(figsize=(8, 8))
+ 
+     # Draw unit square
+     ax.set_xlim(0, 1)
+     ax.set_ylim(0, 1)
+     ax.set_aspect("equal")
+     ax.grid(True)
+ 
+     # Draw circles
+     for i, (center, radius) in enumerate(zip(centers, radii)):
+         circle = Circle(center, radius, alpha=0.5)
+         ax.add_patch(circle)
+         ax.text(center[0], center[1], str(i), ha="center", va="center")
+ 
+     plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+     plt.show()
+ 
+ 
+ if __name__ == "__main__":
+     centers, radii, sum_radii = run_packing()
+     print(f"Sum of radii: {sum_radii}")
+     # AlphaEvolve improved this to 2.635
+ 
+     # Uncomment to visualize:
+     visualize(centers, radii)

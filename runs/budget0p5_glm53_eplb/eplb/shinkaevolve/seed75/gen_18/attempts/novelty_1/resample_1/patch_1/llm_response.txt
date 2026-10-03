@@ -1,0 +1,227 @@
+<NAME>
+flat_lpt_replication_and_gpu_packing</NAME>
+<DESCRIPTION>
+Replace the three-level hierarchical pipeline (group→node packing, node-local replication, node-local GPU packing) with a flat, direct two-stage scheme: (1) decide replica counts per logical expert with a greedy loop that always replicates the expert with the highest per-replica load (weight/logcnt), and (2) build a flat list of all physical replicas (each with load weight/logcnt), sort them descending, and run one batched LPT `balanced_packing` across *all* GPUs. This removes the intermediate node constraint that forced heavy experts to stay within a node's expert budget, so the greedy LPT sees the whole GPU pool and both the expert-level loads (weight/logcnt) and the GPU-level loads are directly minimized by the same LPT that already scored well (0.66 gpu balancedness). Post-replication loads feeding LPT (instead of the naive load/count ratio heuristic deciding placement) directly target the weakest metric, expert balancedness. The algorithm is also simpler: one replication loop + one LPT pass instead of two LPT passes plus gather/scatter plumbing, so execution time stays small.</DESCRIPTION>
+<CODE>
+```python
+# SPDX-License-Identifier: Apache-2.0
+"""
+Expert parallelism load balancer (EPLB) for vLLM.
+
+Flat LPT-based rearrangement: decide replica counts greedily by per-replica
+load, then place all physical replicas directly onto GPUs with a single
+batched LPT packing.
+"""
+
+# EVOLVE-BLOCK-START
+
+import torch
+
+
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    if groups_per_pack == 1:
+        pack_index = torch.arange(weight.size(-1),
+                                  dtype=torch.int64,
+                                  dtype_place := None,
+                                  device=weight.device).expand(weight.shape) \
+            if False else torch.arange(
+                weight.size(-1), dtype=torch.int64,
+                device=weight.device).expand(weight.shape)
+        rank_in_pack = torch.zeros(weight.shape, dtype=torch.int64)
+        return pack_index, rank_in_pack
+
+    weight = weight.float().cpu()
+    indices = weight.sort(-1, descending=True).indices
+    num_layers = weight.size(0)
+    layer_rows = torch.arange(num_layers)
+    pack_index = torch.full((num_layers, num_groups),
+                            fill_value=-1,
+                            dtype=torch.int64)
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    pack_weights = torch.zeros(num_layers, num_packs)
+    pack_items = torch.zeros(num_layers, num_packs, dtype=torch.int64)
+    for t in range(num_groups):
+        group = indices[:, t]
+        # Mask out full packs by giving them infinite weight.
+        cand_weights = pack_weights.masked_fill(
+            pack_items >= groups_per_pack, float("inf"))
+        pack = cand_weights.argmin(-1)
+        pack_index[layer_rows, group] = pack
+        rank_in_pack[layer_rows, group] = pack_items[layer_rows, pack]
+        pack_weights[layer_rows, pack] += weight[layer_rows, group]
+        pack_items[layer_rows, pack] += 1
+    return pack_index, rank_in_pack
+
+
+def replicate_experts(
+        weight: torch.Tensor,
+        num_phy: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Replicate `num_log` experts to `num_phy` replicas, such that the maximum
+    load of all replicas is minimized.
+
+    Greedy: repeatedly replicate the expert whose current per-replica load
+    (weight / logcnt) is the largest.
+
+    Parameters:
+        weight: [X, num_log]
+        num_phy: total number of experts after replication
+
+    Returns:
+        phy2log: [X, num_phy], logical expert id of each physical expert
+        rank: [X, num_phy], the replica rank
+        logcnt: [X, num_log], number of replicas for each logical expert
+    """
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+
+
+def rebalance_experts(
+    weight: torch.Tensor,
+    num_replicas: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Entry point for expert-parallelism load balancer.
+
+    Flat strategy:
+      1. Decide replica counts per logical expert per layer by greedy
+         replication of the expert with the highest per-replica load.
+      2. Build the flat list of all physical replicas with load
+         weight / logcnt and LPT-pack them directly onto all GPUs.
+      3. Convert pack assignment into physical expert indices.
+
+    Parameters:
+        weight: [layers, num_logical_experts], the load statistics for all
+            logical experts
+        num_replicas: number of physical experts, must be a multiple of
+            `num_gpus`
+        num_groups: number of expert groups (unused by the flat strategy)
+        num_nodes: number of server nodes (unused by the flat strategy)
+        num_gpus: number of GPUs
+
+    Returns:
+        physical_to_logical_map: [layers, num_replicas], the expert index of
+            each replica
+        logical_to_physical_map: [layers, num_logical_experts, X], the replica
+            indices for each expert
+        expert_count: [layers, num_logical_experts], number of physical
+            replicas for each logical expert
+    """
+    num_layers, num_logical_experts = weight.shape
+    num_redundant_experts = num_replicas - num_logical_experts
+    maxlogcnt = num_redundant_experts + 1
+    assert num_replicas % num_gpus == 0
+    phy_experts_per_gpu = num_replicas // num_gpus
+    weight = weight.float().cpu()
+
+    # ---- Stage 1: replication ----
+    # The flat strategy ignores group/node locality; replication happens
+    # globally per layer.
+    _, _, logcnt = replicate_experts(weight, num_replicas)
+
+    # ---- Stage 2: build flat replica loads and LPT-pack onto GPUs ----
+    # replica load for each logical expert = weight / logcnt
+    replica_load = weight / logcnt  # [num_layers, num_logical_experts]
+    layer_rows = torch.arange(num_layers)
+
+    # Expanded list of physical replicas: each expert appears logcnt times.
+    # Sort experts by replica load descending; LPT will then place the
+    # heaviest replicas first.
+    order = replica_load.sort(-1, descending=True).indices  # expert ids desc
+    # logcnt gathered in descending-load order
+    cnt_sorted = logcnt.gather(-1, order)  # [num_layers, num_logical_experts]
+
+    # For LPT we want each *replica* as an item. Build repeated loads:
+    # max replication count is small; build via scatter-free expansion.
+    # Create the flat replica list per layer:
+    # replicas of expert j appear cnt_sorted[j] times with load
+    # replica_load[j].
+    loads_sorted = replica_load.gather(-1, order)
+
+    # Use balanced_packing on the *expert* granularity? No: we need
+    # per-replica granularity. Build repeated tensor using repeat_interleave
+    # per layer. Do it in a loop-free way with a helper:
+    phy2log = torch.empty(num_layers, num_replicas, dtype=torch.int64)
+    for li in range(num_layers):
+        # repeat each expert id cnt_sorted times
+        ids = order[li].repeat_interleave(cnt_sorted[li])
+        # ids is length num_replicas, sorted by descending replica load
+        phy2log[li] = ids
+
+    # Replica loads flattened: [num_layers, num_replicas]
+    flat_loads = replica_load.gather(-1, phy2log)
+    pack_index, rank_in_pack = balanced_packing(flat_loads, num_gpus)
+    # pack_index: GPU of each (desc-load-ordered) replica slot
+    # physical index = gpu * phy_experts_per_gpu + rank
+    pphy = pack_index * phy_experts_per_gpu + rank_in_pack
+    # phy2log_final[li, pphy[li, slot]] = phy2log[li, slot]
+    phy2log_final = torch.empty_like(pphy)
+    phy2log_final.scatter_(1, pphy, phy2log)
+    # rank of each replica: the k-th replica (0-based) of its logical expert
+    # Recompute ranks by scanning: for each physical expert, its rank within
+    # its logical expert replicas in physical order.
+    phyrank = torch.empty_like(pphy)
+    # compute rank: for each layer, iterate physical indices in order and
+    # count occurrences of each logical expert.
+    for li in range(num_layers):
+        counts = torch.zeros(num_logical_experts, dtype=torch.int64)
+        ranks = torch.empty(num_replicas, dtype=torch.int64)
+        row = phy2log_final[li]
+        for pi in range(num_replicas):
+            e = row[pi].item()
+            ranks[pi] = counts[e]
+            counts[e] += 1
+        phyrank[li] = ranks
+
+    # ---- Stage 3: build inverse map ----
+    log2phy: torch.Tensor = torch.full(
+        (num_layers, num_logical_experts, maxlogcnt),
+        -1,
+        dtype=torch.int64,
+    )
+    log2phy.view(num_layers, -1).scatter_(
+        -1,
+        phy2log_final * maxlogcnt + phyrank,
+        torch.arange(num_replicas, dtype=torch.int64).expand(num_layers, -1),
+    )
+    return phy2log_final, log2phy, logcnt
+
+
+# EVOLVE-BLOCK-END
+
+__all__ = ["rebalance_experts"]
+```
+</CODE>

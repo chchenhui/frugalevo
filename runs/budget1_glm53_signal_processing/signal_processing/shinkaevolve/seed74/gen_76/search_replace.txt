@@ -1,0 +1,88 @@
+<NAME>
+guarded_flip_escalation_loop</NAME>
+<DESCRIPTION>
+Add a guarded iterative slope-flip escalation loop after the full polish stack. Count sign flips of np.diff(y); while flips exceed a target and correlation with the pre-loop signal stays >= 0.97, re-run the reversal damp with escalating threshold (x1.5) and a light alpha=0.85 bilateral pass, keeping the best iterate (lowest flip count). This auto-calibrates per signal and directly optimizes the slope_changes / false_reversals metrics that gate the composite, following the escalate-until-guard-trips pattern that previously lifted noise reduction. Also restore the defensive sanitization (NaN/inf interpolation, short-signal graceful fallback, all-non-finite zeros) that the current generation dropped — the 0.00 failure cluster came from contract/syntax failures on adversarial inputs, so robustness must be preserved.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    x = np.asarray(x, dtype=float).ravel()
+    n = x.size
+    if n < window_size:
+        raise ValueError(
+            f"Input signal length ({n}) must be >= window_size ({window_size})"
+        )
+    if n == 1:
+        return x.copy()
+=======
+    x = np.asarray(x, dtype=float, copy=True).ravel()
+    # Sanitize non-finite values (guard against failures on adversarial
+    # inputs): replace NaN/inf with local interpolation/fill.
+    bad = ~np.isfinite(x)
+    if bad.any():
+        idx = np.arange(x.size)
+        if bad.all():
+            return np.zeros(max(0, x.size - window_size + 1))
+        x[bad] = np.interp(idx[bad], idx[~bad], x[~bad])
+    n = x.size
+    if n < window_size:
+        # Graceful fallback: return input clipped to expected length.
+        return x[: max(1, n - window_size + 1)].copy()
+    if n == 1:
+        return x.copy()
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+        if step_std > 0:
+            y_pre = y.copy()
+            y_try = _reversal_damp(y_pre, 2.0 * step_std, keep=0.25)
+            c = np.corrcoef(y_try, y_pre)[0, 1]
+            if np.isfinite(c) and c >= 0.97:
+                y = y_try
+
+    # --- Slice to output contract ---
+=======
+        if step_std > 0:
+            y_pre = y.copy()
+            y_try = _reversal_damp(y_pre, 2.0 * step_std, keep=0.25)
+            c = np.corrcoef(y_try, y_pre)[0, 1]
+            if np.isfinite(c) and c >= 0.97:
+                y = y_try
+
+    # --- Guarded iterative slope-flip escalation loop ---
+    # Count sign flips of the first difference; while flips exceed the
+    # target and correlation with the pre-loop signal stays >= 0.97,
+    # re-run reversal damping at an escalating threshold plus a light
+    # alpha=0.85 bilateral pass, keeping the best (fewest flips) iterate.
+    # Auto-calibrates per signal against the reversal metric.
+    if n >= 3:
+        def _count_flips(v):
+            dv = np.diff(v)
+            dv = dv[dv != 0]
+            return int(np.sum(dv[1:] * dv[:-1] < 0)) if dv.size > 1 else 0
+
+        y_base = y.copy()
+        flips_base = _count_flips(y_base)
+        target_flips = 12
+        thresh = 2.0 * step_std if step_std > 0 else 1e-12
+        best_y = y_base
+        best_flips = flips_base
+        cur = y_base
+        for _iter in range(4):
+            if best_flips <= target_flips:
+                break
+            cand = _reversal_damp(cur, thresh, keep=0.25)
+            cand = _bilateral_one_pole(cand, 0.85)
+            c = np.corrcoef(cand, y_base)[0, 1]
+            if not np.isfinite(c) or c < 0.97:
+                break
+            f = _count_flips(cand)
+            if f < best_flips:
+                best_flips = f
+                best_y = cand
+            cur = cand
+            thresh *= 1.5
+        y = best_y
+
+    # --- Slice to output contract ---
+>>>>>>> REPLACE
+</DIFF>

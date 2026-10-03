@@ -1,0 +1,249 @@
+--- a/original.py
++++ b/original.py
+@@ -1,153 +1,206 @@
+ GPU_MEM_SIZE = 80 # GB
+ 
+ # EVOLVE-BLOCK-START
+ 
+ def compute_model_placement(gpu_num, models):
+     """
+     Compute a model placement that minimizes the maximum KVPR across all GPUs.
+-
+-    Args:
+-        gpu_num: Number of GPUs
+-        models: List of models to place
+-
+-    Returns:
+-        A placement of models to GPUs
+     """
+-
+-    # 1) Sort models by r_j / s_j in descending order
+     sorted_models = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
+ 
+-    # 2) Initialize per-GPU states (track by index to avoid duplicate-object issues)
+     placement = {gpu_id: [] for gpu_id in range(gpu_num)}  # lists of (idx, model)
+     shared_kv = [GPU_MEM_SIZE for _ in range(gpu_num)]
+     weighted_req_rate = [0.0 for _ in range(gpu_num)]
+ 
+-    # 3) Greedy assignment: put each model on the GPU with lowest current KVPR that fits
++    # Greedy assignment
+     for idx, model in enumerate(sorted_models):
+         best_idx = None
+         best_ratio = float('inf')
+         for gpu_id in range(gpu_num):
+             if model.model_size <= shared_kv[gpu_id] and shared_kv[gpu_id] > 0:
+                 current_ratio = weighted_req_rate[gpu_id] / shared_kv[gpu_id]
+                 if current_ratio < best_ratio:
+                     best_ratio = current_ratio
+                     best_idx = gpu_id
+         if best_idx is None:
+             raise ValueError(
+                 f"Unable to place model of size {model.model_size} GB on any GPU."
+             )
+         placement[best_idx].append((idx, model))
+         weighted_req_rate[best_idx] += model.req_rate / model.slo
+         shared_kv[best_idx] -= model.model_size
+ 
+-    # 4) Local search refinement (index-based move/swap, safe for duplicates)
+     def gpu_kvpr(gpu_id):
+         mem_left = GPU_MEM_SIZE - sum(m.model_size for _, m in placement[gpu_id])
+         if mem_left <= 0:
+             return float('inf')
+         return weighted_req_rate[gpu_id] / mem_left
+ 
+     def max_kvpr():
+         return max(gpu_kvpr(g) for g in range(gpu_num))
+ 
+-    for _round in range(20):  # cap iterations to guarantee termination
++    def apply_move(src, pos, dst):
++        idx, model = placement[src].pop(pos)
++        placement[dst].append((idx, model))
++        weighted_req_rate[src] -= model.req_rate / model.slo
++        weighted_req_rate[dst] += model.req_rate / model.slo
++        shared_kv[src] += model.model_size
++        shared_kv[dst] -= model.model_size
++        return idx, model
++
++    def undo_move(src, pos, dst, item):
++        idx, model = item
++        placement[dst].pop()
++        placement[src].insert(pos, (idx, model))
++        weighted_req_rate[dst] -= model.req_rate / model.slo
++        weighted_req_rate[src] += model.req_rate / model.slo
++        shared_kv[dst] += model.model_size
++        shared_kv[src] -= model.model_size
++
++    for _round in range(20):
+         improved = False
+         best_max = max_kvpr()
+-        # Try moving a single model to another GPU
++
++        # Move 1: single-model relocation from hottest GPUs
+         for src in range(gpu_num):
+             if gpu_kvpr(src) < best_max - 1e-12:
+-                continue  # only perturb GPUs at the max
++                continue
+             for pos in range(len(placement[src])):
+                 idx, model = placement[src][pos]
+                 for dst in range(gpu_num):
+                     if dst == src or model.model_size > shared_kv[dst]:
+                         continue
+-                    # Apply move
+-                    placement[src].pop(pos)
+-                    placement[dst].append((idx, model))
+-                    weighted_req_rate[src] -= model.req_rate / model.slo
+-                    weighted_req_rate[dst] += model.req_rate / model.slo
+-                    shared_kv[src] += model.model_size
+-                    shared_kv[dst] -= model.model_size
++                    item = apply_move(src, pos, dst)
+                     if max_kvpr() < best_max - 1e-12:
+-                        best_max = max_kvpr()
+                         improved = True
+-                        break  # pos now stale; restart scanning this src
+-                    # Revert
+-                    placement[dst].pop()
+-                    placement[src].insert(pos, (idx, model))
+-                    weighted_req_rate[dst] -= model.req_rate / model.slo
+-                    weighted_req_rate[src] += model.req_rate / model.slo
+-                    shared_kv[dst] += model.model_size
+-                    shared_kv[src] -= model.model_size
++                        break
++                    undo_move(src, pos, dst, item)
+                 if improved:
+                     break
+             if improved:
+                 break
+         if improved:
+             continue
+-        # Try swapping pairs of models between GPUs
++
++        # Move 2: pairwise swap between GPUs
+         for src in range(gpu_num):
+             for dst in range(src + 1, gpu_num):
+                 for p1 in range(len(placement[src])):
+                     for p2 in range(len(placement[dst])):
+                         i1, m1 = placement[src][p1]
+                         i2, m2 = placement[dst][p2]
+                         delta_mem = m2.model_size - m1.model_size
+                         if shared_kv[dst] + delta_mem < 0 or shared_kv[src] - delta_mem < 0:
+                             continue
+-                        # Apply swap
+                         placement[src][p1] = (i2, m2)
+                         placement[dst][p2] = (i1, m1)
+-                        weighted_req_rate[src] += m2.req_rate / m2.slo - m1.req_rate / m1.slo
+-                        weighted_req_rate[dst] += m1.req_rate / m1.slo - m2.req_rate / m2.slo
++                        w_delta = m2.req_rate / m2.slo - m1.req_rate / m1.slo
++                        weighted_req_rate[src] += w_delta
++                        weighted_req_rate[dst] -= w_delta
+                         shared_kv[src] += delta_mem
+                         shared_kv[dst] -= delta_mem
+                         if max_kvpr() < best_max - 1e-12:
+-                            best_max = max_kvpr()
+                             improved = True
+                             break
+-                        # Revert
+                         placement[src][p1] = (i1, m1)
+                         placement[dst][p2] = (i2, m2)
+-                        weighted_req_rate[src] += m1.req_rate / m1.slo - m2.req_rate / m2.slo
+-                        weighted_req_rate[dst] += m2.req_rate / m2.slo - m1.req_rate / m1.slo
++                        weighted_req_rate[src] -= w_delta
++                        weighted_req_rate[dst] += w_delta
+                         shared_kv[src] -= delta_mem
+                         shared_kv[dst] += delta_mem
+                     if improved:
+                         break
+                 if improved:
+                     break
+             if improved:
+                 break
++        if improved:
++            continue
++
++        # Move 3: 3-cycle rotation across three GPUs, restricted to hottest GPUs
++        kvs = [gpu_kvpr(g) for g in range(gpu_num)]
++        hot_order = sorted(range(gpu_num), key=lambda g: -kvs[g])
++        cand_gpus = hot_order[:3]  # two hottest plus one more
++        found = False
++        for gi in range(len(cand_gpus)):
++            for gj in range(len(cand_gpus)):
++                for gk in range(len(cand_gpus)):
++                    if len({gi, gj, gk}) < 3:
++                        continue
++                    g1, g2, g3 = cand_gpus[gi], cand_gpus[gj], cand_gpus[gk]
++                    for p1 in range(len(placement[g1])):
++                        for p2 in range(len(placement[g2])):
++                            for p3 in range(len(placement[g3])):
++                                i1, m1 = placement[g1][p1]
++                                i2, m2 = placement[g2][p2]
++                                i3, m3 = placement[g3][p3]
++                                # memory feasibility: g1 gets m2, g2 gets m3, g3 gets m1
++                                if (shared_kv[g1] + m1.model_size - m2.model_size < 0 or
++                                    shared_kv[g2] + m2.model_size - m3.model_size < 0 or
++                                    shared_kv[g3] + m3.model_size - m1.model_size < 0):
++                                    continue
++                                # apply cycle
++                                placement[g1][p1] = (i2, m2)
++                                placement[g2][p2] = (i3, m3)
++                                placement[g3][p3] = (i1, m1)
++                                w1 = m1.req_rate / m1.slo
++                                w2 = m2.req_rate / m2.slo
++                                w3 = m3.req_rate / m3.slo
++                                weighted_req_rate[g1] += w2 - w1
++                                weighted_req_rate[g2] += w3 - w2
++                                weighted_req_rate[g3] += w1 - w3
++                                shared_kv[g1] += m1.model_size - m2.model_size
++                                shared_kv[g2] += m2.model_size - m3.model_size
++                                shared_kv[g3] += m3.model_size - m1.model_size
++                                if max_kvpr() < best_max - 1e-12:
++                                    improved = True
++                                    found = True
++                                    break
++                                # revert
++                                placement[g1][p1] = (i1, m1)
++                                placement[g2][p2] = (i2, m2)
++                                placement[g3][p3] = (i3, m3)
++                                weighted_req_rate[g1] += w1 - w2
++                                weighted_req_rate[g2] += w2 - w3
++                                weighted_req_rate[g3] += w3 - w1
++                                shared_kv[g1] += m2.model_size - m1.model_size
++                                shared_kv[g2] += m3.model_size - m2.model_size
++                                shared_kv[g3] += m1.model_size - m3.model_size
++                            if found:
++                                break
++                        if found:
++                            break
++                    if found:
++                        break
++                if found:
++                    break
+         if not improved:
+             break
+ 
+-    # Convert back to expected output format: dict of gpu_id -> list of models
+     return {gpu_id: [m for _, m in placement[gpu_id]] for gpu_id in range(gpu_num)}
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ if __name__ == "__main__":
+     # Test the algorithm
+ 
+     from evaluator import generate_test_gpu_models
+     from evaluator import calculate_kvcache_pressure
+     from evaluator import safe_float
+     import numpy as np
+ 
+     test_cases = generate_test_gpu_models()
+     all_kvpr = []
+     for i, (gpu_num, gpu_models) in enumerate(test_cases):
+ 
+         results = compute_model_placement(gpu_num, gpu_models)
+         max_kvpr = calculate_kvcache_pressure(results)
+         all_kvpr.append(safe_float(max_kvpr))
+ 
+     avg_kvpr = np.mean(all_kvpr)
+     if avg_kvpr != 0:
+         avg_kvpr = 1.0 / avg_kvpr
+ 
+ 
+     print(f"Max KVPR: {avg_kvpr:.3f}")

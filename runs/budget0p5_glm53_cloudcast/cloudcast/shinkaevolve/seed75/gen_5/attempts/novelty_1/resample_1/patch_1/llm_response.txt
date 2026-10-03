@@ -1,0 +1,85 @@
+<NAME>
+multipath_load_balanced_search
+
+</NAME>
+<DESCRIPTION>
+The current algorithm naively uses single-source Dijkstra for every destination, which (a) forces all partitions of a destination down the same path, overloading low-cost links (throughput is a hard constraint, so congestion inflates effective cost) and (b) recomputes paths redundantly for each destination. 
+
+The proposed edit: (1) compute k-shortest paths per destination using Yen's algorithm, (2) iteratively pick paths that minimize cost *after* accounting for congestion — edges already carrying flow from previously routed partitions get their effective cost scaled up, spreading load across parallel networks/links, and (3) alternate partitions among the top-k candidate paths so partitions of the same destination traverse different (overlapping/non-overlapping) low-cost routes, exploiting multi-network topologies instead of funneling everything through one cheapest path. This reduces cost by avoiding congestion-induced slow transfers and by distributing flow over cheaper parallel edges, while remaining a pure drop-in replacement for `search_algorithm`.
+
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    # Track congestion: how much flow each edge already carries
+    edge_load = {e: 0 for e in h.edges()}
+
+    def edge_weight(u, v, data):
+        # Effective cost rises with utilization: load-balanced routing
+        throughput = data.get("throughput") or 1.0
+        base_cost = data.get("cost")
+        if base_cost is None:
+            base_cost = 1e9
+        utilization = edge_load[(u, v)] / max(throughput, 1e-9)
+        # Penalize heavily used links so partitions spread across networks
+        return base_cost * (1.0 + 2.0 * utilization)
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Pre-compute up to k candidate paths per destination
+    k_paths = {}
+    for dst in dsts:
+        try:
+            paths = list(nx.shortest_simple_paths(h, src, dst, weight="cost"))
+        except nx.NetworkXNoPath:
+            paths = []
+        k_paths[dst] = paths[:min(3, len(paths))]
+
+    # Route each partition, alternating across candidate paths and
+    # updating edge load so subsequent routing decisions see congestion.
+    for dst in dsts:
+        cands = k_paths[dst]
+        if not cands:
+            # fallback: plain dijkstra on effective weights
+            try:
+                cands = [nx.dijkstra_path(h, src, dst, weight=edge_weight)]
+            except nx.NetworkXNoPath:
+                continue
+
+        for j in range(bc_topology.num_partitions):
+            # pick the candidate with the lowest effective (congestion-aware) cost
+            best_path, best_cost = None, float("inf")
+            for cand in cands:
+                c = sum(edge_weight(cand[i], cand[i + 1], h[cand[i]][cand[i + 1]])
+                        for i in range(len(cand) - 1))
+                if c < best_cost:
+                    best_path, best_cost = cand, c
+
+            path = best_path
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                edge_data = G[s][t]
+                throughput = edge_data.get("throughput") or 1.0
+                edge_load[(s, t)] += 1.0 / num_partitions * throughput
+                bc_topology.append_dst_partition_path(dst, j, [s, t, edge_data])
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

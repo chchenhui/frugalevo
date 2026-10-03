@@ -1,0 +1,478 @@
+// EVOLVE-BLOCK-START
+#pragma GCC optimize("O3,unroll-loops")
+
+#include <bits/stdc++.h>
+using namespace std;
+
+static constexpr int N = 50;
+static constexpr int M = 100;
+static constexpr int V = N * N;
+static constexpr int C = M + 1;
+
+struct RNG {
+    uint64_t s;
+
+    RNG() {
+        s = (uint64_t)chrono::high_resolution_clock::now().time_since_epoch().count();
+        s ^= (uint64_t)(uintptr_t)this;
+        if (s == 0) s = 88172645463325252ULL;
+    }
+
+    uint64_t next() {
+        s ^= s << 7;
+        s ^= s >> 9;
+        return s;
+    }
+
+    int nextInt(int n) {
+        return (int)(next() % (uint64_t)n);
+    }
+
+    double nextDouble() {
+        return (next() >> 11) * (1.0 / 9007199254740992.0);
+    }
+};
+
+struct Solver {
+    int board[V];
+    int best[V];
+
+    bool required[C][C];
+    int edgeCount[C][C];
+
+    vector<int> cells[C];
+    int position[V];
+
+    int seen[V];
+    int stamp = 1;
+    int bfsQueue[V];
+
+    int bestZero = 0;
+    RNG rng;
+    chrono::steady_clock::time_point start;
+
+    struct Move {
+        int id = -1;
+        int oldColor = -1;
+        int newColor = -1;
+        int pairId[8];
+        int delta[8];
+        int count = 0;
+        bool applied = false;
+    };
+
+    inline bool inside(int r, int c) const {
+        return (unsigned)r < N && (unsigned)c < N;
+    }
+
+    inline int cellId(int r, int c) const {
+        return r * N + c;
+    }
+
+    inline int row(int id) const {
+        return id / N;
+    }
+
+    inline int col(int id) const {
+        return id % N;
+    }
+
+    inline int encodePair(int a, int b) const {
+        if (a > b) swap(a, b);
+        return a * C + b;
+    }
+
+    inline void decodePair(int code, int &a, int &b) const {
+        a = code / C;
+        b = code % C;
+    }
+
+    inline void addRequired(int a, int b) {
+        if (a == b) return;
+        required[a][b] = required[b][a] = true;
+    }
+
+    inline void addEdge(int a, int b, int d) {
+        if (a == b) return;
+        edgeCount[a][b] += d;
+        edgeCount[b][a] += d;
+    }
+
+    void addCell(int id, int color) {
+        position[id] = (int)cells[color].size();
+        cells[color].push_back(id);
+    }
+
+    void eraseCell(int id, int color) {
+        int p = position[id];
+        int last = cells[color].back();
+        cells[color][p] = last;
+        position[last] = p;
+        cells[color].pop_back();
+    }
+
+    void relocateCell(int id, int from, int to) {
+        eraseCell(id, from);
+        addCell(id, to);
+    }
+
+    bool isBoundary(int id) const {
+        int r = row(id), c = col(id);
+        return r == 0 || r == N - 1 || c == 0 || c == N - 1;
+    }
+
+    bool hasNeighborColor(int id, int color) const {
+        int r = row(id), c = col(id);
+        if (r > 0 && board[id - N] == color) return true;
+        if (r + 1 < N && board[id + N] == color) return true;
+        if (c > 0 && board[id - 1] == color) return true;
+        if (c + 1 < N && board[id + 1] == color) return true;
+        return false;
+    }
+
+    bool connectedColor(int color) {
+        if (cells[color].empty()) return false;
+
+        int source = cells[color][0];
+
+        if (color == 0) {
+            source = -1;
+            for (int id : cells[0]) {
+                if (isBoundary(id)) {
+                    source = id;
+                    break;
+                }
+            }
+            if (source == -1) return false;
+        }
+
+        ++stamp;
+        if (stamp == INT_MAX) {
+            memset(seen, 0, sizeof(seen));
+            stamp = 1;
+        }
+
+        int head = 0, tail = 0;
+        bfsQueue[tail++] = source;
+        seen[source] = stamp;
+
+        while (head < tail) {
+            int id = bfsQueue[head++];
+            int r = row(id), c = col(id);
+
+            if (r > 0) {
+                int to = id - N;
+                if (board[to] == color && seen[to] != stamp) {
+                    seen[to] = stamp;
+                    bfsQueue[tail++] = to;
+                }
+            }
+            if (r + 1 < N) {
+                int to = id + N;
+                if (board[to] == color && seen[to] != stamp) {
+                    seen[to] = stamp;
+                    bfsQueue[tail++] = to;
+                }
+            }
+            if (c > 0) {
+                int to = id - 1;
+                if (board[to] == color && seen[to] != stamp) {
+                    seen[to] = stamp;
+                    bfsQueue[tail++] = to;
+                }
+            }
+            if (c + 1 < N) {
+                int to = id + 1;
+                if (board[to] == color && seen[to] != stamp) {
+                    seen[to] = stamp;
+                    bfsQueue[tail++] = to;
+                }
+            }
+        }
+
+        return tail == (int)cells[color].size();
+    }
+
+    void addDelta(Move &mv, int a, int b, int d) {
+        if (a == b) return;
+        int code = encodePair(a, b);
+
+        for (int i = 0; i < mv.count; ++i) {
+            if (mv.pairId[i] == code) {
+                mv.delta[i] += d;
+                return;
+            }
+        }
+
+        mv.pairId[mv.count] = code;
+        mv.delta[mv.count] = d;
+        ++mv.count;
+    }
+
+    void applyDeltas(const Move &mv, int sign) {
+        for (int i = 0; i < mv.count; ++i) {
+            if (mv.delta[i] == 0) continue;
+            int a, b;
+            decodePair(mv.pairId[i], a, b);
+            addEdge(a, b, sign * mv.delta[i]);
+        }
+    }
+
+    bool edgeConditionsHold(const Move &mv) const {
+        for (int i = 0; i < mv.count; ++i) {
+            if (mv.delta[i] == 0) continue;
+            int a, b;
+            decodePair(mv.pairId[i], a, b);
+            bool exists = edgeCount[a][b] > 0;
+            if (exists != required[a][b]) return false;
+        }
+        return true;
+    }
+
+    void undo(Move &mv) {
+        if (!mv.applied) return;
+
+        applyDeltas(mv, -1);
+        board[mv.id] = mv.oldColor;
+        relocateCell(mv.id, mv.newColor, mv.oldColor);
+        mv.applied = false;
+    }
+
+    bool tryMove(int id, int to, Move &mv) {
+        int from = board[id];
+        if (from == to) return false;
+
+        // Keeping zero attached to the outside makes zero insertion cheap and safe.
+        if (to == 0 && !isBoundary(id) && !hasNeighborColor(id, 0)) return false;
+
+        // Every positive ward must remain represented.
+        if (from != 0 && cells[from].size() <= 1) return false;
+
+        mv = Move();
+        mv.id = id;
+        mv.oldColor = from;
+        mv.newColor = to;
+
+        int r = row(id), c = col(id);
+
+        auto inspectNeighbor = [&](int neighborColor) {
+            addDelta(mv, from, neighborColor, -1);
+            addDelta(mv, to, neighborColor, +1);
+        };
+
+        inspectNeighbor(r > 0 ? board[id - N] : 0);
+        inspectNeighbor(r + 1 < N ? board[id + N] : 0);
+        inspectNeighbor(c > 0 ? board[id - 1] : 0);
+        inspectNeighbor(c + 1 < N ? board[id + 1] : 0);
+
+        board[id] = to;
+        relocateCell(id, from, to);
+        applyDeltas(mv, +1);
+        mv.applied = true;
+
+        if (!edgeConditionsHold(mv)) {
+            undo(mv);
+            return false;
+        }
+
+        // Only the removed color can be split. The added color is selected from a
+        // neighboring tile or is zero attached to boundary/zero.
+        if (!connectedColor(from)) {
+            undo(mv);
+            return false;
+        }
+
+        return true;
+    }
+
+    void initialize() {
+        memset(required, 0, sizeof(required));
+        memset(edgeCount, 0, sizeof(edgeCount));
+
+        for (int c = 0; c <= M; ++c) cells[c].clear();
+
+        for (int r = 0; r < N; ++r) {
+            for (int c = 0; c < N; ++c) {
+                int x;
+                cin >> x;
+                int id = cellId(r, c);
+                board[id] = x;
+                addCell(id, x);
+            }
+        }
+
+        for (int r = 0; r < N; ++r) {
+            for (int c = 0; c < N; ++c) {
+                int id = cellId(r, c);
+                int x = board[id];
+
+                if (r == 0) {
+                    addRequired(0, x);
+                    addEdge(0, x, 1);
+                }
+                if (r == N - 1) {
+                    addRequired(0, x);
+                    addEdge(0, x, 1);
+                }
+                if (c == 0) {
+                    addRequired(0, x);
+                    addEdge(0, x, 1);
+                }
+                if (c == N - 1) {
+                    addRequired(0, x);
+                    addEdge(0, x, 1);
+                }
+
+                if (c + 1 < N) {
+                    int y = board[id + 1];
+                    addRequired(x, y);
+                    addEdge(x, y, 1);
+                }
+                if (r + 1 < N) {
+                    int y = board[id + N];
+                    addRequired(x, y);
+                    addEdge(x, y, 1);
+                }
+            }
+        }
+
+        memcpy(best, board, sizeof(board));
+        bestZero = 0;
+    }
+
+    void recordBest() {
+        int score = (int)cells[0].size();
+        if (score > bestZero) {
+            bestZero = score;
+            memcpy(best, board, sizeof(board));
+        }
+    }
+
+    double elapsedMs() const {
+        return chrono::duration<double, milli>(
+            chrono::steady_clock::now() - start
+        ).count();
+    }
+
+    void erosionPhase(double limitMs) {
+        vector<int> order(V);
+        iota(order.begin(), order.end(), 0);
+
+        while (elapsedMs() < limitMs) {
+            for (int i = V - 1; i > 0; --i) {
+                swap(order[i], order[rng.nextInt(i + 1)]);
+            }
+
+            int improved = 0;
+
+            for (int id : order) {
+                if (elapsedMs() >= limitMs) return;
+                if (board[id] == 0) continue;
+
+                Move mv;
+                if (tryMove(id, 0, mv)) {
+                    ++improved;
+                    recordBest();
+                }
+            }
+
+            // Additional passes still matter after successful erosion because new
+            // zero tiles expose fresh candidates. Stop only after a dry pass.
+            if (improved == 0) {
+                for (int k = 0; k < 400; ++k) {
+                    int id = rng.nextInt(V);
+                    if (board[id] == 0) continue;
+                    Move mv;
+                    if (tryMove(id, 0, mv)) {
+                        recordBest();
+                        improved = 1;
+                    }
+                }
+                if (improved == 0) return;
+            }
+        }
+    }
+
+    void annealPhase(double limitMs) {
+        const double beginTemp = 0.85;
+        const double endTemp = 0.015;
+        const double phaseStart = elapsedMs();
+        const double phaseLength = max(1.0, limitMs - phaseStart);
+
+        int iterations = 0;
+
+        while (true) {
+            if ((++iterations & 255) == 0 && elapsedMs() >= limitMs) break;
+
+            double p = min(1.0, (elapsedMs() - phaseStart) / phaseLength);
+            double temp = beginTemp * pow(endTemp / beginTemp, p);
+
+            int id = rng.nextInt(V);
+            int from = board[id];
+
+            int candidates[5];
+            int cnt = 0;
+
+            // Bias strongly toward deletion, while still allowing reshaping.
+            if (rng.nextInt(100) < 70) {
+                candidates[cnt++] = 0;
+            } else {
+                int r = row(id), c = col(id);
+                if (r > 0) candidates[cnt++] = board[id - N];
+                if (r + 1 < N) candidates[cnt++] = board[id + N];
+                if (c > 0) candidates[cnt++] = board[id - 1];
+                if (c + 1 < N) candidates[cnt++] = board[id + 1];
+                if (cnt == 0) candidates[cnt++] = 0;
+            }
+
+            int to = candidates[rng.nextInt(cnt)];
+            if (to == from) continue;
+
+            Move mv;
+            if (!tryMove(id, to, mv)) continue;
+
+            int gain = (to == 0) - (from == 0);
+            bool accept = gain >= 0;
+
+            if (!accept) {
+                double probability = exp((double)gain / temp);
+                accept = rng.nextDouble() < probability;
+            }
+
+            if (accept) {
+                if (gain > 0) recordBest();
+            } else {
+                undo(mv);
+            }
+        }
+    }
+
+    void run() {
+        start = chrono::steady_clock::now();
+        initialize();
+
+        erosionPhase(850.0);
+        annealPhase(1950.0);
+
+        for (int r = 0; r < N; ++r) {
+            for (int c = 0; c < N; ++c) {
+                if (c) cout << ' ';
+                cout << best[cellId(r, c)];
+            }
+            cout << '\n';
+        }
+    }
+};
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int n, m;
+    cin >> n >> m;
+
+    Solver solver;
+    solver.run();
+    return 0;
+}
+// EVOLVE-BLOCK-END

@@ -1,0 +1,115 @@
+<NAME>
+reuse_reward_joint_broadcast</NAME>
+
+<DESCRIPTION>
+Invert the per-edge load penalty into a per-partition reuse reward. For each destination, process partitions in order and prefer candidate paths whose edges have already been used by earlier partitions (or by previously processed destinations) — if cost is charged per unique edge or aggregate flows get discounted, reusing edges lowers total cost. Destinations are processed in decreasing shortest-path cost order so expensive destinations first establish the shared backbone that cheaper destinations can then piggyback on. Keeps the `[s, t, G[s][t]]` append format untouched.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Track how many partitions are already assigned to each edge so we can
+    # spread load across parallel network paths.
+    edge_load = {}
+
+    def path_cost(path):
+        return sum(h[path[i]][path[i + 1]].get("cost") or 0.0
+                   for i in range(len(path) - 1))
+
+    for dst in dsts:
+=======
+    # Track how many times each edge has been used across all destinations
+    # and partitions. Reusing edges is rewarded (cost may be charged per
+    # unique edge / aggregate flows get bulk discounts).
+    edge_use = {}
+
+    def path_cost(path):
+        return sum(h[path[i]][path[i + 1]].get("cost") or 0.0
+                   for i in range(len(path) - 1))
+
+    def dst_base_cost(dst):
+        try:
+            return nx.dijkstra_path_length(h, src, dst, weight="cost")
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return float("inf")
+
+    # Process expensive destinations first so they establish a shared
+    # backbone of reused edges that later (cheaper) destinations can ride.
+    ordered_dsts = sorted(dsts, key=dst_base_cost, reverse=True)
+
+    for dst in ordered_dsts:
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+        # Score each candidate path: cheap and lightly-loaded edges are better.
+        def score(path):
+            c = path_cost(path)
+            load_penalty = 0.0
+            for i in range(len(path) - 1):
+                load_penalty += edge_load.get((path[i], path[i + 1]), 0)
+            # avoid division by zero
+            return (c + 1e-9) / (1.0 + load_penalty)
+
+        candidates = sorted(candidates, key=score)
+
+        # Find the common prefix shared by the cheapest paths so partitions
+        # can share the initial hops (a transfer along a shared edge serves
+        # all partitions) and only diverge on the suffix.
+        best = candidates[0]
+        common_prefix_len = 0
+        for alt in candidates[1:]:
+            i = 0
+            while (i < len(best) - 1 and i < len(alt) - 1
+                   and best[i] == alt[i] and best[i + 1] == alt[i + 1]):
+                i += 1
+            common_prefix_len = max(common_prefix_len, i)
+        # Only share if the alternative paths truly diverge late.
+        best_prefix_len = 0
+        for alt in candidates[1:]:
+            i = 0
+            while i < len(best) - 1 and i < len(alt) - 1 and best[i] == alt[i] and best[i + 1] == alt[i + 1]:
+                i += 1
+            if i == len(best) - 1 or i == len(alt) - 1:
+                best_prefix_len = max(best_prefix_len, i)
+
+        num_parts = bc_topology.num_partitions
+        # Assign partitions: greedily pick the currently best-scoring path for
+        # each partition (load-aware) rather than blind round-robin.
+        for j in range(num_parts):
+            # re-rank candidates each iteration so load updates are reflected
+            ranked = sorted(candidates, key=score)
+            # For the first partition (or a large fraction of them) prefer the
+            # single cheapest route; spread remaining partitions to balance load.
+            if j == 0 or (j + 1) * 2 <= num_parts:
+                path = ranked[0] if j == 0 else ranked[j % len(ranked)]
+            else:
+                path = ranked[j % len(ranked)]
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+                edge_load[(s, t)] = edge_load.get((s, t), 0) + 1
+=======
+        # Score each candidate path: cheap paths that reuse edges already
+        # chosen for other partitions/destinations are better (reuse reward).
+        def score(path):
+            c = path_cost(path)
+            reuse_bonus = 0.0
+            for i in range(len(path) - 1):
+                if (path[i], path[i + 1]) in edge_use:
+                    reuse_bonus += 1.0
+            # effective cost is discounted by reuse; epsilon avoids ties at 0
+            return (c + 1e-9) / (1.0 + reuse_bonus)
+
+        candidates = sorted(candidates, key=score)
+
+        num_parts = bc_topology.num_partitions
+        # Assign partitions: re-rank each iteration so reuse of edges picked
+        # by earlier partitions of this same destination is rewarded.
+        for j in range(num_parts):
+            ranked = sorted(candidates, key=score)
+            path = ranked[0]
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+                edge_use[(s, t)] = edge_use.get((s, t), 0) + 1
+>>>>>>> REPLACE
+</DIFF>

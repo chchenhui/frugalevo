@@ -1,0 +1,445 @@
+# EVOLVE-BLOCK-START
+"""
+Real-Time Adaptive Signal Processing Algorithm for Non-Stationary Time Series
+
+Crossover pipeline (best of both parents):
+  Stage 1: NoiseEstimator        - robust MAD-based measurement variance
+  Stage 2: AdaptiveKalmanStage   - capped NIS-adaptive process noise
+  Stage 3: RobustSavgolStage     - widened (2W+7) iterative-reweighted SG
+  Stage 3.5: MedianSnap          - vectorized 5-tap median snap (shared helper)
+  Stage 4: RecencyConvolveStage  - recency-weighted (e^-1.2) valid convolution
+  Stage 5: LocalHysteresisSnap   - rolling local MAD threshold with hysteresis
+  Stage 5.5: MedianSnap (repeat) - second impulsive-noise pass, O(n)
+  Stage 6: ZeroPhasePolishStage  - 7-tap quadratic SG polish, zero group delay
+"""
+import numpy as np
+
+
+class NoiseEstimator:
+    """Stage 1: robust MAD-based measurement-noise variance from first diffs."""
+
+    @staticmethod
+    def estimate(x):
+        if len(x) > 2:
+            d = np.diff(x)
+            med = np.median(d)
+            mad = np.median(np.abs(d - med)) / 0.6745
+            return max((mad * mad) / 2.0, 1e-8)
+        return max(float(np.var(x)) if len(x) > 1 else 1.0, 1e-8)
+
+
+class AdaptiveKalmanStage:
+    """Stage 2: constant-velocity Kalman with capped NIS-adaptive process noise."""
+
+    def __init__(self, meas_var, q_base=0.01):
+        self.r = max(meas_var, 1e-8)
+        self.q_base = q_base
+        self.x = np.zeros(2)
+        self.P = np.eye(2) * max(self.r, 1.0)
+        self.initialized = False
+
+    def step(self, z):
+        if not self.initialized:
+            self.x[0] = z
+            self.x[1] = 0.0
+            self.P = np.eye(2) * max(self.r, 1.0)
+            self.initialized = True
+            return self.x[0]
+
+        self.x[0] += self.x[1]
+        p00, p01, p11 = self.P[0, 0], self.P[0, 1], self.P[1, 1]
+        self.P[0, 0] = p00 + 2.0 * p01 + p11
+        self.P[0, 1] = self.P[1, 0] = p01 + p11
+
+        innov = z - self.x[0]
+        S = self.P[0, 0] + self.r
+        nis = innov * innov / max(S, 1e-12)
+        mult = 1.0 + 3.0 * min(nis, 6.0) / 6.0
+        q = self.q_base * self.r * mult
+        self.P[0, 0] += 0.25 * q
+        self.P[0, 1] += 0.5 * q
+        self.P[1, 0] += 0.5 * q
+        self.P[1, 1] += q
+
+        S = self.P[0, 0] + self.r
+        k0 = self.P[0, 0] / S
+        k1 = self.P[1, 0] / S
+        self.x[0] += k0 * innov
+        self.x[1] += k1 * innov
+        p00, p01, p11 = self.P[0, 0], self.P[0, 1], self.P[1, 1]
+        self.P[0, 0] = max((1.0 - k0) * p00, 1e-12)
+        self.P[0, 1] = (1.0 - k0) * p01
+        self.P[1, 0] = p01 - k1 * p00
+        self.P[1, 1] = max(p11 - k1 * p01, 1e-12)
+        return self.x[0]
+
+    def run(self, x):
+        return np.array([self.step(z) for z in x])
+
+
+class RobustSavgolStage:
+    """Stage 3: iterative-reweighted (Huber winsorization) SG smoothing."""
+
+    def __init__(self, n_iter=2, clip_sigma=2.5):
+        self.n_iter = n_iter
+        self.clip_sigma = clip_sigma
+
+    @staticmethod
+    def _sg(x, win, order=2):
+        try:
+            from scipy.signal import savgol_filter
+            return savgol_filter(x, win, order)
+        except Exception:
+            k = np.ones(win) / win
+            pad = win // 2
+            xp = np.pad(x, pad, mode="edge")
+            return np.convolve(xp, k, mode="valid")[: len(x)]
+
+    def run(self, x, sg_window):
+        y_fit = self._sg(x, sg_window)
+        for _ in range(self.n_iter):
+            residuals = x - y_fit
+            med_r = np.median(residuals)
+            mad_r = np.median(np.abs(residuals - med_r)) / 0.6745
+            sigma = max(mad_r, 1e-12)
+            clipped = np.clip(residuals - med_r,
+                              -self.clip_sigma * sigma, self.clip_sigma * sigma)
+            y_new = self._sg(y_fit + clipped, sg_window)
+            if not np.all(np.isfinite(y_new)):
+                break
+            y_fit = y_new
+        return y_fit
+
+
+class RecencyConvolveStage:
+    """Stage 4: recency-weighted valid-mode convolution (tilt e^-1.2)."""
+
+    def __init__(self, tilt=1.2):
+        self.tilt = tilt
+
+    def run(self, x, window_size):
+        w = np.exp(np.linspace(-self.tilt, 0.0, window_size))
+        w /= np.sum(w)
+        return np.convolve(x, w[::-1], mode="valid")
+
+
+class MedianSnap:
+    """
+    Vectorized 5-tap median snap: blends sub-noise samples 0.5/0.5 toward
+    the local running median. Edge-preserving, kills residual impulsive
+    noise without flattening genuine trends. Reused at two pipeline points.
+    """
+
+    @staticmethod
+    def run(x):
+        m = len(x)
+        if m < 5:
+            return x
+        pad = np.concatenate((x[:2][::-1], x, x[-2:][::-1]))
+        windows = np.lib.stride_tricks.sliding_window_view(pad, 5)
+        med5 = np.median(windows, axis=1)
+
+        d = np.diff(x)
+        med_d = np.median(d)
+        sigma = np.median(np.abs(d - med_d)) / 0.6745 / np.sqrt(2.0)
+        sigma = max(sigma, 1e-12)
+
+        steps = np.zeros(m)
+        steps[1:] = np.abs(d)
+        steps[:-1] = np.maximum(steps[:-1], steps[1:])
+        small = steps < 0.5 * sigma
+        return np.where(small, 0.5 * x + 0.5 * med5, x)
+
+
+class LocalHysteresisSnap:
+    """Stage 5: rolling local MAD threshold with sign hysteresis."""
+
+    def __init__(self, block=51, k=0.6, blend=0.6):
+        self.block = block
+        self.k = k
+        self.blend = blend
+
+    def run(self, y):
+        m = len(y)
+        if m <= 4:
+            return y
+        d = np.diff(y)
+        dm = len(d)
+
+        B = min(self.block, dm if dm % 2 == 1 else dm - 1)
+        B = max(B, 3)
+        pad_n = B // 2
+        dpad = np.concatenate((np.full(pad_n, d[0]), d,
+                               np.full(pad_n, d[-1])))
+        windows = np.lib.stride_tricks.sliding_window_view(dpad, B)
+        local_sigma = (1.4826 * np.median(
+            np.abs(windows - np.median(windows, axis=1, keepdims=True)),
+            axis=1) + 1e-12)[:dm]
+
+        pad = np.concatenate((y[:2][::-1], y, y[-2:][::-1]))
+        windows5 = np.lib.stride_tricks.sliding_window_view(pad, 5)
+        med5 = np.median(windows5, axis=0)
+
+        thresh = self.k * local_sigma
+        absd = np.abs(d)
+        sign_flip = np.zeros(dm, dtype=bool)
+        sign_flip[1:] = (d[1:] * d[:-1]) < 0.0
+        snap_mask = (absd < thresh) & (sign_flip | (absd < 0.5 * thresh))
+
+        idx = np.where(snap_mask)[0] + 1
+        out = y.copy()
+        out[idx] = (1.0 - self.blend) * out[idx] + self.blend * med5[idx]
+        return out
+
+
+class ZeroPhasePolishStage:
+    """Stage 6: 7-tap quadratic SG polish — zero group delay noise cleanup."""
+
+    def __init__(self, win=7):
+        self.win = win
+
+    def run(self, y):
+        m = len(y)
+        if m < 5:
+            return y
+        win = self.win
+        if win > m:
+            win = m if m % 2 == 1 else m - 1
+        win = max(win, 5)
+        if win % 2 == 0:
+            win = max(win - 1, 5)
+        try:
+            from scipy.signal import savgol_filter
+            out = savgol_filter(y, win, 2)
+            return out if np.all(np.isfinite(out)) else y
+        except Exception:
+            k = np.array([1.0, 4.0, 6.0, 4.0, 1.0]) / 16.0
+            pad = np.concatenate((y[:2][::-1], y, y[-2:][::-1]))
+            return np.convolve(pad, k, mode="valid")
+
+
+class CoarseFinePipeline:
+    """Composable staged pipeline with co-swept window/tilt parameters."""
+
+    def __init__(self, window_size=20):
+        self.window_size = window_size
+        self.savgol = RobustSavgolStage(n_iter=2, clip_sigma=2.5)
+        self.sg_window = 2 * window_size + 7
+        if self.sg_window % 2 == 0:
+            self.sg_window += 1
+        self.sg_window = max(self.sg_window, 5)
+        self.recency = RecencyConvolveStage(tilt=1.2)
+        self.snapper = LocalHysteresisSnap(block=51, k=0.6, blend=0.6)
+        self.polish = ZeroPhasePolishStage(win=7)
+
+    def run(self, x):
+        xf = np.asarray(x, dtype=float)
+        if len(xf) < self.window_size:
+            raise ValueError(
+                f"Input signal length ({len(xf)}) must be >= window_size "
+                f"({self.window_size})"
+            )
+
+        # Stage 1+2: robust noise estimate -> adaptive Kalman
+        r = NoiseEstimator.estimate(xf)
+        x_kalman = AdaptiveKalmanStage(r, q_base=0.01).run(xf)
+
+        # Stage 3: robust SG with co-swept widened window
+        sg_win = self.sg_window
+        n = len(x_kalman)
+        if sg_win > n:
+            sg_win = n if n % 2 == 1 else n - 1
+            sg_win = max(sg_win, 5)
+        x_smooth = self.savgol.run(x_kalman, sg_win)
+
+        # Stage 3.5: first median snap (pre-convolution)
+        x_smooth = MedianSnap.run(x_smooth)
+
+        # Stage 4: recency-weighted convolution (length contract preserved)
+        y = self.recency.run(x_smooth, self.window_size)
+
+        # Stage 5: local hysteresis snap
+        y = self.snapper.run(y)
+
+        # Stage 5.5: second median snap (post-hysteresis, O(n))
+        y = MedianSnap.run(y)
+
+        # Stage 6: zero-phase small-window SG polish
+        y = self.polish.run(y)
+        return y
+
+
+def adaptive_filter(x, window_size=20):
+    """
+    Adaptive signal processing algorithm using sliding window approach.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window (W samples)
+
+    Returns:
+        y: Filtered output signal with length = len(x) - window_size + 1
+    """
+    xf = np.asarray(x, dtype=float)
+    if len(xf) < window_size:
+        raise ValueError(
+            f"Input signal length ({len(xf)}) must be >= window_size ({window_size})"
+        )
+    c = np.cumsum(np.insert(xf, 0, 0.0))
+    return (c[window_size:] - c[:-window_size]) / window_size
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Enhanced pipeline: robust noise estimate -> capped-Q adaptive Kalman ->
+    widened robust SG (2W+7) -> median snap -> recency convolution (e^-1.2)
+    -> local hysteresis snap -> median snap -> zero-phase SG polish.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window (W)
+
+    Returns:
+        y: Filtered output signal
+    """
+    return CoarseFinePipeline(window_size).run(x)
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """
+    Main signal processing function that applies the selected algorithm.
+
+    Args:
+        input_signal: Input time series data
+        window_size: Window size for processing
+        algorithm_type: Type of algorithm to use ("basic" or "enhanced")
+
+    Returns:
+        Filtered signal
+    """
+    if algorithm_type == "enhanced":
+        return enhanced_filter_with_trend_preservation(input_signal, window_size)
+    return adaptive_filter(input_signal, window_size)
+
+
+# EVOLVE-BLOCK-END
+
+
+def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+    """
+    Generate synthetic test signal with known characteristics.
+
+    Args:
+        length: Length of the signal
+        noise_level: Standard deviation of noise to add
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (noisy_signal, clean_signal)
+    """
+    np.random.seed(seed)
+    t = np.linspace(0, 10, length)
+
+    # Create a complex signal with multiple components
+    clean_signal = (
+        2 * np.sin(2 * np.pi * 0.5 * t)  # Low frequency component
+        + 1.5 * np.sin(2 * np.pi * 2 * t)  # Medium frequency component
+        + 0.5 * np.sin(2 * np.pi * 5 * t)  # Higher frequency component
+        + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)  # Decaying oscillation
+    )
+
+    # Add non-stationary behavior
+    trend = 0.1 * t * np.sin(0.2 * t)  # Slowly varying trend
+    clean_signal += trend
+
+    # Add random walk component for non-stationarity
+    random_walk = np.cumsum(np.random.randn(length) * 0.05)
+    clean_signal += random_walk
+
+    # Add noise
+    noise = np.random.normal(0, noise_level, length)
+    noisy_signal = clean_signal + noise
+
+    return noisy_signal, clean_signal
+
+
+def run_signal_processing(noisy_signal=None, signal_length=1000, noise_level=0.3, window_size=20):
+    """
+    Run the signal processing algorithm on a test signal.
+
+    Args:
+        noisy_signal: Input signal to filter (if provided, use this; otherwise generate)
+        signal_length: Length if generating signal (for backward compatibility)
+        noise_level: Noise level if generating signal (for backward compatibility)
+        window_size: Window size for processing
+
+    Returns:
+        Dictionary containing results and metrics
+    """
+    # Use provided signal or generate test signal (for backward compatibility)
+    if noisy_signal is not None:
+        # Filter the provided signal
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+        clean_signal = None  # Not available when using provided signal
+    else:
+        # Generate test signal (for __main__ and backward compatibility)
+        noisy_signal, clean_signal = generate_test_signal(signal_length, noise_level)
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+
+    # Calculate basic metrics (only if we have clean_signal from generation)
+    if len(filtered_signal) > 0 and clean_signal is not None:
+        # Align signals for comparison (account for processing delay)
+        delay = window_size - 1
+        aligned_clean = clean_signal[delay:]
+        aligned_noisy = noisy_signal[delay:]
+
+        # Ensure same length
+        min_length = min(len(filtered_signal), len(aligned_clean))
+        filtered_signal = filtered_signal[:min_length]
+        aligned_clean = aligned_clean[:min_length]
+        aligned_noisy = aligned_noisy[:min_length]
+
+        # Calculate correlation with clean signal
+        correlation = np.corrcoef(filtered_signal, aligned_clean)[0, 1] if min_length > 1 else 0
+
+        # Calculate noise reduction
+        noise_before = np.var(aligned_noisy - aligned_clean)
+        noise_after = np.var(filtered_signal - aligned_clean)
+        noise_reduction = (noise_before - noise_after) / noise_before if noise_before > 0 else 0
+
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": aligned_clean,
+            "noisy_signal": aligned_noisy,
+            "correlation": correlation,
+            "noise_reduction": noise_reduction,
+            "signal_length": min_length,
+        }
+    elif len(filtered_signal) > 0:
+        # When using provided signal (no clean_signal available), just return filtered signal
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": None,
+            "noisy_signal": None,
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": len(filtered_signal),
+        }
+    else:
+        return {
+            "filtered_signal": [],
+            "clean_signal": [],
+            "noisy_signal": [],
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": 0,
+        }
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    results = run_signal_processing()
+    print("Signal processing completed!")
+    print(f"Correlation with clean signal: {results['correlation']:.3f}")
+    print(f"Noise reduction: {results['noise_reduction']:.3f}")
+    print(f"Processed signal length: {results['signal_length']}")

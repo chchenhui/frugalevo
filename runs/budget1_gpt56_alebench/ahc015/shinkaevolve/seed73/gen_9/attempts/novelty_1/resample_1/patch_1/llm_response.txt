@@ -1,0 +1,364 @@
+<NAME>
+compact_expectimax</NAME>
+
+<DESCRIPTION>
+This redesign replaces the vector-backed `GameState` architecture with a compact fixed-size board model. Tilts now rebuild into a fixed temporary array, eliminating candy-list reconstruction and dynamic container copies during lookahead.
+
+The policy is organized into separate `Board`, `Evaluator`, and `ExpectimaxPolicy` components. The forecast uses stratified sampling of empty-cell ranks, compact state copies, and a terminal evaluator that directly prioritizes the true connected-component objective once the board is full. This permits a moderately stronger lookahead sampling budget while keeping per-node overhead low.
+</DESCRIPTION>
+
+<CODE>
+```cpp
+// EVOLVE-BLOCK-START
+#include <array>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+
+using namespace std;
+
+namespace {
+constexpr int N = 10;
+constexpr int CELLS = 100;
+constexpr int FLAVORS = 3;
+constexpr int DIRS = 4;
+constexpr char DIR_CHAR[DIRS] = {'F', 'B', 'L', 'R'};
+
+// First forecasted candy / second forecasted candy sample counts.
+constexpr array<int, 2> SAMPLE_COUNT = {20, 7};
+
+struct Random {
+    uint64_t state;
+
+    Random() : state(
+        static_cast<uint64_t>(
+            chrono::steady_clock::now().time_since_epoch().count()
+        ) | 1ULL
+    ) {}
+
+    uint64_t next() {
+        state ^= state << 7;
+        state ^= state >> 9;
+        state ^= state << 8;
+        return state;
+    }
+
+    int range(int n) {
+        return n <= 1 ? 0 : static_cast<int>(next() % static_cast<uint64_t>(n));
+    }
+};
+
+Random rng;
+
+struct LayoutPlan {
+    array<int, FLAVORS + 1> total{};
+    array<int, FLAVORS + 1> left{};
+    array<int, FLAVORS + 1> right{};
+
+    void read() {
+        for (int t = 0; t < CELLS; ++t) {
+            // Filled by caller through the sequence; this function only exists
+            // to keep plan construction structurally separate.
+        }
+    }
+
+    void build(const array<int, CELLS>& sequence) {
+        total.fill(0);
+        left.fill(0);
+        right.fill(-1);
+
+        for (int x : sequence) ++total[x];
+
+        array<int, FLAVORS> order = {1, 2, 3};
+        sort(order.begin(), order.end(), [&](int a, int b) {
+            if (total[a] != total[b]) return total[a] > total[b];
+            return a < b;
+        });
+
+        array<int, FLAVORS + 1> width{};
+        int used = 0;
+        for (int f = 1; f <= FLAVORS; ++f) {
+            width[f] = N * total[f] / CELLS;
+            used += width[f];
+        }
+
+        for (int i = 0; used < N; ++i, ++used) {
+            ++width[order[i % FLAVORS]];
+        }
+
+        int cursor = 0;
+        for (int f : order) {
+            left[f] = cursor;
+            right[f] = cursor + width[f] - 1;
+            cursor += width[f];
+        }
+    }
+};
+
+struct Board {
+    array<uint8_t, CELLS> cell{};
+    int count = 0;
+
+    int emptyCount() const {
+        return CELLS - count;
+    }
+
+    int nthEmpty(int rank1) const {
+        int seen = 0;
+        for (int i = 0; i < CELLS; ++i) {
+            if (cell[i] == 0 && ++seen == rank1) return i;
+        }
+        return -1;
+    }
+
+    void placeAt(int index, int flavor) {
+        cell[index] = static_cast<uint8_t>(flavor);
+        ++count;
+    }
+
+    void tilt(int dir) {
+        array<uint8_t, CELLS> next{};
+        if (dir == 0 || dir == 1) {
+            // F / B: process every vertical line.
+            for (int c = 0; c < N; ++c) {
+                int write = (dir == 0 ? 0 : N - 1);
+                const int step = (dir == 0 ? 1 : -1);
+                for (int k = 0; k < N; ++k) {
+                    int r = (dir == 0 ? k : N - 1 - k);
+                    uint8_t candy = cell[r * N + c];
+                    if (candy != 0) {
+                        next[write * N + c] = candy;
+                        write += step;
+                    }
+                }
+            }
+        } else {
+            // L / R: process every horizontal line.
+            for (int r = 0; r < N; ++r) {
+                int write = (dir == 2 ? 0 : N - 1);
+                const int step = (dir == 2 ? 1 : -1);
+                for (int k = 0; k < N; ++k) {
+                    int c = (dir == 2 ? k : N - 1 - k);
+                    uint8_t candy = cell[r * N + c];
+                    if (candy != 0) {
+                        next[r * N + write] = candy;
+                        write += step;
+                    }
+                }
+            }
+        }
+        cell = next;
+    }
+};
+
+struct Evaluator {
+    const LayoutPlan& plan;
+
+    long long componentSquares(const Board& board) const {
+        array<uint8_t, CELLS> visited{};
+        array<int, CELLS> queue{};
+        long long result = 0;
+
+        for (int start = 0; start < CELLS; ++start) {
+            uint8_t flavor = board.cell[start];
+            if (flavor == 0 || visited[start]) continue;
+
+            int head = 0;
+            int tail = 0;
+            int size = 0;
+            queue[tail++] = start;
+            visited[start] = 1;
+
+            while (head < tail) {
+                int v = queue[head++];
+                ++size;
+                int r = v / N;
+                int c = v % N;
+
+                const int neighbor[4] = {
+                    r > 0 ? v - N : -1,
+                    r + 1 < N ? v + N : -1,
+                    c > 0 ? v - 1 : -1,
+                    c + 1 < N ? v + 1 : -1
+                };
+
+                for (int to : neighbor) {
+                    if (to >= 0 && !visited[to] && board.cell[to] == flavor) {
+                        visited[to] = 1;
+                        queue[tail++] = to;
+                    }
+                }
+            }
+            result += 1LL * size * size;
+        }
+        return result;
+    }
+
+    double score(const Board& board) const {
+        const long long comp = componentSquares(board);
+
+        // At completion this is exactly the quantity used by the official
+        // numerator, so do not let temporary shaping terms distort it.
+        if (board.count == CELLS) {
+            return static_cast<double>(comp) * 10000.0;
+        }
+
+        array<int, FLAVORS + 1> cnt{};
+        array<int, FLAVORS + 1> sumR{};
+        array<int, FLAVORS + 1> sumC{};
+
+        int mixedEdges = 0;
+        double stripPenalty = 0.0;
+        double edgeBonus = 0.0;
+
+        for (int p = 0; p < CELLS; ++p) {
+            int flavor = board.cell[p];
+            if (flavor == 0) continue;
+
+            int r = p / N;
+            int c = p % N;
+            ++cnt[flavor];
+            sumR[flavor] += r;
+            sumC[flavor] += c;
+
+            if (c < plan.left[flavor]) {
+                stripPenalty += plan.left[flavor] - c;
+            } else if (c > plan.right[flavor]) {
+                stripPenalty += c - plan.right[flavor];
+            }
+
+            if (c >= plan.left[flavor] && c <= plan.right[flavor]) {
+                if (r == 0 || r == N - 1) edgeBonus += 0.5;
+                if ((c == 0 && plan.left[flavor] == 0) ||
+                    (c == N - 1 && plan.right[flavor] == N - 1)) {
+                    edgeBonus += 0.5;
+                }
+            }
+
+            if (r + 1 < N) {
+                int below = board.cell[p + N];
+                if (below != 0 && below != flavor) ++mixedEdges;
+            }
+            if (c + 1 < N) {
+                int beside = board.cell[p + 1];
+                if (beside != 0 && beside != flavor) ++mixedEdges;
+            }
+        }
+
+        double centerPenalty = 0.0;
+        for (int p = 0; p < CELLS; ++p) {
+            int flavor = board.cell[p];
+            if (flavor == 0 || cnt[flavor] <= 1) continue;
+
+            int r = p / N;
+            int c = p % N;
+            centerPenalty += abs(r - static_cast<double>(sumR[flavor]) / cnt[flavor]);
+            centerPenalty += abs(c - static_cast<double>(sumC[flavor]) / cnt[flavor]);
+        }
+
+        const double turn = static_cast<double>(board.count);
+        const double connectivityWeight = 15.0 + 1.1 * turn;
+        const double centerWeight = max(0.0, 170.0 - 1.7 * turn);
+        const double stripWeight = max(2.0, 27.0 - 0.17 * turn);
+        const double edgeWeight = 5.0 + 0.2 * turn;
+        const double mixedWeight = 4.0 + 0.29 * turn;
+
+        return connectivityWeight * comp
+             - centerWeight * centerPenalty
+             - stripWeight * stripPenalty
+             + edgeWeight * edgeBonus
+             - mixedWeight * mixedEdges;
+    }
+};
+
+struct ExpectimaxPolicy {
+    const array<int, CELLS>& sequence;
+    const Evaluator& evaluator;
+
+    double forecast(const Board& state, int placed, int depth) const {
+        if (depth == 0 || placed >= CELLS || state.emptyCount() == 0) {
+            return evaluator.score(state);
+        }
+
+        const int empty = state.emptyCount();
+        const int sampleTarget = SAMPLE_COUNT[2 - depth];
+        const int samples = min(empty, sampleTarget);
+        const int phase = (samples == empty ? 0 : rng.range(empty));
+
+        double expected = 0.0;
+        const int nextFlavor = sequence[placed];
+
+        for (int s = 0; s < samples; ++s) {
+            int rank;
+            if (samples == empty) {
+                rank = s + 1;
+            } else {
+                rank = ((phase + (s * empty) / samples) % empty) + 1;
+            }
+
+            Board afterPlacement = state;
+            afterPlacement.placeAt(afterPlacement.nthEmpty(rank), nextFlavor);
+
+            double best = -numeric_limits<double>::infinity();
+            for (int dir = 0; dir < DIRS; ++dir) {
+                Board child = afterPlacement;
+                child.tilt(dir);
+                best = max(best, forecast(child, placed + 1, depth - 1));
+            }
+            expected += best;
+        }
+        return expected / samples;
+    }
+
+    int choose(const Board& afterPlacement) const {
+        int bestDirection = 0;
+        double bestValue = -numeric_limits<double>::infinity();
+
+        for (int dir = 0; dir < DIRS; ++dir) {
+            Board child = afterPlacement;
+            child.tilt(dir);
+            double value = forecast(child, afterPlacement.count, 2);
+            if (value > bestValue) {
+                bestValue = value;
+                bestDirection = dir;
+            }
+        }
+        return bestDirection;
+    }
+};
+} // namespace
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    array<int, CELLS> flavors{};
+    for (int i = 0; i < CELLS; ++i) cin >> flavors[i];
+
+    LayoutPlan plan;
+    plan.build(flavors);
+
+    Evaluator evaluator{plan};
+    ExpectimaxPolicy policy{flavors, evaluator};
+    Board current;
+
+    for (int turn = 0; turn < CELLS; ++turn) {
+        int placementRank;
+        cin >> placementRank;
+
+        current.placeAt(current.nthEmpty(placementRank), flavors[turn]);
+
+        int direction = policy.choose(current);
+        cout << DIR_CHAR[direction] << '\n' << flush;
+
+        current.tilt(direction);
+    }
+
+    return 0;
+}
+// EVOLVE-BLOCK-END
+``` 
+</CODE>

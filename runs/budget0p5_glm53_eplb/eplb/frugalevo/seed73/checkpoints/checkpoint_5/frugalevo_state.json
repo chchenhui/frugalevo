@@ -1,0 +1,289 @@
+{
+  "version": 24,
+  "curve": {
+    "unit": "usd",
+    "budget": 0.5,
+    "spent": 0.040953125,
+    "final_incumbent": 0.1449426648322307,
+    "ba_auc": 0.07182550456176708,
+    "ba_auc_normalized": 0.14365100912353415,
+    "num_points": 6,
+    "points": [
+      {
+        "cost": 0.0,
+        "score": 0.1269376424072818,
+        "incumbent": 0.1269376424072818,
+        "iteration": 0,
+        "candidates": 0
+      },
+      {
+        "cost": 0.000445125,
+        "score": 0.12919729678785982,
+        "incumbent": 0.12919729678785982,
+        "iteration": 1,
+        "candidates": 1
+      },
+      {
+        "cost": 0.0017574749999999999,
+        "score": 0.0,
+        "incumbent": 0.12919729678785982,
+        "iteration": 2,
+        "candidates": 1
+      },
+      {
+        "cost": 0.021109725,
+        "score": 0.12729848715108313,
+        "incumbent": 0.12919729678785982,
+        "iteration": 3,
+        "candidates": 1
+      },
+      {
+        "cost": 0.0251476,
+        "score": 0.0,
+        "incumbent": 0.12919729678785982,
+        "iteration": 4,
+        "candidates": 2
+      },
+      {
+        "cost": 0.040953125,
+        "score": 0.1449426648322307,
+        "incumbent": 0.1449426648322307,
+        "iteration": 5,
+        "candidates": 3
+      }
+    ]
+  },
+  "strategy_objective_guidance": "- **What we can see:** the adapter only wraps a hidden `evaluator.py`; the actual `combined_score` is defined there. From the task statement it combines (1) **load-balancing quality** (the post-rearrangement distribution of expert load across physical devices, with expert replication allowed) and (2) **algorithm execution time** (wall time of `rebalance_experts` itself, since the wrapper pins 1 thread and measures a 360 s budget). The first action of any search run should be to extract or empirically map the exact formula (e.g., by submitting trivial vs. greedy variants and reading the returned subscores) before committing to a family.\n- **Known structural facts that bound the objective:**\n  - The evaluator forces **single-threaded** execution (`torch.set_num_threads(1)`, `OMP/MKL/OPENBLAS/NUMEXPR=1`). Any speed strategy must be *algorithmic* (vectorization, fewer iterations, lower complexity), not parallelism. Multi-threaded proposals score zero gain.\n  - The program receives the **complete load metrics at once** (offline/batch); the wrapper reads a fixed `expert-load.json` before invoking the program. No streaming/causality constraint exists \u2014 full-information batch algorithms (LP/MILP, global matching, differencing) are admissible and preferred.\n  - Hard constraints to preserve: the physical replication budget (number of expert slots per GPU, `num_gpus`/`num_replicas`), every expert must be placed at least once, and the returned mapping must be valid logical\u2192physical for the vLLM APIs the evaluator calls. Violating these yields 0, not a partial score.\n- **Tradeoff:** balance quality and runtime are the two scored axes and they conflict \u2014 exhaustive/MILP search maximizes balance but blows the time term; naive greedy minimizes time but leaves imbalance. The **largest remaining lever is the balance term** if the baseline is the current greedy `rebalance_experts` (time is likely already small), so most gain comes from smarter placement per unit of time, not from shaving microseconds off a weak algorithm.\n- **Caveat to state plainly:** if the hidden `combined_score` weights time heavily or heavily discounts balance beyond a threshold, the optimal program is a *fast near-greedy* one, not the best balancer. This must be verified empirically before deep investment in exact optimization.",
+  "strategy_diverge_guidance": "- **List scheduling / bin-packing family:** LPT (longest-processing-time-first) greedy with replication of the highest-load experts; vectorized with `numpy.argsort`/`argpartition`. This is the standard EPLB baseline; the main evaluator-visible lever is choosing *which* experts to replicate (top-k by load) and packing the rest LPT.\n- **Assignment/matching family:** treat placement as a balanced assignment of expert-replicas to GPU slots; `scipy.optimize.linear_sum_assignment` (min-cost perfect matching) or `networkx.algorithms.bipartite.minimum_weight_full_matching` with load-dependent edge costs. Exact for a linear objective, fast (Hungarian is O(n\u00b3)), gives near-optimal balance in one shot \u2014 a genuinely different mechanism from greedy sequencing.\n- **Differencing/partition family:** Karmarkar\u2013Karp number-partitioning on the load vector when replication isn't needed, then add replicas for the residual gap; pure `numpy`, O(n log n)-ish, extremely fast \u2014 good if the time term turns out dominant.\n- **Exact-optimization family (offline):** `scipy.optimize.milp` (HiGHS) over binary placement variables with min-max load (epigraph formulation). Guaranteed best balance; only worth it if instance sizes and the 360 s / time-weight budget allow. Check problem scale first.\n- **Local-search family:** simulated annealing / iterated 1-opt swaps starting from the greedy solution; `numpy` mutation of the assignment, anneal until a runtime budget (e.g., a fraction of the measured time weight). Directly trades the two terms via its time budget knob.",
+  "strategy_refine_guidance": "- **Replica-count sweep:** run k \u2208 {0, \u2026, max replicas} replication of top-load experts; pick k minimizing max-GPU-load. The balance term is monotone-ish in k up to the slot constraint \u2014 cheap, decisive refinement.\n- **Cost-matrix shaping for matching:** refine the `linear_sum_assignment` edge costs (e.g., load + \u03bb\u00b7slot-fill penalty, \u03bb \u2208 {0.1, 0.5, 1, 2}) and measure the returned balance subscore.\n- **Time-budget annealing:** bound local search by a wall-clock slice (e.g., `time.perf_counter()` guard at 10/50/100 ms) and tune the slice against the empirical time weight \u2014 this calibrates the exact balance/time tradeoff.\n- **Vectorization polish:** replace per-slot Python loops with `numpy.bincount`/`cumsum` load accumulation; pre-sort the expert load vector once. Only worth doing after the balance term is near its ceiling.\n- **Empirical score mapping:** submit a scale of variants (trivial, greedy, Hungarian, MILP) and fit the observed `combined_score` to infer the hidden weights; then re-target the portfolio toward the dominant term.",
+  "strategy_guidance_attempted": true,
+  "strategy_guidance_cost": 0.0069415,
+  "strategies": [
+    {
+      "index": 1,
+      "title": "[min-cost-assignment] Hungarian slot-to-GPU placement replacing greedy LPT packi",
+      "plan": "<STRATEGY_TITLE>[min-cost-assignment] Hungarian slot-to-GPU placement replacing greedy LPT packing</STRATEGY>\nMechanism family: exact bipartite min-cost matching (scipy.optimize.linear_sum_assignment)\nReplacement scope: the `balanced_packing` function (both call sites: group\u2192node packing in Step 1 and physical-expert\u2192GPU packing in Step 3 of `rebalance_experts_hierarchical`)\nCompute budget: one Hungarian solve per layer batch per packing phase (\u22642 solves total, O(n\u00b3) with n \u2248 hundreds; expected added time < 50 ms single-threaded, negligible vs. the time term)\nGain mechanism: LPT greedy packs items in weight order into the least-loaded pack and cannot undo early mistakes; a min-cost assignment jointly optimizes the entire placement in one shot. Construct the cost matrix as: rows = physical expert slots (each with load weight/cnt), columns = GPU slots (phy_experts_per_gpu copies of each GPU index, expanded so column j of GPU g costs `load_item` if it fills one of g's slot positions \u2014 concretely build a [num_items \u00d7 num_gpu_slots] matrix where entry (i, s) = item_load_i if we want to discourage heavy items on already-heavy GPUs; the standard trick is cost(i, s) = item_load_i * gpu_penalty(s) is nonlinear, so instead use the epigraph-free linear surrogate: cost(i, s) = item_load_i * (rank of slot s within its GPU) i.e., each GPU's slots get multipliers 1, 2, 3, \u2026; minimizing total cost then forces the heaviest items into every GPU's first slots, which equalizes per-GPU sums far better than sequential LPT and directly lowers the max-GPU-load that `balancedness_score_gpu` measures. Validity is preserved: every item gets exactly one slot, every slot exactly one item, counts per GPU exact, so all hard constraints (every expert placed, slot budget) hold by construction of a perfect matching on a complete rectangular-expanded bipartite graph.\nExpected-gain check: the incumbent's GPU balancedness is 0.663, and LPT greedy is provably a 4/3-approximation while joint assignment dominates it on the same item set \u2014 the new degree of freedom is simultaneous (non-sequential) placement, which LPT cannot realize; falsifiable threshold: `balancedness_score_gpu` must rise above 0.70 on the fixed expert-load.json or the strategy is rejected.\n</STRATEGY>\n\n<STRATEGY_TITLE>[waterfilling-replication] Proportional water-filling replica counts replacing max-greedy replication</STRATEGY>\nMechanism family: continuous relaxation + rounding (water-filling / binary search on target load)\nReplacement scope: the `replicate_experts` function (Step 2 of `rebalance_experts_hierarchical`); the per-step `argmax(weight/logcnt)` loop is deleted entirely\nCompute budget: one vectorized binary search (\u2264 20 iterations of pure tensor ops) plus one rounding pass; expected time drops from O(num_redundant) Python-loop iterations to ~20 vectorized steps, so runtime decreases or stays equal\nGain mechanism: the incumbent replicates one expert at a time by always picking max(weight/cnt), which is myopic and leaves mid-load experts unreplicated even when the per-replica load weight/cnt stays far above the pack average. Instead: find the smallest target T such that sum over experts of ceil(weight_i / T) \u2264 num_phy (binary search on T over [0, max weight], each evaluation a single vectorized `ceil(w/T).sum()`), then assign cnt_i = max(1, ceil(weight_i / T)) and strip the excess replicas (num_phy \u2212 \u03a3cnt) one at a time from the experts where removing one replica least increases max(weight_i/(cnt_i\u22121)) \u2014 a single vectorized argmin pass per stripped replica. This equalizes per-replica load weight_i/cnt_i near T across all experts, which is exactly the quantity that Step 3 packs and that `balancedness_score_expert` (currently only 0.25, the weakest term) measures. Hard constraints preserved: cnt_i \u2265 1 for every logical expert (so every expert placed at least once), \u03a3cnt_i = num_phy exactly by the stripping pass, and phy2log/rank/logcnt are constructed identically from cnt.\nExpected-gain check: greedy max-replication leaves per-replica loads with spread up to (max weight) \u2212 T whereas water-filling caps them near T; the new degree of freedom is the jointly-chosen replica-count vector, which the sequential incumbent cannot reach; falsifiable threshold: `balancedness_score_expert` must rise above 0.35 or the strategy is rejected.\n</STRATEGY>\n\n<STRATEGY_TITLE>[time-budgeted-localsearch] 1-swap hill-climbing refinement over physical slots with wall-clock guard</STRATEGY>\nMechanism family: local search / iterated 1-opt swaps on the final placement\nReplacement scope: new post-pass appended inside `rebalance_experts_hierarchical` after Step 3, operating on the final per-layer GPU assignment (pphy2log); incumbent output kept as fallback if no improving move is found\nCompute budget: hard wall-clock cap of 100 ms via `time.perf_counter()` checked every swap batch; \u2264 2000 swap evaluations total, all delta computations vectorized with `torch.bincount` per-GPU load sums; expected added time \u2264 100 ms, still negligible against the 360 s budget and the ~6 ms baseline dominating the speed term only marginally\nGain mechanism: both greedy phases are construction heuristics with no improvement phase; the incumbent's final placement can contain pairs (heavy item on overloaded GPU, light item on underloaded GPU) that a single swap fixes. The pass computes per-GPU loads L_g, identifies max-load GPU g* and min-load GPU g-, and repeatedly swaps (or moves, respecting the exact items-per-GPU count via a pure swap) the lightest item on g* with the heaviest item on g- whenever this strictly reduces max_g L_g; iterate over the (g*, g-) pair list sorted by gap, one pass per layer batched with tensor ops. This directly minimizes the max-GPU-load objective that the evaluator scores, a correction the incumbent's construction-only pipeline structurally lacks. Validity: swaps only permute items between GPU slot sets, so every expert remains placed exactly cnt_i times and slot counts per GPU are unchanged \u2014 all hard constraints invariant by construction.\nExpected-gain check: each accepted swap strictly reduces the max-GPU load, so the post-pass output dominates the incumbent on the same metric; the new degree of freedom is post-hoc cross-GPU exchange, unreachable by the incumbent's one-shot greedy; falsifiable threshold: `balancedness_score_gpu` must exceed 0.70 (same fixed input) or the strategy is rejected.\n</STRATEGY>",
+      "cost": 0.011662550000000002,
+      "best_score": 0.12729848715108313,
+      "baseline_score": 0.12919729678785982,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 1,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.0007481999999999975,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 3,
+      "failure_feedback": []
+    },
+    {
+      "index": 2,
+      "title": "ordered attempt [min-cost-assignment] Hungarian slot-to-GPU placement replacing greedy LPT packi",
+      "plan": "<STRATEGY_TITLE>[min-cost-assignment] Hungarian slot-to-GPU placement replacing greedy LPT packing</STRATEGY>\nMechanism family: exact bipartite min-cost matching (scipy.optimize.linear_sum_assignment)\nReplacement scope: the `balanced_packing` function (both call sites: group\u2192node packing in Step 1 and physical-expert\u2192GPU packing in Step 3 of `rebalance_experts_hierarchical`)\nCompute budget: one Hungarian solve per layer batch per packing phase (\u22642 solves total, O(n\u00b3) with n \u2248 hundreds; expected added time < 50 ms single-threaded, negligible vs. the time term)\nGain mechanism: LPT greedy packs items in weight order into the least-loaded pack and cannot undo early mistakes; a min-cost assignment jointly optimizes the entire placement in one shot. Construct the cost matrix as: rows = physical expert slots (each with load weight/cnt), columns = GPU slots (phy_experts_per_gpu copies of each GPU index, expanded so column j of GPU g costs `load_item` if it fills one of g's slot positions \u2014 concretely build a [num_items \u00d7 num_gpu_slots] matrix where entry (i, s) = item_load_i if we want to discourage heavy items on already-heavy GPUs; the standard trick is cost(i, s) = item_load_i * gpu_penalty(s) is nonlinear, so instead use the epigraph-free linear surrogate: cost(i, s) = item_load_i * (rank of slot s within its GPU) i.e., each GPU's slots get multipliers 1, 2, 3, \u2026; minimizing total cost then forces the heaviest items into every GPU's first slots, which equalizes per-GPU sums far better than sequential LPT and directly lowers the max-GPU-load that `balancedness_score_gpu` measures. Validity is preserved: every item gets exactly one slot, every slot exactly one item, counts per GPU exact, so all hard constraints (every expert placed, slot budget) hold by construction of a perfect matching on a complete rectangular-expanded bipartite graph.\nExpected-gain check: the incumbent's GPU balancedness is 0.663, and LPT greedy is provably a 4/3-approximation while joint assignment dominates it on the same item set \u2014 the new degree of freedom is simultaneous (non-sequential) placement, which LPT cannot realize; falsifiable threshold: `balancedness_score_gpu` must rise above 0.70 on the fixed expert-load.json or the strategy is rejected.\n</STRATEGY>\n\n<STRATEGY_TITLE>[waterfilling-replication] Proportional water-filling replica counts replacing max-greedy replication</STRATEGY>\nMechanism family: continuous relaxation + rounding (water-filling / binary search on target load)\nReplacement scope: the `replicate_experts` function (Step 2 of `rebalance_experts_hierarchical`); the per-step `argmax(weight/logcnt)` loop is deleted entirely\nCompute budget: one vectorized binary search (\u2264 20 iterations of pure tensor ops) plus one rounding pass; expected time drops from O(num_redundant) Python-loop iterations to ~20 vectorized steps, so runtime decreases or stays equal\nGain mechanism: the incumbent replicates one expert at a time by always picking max(weight/cnt), which is myopic and leaves mid-load experts unreplicated even when the per-replica load weight/cnt stays far above the pack average. Instead: find the smallest target T such that sum over experts of ceil(weight_i / T) \u2264 num_phy (binary search on T over [0, max weight], each evaluation a single vectorized `ceil(w/T).sum()`), then assign cnt_i = max(1, ceil(weight_i / T)) and strip the excess replicas (num_phy \u2212 \u03a3cnt) one at a time from the experts where removing one replica least increases max(weight_i/(cnt_i\u22121)) \u2014 a single vectorized argmin pass per stripped replica. This equalizes per-replica load weight_i/cnt_i near T across all experts, which is exactly the quantity that Step 3 packs and that `balancedness_score_expert` (currently only 0.25, the weakest term) measures. Hard constraints preserved: cnt_i \u2265 1 for every logical expert (so every expert placed at least once), \u03a3cnt_i = num_phy exactly by the stripping pass, and phy2log/rank/logcnt are constructed identically from cnt.\nExpected-gain check: greedy max-replication leaves per-replica loads with spread up to (max weight) \u2212 T whereas water-filling caps them near T; the new degree of freedom is the jointly-chosen replica-count vector, which the sequential incumbent cannot reach; falsifiable threshold: `balancedness_score_expert` must rise above 0.35 or the strategy is rejected.\n</STRATEGY>\n\n<STRATEGY_TITLE>[time-budgeted-localsearch] 1-swap hill-climbing refinement over physical slots with wall-clock guard</STRATEGY>\nMechanism family: local search / iterated 1-opt swaps on the final placement\nReplacement scope: new post-pass appended inside `rebalance_experts_hierarchical` after Step 3, operating on the final per-layer GPU assignment (pphy2log); incumbent output kept as fallback if no improving move is found\nCompute budget: hard wall-clock cap of 100 ms via `time.perf_counter()` checked every swap batch; \u2264 2000 swap evaluations total, all delta computations vectorized with `torch.bincount` per-GPU load sums; expected added time \u2264 100 ms, still negligible against the 360 s budget and the ~6 ms baseline dominating the speed term only marginally\nGain mechanism: both greedy phases are construction heuristics with no improvement phase; the incumbent's final placement can contain pairs (heavy item on overloaded GPU, light item on underloaded GPU) that a single swap fixes. The pass computes per-GPU loads L_g, identifies max-load GPU g* and min-load GPU g-, and repeatedly swaps (or moves, respecting the exact items-per-GPU count via a pure swap) the lightest item on g* with the heaviest item on g- whenever this strictly reduces max_g L_g; iterate over the (g*, g-) pair list sorted by gap, one pass per layer batched with tensor ops. This directly minimizes the max-GPU-load objective that the evaluator scores, a correction the incumbent's construction-only pipeline structurally lacks. Validity: swaps only permute items between GPU slot sets, so every expert remains placed exactly cnt_i times and slot counts per GPU are unchanged \u2014 all hard constraints invariant by construction.\nExpected-gain check: each accepted swap strictly reduces the max-GPU load, so the post-pass output dominates the incumbent on the same metric; the new degree of freedom is post-hoc cross-GPU exchange, unreachable by the incumbent's one-shot greedy; falsifiable threshold: `balancedness_score_gpu` must exceed 0.70 (same fixed input) or the strategy is rejected.\n</STRATEGY>",
+      "cost": 0.0,
+      "best_score": null,
+      "baseline_score": 0.12919729678785982,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 2,
+      "implementations": 0,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": 1,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 1,
+      "implementation_spend": 0.004037875,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 4,
+      "failure_feedback": [
+        "repeats must have the same size as input along dim, but got repeats.size(0) = 14848 and input.size(0) = 64",
+        "index 1099511627776 is out of bounds for dimension 1 with size 72"
+      ]
+    },
+    {
+      "index": 3,
+      "title": "[global-replication] Global per-layer replication + LPT packing across all GPUs",
+      "plan": "Mechanism family: global-replication\nReplacement scope: Replace the body of `rebalance_experts`'s dispatch (and effectively `rebalance_experts_hierarchical`'s Step 1/2 node-packing) with a single global pipeline per layer: run `replicate_experts(weight, num_replicas)` directly on the full `[num_layers, num_logical_experts]` weight (not the per-node reshaped view), then run `balanced_packing(tokens_per_phy, num_gpus)` on the full `[num_layers, num_replicas]` physical-expert load tensor, where `tokens_per_phy = weight / logcnt` gathered by `phy2log`. Keep the existing `log2phy` scatter construction unchanged.\nCompute budget: One sort over num_replicas per layer-batch plus one greedy loop of num_replicas steps (same order as current); expected evaluation time equal to or lower than incumbent (~6 ms), since the node-packing phase is removed.\nGain mechanism: The incumbent's hierarchical policy hard-partitions logical experts to nodes by group-token sums *before* replication, so a hot expert cannot be replicated onto another node's GPUs and a node with many hot experts is stuck. The new degree of freedom is placing replicas of the same logical expert on any GPU cluster; the greedy replication step (max of weight/logcnt) plus global LPT packing directly minimizes per-GPU max load, which is exactly what `balancedness_score_expert` measures. The current expert score of 0.25 is consistent with the node-partition bottleneck; removing the partition strictly enlarges the feasible set of placements, so per-GPU max load cannot increase under the same greedy operators. Keep the hierarchical path as a fallback branch only if the global path throws (it cannot, given the same assertions minus the group/node divisibility ones \u2014 drop those asserts in the global path). Expected-gain check: the global construction strictly dominates the hierarchical one on the same greedy operators (fewer constraints, same objective), so `balancedness_score_expert` should rise from 0.25 toward the GPU-level value (~0.66) with unchanged runtime; falsifiable threshold: expert score > 0.35 with combined_score > 0.1292.",
+      "cost": 0.004429516666666668,
+      "best_score": 0.1449426648322307,
+      "baseline_score": 0.12919729678785982,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 1,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.015745368044370878,
+      "cumulative_relative_gain": 0.10863169973172455,
+      "productive_rounds": 1,
+      "barren_rounds": 0,
+      "implementation_spend": 0.0008389916666666659,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 5,
+      "failure_feedback": []
+    },
+    {
+      "index": 4,
+      "title": "[load-proportional-replication] Waterfilling replica allocation minimizing max p",
+      "plan": "Mechanism family: load-proportional-replication\nReplacement scope: Replace `replicate_experts`'s sequential \"give the next redundant slot to argmax(weight/logcnt)\" loop with a closed-form waterfilling allocation: for each layer, compute replica counts `c_i` by the proportional-rounding rule \u2014 sort logical experts by weight, then allocate the `num_redundant` extra replicas one at a time to the expert maximizing `w_i/(c_i+1)` (this is equivalent but batched differently: equivalently, choose counts minimizing max_i w_i/c_i subject to sum c_i = num_replicas, c_i \u2265 1, via a bisection on the level \u03bb: c_i = max(1, ceil(w_i/\u03bb)), decreasing \u03bb until sum c_i = num_replicas, then trim the smallest over-ceil contributions). Then build `phy2log`, `rank`, `logcnt` vectorized via `torch.repeat_interleave` with per-layer counts (use a bucketed approach: since counts are small, build with `cumsum` offsets and one scatter). The downstream `balanced_packing` and all map constructions stay unchanged.\nCompute budget: Bisection over \u03bb: \u2264 40 iterations of vectorized ceil/sum over [num_layers, num_logical_experts]; strictly cheaper than the current num_redundant-step Python loop with per-step `max` gathers. Runtime \u2264 incumbent.\nGain mechanism: The incumbent's greedy replication is myopic: it always grants the next replica to the current argmax of w/c, which is exactly the waterfilling optimum only when weights are uniform-ish; with skewed loads it can leave the final max-load up to ~2\u00d7 the optimum because early replicas are assigned before later load information reshapes the marginal gains. The closed-form waterfilling gives the provably minimal max per-replica load for the fixed count budget (standard minimax rounding argument: any allocation has max_i w_i/c_i \u2265 \u03bb* where \u03bb* is the bisection fixed point). Since `balanced_packing` then packs these per-replica loads, a lower max per-replica load propagates to a lower max per-GPU load. Expected-gain check: waterfilling's max per-replica load is \u2264 the greedy's by construction (greedy's allocation is one feasible point of the same minimax problem waterfilling solves exactly), so both balance subscores are non-decreasing and the expert score should strictly improve on skewed load vectors; falsifiable threshold: `balancedness_score_expert` > 0.25 with runtime \u2264 7 ms.",
+      "cost": 0.004429516666666668,
+      "best_score": null,
+      "baseline_score": 0.12919729678785982,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 0,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.0008389916666666659,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 5,
+      "failure_feedback": [
+        "The size of tensor a (16704) must match the size of tensor b (16672) at non-singleton dimension 0"
+      ]
+    },
+    {
+      "index": 5,
+      "title": "[pairwise-swap-local-search] Time-budgeted 1-opt swap refinement of the greedy G",
+      "plan": "Mechanism family: pairwise-swap-local-search\nReplacement scope: Insert a refinement phase between Step 3 and the return of `rebalance_experts_hierarchical` (or at the end of the global pipeline if Strategy 1 is adopted): after `balanced_packing` produces `phy2pphy`, run a bounded steepest-descent swap loop. Maintain per-GPU loads `L[l, g]` via `bincount`-style scatter; repeatedly (a) find the max-load GPU `g_hi` and min-load GPU `g_lo` per layer, (b) among experts on `g_hi` find the one whose move to `g_lo` (respecting the fixed experts-per-GPU capacity: swap with the smallest-load expert on `g_lo`) reduces max load; apply the best swap found by vectorized candidate scoring (score = |new load difference| reduction), and stop when no improving swap exists or when `time.perf_counter()` exceeds a 3 ms guard (the incumbent runs in 6.3 ms total; the guard keeps total under ~10 ms).\nCompute budget: Hard wall-clock guard of 3 ms via `time.perf_counter()` checked every swap iteration; each iteration is O(num_experts_per_gpu) vectorized work, so at most a few hundred swaps fit \u2014 bounded by the guard, not an iteration count.\nGain mechanism: LPT greedy is a 4/3-approximation for makespan; the residual gap is closable by local swaps that greedy cannot see because greedy commits each item irrevocably. The swap loop adds a new degree of freedom \u2014 post-hoc pairwise exchange across GPUs \u2014 that strictly reduces max per-GPU load whenever it runs (accept-only-improving moves). The time cost is bounded to a fraction of the incumbent's runtime, and the speed score already sits at 0.008 (near-zero weight in the combined metric relative to balance terms summing to ~0.91), so spending a few milliseconds for balance is the correct trade. Validity is preserved: swaps only permute the physical-to-GPU assignment, never changing replica counts or coverage, so every logical expert remains placed and slot capacities per GPU are respected by construction (a swap exchanges one expert between two GPUs). Expected-gain check: each accepted swap strictly lowers max per-GPU load, so `balancedness_score_gpu`/`_expert` are monotone non-decreasing while runtime stays within ~2\u00d7 the incumbent's 6.3 ms \u2014 given the observed score decomposition (balance terms dominate the combined score), any measurable balance gain yields combined_score > 0.1292; falsifiable threshold: expert score > 0.28 or GPU score > 0.70.",
+      "cost": 0.004429516666666668,
+      "best_score": null,
+      "baseline_score": 0.12919729678785982,
+      "improvement_epsilon": 1e-07,
+      "rounds": 1,
+      "attempts": 1,
+      "implementations": 0,
+      "guide_implementation_attempts": 0,
+      "guide_implementations": 0,
+      "source_strategy_index": null,
+      "cumulative_gain": 0.0,
+      "cumulative_relative_gain": 0.0,
+      "productive_rounds": 0,
+      "barren_rounds": 0,
+      "implementation_spend": 0.0008389916666666659,
+      "reference_attempts": 0,
+      "reference_implementations": 0,
+      "reference_solution": null,
+      "reference_score": null,
+      "last_used_iteration": 5,
+      "failure_feedback": [
+        "index 4 is out of bounds for dimension 1 with size 4"
+      ]
+    }
+  ],
+  "active_strategy": null,
+  "strategy_queue": [],
+  "ordered_portfolio_roots": [
+    3,
+    4,
+    5
+  ],
+  "ordered_exploitation_queue": [
+    3,
+    4,
+    5
+  ],
+  "ordered_active_root": null,
+  "ordered_pilot_scores": {
+    "3": 0.1449426648322307,
+    "4": null,
+    "5": null
+  },
+  "ordered_phase": "exploit",
+  "ordered_reference_feedback": [],
+  "strategy_reference_failure_streak": 0,
+  "strategy_reference_disabled": false,
+  "strategy_costs": [
+    0.011662550000000002,
+    0.013288550000000003
+  ],
+  "implementation_costs": [
+    0.000445125,
+    0.0013123499999999999,
+    0.0007481999999999975,
+    0.0020189375,
+    0.0008389916666666659
+  ],
+  "guide_implementation_costs": [],
+  "guide_implementation_due": false,
+  "guide_implementation_due_reason": null,
+  "guide_implementation_unguided": false,
+  "strategy_call_count": 2,
+  "anchor_next_cheap_to_incumbent": false,
+  "opening_cheap_probe_done": true,
+  "opening_failure_retries_used": 0,
+  "opening_guide_hedge_done": false,
+  "success_achieved": false,
+  "barren_rounds": 0,
+  "stagnation": 0,
+  "next_strategy_escalation": 32,
+  "strategy_escalation_gap": 32,
+  "seen_solutions": [
+    "12608b1a678c7b6266a591641d5bda66c737ce72",
+    "90209551b45c715b6a508bf4d93fb7ba2a5a63b4",
+    "91b8238d699fdf127477ed50c0c1b6fca4e82ca8"
+  ],
+  "score_ledger": [
+    [
+      0.129197297,
+      1
+    ],
+    [
+      0.127298487,
+      1
+    ],
+    [
+      0.144942665,
+      1
+    ]
+  ],
+  "cost_samples": [
+    [
+      1,
+      0.000445125
+    ],
+    [
+      1,
+      0.0013123499999999999
+    ],
+    [
+      1,
+      0.019352249999999998
+    ],
+    [
+      2,
+      0.004037875
+    ],
+    [
+      3,
+      0.015805525
+    ]
+  ],
+  "exploring": false
+}

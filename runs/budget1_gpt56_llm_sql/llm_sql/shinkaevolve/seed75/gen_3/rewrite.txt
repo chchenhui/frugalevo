@@ -1,0 +1,344 @@
+# EVOLVE-BLOCK-START
+import heapq
+from collections import Counter, defaultdict
+from typing import Tuple, List, Dict
+
+import numpy as np
+import pandas as pd
+from solver import Algorithm
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-cache aware row-local column reordering.
+
+    The output dataframe always contains exactly the input cells.  A row may
+    have its cells permuted, and column_orderings[row][position] identifies the
+    source column for that output position.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+        self.dep_graph = None
+        self.num_rows = 0
+        self.num_cols = 0
+        self.column_stats = None
+        self.val_len = None
+        self.row_stop = None
+        self.col_stop = None
+        self.base = 2000
+
+    @staticmethod
+    def _serialized_value(value) -> str:
+        """Match evaluator normalization without changing the stored value."""
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, (bool, np.bool_)) and missing:
+                return ""
+        except Exception:
+            pass
+        try:
+            return str(value)
+        except Exception:
+            return repr(value)
+
+    @staticmethod
+    def _lcp(left: str, right: str) -> int:
+        if left == right:
+            return len(left)
+        upper = min(len(left), len(right))
+        low = 0
+        while low < upper:
+            mid = (low + upper + 1) // 2
+            if left[:mid] == right[:mid]:
+                low = mid
+            else:
+                upper = mid - 1
+        return low
+
+    def _trie_score(self, orders: List[List[int]], cell_strings: List[List[str]]) -> int:
+        rows = []
+        for row_number, order in enumerate(orders):
+            rows.append("".join(cell_strings[row_number][column] for column in order))
+        rows.sort()
+        return sum(self._lcp(rows[i - 1], rows[i]) for i in range(1, len(rows)))
+
+    def _make_units(
+        self,
+        columns: List,
+        col_merge: List[List[str]],
+        one_way_dep: List[Tuple[str, str]],
+    ):
+        """Build contiguous merge units and precedence relations between units."""
+        count = len(columns)
+        used = set()
+        units = []
+
+        for requested_group in col_merge or []:
+            positions = []
+            for name in requested_group:
+                positions.extend(
+                    pos for pos, column in enumerate(columns)
+                    if column == name and pos not in used
+                )
+            positions = sorted(set(positions))
+            if positions:
+                units.append(positions)
+                used.update(positions)
+
+        for pos in range(count):
+            if pos not in used:
+                units.append([pos])
+
+        unit_of = {}
+        for unit_id, unit in enumerate(units):
+            for pos in unit:
+                unit_of[pos] = unit_id
+
+        predecessors = [set() for _ in units]
+        for source_hint, target_hint in one_way_dep or []:
+            source_positions = [
+                pos for pos, column in enumerate(columns)
+                if str(source_hint) in str(column)
+            ]
+            target_positions = [
+                pos for pos, column in enumerate(columns)
+                if str(target_hint) in str(column)
+            ]
+            if len(source_positions) == 1 and len(target_positions) == 1:
+                source_unit = unit_of[source_positions[0]]
+                target_unit = unit_of[target_positions[0]]
+                if source_unit != target_unit:
+                    predecessors[target_unit].add(source_unit)
+
+        return units, predecessors
+
+    @staticmethod
+    def _valid_unit_order(priority, predecessors):
+        """Deterministic topological ordering, falling back safely on cycles."""
+        number = len(priority)
+        successors = [[] for _ in range(number)]
+        indegree = [0] * number
+        for target, sources in enumerate(predecessors):
+            for source in sources:
+                successors[source].append(target)
+                indegree[target] += 1
+
+        available = []
+        for unit in range(number):
+            if indegree[unit] == 0:
+                heapq.heappush(available, (priority[unit], unit))
+
+        result = []
+        while available:
+            _, unit = heapq.heappop(available)
+            result.append(unit)
+            for target in successors[unit]:
+                indegree[target] -= 1
+                if indegree[target] == 0:
+                    heapq.heappush(available, (priority[target], target))
+
+        # Invalid/cyclic dependency input must never lose columns.
+        if len(result) != number:
+            result.extend(unit for unit in range(number) if unit not in set(result))
+        return result
+
+    def _conditional_orders(
+        self,
+        unit_values: List[List[str]],
+        base_units: List[int],
+        predecessors: List[set],
+        max_depth: int,
+    ) -> List[List[int]]:
+        """Bounded partition tree with per-group prefix choices."""
+        row_count = len(unit_values)
+        unit_count = len(base_units)
+        result = [None] * row_count
+        priority_rank = {unit: rank for rank, unit in enumerate(base_units)}
+
+        def complete(prefix, remaining):
+            pending = set(remaining)
+            output = list(prefix)
+            while pending:
+                eligible = [
+                    unit for unit in pending
+                    if not (predecessors[unit] & pending)
+                ]
+                if not eligible:
+                    eligible = sorted(pending, key=lambda u: priority_rank[u])
+                else:
+                    eligible.sort(key=lambda u: priority_rank[u])
+                chosen = eligible[0]
+                output.append(chosen)
+                pending.remove(chosen)
+            return output
+
+        def visit(rows, prefix, remaining, depth):
+            if not rows:
+                return
+            if depth >= max_depth or not remaining or len(rows) < 2:
+                order = complete(prefix, remaining)
+                for row in rows:
+                    result[row] = order
+                return
+
+            remaining_set = set(remaining)
+            eligible = [
+                unit for unit in remaining
+                if not (predecessors[unit] & remaining_set)
+            ]
+            if not eligible:
+                order = complete(prefix, remaining)
+                for row in rows:
+                    result[row] = order
+                return
+
+            # Limit the work on wide inputs to the most promising global units.
+            eligible.sort(key=lambda u: priority_rank[u])
+            eligible = eligible[:24]
+            best_unit = None
+            best_gain = 0
+            best_groups = None
+
+            for unit in eligible:
+                groups = defaultdict(list)
+                for row in rows:
+                    groups[unit_values[row][unit]].append(row)
+                gain = sum(
+                    len(value) * len(group) * (len(group) - 1)
+                    for value, group in groups.items()
+                    if len(group) > 1
+                )
+                if gain > best_gain:
+                    best_unit = unit
+                    best_gain = gain
+                    best_groups = groups
+
+            if best_unit is None or best_gain <= 0:
+                order = complete(prefix, remaining)
+                for row in rows:
+                    result[row] = order
+                return
+
+            next_remaining = [unit for unit in remaining if unit != best_unit]
+            for value in sorted(best_groups, key=lambda item: (item,)):
+                visit(
+                    best_groups[value],
+                    prefix + [best_unit],
+                    next_remaining,
+                    depth + 1,
+                )
+
+        visit(list(range(row_count)), [], list(base_units), 0)
+        return result
+
+    # Kept for compatibility with callers that used the previous helpers.
+    def find_max_group_value(self, df: pd.DataFrame, value_counts: Dict, early_stop: int = 0):
+        if not value_counts:
+            return None
+        best_value, best_count = max(value_counts.items(), key=lambda item: item[1])
+        return best_value if best_count > early_stop else None
+
+    def reorder_columns_for_value(self, row, value, column_names, grouped_rows_len: int = 1):
+        order = list(column_names)
+        return [getattr(row, name) for name in order], order
+
+    def get_dependent_columns(self, col: str) -> List[str]:
+        return []
+
+    def get_cached_dependent_columns(self, col: str) -> List[str]:
+        return self.get_dependent_columns(col)
+
+    def fixed_reorder(self, df: pd.DataFrame, row_sort: bool = True):
+        order = list(df.columns)
+        return df.copy(), [order[:] for _ in range(len(df))]
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        # Empty frames need no special fabricated columns or index bookkeeping.
+        if df.shape[0] == 0 or df.shape[1] == 0:
+            return df.copy(), [[] for _ in range(len(df))]
+
+        columns = list(df.columns)
+        values = df.to_numpy(dtype=object, copy=True)
+        row_count, column_count = values.shape
+        cell_strings = [
+            [self._serialized_value(values[row, col]) for col in range(column_count)]
+            for row in range(row_count)
+        ]
+
+        units, predecessors = self._make_units(columns, col_merge, one_way_dep)
+        unit_count = len(units)
+        unit_values = [
+            ["".join(cell_strings[row][column] for column in unit) for unit in units]
+            for row in range(row_count)
+        ]
+
+        # Required global frequency-ranked candidate:
+        # sum(len(v) * count(v) * (count(v)-1)).
+        global_strength = []
+        for unit in range(unit_count):
+            counts = Counter(unit_values[row][unit] for row in range(row_count))
+            strength = sum(
+                len(value) * count * (count - 1)
+                for value, count in counts.items()
+            )
+            global_strength.append(strength)
+
+        descending_priority = [(-global_strength[unit], unit) for unit in range(unit_count)]
+        ascending_priority = [(global_strength[unit], unit) for unit in range(unit_count)]
+        global_units = self._valid_unit_order(descending_priority, predecessors)
+        alternate_units = self._valid_unit_order(ascending_priority, predecessors)
+
+        global_columns = [column for unit in global_units for column in units[unit]]
+        alternate_columns = [column for unit in alternate_units for column in units[unit]]
+        candidates = [
+            [global_columns[:] for _ in range(row_count)],
+            [alternate_columns[:] for _ in range(row_count)],
+        ]
+
+        # Conditional construction is bounded by depth and candidate fields.
+        if unit_count > 1 and row_count > 1:
+            depth_limit = min(12, unit_count)
+            conditional_units = self._conditional_orders(
+                unit_values, global_units, predecessors, depth_limit
+            )
+            candidates.append([
+                [column for unit in order for column in units[unit]]
+                for order in conditional_units
+            ])
+
+        best_orders = candidates[0]
+        best_score = self._trie_score(best_orders, cell_strings)
+        for candidate in candidates[1:]:
+            score = self._trie_score(candidate, cell_strings)
+            if score > best_score:
+                best_score = score
+                best_orders = candidate
+
+        output = np.empty((row_count, column_count), dtype=object)
+        for row, order in enumerate(best_orders):
+            output[row, :] = values[row, order]
+
+        # Keep dataframe labels/index exactly as supplied.  The separate order
+        # list states which original source column occupies each output position.
+        reordered = pd.DataFrame(output, index=df.index.copy(), columns=df.columns.copy())
+        column_orderings = [
+            [columns[column] for column in order]
+            for order in best_orders
+        ]
+
+        assert reordered.shape == df.shape
+        return reordered, column_orderings
+
+
+# EVOLVE-BLOCK-END

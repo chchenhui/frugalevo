@@ -1,0 +1,225 @@
+# EVOLVE-BLOCK-START
+"""Nonlinear/linear-program constructor-based circle packing for n=26."""
+import numpy as np
+
+
+def _hexagonal_seed():
+    """Six staggered rows, chosen as a good interior starting topology."""
+    counts = [5, 4, 5, 4, 5, 3]
+    r0 = 0.082
+    dy = np.sqrt(3.0) * r0
+
+    centers = []
+    y0 = 0.5 - 0.5 * (len(counts) - 1) * dy
+
+    for row, count in enumerate(counts):
+        y = y0 + row * dy
+        # Center each row horizontally.  Alternate rows naturally form a
+        # triangular lattice, while the short final row leaves flexibility
+        # for boundary-radius variation.
+        xs = np.linspace(0.5 - (count - 1) * r0,
+                         0.5 + (count - 1) * r0, count)
+        for x in xs:
+            centers.append((x, y))
+
+    return np.asarray(centers[:26], dtype=float)
+
+
+def _best_radii_for_centers(centers):
+    """
+    Solve the exact radius subproblem:
+       maximize sum r_i
+       r_i <= distance of center i to every wall
+       r_i + r_j <= distance(center_i, center_j)
+
+    This is a linear program once centers are fixed.
+    """
+    n = len(centers)
+    wall = np.minimum(np.minimum(centers[:, 0], centers[:, 1]),
+                      np.minimum(1.0 - centers[:, 0], 1.0 - centers[:, 1]))
+
+    ii, jj = np.triu_indices(n, 1)
+    distances = np.sqrt(np.sum((centers[ii] - centers[jj]) ** 2, axis=1))
+
+    try:
+        from scipy.optimize import linprog
+
+        a_pairs = np.zeros((len(ii), n), dtype=float)
+        a_pairs[np.arange(len(ii)), ii] = 1.0
+        a_pairs[np.arange(len(ii)), jj] = 1.0
+
+        result = linprog(
+            c=-np.ones(n),
+            A_ub=a_pairs,
+            b_ub=distances,
+            bounds=[(0.0, max(0.0, float(w))) for w in wall],
+            method="highs",
+        )
+        if result.success:
+            return np.maximum(result.x, 0.0)
+    except Exception:
+        pass
+
+    # Dependency-free feasible fallback.  It is conservative but always
+    # produces a valid packing.
+    radii = np.maximum(wall, 0.0)
+    for _ in range(8):
+        for k in range(len(ii)):
+            i, j = ii[k], jj[k]
+            total = radii[i] + radii[j]
+            if total > distances[k] and total > 0.0:
+                factor = distances[k] / total
+                radii[i] *= factor
+                radii[j] *= factor
+    return radii
+
+
+def construct_packing():
+    """
+    Construct 26 non-overlapping circles in the unit square.
+
+    Returns:
+        (centers, radii, sum_of_radii)
+    """
+    n = 26
+    seed = _hexagonal_seed()
+    rng = np.random.default_rng(26031991)
+
+    # Keep the best centers seen, measured by the exact LP radius objective.
+    candidates = [seed]
+    best_centers = seed.copy()
+    best_radii = _best_radii_for_centers(best_centers)
+    best_value = float(np.sum(best_radii))
+
+    try:
+        from scipy.optimize import minimize
+
+        ii, jj = np.triu_indices(n, 1)
+
+        def unpack(z):
+            return z[:2 * n].reshape(n, 2), z[2 * n:]
+
+        def objective(z):
+            return -float(np.sum(z[2 * n:]))
+
+        def objective_jac(z):
+            g = np.zeros_like(z)
+            g[2 * n:] = -1.0
+            return g
+
+        def constraints(z):
+            c, r = unpack(z)
+            # Four wall inequalities per circle.
+            walls = np.concatenate((
+                c[:, 0] - r,
+                c[:, 1] - r,
+                1.0 - c[:, 0] - r,
+                1.0 - c[:, 1] - r,
+            ))
+            # Euclidean, rather than squared, constraints have better
+            # conditioning near the touching contacts.
+            d = np.sqrt(np.sum((c[ii] - c[jj]) ** 2, axis=1))
+            return np.concatenate((walls, d - r[ii] - r[jj]))
+
+        # The regular seed plus asymmetric perturbations explores different
+        # contact graphs without relying on a rigid symmetric pattern.
+        starts = [seed]
+        for scale in (0.012, 0.025, 0.040):
+            p = seed + rng.normal(0.0, scale, seed.shape)
+            p = np.clip(p, 0.035, 0.965)
+            starts.append(p)
+
+        for start in starts:
+            # Low feasible initial radii let SLSQP rearrange the topology
+            # before radii become active at many contacts.
+            initial_r = np.minimum(
+                np.minimum(np.minimum(start[:, 0], start[:, 1]),
+                           np.minimum(1.0 - start[:, 0], 1.0 - start[:, 1])),
+                0.055,
+            )
+            z0 = np.concatenate((start.ravel(), initial_r))
+
+            result = minimize(
+                objective,
+                z0,
+                jac=objective_jac,
+                method="SLSQP",
+                bounds=[(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n,
+                constraints={"type": "ineq", "fun": constraints},
+                options={"maxiter": 700, "ftol": 1e-10, "disp": False},
+            )
+
+            if result.x is not None and np.all(np.isfinite(result.x)):
+                c, _ = unpack(result.x)
+                c = np.clip(c, 0.0, 1.0)
+                candidates.append(c)
+
+        # Radius LP polishing is deliberately performed after every nonlinear
+        # run, because it is more accurate than trusting optimizer radii.
+        for c in candidates:
+            r = _best_radii_for_centers(c)
+            value = float(np.sum(r))
+            if value > best_value:
+                best_centers, best_radii, best_value = c.copy(), r, value
+
+    except Exception:
+        # The initial LP packing remains a valid deterministic result if scipy
+        # is unavailable in a restricted runtime.
+        pass
+
+    # Tiny inward scaling protects against floating-point contact roundoff.
+    best_radii = np.maximum(0.0, best_radii * (1.0 - 2e-11))
+    return best_centers, best_radii, float(np.sum(best_radii))
+
+
+def compute_max_radii(centers):
+    """Compatibility helper: solve the radius LP for supplied centers."""
+    return _best_radii_for_centers(np.asarray(centers, dtype=float))
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

@@ -1,0 +1,198 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+_V0 = np.array([0.0, 0.0])
+_V1 = np.array([1.0, 0.0])
+_V2 = np.array([0.5, np.sqrt(3.0) / 2.0])
+_H = np.sqrt(3.0) / 2.0
+_TRI_AREA = 0.5 * _H
+
+_TRIP = np.array(list(combinations(range(11), 3)), dtype=int)
+_TA = _TRIP[:, 0]; _TB = _TRIP[:, 1]; _TC = _TRIP[:, 2]
+
+
+def _min_area(pts):
+    a = pts[_TA]; b = pts[_TB]; c = pts[_TC]
+    cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    return np.min(np.abs(cross)) / (2.0 * _TRI_AREA)
+
+
+def _bary(pts):
+    """Barycentric coords (n,3) w.r.t. V0,V1,V2."""
+    l2 = pts[:, 1] / _H
+    l1 = pts[:, 0] - 0.5 * l2
+    l0 = 1.0 - l1 - l2
+    return np.stack([l0, l1, l2], axis=1)
+
+
+def _clip(pts):
+    lam = _bary(pts)
+    bad = np.any(lam < 0.0, axis=1)
+    if not np.any(bad):
+        return pts
+    out = pts.copy()
+    for i in np.where(bad)[0]:
+        l = np.maximum(lam[i], 0.0)
+        l = l / l.sum()
+        out[i] = l[0] * _V0 + l[1] * _V1 + l[2] * _V2
+    return out
+
+
+def _initial(seed):
+    rng = np.random.default_rng(seed)
+    pts = []
+    k = 3
+    for i in range(k + 1):
+        for j in range(k + 1 - i):
+            l = k - i - j
+            pts.append((i * _V0 + j * _V1 + l * _V2) / k)
+    pts.append(np.array([0.5, _H / 3.0]))
+    pts = np.array(pts)
+    return _clip(pts + rng.normal(0.0, 0.03, pts.shape))
+
+
+def _soft_grad(pts, tau, margin=0.02, barrier=50.0):
+    """Value and gradient of smooth-min objective (+ interior barrier).
+    Returns (F, grad) with grad shape (n,2)."""
+    a = pts[_TA]; b = pts[_TB]; c = pts[_TC]
+    s = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    sgn = np.where(s >= 0.0, 1.0, -1.0)
+    u = -np.abs(s) / tau
+    u -= u.max()
+    e = np.exp(u)
+    w = e / e.sum()                       # dF/d|s| weights
+    F = -tau * (np.log(e.sum()) + u.max() - (-np.abs(s).min() / tau) * 0.0)  # value unused below
+    F = -tau * np.log(e.sum() + 1e-300) - tau * u.max()
+    F = tau * (-np.abs(s).min() / tau - np.log(e.sum()))  # correct soft-min value
+    grad = np.zeros_like(pts)
+    # d|s|/d vertex for triplet (a,b,c): a:(cy-by, bx-cx) b:(ay-cy, cx-ax) c:(by-ay, ax-bx) times sgn
+    for col, gi in ((_TA, 0), (_TB, 1), (_TC, 2)):
+        p = pts[_TRIP[:, gi]]
+        o1 = pts[_TRIP[:, (gi + 1) % 3]]
+        o2 = pts[_TRIP[:, (gi + 2) % 3]]
+        g = sgn * w * np.stack([o2[:, 1] - o1[:, 1], o1[:, 0] - o2[:, 0]], axis=1)
+        np.add.at(grad, col, g)
+    # interior barrier on barycentric margins
+    lam = _bary(pts)
+    viol = np.minimum(lam - margin, 0.0)   # negative when too close to/outside edge
+    F += barrier * np.sum(viol ** 2)
+    # d lambda / d (x,y): l0=1-x+y/(2H)*0.5... use explicit
+    # l2 = y/H, l1 = x - l2/2, l0 = 1 - l1 - l2
+    n = pts.shape[0]
+    for r in range(3):
+        v = 2.0 * barrier * viol[:, r]
+        # d l0/dp = (-1, -1/(2H)*0 + ...) compute explicitly:
+        # dl0/dx = -1, dl0/dy = -(-1/(2H)) - 1/H = 1/(2H) - 1/H = -1/(2H)
+        # dl1/dx = 1, dl1/dy = -1/(2H)
+        # dl2/dx = 0, dl2/dy = 1/H
+        if r == 0:
+            gx = -v; gy = -v / (2.0 * _H)
+        elif r == 1:
+            gx = v; gy = -v / (2.0 * _H)
+        else:
+            gx = 0.0 * v; gy = v / _H
+        grad[:, 0] += gx
+        grad[:, 1] += gy
+    return F, grad
+
+
+def _adam(pts, iters=400, tau0=0.02, tau1=0.0008, lr0=0.01, lr1=0.0008, seed=None):
+    """Adam ascent on the soft-min objective with exponential tau/lr decay."""
+    m = np.zeros_like(pts); v = np.zeros_like(pts)
+    best = _clip(pts); best_v = _min_area(best)
+    cur = best.copy()
+    rng = np.random.default_rng(seed if seed is not None else 0)
+    b1, b2, eps = 0.9, 0.999, 1e-8
+    for it in range(iters):
+        frac = it / max(1, iters - 1)
+        tau = tau0 * (tau1 / tau0) ** frac
+        lr = lr0 * (lr1 / lr0) ** frac
+        F, g = _soft_grad(cur, tau)
+        m = b1 * m + (1 - b1) * g
+        v = b2 * v + (1 - b2) * g * g
+        mh = m / (1 - b1 ** (it + 1)); vh = v / (1 - b2 ** (it + 1))
+        step = lr * mh / (np.sqrt(vh) + eps)
+        cur = _clip(cur + step)
+        if it % 10 == 0 or it == iters - 1:
+            val = _min_area(cur)
+            if val > best_v:
+                best_v = val; best = cur.copy()
+    return best, best_v
+
+
+def _polish(best, best_v):
+    """Exact greedy coordinate polish on bottleneck vertices (singles+pairs)."""
+    n_dirs = 8
+    ang = 2.0 * np.pi * np.arange(n_dirs) / n_dirs
+    dirs = np.stack([np.cos(ang), np.sin(ang)], axis=1)
+    full = np.concatenate([dirs, -dirs], axis=0)
+    step = 0.003
+    while step > 1e-5:
+        a = best[_TA]; b = best[_TB]; c = best[_TC]
+        cross = np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+        order = np.argsort(cross)[:3]
+        idxs = sorted({int(x) for t in order for x in _TRIP[t]})
+        improved = False
+        for ai in range(len(idxs)):
+            i = idxs[ai]
+            for d in full:
+                cand = best.copy(); cand[i] += step * d
+                cand = _clip(cand)
+                val = _min_area(cand)
+                if val > best_v + 1e-12:
+                    best_v, best, improved = val, cand, True
+            for bi in range(ai + 1, len(idxs)):
+                j = idxs[bi]
+                for d in full:
+                    cand = best.copy(); cand[i] += step * d; cand[j] -= step * d
+                    cand = _clip(cand)
+                    val = _min_area(cand)
+                    if val > best_v + 1e-12:
+                        best_v, best, improved = val, cand, True
+        if not improved:
+            step *= 0.5
+    return best, best_v
+
+
+def _refine(pts, rng):
+    """Adam soft-min core, then outer reheat loop, then exact polish."""
+    best, best_v = _adam(pts, iters=400, tau0=0.02, tau1=0.0008, lr0=0.012, lr1=0.0008)
+    best, best_v = _polish(best, best_v)
+    for cycle in range(4):
+        if best_v >= 0.0355:
+            break
+        # reheat: perturb around best, flatter tau schedule, reset Adam moments
+        start = _clip(best + rng.normal(0.0, 0.006, best.shape))
+        b2, v2 = _adam(start, iters=250, tau0=0.004, tau1=0.0006,
+                      lr0=0.004, lr1=0.0005)
+        b2, v2 = _polish(b2, v2)
+        if v2 > best_v:
+            best_v, best = v2, b2
+    return best, best_v
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of 11 points on or inside the equilateral triangle with
+    vertices (0,0), (1,0), (0.5, sqrt(3)/2), maximizing the minimum triangle area.
+
+    Differentiable soft-min Adam optimization with reheat outer loops and exact polish.
+    Falls back to the initial configuration if optimization fails.
+    """
+    best_pts = None
+    best_val = -1.0
+    try:
+        for seed in range(6):
+            rng = np.random.default_rng(1234 + seed)
+            init = _initial(1234 + seed)
+            pts, val = _refine(init, rng)
+            if val > best_val:
+                best_val = val
+                best_pts = pts
+    except Exception:
+        if best_pts is None:
+            best_pts = _initial(1234)
+    return np.asarray(best_pts, dtype=float)
+
+# EVOLVE-BLOCK-END

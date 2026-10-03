@@ -1,0 +1,268 @@
+# EVOLVE-BLOCK-START
+import time
+import numpy as np
+from scipy.optimize import minimize
+from scipy.special import logsumexp
+
+N = 14
+D = 3
+_IU = np.triu_indices(N, 1)
+_IJ = np.array([(i, j) for i in range(N) for j in range(i + 1, N)])
+_TIME0 = time.time()
+_BUDGET = 55.0  # seconds of wall-clock search
+
+
+def _time_left():
+    return _BUDGET - (time.time() - _TIME0)
+
+
+def pair_dists(P):
+    Dm = np.linalg.norm(P[:, None] - P[None, :], axis=-1)
+    return Dm[_IU]
+
+
+def ratio(P):
+    d = pair_dists(P)
+    return d.min() / d.max()
+
+
+def normalize(P):
+    P = (P - P.mean(axis=0)).copy()
+    return P / pair_dists(P).max()
+
+
+def d6_family(R, h, z0):
+    th = np.arange(6) * (np.pi / 3.0)
+    r1 = np.stack([R * np.cos(th), R * np.sin(th), np.full(6, h)], axis=1)
+    r2 = np.stack([R * np.cos(th + np.pi / 6), R * np.sin(th + np.pi / 6),
+                   np.full(6, -h)], axis=1)
+    poles = np.array([[0.0, 0.0, z0], [0.0, 0.0, -z0]])
+    return np.vstack([r1, r2, poles])
+
+
+def ring_poles_family(n_ring, h, z0, twist=0.0):
+    th = np.arange(n_ring) * (2 * np.pi / n_ring) + twist
+    ring = np.stack([np.cos(th), np.sin(th), np.full(n_ring, h)], axis=1)
+    poles = np.array([[0.0, 0.0, z0], [0.0, 0.0, -z0]])
+    return np.vstack([ring, poles])
+
+
+def hept_antiprism_family(R, h):
+    th = np.arange(7) * (2 * np.pi / 7)
+    r1 = np.stack([R * np.cos(th), R * np.sin(th), np.full(7, h)], axis=1)
+    r2 = np.stack([R * np.cos(th + np.pi / 7), R * np.sin(th + np.pi / 7),
+                   np.full(7, -h)], axis=1)
+    return np.vstack([r1, r2])
+
+
+def polish(P0, taus=(0.05, 0.02, 0.008, 0.003, 0.001, 0.0004)):
+    """Annealed soft-min/soft-max L-BFGS-B polish, scale-invariant objective."""
+    P = normalize(P0)
+    x = P.ravel()
+    I = _IJ[:, 0]
+    J = _IJ[:, 1]
+
+    def obj(z, tau=0.01):
+        X = z.reshape(N, D)
+        diff = X[I] - X[J]
+        d2 = np.sum(diff * diff, axis=1)
+        return tau * (logsumexp(-d2 / tau) + logsumexp(d2 / tau))
+
+    for tau in taus:
+        res = minimize(lambda z, t=tau: obj(z, t), x, method="L-BFGS-B",
+                       options={"maxiter": 300, "ftol": 1e-14, "gtol": 1e-12})
+        if np.isfinite(res.x).all():
+            x = res.x
+    X = normalize(x.reshape(N, D))
+    return X
+
+
+def _perp_dirs(u):
+    """Two fixed unit vectors perpendicular to u."""
+    a = np.array([0.0, 0.0, 1.0])
+    if abs(u[2]) > 0.9:
+        a = np.array([1.0, 0.0, 0.0])
+    w1 = np.cross(u, a)
+    w1 /= np.linalg.norm(w1)
+    w2 = np.cross(u, w1)
+    return w1, w2
+
+
+def climb(P, steps=(0.02, 0.006, 0.002, 6e-4, 2e-4, 8e-5, 3e-5),
+          deadline=None):
+    """Exact greedy hill-climb on the true ratio with axial + tangential
+    pair moves and single-coordinate nudges."""
+    P = normalize(P)
+    best_r = ratio(P)
+    for step in steps:
+        n_acc = 0
+        while n_acc < 4000:
+            if deadline is not None and time.time() > deadline:
+                return P, best_r
+            d = pair_dists(P)
+            imin = int(np.argmin(d))
+            imax = int(np.argmax(d))
+            i0, j0 = int(_IU[0][imin]), int(_IU[1][imin])
+            i1, j1 = int(_IU[0][imax]), int(_IU[1][imax])
+            cands = []
+            u = P[j0] - P[i0]
+            nu = np.linalg.norm(u)
+            if nu > 1e-12:
+                u = u / nu
+                w1, w2 = _perp_dirs(u)
+                # axial moves
+                Q = P.copy(); Q[i0] -= 0.5 * step * u; Q[j0] += 0.5 * step * u
+                cands.append(Q)
+                Q = P.copy(); Q[i0] -= step * u; cands.append(Q)
+                Q = P.copy(); Q[j0] += step * u; cands.append(Q)
+                # tangential sliding moves (both points, tangential comp)
+                for w in (w1, w2):
+                    for tf in (0.3, 1.0):
+                        g = u + tf * w
+                        g /= np.linalg.norm(g)
+                        Q = P.copy()
+                        Q[i0] -= 0.5 * step * g
+                        Q[j0] += 0.5 * step * g
+                        cands.append(Q)
+                        g2 = u - tf * w
+                        g2 /= np.linalg.norm(g2)
+                        Q = P.copy()
+                        Q[i0] -= 0.5 * step * g2
+                        Q[j0] += 0.5 * step * g2
+                        cands.append(Q)
+                # tangential single-point moves
+                for w in (w1, w2):
+                    Q = P.copy(); Q[i0] -= step * w; cands.append(Q)
+                    Q = P.copy(); Q[j0] += step * w; cands.append(Q)
+            v = P[j1] - P[i1]
+            nv = np.linalg.norm(v)
+            if nv > 1e-12:
+                v = v / nv
+                Q = P.copy(); Q[i1] += 0.5 * step * v; Q[j1] -= 0.5 * step * v
+                cands.append(Q)
+                Q = P.copy(); Q[i1] += step * v; cands.append(Q)
+                Q = P.copy(); Q[j1] -= step * v; cands.append(Q)
+            for a in range(N):
+                for c in range(D):
+                    for s in (step, -step):
+                        Q = P.copy(); Q[a, c] += s; cands.append(Q)
+            improved = False
+            for Q in cands:
+                r = ratio(Q)
+                if r > best_r + 1e-15:
+                    best_r = r
+                    P = Q
+                    improved = True
+                    break
+            if not improved:
+                break
+            n_acc += 1
+    return P, best_r
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    rng = np.random.default_rng(7)
+    deadline = _TIME0 + _BUDGET
+
+    # --- Stage 1: grid search over symmetric families ---
+    fam_seeds = []
+    best_r, best_param = -1.0, None
+    for h in np.linspace(0.15, 1.4, 26):
+        for z0 in np.linspace(max(h, 0.2) + 0.05, 2.6, 48):
+            P = d6_family(1.0, h, z0)
+            r = ratio(P)
+            if r > best_r:
+                best_r, best_param = r, (1.0, h, z0)
+    fam_seeds.append(d6_family(*best_param))
+    best_r2, best_p2 = -1.0, None
+    for h in np.linspace(-0.9, 0.9, 37):
+        for z0 in np.linspace(max(abs(h), 0.2) + 0.05, 2.6, 48):
+            P = ring_poles_family(12, h, z0)
+            r = ratio(P)
+            if r > best_r2:
+                best_r2, best_p2 = r, (12, h, z0, 0.0)
+    fam_seeds.append(ring_poles_family(*best_p2))
+    best_r3, best_p3 = -1.0, None
+    for R in np.linspace(0.3, 1.6, 27):
+        for h in np.linspace(0.05, 1.2, 24):
+            P = hept_antiprism_family(R, h)
+            r = ratio(P)
+            if r > best_r3:
+                best_r3, best_p3 = r, (R, h)
+    fam_seeds.append(hept_antiprism_family(*best_p3))
+    # variants of D6 with different twist
+    for tw in (np.pi / 9, np.pi / 4, np.pi / 18):
+        th = np.arange(6) * (np.pi / 3.0)
+        R, h, z0 = best_param
+        r1 = np.stack([R * np.cos(th), R * np.sin(th), np.full(6, h)], axis=1)
+        r2 = np.stack([R * np.cos(th + tw), R * np.sin(th + tw),
+                       np.full(6, -h)], axis=1)
+        poles = np.array([[0, 0, z0], [0, 0, -z0]], dtype=float)
+        fam_seeds.append(np.vstack([r1, r2, poles]))
+
+    # random spherical seeds
+    rand_seeds = []
+    for _ in range(30):
+        p = rng.normal(size=(N, D))
+        rand_seeds.append(p / np.linalg.norm(p, axis=1, keepdims=True))
+
+    best, best_r = None, -1.0
+
+    # --- Stage 2: polish + climb all seeds (family first, then random) ---
+    all_seeds = fam_seeds + rand_seeds
+    polished = []
+    for idx, P0 in enumerate(all_seeds):
+        if _time_left() < 15.0 and idx >= len(fam_seeds):
+            break
+        Q = polish(P0)
+        rq = ratio(Q)
+        polished.append((rq, Q))
+        if rq > best_r:
+            best_r, best = rq, Q
+        Qc, rc = climb(Q, deadline=deadline)
+        if rc > best_r:
+            best_r, best = rc, Qc
+        if idx < len(fam_seeds):
+            Qc, rc = climb(normalize(P0), deadline=deadline)
+            if rc > best_r:
+                best_r, best = rc, Qc
+    if best is None:
+        best = polish(fam_seeds[0])
+        best_r = ratio(best)
+
+    # climb the top polished random seeds too
+    polished.sort(key=lambda t: -t[0])
+    for rq, Q in polished[:8]:
+        if _time_left() < 10.0:
+            break
+        Qc, rc = climb(Q, deadline=deadline)
+        if rc > best_r:
+            best_r, best = rc, Qc
+
+    # --- Stage 3: perturb -> polish -> climb restarts around incumbent ---
+    k = 0
+    while _time_left() > 8.0 and k < 40:
+        mag = 0.05 * (0.9 ** (k % 10))
+        Q = best + mag * rng.normal(size=best.shape)
+        Qp = polish(Q, taus=(0.02, 0.005, 0.001))
+        rp = ratio(Qp)
+        if rp > best_r:
+            best_r, best = rp, Qp
+        Qc, rc = climb(Qp, deadline=deadline)
+        if rc > best_r:
+            best_r, best = rc, Qc
+        k += 1
+
+    # --- Stage 4: tiny high-precision polish of the winner ---
+    Q = polish(best, taus=(0.001, 0.0003, 0.0001))
+    if ratio(Q) > best_r:
+        best, best_r = Q, ratio(Q)
+    Qc, rc = climb(best, deadline=_TIME0 + _BUDGET + 10.0)
+    if rc > best_r:
+        best, best_r = Qc, rc
+
+    points = np.asarray(best, dtype=float)
+    assert points.shape == (N, D) and np.isfinite(points).all()
+    assert pair_dists(points).max() > 0
+    return points
+# EVOLVE-BLOCK-END

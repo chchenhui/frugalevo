@@ -1,0 +1,233 @@
+<NAME>
+batch_active_de13
+</NAME>
+
+<DESCRIPTION>
+The current approach uses six sequential simulated-annealing restarts of 36,000 proposals, with an initial step of 0.112, lower-tail blend weight 0.085, temperature 0.0025, and a 10-scale bottleneck polish beginning at 0.018. Its main limitation is that most proposals modify only one point and are evaluated serially, making basin exploration relatively narrow.
+
+This version replaces the long sequential annealing schedule with a vectorized population search. It uses 104 concurrent layouts, 980 generations, three complementary proposal types per generation (correlated local perturbation, differential-evolution transport, and bottleneck-targeted moves), periodic diversity injection, and a lower-tail surrogate that decays from 0.070 to zero. The final stage is strict maximin-only active-set polishing with coordinated one- and two-point proposals. All layouts remain inside a unit square with fixed corners, so the raw minimum triangle area remains exactly the hull-normalized objective.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Deterministic population-based maximin search for thirteen points in the
+    unit square.  The four fixed corners give every returned layout convex
+    hull area one, hence raw triangle area equals normalized triangle area.
+    """
+    rng = np.random.default_rng(918273645)
+    n = 13
+    mobile = 9
+
+    corners = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        dtype=float,
+    )
+    triples = np.array(
+        [(i, j, k) for i in range(n) for j in range(i + 1, n)
+         for k in range(j + 1, n)],
+        dtype=np.intp,
+    )
+
+    def clip_layout(x: np.ndarray) -> np.ndarray:
+        return np.clip(x, 0.026, 0.974)
+
+    def areas_batch(layouts: np.ndarray) -> np.ndarray:
+        """Return all 286 triangle areas for a batch of mobile-point layouts."""
+        batch = layouts.shape[0]
+        pts = np.empty((batch, n, 2), dtype=float)
+        pts[:, :4, :] = corners
+        pts[:, 4:, :] = layouts
+
+        a = pts[:, triples[:, 0], :]
+        b = pts[:, triples[:, 1], :]
+        c = pts[:, triples[:, 2], :]
+        return 0.5 * np.abs(
+            (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
+            - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
+        )
+
+    def quality(values: np.ndarray, blend: float) -> tuple[np.ndarray, np.ndarray]:
+        """
+        The mean of the lowest constraints is used only during global search.
+        The primary minimum is retained separately and governs final polish.
+        """
+        low = np.partition(values, 19, axis=1)[:, :20]
+        minimum = low.min(axis=1)
+        return minimum + blend * low.mean(axis=1), minimum
+
+    # A mixture of jittered grids and uniform designs provides both a useful
+    # covering baseline and genuinely asymmetric initial basins.
+    population_size = 104
+    population = rng.uniform(0.055, 0.945, size=(population_size, mobile, 2))
+    grid = np.array(
+        [[x, y] for y in (0.18, 0.50, 0.82) for x in (0.18, 0.50, 0.82)],
+        dtype=float,
+    )
+    for row in range(32):
+        population[row] = clip_layout(
+            grid[rng.permutation(mobile)] + rng.normal(0.0, 0.075, (mobile, 2))
+        )
+
+    values = areas_batch(population)
+    fit, minima = quality(values, 0.070)
+    best_id = int(np.argmax(minima))
+    best = population[best_id].copy()
+    best_minimum = float(minima[best_id])
+    best_values = values[best_id].copy()
+
+    generations = 980
+    for generation in range(generations):
+        p = generation / (generations - 1.0)
+        # Broad exploration is retained longer than in the previous annealer;
+        # the final generations are effectively a population pattern search.
+        step = 0.082 * (0.0042 / 0.082) ** p + 0.00035
+        blend = 0.070 * max(0.0, 1.0 - 1.20 * p) ** 1.35
+
+        # 1) correlated full-layout mutation
+        local = clip_layout(
+            population + rng.normal(0.0, step, size=population.shape)
+        )
+
+        # 2) differential transport between successful geometric patterns
+        ia = rng.integers(population_size, size=population_size)
+        ib = rng.integers(population_size, size=population_size)
+        de_scale = 0.72 - 0.22 * p
+        differential = clip_layout(
+            population
+            + de_scale * (population[ia] - population[ib])
+            + rng.normal(0.0, step * 0.16, size=population.shape)
+        )
+
+        # 3) move points participating in each layout's presently tight
+        # triangles.  A minority are coupled moves to resolve active networks.
+        active = np.argpartition(values, 17, axis=1)[:, :18]
+        targeted = population.copy()
+        for row in range(population_size):
+            participation = np.bincount(
+                triples[active[row]].ravel(), minlength=n
+            )[4:].astype(float)
+            probabilities = participation + 0.22
+            probabilities /= probabilities.sum()
+            first = int(rng.choice(mobile, p=probabilities))
+            targeted[row, first] += rng.normal(0.0, step * 1.34, size=2)
+
+            if rng.random() < 0.31:
+                second = int(rng.choice(mobile, p=probabilities))
+                if second != first:
+                    targeted[row, second] += rng.normal(
+                        0.0, step * 0.64, size=2
+                    )
+        targeted = clip_layout(targeted)
+
+        candidates = np.concatenate(
+            (population, local, differential, targeted), axis=0
+        )
+        candidate_values = areas_batch(candidates)
+        candidate_fit, candidate_minima = quality(candidate_values, blend)
+
+        candidate_fit = candidate_fit.reshape(4, population_size).T
+        candidate_minima = candidate_minima.reshape(4, population_size).T
+        choice = np.argmax(candidate_fit, axis=1)
+        offset = choice * population_size + np.arange(population_size)
+
+        population = candidates[offset]
+        values = candidate_values[offset]
+        fit = candidate_fit[np.arange(population_size), choice]
+        minima = candidate_minima[np.arange(population_size), choice]
+
+        current = int(np.argmax(minima))
+        if minima[current] > best_minimum + 1.0e-15:
+            best = population[current].copy()
+            best_values = values[current].copy()
+            best_minimum = float(minima[current])
+
+        # Controlled restarts stop differential evolution from collapsing to
+        # one mediocre basin.  Descendants of the record retain local insight.
+        if generation in (210, 430, 650):
+            worst = np.argsort(minima)[:20]
+            fresh = rng.uniform(0.045, 0.955, size=(20, mobile, 2))
+            fresh[10:] = clip_layout(
+                best[None, :, :]
+                + rng.normal(0.0, 0.105, size=(10, mobile, 2))
+            )
+            population[worst] = fresh
+            values[worst] = areas_batch(fresh)
+            fit[worst], minima[worst] = quality(values[worst], blend)
+
+    # Strict maximin active-set refinement.  Unlike the population score,
+    # no tail tradeoff is accepted in this stage.
+    directions = np.array(
+        [
+            [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
+            [1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0],
+        ],
+        dtype=float,
+    )
+    directions[4:] /= np.sqrt(2.0)
+
+    for scale, step in enumerate((0.018, 0.010, 0.0052, 0.0025, 0.0011, 0.00045)):
+        stalled = 0
+        for sweep in range(90):
+            active_ids = np.argpartition(best_values, 27)[:28]
+            participation = np.bincount(
+                triples[active_ids].ravel(), minlength=n
+            )[4:].astype(float)
+            weights = participation + 0.16
+            weights /= weights.sum()
+
+            trial_count = 64
+            trials = np.repeat(best[None, :, :], trial_count, axis=0)
+            for q in range(trial_count):
+                first = int(rng.choice(mobile, p=weights))
+                direction = directions[(q + 3 * sweep + scale) % 8]
+                trials[q, first] += step * direction
+
+                if q >= 32:
+                    second = int(rng.choice(mobile, p=weights))
+                    if second != first:
+                        paired = directions[(2 * q + scale + 1) % 8]
+                        trials[q, second] += step * 0.68 * paired
+
+            trials = clip_layout(trials)
+            trial_values = areas_batch(trials)
+            trial_minima = trial_values.min(axis=1)
+            chosen = int(np.argmax(trial_minima))
+
+            if trial_minima[chosen] > best_minimum + 1.0e-14:
+                best = trials[chosen].copy()
+                best_values = trial_values[chosen].copy()
+                best_minimum = float(trial_minima[chosen])
+                stalled = 0
+            else:
+                stalled += 1
+                if stalled >= 14:
+                    break
+
+        # Exhaustive deterministic single-point checks at each resolution.
+        improved = True
+        while improved:
+            improved = False
+            for point in range(mobile):
+                trials = np.repeat(best[None, :, :], 8, axis=0)
+                trials[:, point, :] += step * directions
+                trials = clip_layout(trials)
+                trial_values = areas_batch(trials)
+                trial_minima = trial_values.min(axis=1)
+                chosen = int(np.argmax(trial_minima))
+                if trial_minima[chosen] > best_minimum + 1.0e-14:
+                    best = trials[chosen].copy()
+                    best_values = trial_values[chosen].copy()
+                    best_minimum = float(trial_minima[chosen])
+                    improved = True
+
+    return np.vstack((corners, best))
+
+
+# EVOLVE-BLOCK-END
+```

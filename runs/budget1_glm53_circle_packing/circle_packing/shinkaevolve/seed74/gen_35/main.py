@@ -1,0 +1,249 @@
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles.
+
+Architecture (redesigned):
+  1. seeds:    multiple structured layouts (hex rows, diagonal, grid, ring+rows)
+  2. solver:   vectorized LP for optimal radii given centers (fast constraint build)
+  3. annealer: simulated-annealing center refinement with restart-from-best,
+               applied to each seed; best layout across seeds wins.
+"""
+import numpy as np
+
+try:
+    from scipy.optimize import linprog
+    from scipy.spatial.distance import cdist
+    _HAS_SCIPY = True
+except Exception:  # pragma: no cover
+    _HAS_SCIPY = False
+
+N = 26
+
+
+# ------------------------------------------------------------------ seeds ----
+def seed_hex_rows():
+    counts = [5, 6, 5, 6, 4]
+    ys = [0.10, 0.30, 0.50, 0.70, 0.90]
+    pts = []
+    for k, (cnt, y) in enumerate(zip(counts, ys)):
+        x0 = 0.5 / cnt if k % 2 else 0.0
+        xs = x0 + (np.arange(cnt) + 0.5) / cnt
+        pts.extend([[x, y] for x in xs])
+    return np.array(pts)
+
+
+def seed_diagonal():
+    """Circles strung along both diagonals plus border fill."""
+    t = np.linspace(0.06, 0.94, 7)
+    pts = [[a, a] for a in t] + [[a, 1 - a] for a in t[1:]]
+    # vertical mid-column fill
+    yy = np.linspace(0.08, 0.92, 12)
+    pts.extend([[0.5, y] for y in yy[1:-1]])
+    pts = np.array(pts[:N])
+    return np.clip(pts, 0.02, 0.98)
+
+
+def seed_grid():
+    """6x5 grid slightly staggered."""
+    pts = []
+    for r in range(6):
+        for c in range(5):
+            x = (c + 0.5 + 0.25 * (r % 2)) / 5.0
+            y = (r + 0.5) / 6.0
+            pts.append([x, y])
+    return np.array(pts[:N])
+
+
+def seed_ring_rows():
+    """Large ring near boundary, inner staggered rows."""
+    pts = []
+    for i in range(8):
+        a = 2 * np.pi * i / 8 + np.pi / 8
+        pts.append([0.5 + 0.42 * np.cos(a), 0.5 + 0.42 * np.sin(a)])
+    counts = [6, 6, 6]
+    ys = [0.25, 0.5, 0.75]
+    for k, (cnt, y) in enumerate(zip(counts, ys)):
+        x0 = 0.5 / cnt if k % 2 else 0.0
+        xs = x0 + (np.arange(cnt) + 0.5) / cnt
+        pts.extend([[x, y] for x in xs])
+    pts = np.array(pts[:N])
+    return np.clip(pts, 0.02, 0.98)
+
+
+# ----------------------------------------------------------------- solver ----
+def solve_radii_lp(centers):
+    """Max sum(r) s.t. r_i + r_j <= d_ij, r_i <= wall dist. Vectorized build."""
+    n = len(centers)
+    if _HAS_SCIPY:
+        walls = np.minimum(centers, 1.0 - centers).min(axis=1)  # (n,)
+        # wall constraints: sparse-like rows built at once
+        A_wall = np.zeros((n, n))
+        A_wall[np.arange(n), np.arange(n)] = 1.0
+        D = cdist(centers, centers)
+        iu = np.triu_indices(n, 1)
+        d = D[iu]  # (m,)
+        m = len(d)
+        A_pair = np.zeros((m, n))
+        A_pair[np.arange(m), iu[0]] = 1.0
+        A_pair[np.arange(m), iu[1]] = 1.0
+        A = np.vstack([A_wall, A_pair])
+        b = np.concatenate([walls, d])
+        res = linprog(c=-np.ones(n), A_ub=A, b_ub=b,
+                      bounds=[(0, None)] * n, method="highs")
+        if res.success:
+            return np.maximum(res.x, 0.0)
+    # fallback: greedy scaling
+    radii = np.minimum(centers, 1.0 - centers).min(axis=1)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(*(centers[i] - centers[j]))
+            s = radii[i] + radii[j]
+            if s > d and s > 0:
+                f = d / s
+                radii[i] *= f
+                radii[j] *= f
+    return radii
+
+
+def ensure_valid(centers, radii):
+    """Hard-clip radii so constraints hold exactly."""
+    r = np.minimum(radii, np.minimum(centers, 1.0 - centers).min(axis=1))
+    D = cdist(centers, centers) if _HAS_SCIPY else None
+    n = len(r)
+    for _ in range(5):
+        if D is not None:
+            s = r[:, None] + r[None, :]
+            mask = s > D + 1e-12
+            np.fill_diagonal(mask, False)
+            if not mask.any():
+                break
+            i, j = np.nonzero(mask)
+            f = D[i, j] / s[i, j]
+            # apply min factor per circle
+            fmin_i = np.ones(n)
+            np.minimum.at(fmin_i, i, f)
+            r *= fmin_i
+        else:
+            ok = True
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = np.hypot(*(centers[i] - centers[j]))
+                    s = r[i] + r[j]
+                    if s > d:
+                        f = d / s if s > 0 else 1.0
+                        r[i] *= f
+                        r[j] *= f
+                        ok = False
+            if ok:
+                break
+    return r
+
+
+def evaluate(centers):
+    return ensure_valid(centers, solve_radii_lp(centers))
+
+
+# --------------------------------------------------------------- annealer ----
+def anneal(centers, steps=400, t0=0.02, step0=0.03, seed=0):
+    """Simulated annealing on centers; restarts cur from best on stall."""
+    rng = np.random.default_rng(seed)
+    best = centers.copy()
+    best_r = evaluate(best)
+    best_sum = best_r.sum()
+    cur, cur_sum = best.copy(), best_sum
+    stall = 0
+    for t in range(steps):
+        temp = t0 * (1.0 - t / steps) + 1e-4
+        step = step0 * (1.0 - t / steps) + 1e-4
+        cand = cur.copy()
+        i = rng.integers(len(cand))
+        cand[i] = np.clip(cand[i] + rng.normal(size=2) * step, 0.02, 0.98)
+        r = evaluate(cand)
+        s = r.sum()
+        if s > cur_sum or rng.random() < np.exp((s - cur_sum) / max(temp, 1e-9)):
+            cur, cur_sum = cand, s
+            if s > best_sum:
+                best, best_r, best_sum = cand.copy(), r, s
+                stall = 0
+            else:
+                stall += 1
+        else:
+            stall += 1
+        if stall > 60:  # restart from best
+            cur, cur_sum = best.copy(), best_sum
+            stall = 0
+    return best, best_r
+
+
+# -------------------------------------------------------------- interface ----
+def construct_packing():
+    """Best-of-multi-seed annealed packing with per-start jitter decorrelation."""
+    base_seeds = [seed_hex_rows(), seed_hex_rows(), seed_diagonal(),
+                  seed_grid(), seed_ring_rows()]
+    best_c, best_r, best_s = None, None, -1.0
+    n_starts = len(base_seeds)
+    import time
+    t_start = time.time()
+    deadline = t_start + 2.4  # keep within eval budget
+    for k, s in enumerate(base_seeds):
+        rng = np.random.default_rng(1000 + k)
+        # small per-start jitter decorrelates basins while keeping structure
+        s = np.clip(s + rng.normal(scale=0.01, size=s.shape), 0.02, 0.98)
+        # shrinking per-start budget: later starts get less time
+        remaining = max(deadline - time.time(), 0.05)
+        budget = remaining / (n_starts - k)
+        steps = int(np.clip(budget * 900, 60, 500))
+        c, r = anneal(s, steps=steps, seed=k)
+        if r.sum() > best_s:
+            best_c, best_r, best_s = c, r, r.sum()
+    return best_c, best_r, float(best_s)
+
+
+def compute_max_radii(centers):
+    """Backward-compatible helper."""
+    return evaluate(np.asarray(centers))
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

@@ -1,0 +1,250 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from itertools import combinations
+
+TRI_IDX = np.array(list(combinations(range(13), 3)))
+N = 13
+I0 = TRI_IDX[:, 0]
+I1 = TRI_IDX[:, 1]
+I2 = TRI_IDX[:, 2]
+
+
+def _hull_area(pts):
+    P = sorted(map(tuple, np.round(pts, 12)))
+    P = list(dict.fromkeys(P))
+    if len(P) < 3:
+        return 0.0
+    def cross(o, a, b):
+        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+    lo, up = [], []
+    for p in P:
+        while len(lo) >= 2 and cross(lo[-2], lo[-1], p) <= 0:
+            lo.pop()
+        lo.append(p)
+    for p in reversed(P):
+        while len(up) >= 2 and cross(up[-2], up[-1], p) <= 0:
+            up.pop()
+        up.append(p)
+    hull = lo[:-1] + up[:-1]
+    if len(hull) < 3:
+        return 0.0
+    H = np.array(hull)
+    x, y = H[:, 0], H[:, 1]
+    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def _rescale_unit_hull(pts):
+    ha = _hull_area(pts)
+    if ha > 1e-12:
+        pts = pts / np.sqrt(ha)
+    return pts
+
+
+def _tri_signed2(pts):
+    """2x signed double areas of all triangles (vectorized)."""
+    A = pts[I0]; B = pts[I1]; C = pts[I2]
+    u = B - A
+    v = C - A
+    return u[:, 0]*v[:, 1] - u[:, 1]*v[:, 0], u, v
+
+
+def _score(pts):
+    ha = _hull_area(pts)
+    if ha <= 1e-12:
+        return 0.0
+    c, _, _ = _tri_signed2(pts)
+    return 0.5*np.abs(c).min() / ha
+
+
+def _smooth_grad(pts, p):
+    """Soft-min of triangle areas (points assumed hull-normalized) and
+    its exact gradient wrt all 26 coordinates."""
+    c, u, v = _tri_signed2(pts)          # signed double areas
+    s = np.sign(c); s[s == 0] = 1.0
+    a = 0.5 * np.abs(c)                  # areas
+    # weights: softmax over -p*a
+    z = -p * a
+    z -= z.max()
+    w = np.exp(z)
+    w /= w.sum()
+    # softmin value S = -(1/p) log sum exp(-p a)
+    S = -(z.max() + np.log(np.exp(-p*a - z.max()).sum())) / p
+    q = 0.5 * s * w / p * p / p * p      # placeholder; compute properly below
+    # dS/da = w ; da/d(signed double area c) = 0.5*s
+    q = 0.5 * s * w
+    # per-triangle gradients wrt A, B, C
+    gA_t = np.stack([q*(u[:, 1] - v[:, 1]), q*(v[:, 0] - u[:, 0])], axis=1)
+    gB_t = np.stack([q*v[:, 1], -q*v[:, 0]], axis=1)
+    gC_t = np.stack([-q*u[:, 1], q*u[:, 0]], axis=1)
+    g = np.zeros((N, 2))
+    np.add.at(g, I0, gA_t)
+    np.add.at(g, I1, gB_t)
+    np.add.at(g, I2, gC_t)
+    return S, g
+
+
+def _adam_run(pts, deadline, lr=0.02, p0=30.0):
+    """Adam ascent on soft-min of areas with unit-hull rescaling each step.
+    Tracks the exact score and returns the best configuration seen."""
+    pts = _rescale_unit_hull(pts.copy())
+    m = np.zeros((N, 2)); vv = np.zeros((N, 2))
+    b1, b2, eps = 0.9, 0.999, 1e-8
+    p = p0
+    step = 0
+    best_pts, best_sc = pts.copy(), _score(pts)
+    while time.time() < deadline:
+        for _ in range(20):
+            step += 1
+            S, g = _smooth_grad(pts, p)
+            m = b1*m + (1-b1)*g
+            vv = b2*vv + (1-b2)*g*g
+            mh = m / (1 - b1**step)
+            vh = vv / (1 - b2**step)
+            pts = pts + lr * mh / (np.sqrt(vh) + eps)
+            pts = _rescale_unit_hull(pts)
+            sc = _score(pts)
+            if sc > best_sc + 1e-14:
+                best_sc = sc
+                best_pts = pts.copy()
+        p = min(p * 1.15, 600.0)
+        lr *= 0.93
+        if lr < 1e-5:
+            break
+    return best_pts, best_sc
+
+
+def _polish(pts, rng, deadline):
+    """Exact-score hill climb with bottleneck-triangle-directed moves."""
+    pts = _rescale_unit_hull(pts.copy())
+    sc = _score(pts)
+    sigma = 0.02
+    while time.time() < deadline:
+        improved = False
+        for _ in range(100):
+            cand = pts.copy()
+            c, _, _ = _tri_signed2(pts)
+            tri = TRI_IDX[int(np.argmin(np.abs(c)))]
+            if rng.random() < 0.25:
+                i = int(rng.integers(N))
+                cand[i] += rng.normal(0, sigma, 2)
+            else:
+                i = int(rng.choice(tri))
+                others = [j for j in tri if j != i]
+                d = pts[others[1]] - pts[others[0]]
+                nd = np.linalg.norm(d)
+                if nd > 1e-9:
+                    perp = np.array([-d[1], d[0]]) / nd
+                    v = pts[i] - pts[others[0]]
+                    if np.dot(perp, v) < 0:
+                        perp = -perp
+                    cand[i] = pts[i] + perp*abs(rng.normal(0, sigma)) \
+                              + rng.normal(0, 0.3*sigma, 2)
+                else:
+                    cand[i] += rng.normal(0, sigma, 2)
+            cand = _rescale_unit_hull(cand)
+            csc = _score(cand)
+            if csc > sc + 1e-14:
+                pts, sc = cand, csc
+                improved = True
+        if improved:
+            sigma = min(sigma*1.3, 0.05)
+        else:
+            sigma *= 0.6
+        if sigma < 1e-6:
+            break
+    return pts, sc
+
+
+def _seeds(rng):
+    t = np.linspace(0, 2*np.pi, N, endpoint=False)
+    seeds = []
+    seeds.append(np.column_stack([np.cos(t), np.sin(t)]))              # 13-gon
+    seeds.append(np.column_stack([1.3*np.cos(t), 0.75*np.sin(t)]))     # ellipse
+    s = np.column_stack([np.cos(t), np.sin(t)]) + rng.normal(0, 0.08, (N, 2))
+    seeds.append(s)                                                    # perturbed
+    # two-arc cluster (asymmetric basin)
+    tA = np.linspace(-0.6*np.pi, 0.4*np.pi, 7)
+    tB = np.linspace(0.4*np.pi, 1.4*np.pi, 6)
+    seeds.append(np.vstack([np.column_stack([np.cos(tA), np.sin(tA)]),
+                            0.9*np.column_stack([np.cos(tB), np.sin(tB)])]))
+    # rounded-square superellipse
+    u = t
+    seeds.append(np.column_stack([np.sign(np.cos(u))*np.abs(np.cos(u))**0.5,
+                                  np.sign(np.sin(u))*np.abs(np.sin(u))**0.5]))
+    # spiral
+    k = np.arange(N)
+    rad = 0.15 + 0.85*k/(N-1)
+    ang = 2.4*k
+    seeds.append(np.column_stack([rad*np.cos(ang), rad*np.sin(ang)]))
+    # 7 outer + 6 inner
+    t7 = np.linspace(0, 2*np.pi, 7, endpoint=False)
+    t6 = np.linspace(0, 2*np.pi, 6, endpoint=False) + np.pi/6
+    seeds.append(np.vstack([np.column_stack([np.cos(t7), np.sin(t7)]),
+                            0.45*np.column_stack([np.cos(t6), np.sin(t6)])]))
+    # 12-ring + center
+    t12 = np.linspace(0, 2*np.pi, 12, endpoint=False)
+    seeds.append(np.vstack([np.column_stack([np.cos(t12), np.sin(t12)]),
+                            [[0.0, 0.0]]]))
+    # 9+4 two-cluster arc (different cluster ratio)
+    t9 = np.linspace(0, 2*np.pi, 9, endpoint=False)
+    t4 = np.linspace(0, 2*np.pi, 4, endpoint=False) + 0.3
+    seeds.append(np.vstack([np.column_stack([np.cos(t9), np.sin(t9)]),
+                            0.42*np.column_stack([np.cos(t4), np.sin(t4)])]))
+    # reversed-chirality logarithmic spiral
+    m = np.arange(N)
+    rr = 0.15 + 0.85*(m/(N-1))**0.8
+    th = 0.5 - 2.4*m
+    seeds.append(np.column_stack([rr*np.cos(th), rr*np.sin(th)]))
+    # perturbed convex 13-gon
+    tp = np.linspace(0, 2*np.pi, N, endpoint=False) + rng.normal(0, 0.06, N)
+    rp = 1.0 + rng.normal(0, 0.03, N)
+    seeds.append(np.column_stack([rp*np.cos(tp), rp*np.sin(tp)]))
+    return seeds
+
+
+def heilbronn_convex13() -> np.ndarray:
+    rng = np.random.default_rng(seed=42)
+    t_start = time.time()
+    time_limit = 3.0
+
+    seeds = _seeds(rng)
+    per_seed = 0.75 * time_limit / len(seeds)
+    best_pts, best_sc = None, -1.0
+    basin_results = []
+    for k, s in enumerate(seeds):
+        deadline = min(t_start + (k+1)*per_seed, t_start + time_limit)
+        if time.time() - t_start > time_limit - 0.1:
+            break
+        pts, sc = _adam_run(np.asarray(s, dtype=float).copy(), deadline)
+        basin_results.append((sc, pts))
+        if sc > best_sc:
+            best_sc, best_pts = sc, pts.copy()
+
+    # basin hopping around the incumbent: strict polish and Adam re-anneals
+    # with long enough windows (0.2s) for the Adam momentum to warm up
+    while time.time() - t_start < time_limit - 0.05:
+        deadline = min(time.time() + 0.2, t_start + time_limit)
+        pts, sc = _polish(best_pts.copy(), rng, deadline)
+        if sc > best_sc:
+            best_sc, best_pts = sc, pts.copy()
+        if time.time() - t_start > time_limit - 0.25:
+            break
+        kick = best_pts + rng.normal(0, 0.05, best_pts.shape)
+        deadline = min(time.time() + 0.2, t_start + time_limit)
+        pts, sc = _adam_run(kick, deadline, lr=0.01, p0=100.0)
+        if sc > best_sc:
+            best_sc, best_pts = sc, pts.copy()
+
+    if best_pts is None:
+        t = np.linspace(0, 2*np.pi, N, endpoint=False)
+        best_pts = np.column_stack([np.cos(t), np.sin(t)])
+    best_pts = np.asarray(best_pts, dtype=float)
+    if not np.all(np.isfinite(best_pts)) \
+            or best_pts.shape != (13, 2):
+        t = np.linspace(0, 2*np.pi, N, endpoint=False)
+        best_pts = np.column_stack([np.cos(t), np.sin(t)])
+    return best_pts
+
+
+# EVOLVE-BLOCK-END

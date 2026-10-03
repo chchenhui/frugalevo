@@ -1,0 +1,154 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct a deterministic maximin arrangement of 13 points.
+
+    The first three points define a reference right triangle of area 1/2.
+    Since every candidate remains inside this simplex, determinant magnitudes
+    are exactly twice ordinary triangle areas and therefore equal to area
+    normalized by the convex hull area.
+    """
+    n = 13
+    rng = np.random.default_rng(seed=13051957)
+
+    triangles = np.array(
+        [
+            (i, j, k)
+            for i in range(n - 2)
+            for j in range(i + 1, n - 1)
+            for k in range(j + 1, n)
+        ],
+        dtype=np.intp,
+    )
+
+    def project_simplex(xy):
+        """Project points into x >= 0, y >= 0, x + y <= 1."""
+        np.maximum(xy, 0.00015, out=xy)
+        sums = xy.sum(axis=-1)
+        scale = np.minimum(1.0, 0.99985 / sums)
+        xy *= scale[..., None]
+        return xy
+
+    def determinants(config):
+        p = config[:, triangles]
+        return np.abs(
+            (p[:, :, 1, 0] - p[:, :, 0, 0])
+            * (p[:, :, 2, 1] - p[:, :, 0, 1])
+            - (p[:, :, 1, 1] - p[:, :, 0, 1])
+            * (p[:, :, 2, 0] - p[:, :, 0, 0])
+        )
+
+    def soft_min(values, temperature):
+        minimum = values.min(axis=1)
+        shifted = -(values - minimum[:, None]) / temperature
+        return minimum - temperature * np.log(np.exp(shifted).sum(axis=1))
+
+    # Use several deterministic starts.  Half of them include one point near
+    # each edge, allowing the search to discover useful boundary structures.
+    starts = 18
+    population = np.empty((starts, n, 2), dtype=float)
+    population[:, :3] = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
+    interior = rng.random((starts, n - 3, 2))
+    reflected = interior.sum(axis=2) > 1.0
+    interior[reflected] = 1.0 - interior[reflected]
+    population[:, 3:] = interior
+
+    edge_t = rng.uniform(0.08, 0.92, size=(starts // 2, 3))
+    population[: starts // 2, 3] = np.column_stack(
+        (edge_t[:, 0], np.full(starts // 2, 0.00015))
+    )
+    population[: starts // 2, 4] = np.column_stack(
+        (np.full(starts // 2, 0.00015), edge_t[:, 1])
+    )
+    population[: starts // 2, 5] = np.column_stack(
+        (edge_t[:, 2], 0.99985 - edge_t[:, 2])
+    )
+
+    initial_areas = determinants(population)
+    initial_scores = soft_min(initial_areas, 0.010)
+    start_index = int(np.argmax(initial_scores))
+
+    current = population[start_index].copy()
+    current_areas = initial_areas[start_index].copy()
+
+    raw_initial = initial_areas.min(axis=1)
+    best_index = int(np.argmax(raw_initial))
+    best = population[best_index].copy()
+    best_value = float(raw_initial[best_index])
+
+    batch = 32
+    iterations = 7600
+
+    for iteration in range(iterations):
+        progress = iteration / (iterations - 1.0)
+        temperature = 0.011 * (0.00022 / 0.011) ** progress
+        step = 0.110 * (0.00075 / 0.110) ** progress
+
+        candidates = np.repeat(current[None, :, :], batch, axis=0)
+
+        # The lowest-area triangles provide useful information about which
+        # point coordinates currently limit the maximin objective.
+        low_count = 18 if iteration < 4300 else 10
+        low_triangles = np.argpartition(current_areas, low_count - 1)[:low_count]
+        active_points = triangles[low_triangles].ravel()
+
+        changed = rng.integers(3, n, size=batch)
+        changed[: batch // 2] = rng.choice(active_points, size=batch // 2)
+        candidates[np.arange(batch), changed] += rng.normal(
+            scale=step, size=(batch, 2)
+        )
+
+        # Early coordinated moves escape configurations that are locally
+        # stable under a single-coordinate mutation.
+        if iteration < 4000 and iteration % 7 == 0:
+            extra_count = 2 if iteration < 2200 else 1
+            extra = rng.choice(active_points, size=(batch, extra_count))
+            candidates[
+                np.arange(batch)[:, None], extra
+            ] += rng.normal(
+                scale=0.48 * step, size=(batch, extra_count, 2)
+            )
+
+        # A small number of early edge probes complements the boundary-aware
+        # initialization without imposing collinear runs of edge points.
+        if iteration < 1800 and iteration % 29 == 0:
+            probe = np.arange(3)
+            t = rng.uniform(0.03, 0.97, size=3)
+            candidates[0, 3 + probe[0]] = (t[0], 0.00015)
+            candidates[1, 3 + probe[1]] = (0.00015, t[1])
+            candidates[2, 3 + probe[2]] = (t[2], 0.99985 - t[2])
+
+        project_simplex(candidates[:, 3:])
+
+        candidate_areas = determinants(candidates)
+        candidate_scores = soft_min(candidate_areas, temperature)
+        current_score = soft_min(current_areas[None, :], temperature)[0]
+        chosen = int(np.argmax(candidate_scores))
+
+        if candidate_scores[chosen] > current_score:
+            current = candidates[chosen]
+            current_areas = candidate_areas[chosen]
+
+        candidate_value = float(candidate_areas[chosen].min())
+        if candidate_value > best_value:
+            best_value = candidate_value
+            best = candidates[chosen].copy()
+
+        current_value = float(current_areas.min())
+        if current_value > best_value:
+            best_value = current_value
+            best = current.copy()
+
+        # Deterministic, modest reheating around the incumbent helps avoid a
+        # permanently frozen soft-min basin in the middle of the search.
+        if iteration in (2600, 4700) and best_value >= current_value:
+            current = best.copy()
+            current_areas = determinants(current[None, :, :])[0]
+
+    return best
+
+
+# EVOLVE-BLOCK-END

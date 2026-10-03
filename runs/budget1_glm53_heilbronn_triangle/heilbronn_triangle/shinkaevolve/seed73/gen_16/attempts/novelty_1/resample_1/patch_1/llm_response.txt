@@ -1,0 +1,189 @@
+<NAME>
+softmin_coarse_multistart_hard_polish</NAME>
+<DESCRIPTION>
+The current program optimizes the hard min-area objective from a single handcrafted seed, which gets stuck: the min-area landscape is highly degenerate (many flat plateaus), and single-coordinate random moves rarely escape poor basins. Two expert-motivated changes: (1) a soft-min (log-sum-exp over the smallest 15-25% of the 165 triangle areas) coarse phase, which gives a smooth gradient-like signal to escape plateaus and lift many small triangles simultaneously, followed by the hard min objective for fine polishing; (2) deterministic multi-start over several structured seeds (perturbed lattices, edge-heavy layouts) with the best result kept, giving better basin coverage. Areas are cached per-iteration in vectorized form (only 165 triplets, cheap). Final greedy coordinate-pattern polish squeezes out remaining slack. Determinism preserved via fixed seeds and fixed iteration counts.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _min_area(pts: np.ndarray) -> float:
+    """Vectorized area of the smallest triangle among all triplets (doubled area)."""
+    idx = np.array(list(itertools.combinations(range(len(pts)), 3)))
+    p = pts[idx]  # (C(n,3), 3, 2)
+    cross = (p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) - \
+            (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0])
+    return np.abs(cross).min()
+=======
+def _all_areas(pts: np.ndarray) -> np.ndarray:
+    """Vectorized doubled areas of all triplets."""
+    idx = np.array(list(itertools.combinations(range(len(pts)), 3)))
+    p = pts[idx]  # (C(n,3), 3, 2)
+    cross = (p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) - \
+            (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0])
+    return np.abs(cross)
+
+
+def _min_area(pts: np.ndarray) -> float:
+    """Doubled area of the smallest triangle among all triplets."""
+    return _all_areas(pts).min()
+
+
+def _soft_obj(pts: np.ndarray, k: float = 300.0, frac: float = 0.20) -> float:
+    """Smooth lower-bound surrogate: soft-min over the smallest fraction of areas.
+    Lifting many near-minimal triangles at once escapes the hard-min plateaus."""
+    areas = _all_areas(pts)
+    m = max(3, int(len(areas) * frac))
+    smallest = np.partition(areas, m - 1)[:m]
+    return -np.log(np.mean(np.exp(-smallest * k))) / k
+
+
+def _seeds(n: int, h: float) -> list:
+    """A few structured, deterministic starting layouts."""
+    seeds = []
+    # Triangular lattice rows (4+3+2+1 = 10) plus one extra interior point
+    pts = []
+    rows = 4
+    for r in range(rows):
+        y = h * r / (rows - 1)
+        cnt = rows - r
+        for c in range(cnt):
+            x = (c + 0.5) / cnt if r > 0 else c / (cnt - 1)
+            pts.append([x * (1.0 - 0.5 * r / (rows - 1)) + 0.25 * r / (rows - 1), y])
+    pts = np.array(pts)
+    pts = np.vstack([pts, [0.5, h / 3.0]])[:n]
+    seeds.append(_clip_to_triangle(pts))
+    # Edge-heavy layout: many points on the boundary
+    t = np.linspace(0.0, 1.0, 7)
+    edge = []
+    for u in t:
+        edge.append([u, 0.0])
+    for u in t[1:-1]:
+        edge.append([0.5 * (1 + u), h * u])
+        edge.append([0.5 * (1 - u), h * u])
+    edge = np.array(edge)
+    # take 11 spread along the boundary
+    sel = np.linspace(0, len(edge) - 1, n).round().astype(int)
+    seeds.append(_clip_to_triangle(edge[sel]))
+    # Interior-spread layout
+    rng = np.random.default_rng(777)
+    u, v = rng.random(n), rng.random(n)
+    su = np.sqrt(u)
+    w0, w1, w2 = 1 - su, su * (1 - v), su * v
+    seeds.append(_clip_to_triangle(np.stack([w1 + 0.5 * w2, h * w2], axis=1)))
+    return seeds
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    # Heuristic starting layout: vertices + edge points + interior spread
+    pts = np.array([
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [0.5, h],
+        [1.0 / 3.0, 0.0],
+        [2.0 / 3.0, 0.0],
+        [1.0 / 6.0, h / 3.0],
+        [5.0 / 6.0, h / 3.0],
+        [1.0 / 3.0, 2.0 * h / 3.0],
+        [2.0 / 3.0, 2.0 * h / 3.0],
+        [0.5, h / 3.0],
+        [0.5, 0.0],
+    ])
+
+    rng = np.random.default_rng(12345)
+    best = _clip_to_triangle(pts)
+    best_val = _min_area(best)
+
+    cur = best.copy()
+    cur_val = best_val
+
+    # Deterministic local search with annealing-style shrinking steps
+    step0 = 0.05
+    iters = 30000
+    for it in range(iters):
+        step = step0 * (1.0 - it / iters) + 1e-4
+        i = rng.integers(n)
+        delta = rng.normal(0.0, step, size=2)
+        trial = cur.copy()
+        trial[i] += delta
+        trial = _clip_to_triangle(trial)
+        val = _min_area(trial)
+        if val >= cur_val - 1e-12:
+            cur, cur_val = trial, val
+            if val > best_val + 1e-15:
+                best, best_val = trial.copy(), val
+
+    # Final fine polishing around the best configuration
+    cur, cur_val = best.copy(), best_val
+    for it in range(10000):
+        step = 0.002 * (1.0 - it / 10000) + 1e-5
+        i = rng.integers(n)
+        delta = rng.normal(0.0, step, size=2)
+        trial = cur.copy()
+        trial[i] += delta
+        trial = _clip_to_triangle(trial)
+        val = _min_area(trial)
+        if val >= cur_val - 1e-12:
+            cur, cur_val = trial, val
+            if val > best_val + 1e-15:
+                best, best_val = trial.copy(), val
+=======
+    rng = np.random.default_rng(12345)
+    best, best_val = None, -1.0
+
+    for seed_id, start in enumerate(_seeds(n, h)):
+        s_rng = np.random.default_rng(12345 + 1000 * seed_id)
+        cur = _clip_to_triangle(start.copy())
+
+        # Phase 1: soft-min coarse search (smooth landscape, larger steps)
+        cur_val = _soft_obj(cur)
+        iters = 12000
+        step0 = 0.05
+        for it in range(iters):
+            step = step0 * (1.0 - it / iters) + 1e-3
+            i = s_rng.integers(n)
+            trial = cur.copy()
+            trial[i] += s_rng.normal(0.0, step, size=2)
+            trial = _clip_to_triangle(trial)
+            val = _soft_obj(trial)
+            if val >= cur_val - 1e-12:
+                cur, cur_val = trial, val
+
+        # Phase 2: hard-min fine search (shrink steps)
+        cur_val = _min_area(cur)
+        iters = 10000
+        step0 = 0.01
+        for it in range(iters):
+            step = step0 * (1.0 - it / iters) + 1e-5
+            i = s_rng.integers(n)
+            trial = cur.copy()
+            trial[i] += s_rng.normal(0.0, step, size=2)
+            trial = _clip_to_triangle(trial)
+            val = _min_area(trial)
+            if val >= cur_val - 1e-13:
+                cur, cur_val = trial, val
+
+        if cur_val > best_val:
+            best, best_val = cur.copy(), cur_val
+
+    # Phase 3: deterministic coordinate-wise greedy polish on the best layout
+    step = 0.005
+    cur, cur_val = best.copy(), best_val
+    for _ in range(60):
+        improved = False
+        for i in range(n):
+            for d in range(2):
+                for s in (+1, -1):
+                    trial = cur.copy()
+                    trial[i, d] += s * step
+                    trial = _clip_to_triangle(trial)
+                    val = _min_area(trial)
+                    if val > cur_val + 1e-15:
+                        cur, cur_val = trial, val
+                        improved = True
+        if not improved:
+            step *= 0.5
+            if step < 1e-7:
+                break
+    if cur_val > best_val:
+        best, best_val = cur.copy(), cur_val
+>>>>>>> REPLACE
+</DIFF>

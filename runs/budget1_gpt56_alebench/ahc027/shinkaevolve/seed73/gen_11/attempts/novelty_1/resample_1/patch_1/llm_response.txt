@@ -1,0 +1,120 @@
+<NAME>
+phase_aware_detours
+</NAME>
+
+<DESCRIPTION>
+Improve Op4’s insertion-point selection. Previously it selected the sampled position with the shortest detour to the dirty target, ignoring where in the target cell’s cleaning cycle that new visit occurs. A slightly longer detour can be substantially better if it splits the target’s largest revisit gap.
+
+The added helper evaluates the target cell’s exact periodic dirt term after a proposed closed detour. Op4 still limits itself to positions whose detour is close to the shortest sampled detour, avoiding wasteful route growth, but selects among them by the predicted reduction in the target’s weighted average contribution. This preserves the cheap sampled neighborhood while making targeted insertions phase-aware.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+const int OP4_SAMPLE_POINTS = 20; 
+const int OP5_MAX_SUBSEGMENT_LEN = 20; 
+=======
+const int OP4_SAMPLE_POINTS = 20; 
+const int OP5_MAX_SUBSEGMENT_LEN = 20; 
+
+// Return the periodic dirt triangle-sum of target after inserting a closed
+// detour at route coordinate insert_index.  The detour reaches target after
+// outward_distance moves and has total length 2*outward_distance, except for
+// a local wiggle at target itself, which returns there after two moves.
+long double target_term_after_detour(const PathData& pd, Pos target,
+                                    int insert_index, int outward_distance) {
+    const int old_length = (int)pd.moves.size();
+    const int added_length = (outward_distance == 0) ? 2 : 2 * outward_distance;
+    const int new_length = old_length + added_length;
+    const int added_visit_time = insert_index +
+        ((outward_distance == 0) ? 2 : outward_distance);
+
+    std::vector<int> visits;
+    const auto& old_visits = CELL_VISIT_TIMES_GLOBAL_BUFFER[target.r][target.c];
+    visits.reserve(old_visits.size() + 1);
+    for (int t : old_visits) {
+        visits.push_back(t > insert_index ? t + added_length : t);
+    }
+    visits.push_back(added_visit_time);
+    std::sort(visits.begin(), visits.end());
+
+    long double term = 0.0L;
+    for (int i = 0; i < (int)visits.size(); ++i) {
+        int previous = (i == 0) ? visits.back() - new_length : visits[i - 1];
+        long long gap = (long long)visits[i] - previous;
+        term += (long double)gap * (gap - 1) / 2.0L;
+    }
+    return term;
+}
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+                if (L_curr >= 0) { // Path can be empty (L_curr=0), then coords has 1 element (0,0)
+                    int num_samples = (L_curr == 0) ? 1: OP4_SAMPLE_POINTS; // If L_curr=0, only one point to pick: coords[0]
+                    for (int i=0; i < num_samples; ++i) {
+                        std::uniform_int_distribution<int> k_idx_dist(0, L_curr); 
+                        int k_coord_idx_sample = (L_curr == 0) ? 0 : k_idx_dist(RND_ENGINE);
+                        Pos p_A_sample = current_pd_obj.coords[k_coord_idx_sample];
+                        
+                        long long current_detour_increase;
+                        if (p_A_sample == target_cell) {
+                             current_detour_increase = 2; // Wiggle cost
+                        } else {
+                            int dist_pa_target = APSP_DIST[p_A_sample.r][p_A_sample.c][target_cell.r][target_cell.c];
+                            if (dist_pa_target != -1) {
+                                current_detour_increase = (long long)dist_pa_target * 2;
+                            } else {
+                                current_detour_increase = (long long)MAX_L_PATH * 2 + 1; // effectively infinity
+                            }
+                        }
+                        if (current_detour_increase < min_detour_len_increase) {
+                            min_detour_len_increase = current_detour_increase;
+                            best_k_coord_idx = k_coord_idx_sample;
+                        }
+                    }
+                }
+=======
+                if (L_curr >= 0) { // Path can be empty (L_curr=0), then coords has 1 element (0,0)
+                    int num_samples = (L_curr == 0) ? 1 : OP4_SAMPLE_POINTS;
+                    std::vector<int> sampled_indices;
+                    std::vector<int> sampled_distances;
+                    sampled_indices.reserve(num_samples);
+                    sampled_distances.reserve(num_samples);
+
+                    // First find the shortest sampled detour.  Later we only consider
+                    // detours close to it, so phase optimization cannot bloat the route.
+                    for (int i = 0; i < num_samples; ++i) {
+                        std::uniform_int_distribution<int> k_idx_dist(0, L_curr);
+                        int idx = (L_curr == 0) ? 0 : k_idx_dist(RND_ENGINE);
+                        Pos p = current_pd_obj.coords[idx];
+                        int dist = (p == target_cell) ? 0 :
+                            APSP_DIST[p.r][p.c][target_cell.r][target_cell.c];
+                        if (dist < 0) continue;
+                        long long added = (dist == 0) ? 2 : 2LL * dist;
+                        sampled_indices.push_back(idx);
+                        sampled_distances.push_back(dist);
+                        min_detour_len_increase = std::min(min_detour_len_increase, added);
+                    }
+
+                    // Splitting a long target revisit interval is often more valuable
+                    // than saving a few moves.  Compare exact target terms among
+                    // near-shortest sampled detours.
+                    long double best_target_contribution = 1e100L;
+                    for (int i = 0; i < (int)sampled_indices.size(); ++i) {
+                        int dist = sampled_distances[i];
+                        long long added = (dist == 0) ? 2 : 2LL * dist;
+                        if (added > min_detour_len_increase + 6) continue;
+                        long double new_term = target_term_after_detour(
+                            current_pd_obj, target_cell, sampled_indices[i], dist);
+                        long double contribution =
+                            (long double)D_SUSC[target_cell.r][target_cell.c] * new_term /
+                            (L_curr + added);
+                        if (contribution < best_target_contribution) {
+                            best_target_contribution = contribution;
+                            best_k_coord_idx = sampled_indices[i];
+                            min_detour_len_increase = added;
+                        }
+                    }
+                }
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,101 @@
+<NAME>
+guarded_curvature_clamp</NAME>
+<DESCRIPTION>
+Diagnosis: across the entire 0.72 family, slope_changes (20.40), false_reversals (14.20) and smoothness_score (0.50) have never moved — velocity clamps, Whittaker polish, adaptive-Q passes and reversal damping all bound the *first* difference only. `_velocity_clamp` limits each step to |Δy| ≤ 2|v|+slack but permits alternating +limit/−limit steps; those alternating-budget steps are pure second-difference (curvature) outliers and they are exactly what registers as the ~20 surviving slope changes. No current stage constrains curvature.
+
+Edit: add `_curvature_clamp`, a zero-phase second-difference limiter applied immediately after `_velocity_clamp` (before the reversal damp). It clamps |y[k+1] − 2y[k] + y[k−1]| to 1.5× the robust MAD scale of the *output's own* second differences — self-scaling: genuinely curved dynamics set the MAD, so the limit sits above typical true curvature and passes it, while ripple riding quiet/straight segments lies far above the MAD and is folded onto the local linear continuation (alternating ±budget steps become straight runs, eliminating their sign flips). The limit is enforced in mirrored forward/backward sweeps (forward adjusts the trailing sample k+1, backward adjusts the leading sample k−1), so the operation adds zero group delay — lag_error and responsiveness_score are untouched. It reuses the proven guard pattern from `_velocity_clamp`: 4 attempts with budget doubling, accepting only if corr ≥ 0.97 against the pre-clamp signal, otherwise identity fallback — this protects correlation/accuracy on highly curved or adversarial inputs. Cost is two O(n) sweeps, the same complexity class as the existing clamps, so efficiency_score (~1.0) and execution_time are preserved. Expected effect: slope_changes and false_reversals drop, smoothness_score rises, with zero-phase operation keeping lag_error, responsiveness, and correlation intact.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    for k in range(n - 2, -1, -1):
+        d = out[k] - out[k + 1]
+        limit = 2.0 * abs(vel[k]) + slack * sigma_r
+        if abs(d) > limit:
+            out[k] = out[k + 1] + np.sign(d) * limit
+    return out
+
+
+def _reversal_damp(y, thresh, keep=0.25):
+=======
+    for k in range(n - 2, -1, -1):
+        d = out[k] - out[k + 1]
+        limit = 2.0 * abs(vel[k]) + slack * sigma_r
+        if abs(d) > limit:
+            out[k] = out[k + 1] + np.sign(d) * limit
+    return out
+
+
+def _curvature_clamp(y, limit):
+    """
+    Zero-phase curvature (second-difference) clamp.
+    The velocity clamp bounds |dy| but still permits alternating
+    +/-budget steps — the exact signature of residual ripple that
+    survives as spurious slope changes. Forward sweep then mirrored
+    backward sweep; each limits |y[k+1] - 2y[k] + y[k-1]| to `limit`
+    by moving the outer sample of the triple onto the locally linear
+    continuation. Alternating ripple folds into straight segments;
+    genuine curved dynamics (curvature within budget) pass untouched.
+    """
+    n = len(y)
+    if n < 3 or limit <= 0.0:
+        return y.copy()
+    out = y.copy()
+    # forward sweep: enforce on triple (k-1, k, k+1) by moving k+1
+    for k in range(1, n - 1):
+        c = out[k + 1] - 2.0 * out[k] + out[k - 1]
+        if abs(c) > limit:
+            out[k + 1] = 2.0 * out[k] - out[k - 1] + np.sign(c) * limit
+    # mirrored backward sweep: enforce by moving k-1
+    for k in range(n - 2, 0, -1):
+        c = out[k - 1] - 2.0 * out[k] + out[k + 1]
+        if abs(c) > limit:
+            out[k - 1] = 2.0 * out[k] - out[k + 1] + np.sign(c) * limit
+    return out
+
+
+def _reversal_damp(y, thresh, keep=0.25):
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+        if y_clamped is not None:
+            y = y_clamped
+
+    # --- Guarded sub-noise reversal damping ---
+=======
+        if y_clamped is not None:
+            y = y_clamped
+
+    # --- Guarded zero-phase curvature (second-difference) clamp ---
+    # The velocity clamp bounds |dy| per step but still permits alternating
+    # +/-budget steps — the exact signature of the residual slope changes
+    # that have never moved across this algorithm family. Clamp the
+    # curvature |y[k+1] - 2y[k] + y[k-1]| to 1.5x the robust MAD scale of
+    # the output's own second differences: self-scaling, since genuine
+    # dynamics set the MAD (limit stays above typical curvature) while
+    # ripple riding quiet segments sits far above it and folds onto the
+    # local linear continuation. Mirrored sweeps keep it zero-phase; the
+    # proven correlation guard (>= 0.97, 4 attempts, budget doubling)
+    # backs off or disables it on distortion.
+    if n >= 3:
+        d2o = y[2:] - 2.0 * y[1:-1] + y[:-2]
+        if d2o.size > 2:
+            cur_mad = np.median(np.abs(d2o - np.median(d2o))) / 0.6745
+        else:
+            cur_mad = 0.0
+        if cur_mad > 0:
+            y_pre2 = y.copy()
+            y_curved = None
+            c_mult = 1.5
+            for _attempt in range(4):
+                cand = _curvature_clamp(y_pre2, c_mult * cur_mad)
+                c = np.corrcoef(cand, y_pre2)[0, 1]
+                if np.isfinite(c) and c >= 0.97:
+                    y_curved = cand
+                    break
+                c_mult *= 2.0
+            if y_curved is not None:
+                y = y_curved
+
+    # --- Guarded sub-noise reversal damping ---
+>>>>>>> REPLACE
+</DIFF>

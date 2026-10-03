@@ -1,0 +1,297 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+try:
+    from scipy.optimize import minimize as _scipy_minimize
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of 11 points inside/on the unit equilateral triangle
+    (vertices (0,0),(1,0),(0.5,sqrt(3)/2)) maximizing the minimum area over all
+    C(11,3) point triplets.
+
+    Architecture:
+      - Registry of best (true-min-area) configuration.
+      - Stage A: Powell optimization of a top-k softmin surrogate over all 33
+        logits (feasible softmax -> barycentric points).
+      - Stage B: discrete worst-triplet refinement: find argmin triplet, then
+        (i) Powell on just that triplet's 9 logits against a softmin of the
+        triplet areas affected by those points, and (ii) geometric perpendicular
+        pushes of each of the 3 points away from the opposite edge.
+      - Stages alternate under a time budget; best config is tracked by exact
+        min-area evaluation.
+
+    Returns:
+        np.ndarray shape (11,2).
+    """
+    n = 11
+    sqrt3 = np.sqrt(3.0)
+    V = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, sqrt3 / 2.0]])
+    area_T = sqrt3 / 4.0
+
+    from itertools import combinations
+    triples = np.array(list(combinations(range(n), 3)), dtype=int)
+    T = len(triples)
+
+    t0 = time.time()
+    TIME_BUDGET = 8.0
+
+    # ---------- exact area machinery ----------
+    def area_vec(pts):
+        p = pts[triples]
+        cr = ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+              - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
+        return 0.5 * np.abs(cr)
+
+    def min_area(pts):
+        return float(area_vec(pts).min())
+
+    # ---------- parametrization ----------
+    def unpack(theta):
+        W = theta.reshape(n, 3)
+        W = W - W.max(axis=1, keepdims=True)
+        E = np.exp(W)
+        W = E / E.sum(axis=1, keepdims=True)
+        return W @ V
+
+    def bary_of(pts):
+        # inverse barycentric coords w.r.t. V
+        v1 = V[1] - V[0]
+        v2 = V[2] - V[0]
+        det = v1[0] * v2[1] - v1[1] * v2[0]
+        rel = pts - V[0]
+        b1 = (rel[:, 0] * v2[1] - rel[:, 1] * v2[0]) / det
+        b2 = (v1[0] * rel[:, 1] - v1[1] * rel[:, 0]) / det
+        b0 = 1.0 - b1 - b2
+        return np.stack([b0, b1, b2], axis=1)
+
+    def to_theta(bary, sharp=8.0):
+        b = np.clip(bary, 1e-4, 1.0)
+        b = b / b.sum(axis=1, keepdims=True)
+        return (np.log(b) * sharp).ravel()
+
+    # ---------- global softmin objective (top-k) ----------
+    def softmin_obj(theta, temp, k=20):
+        pts = unpack(theta)
+        p = pts[triples]
+        cr = ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+              - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
+        a = 0.5 * np.abs(cr)
+        ak = np.partition(a, k)[:k]
+        amin = ak.min()
+        return temp * np.log(np.sum(np.exp(-(ak - amin) / temp))) - amin
+
+    # ---------- triplet-local objective ----------
+    # For a subset S of 3 point indices, only triples involving any of them change.
+    inc_rows = []
+    for i in range(n):
+        inc_rows.append(np.where((triples == i).any(axis=1))[0])
+
+    def triplet_softmin_obj(sub_theta, full_pts_bary, sub_idx, temp, k=12):
+        sub_bary = sub_theta.reshape(3, 3)
+        sub_bary = sub_bary - sub_bary.max(axis=1, keepdims=True)
+        E = np.exp(sub_bary)
+        sub_bary = E / E.sum(axis=1, keepdims=True)
+        pts = full_pts_bary.copy()
+        pts[sub_idx] = sub_bary
+        xy = pts @ V
+        a = area_vec(xy)
+        ak = np.partition(a, k)[:k]
+        amin = ak.min()
+        return temp * np.log(np.sum(np.exp(-(ak - amin) / temp))) - amin
+
+    # ---------- geometric perpendicular push ----------
+    def perp_dir(pa, pb, pc):
+        ex, ey = pb[0] - pa[0], pb[1] - pa[1]
+        L = np.hypot(ex, ey) + 1e-12
+        ux, uy = ex / L, ey / L
+        dx, dy = pc[0] - pa[0], pc[1] - pa[1]
+        if -uy * dx + ux * dy >= 0:
+            return np.array([-uy, ux])
+        return np.array([uy, -ux])
+
+    def proj_tri(pts):
+        orig = pts.shape
+        flat = pts.reshape(-1, 2)
+        b = bary_of(flat)
+        b = np.clip(b, 0.0, 1.0)
+        b = b / b.sum(axis=1, keepdims=True)
+        return (b @ V).reshape(orig)
+
+    # ---------- stage B: worst-triplet refinement ----------
+    def refine_worst_triplet(pts):
+        a = area_vec(pts)
+        w = int(np.argmin(a))
+        i, j, k = triples[w]
+        cur = float(a[w])
+
+        # (i) Powell on the 9 logits of the worst triplet's points
+        if _HAVE_SCIPY:
+            try:
+                bary = bary_of(pts)
+                sub_idx = np.array([i, j, k])
+                sub0 = to_theta(bary[sub_idx])
+                res = _scipy_minimize(
+                    triplet_softmin_obj, sub0,
+                    args=(bary, sub_idx, 1e-3 * area_T),
+                    method="Powell",
+                    options={"maxiter": 60, "xtol": 1e-6, "ftol": 1e-9},
+                )
+                if np.all(np.isfinite(res.x)):
+                    cand_bary = bary.copy()
+                    sub = res.x.reshape(3, 3)
+                    sub = sub - sub.max(axis=1, keepdims=True)
+                    E = np.exp(sub)
+                    sub = E / E.sum(axis=1, keepdims=True)
+                    cand_bary[sub_idx] = sub
+                    cand = cand_bary @ V
+                    v = min_area(cand)
+                    if v > cur + 1e-14:
+                        pts, cur = cand, v
+            except Exception:
+                pass
+
+        # (ii) geometric perpendicular pushes
+        step = 0.02
+        while step > 1e-7 and time.time() - t0 < TIME_BUDGET:
+            a = area_vec(pts)
+            w = int(np.argmin(a))
+            i, j, k = triples[w]
+            cur = float(a[w])
+            dirs = {
+                i: perp_dir(pts[j], pts[k], pts[i]),
+                j: perp_dir(pts[i], pts[k], pts[j]),
+                k: perp_dir(pts[i], pts[j], pts[k]),
+            }
+            improved = False
+            for trial in [(i, j, k), (i, j), (i, k), (j, k), (i,), (j,), (k,)]:
+                cand = pts.copy()
+                for m in trial:
+                    cand[m] = pts[m] + step * dirs[m]
+                cand = proj_tri(cand)
+                v = min_area(cand)
+                if v > cur + 1e-14:
+                    pts, cur = cand, v
+                    improved = True
+                    break
+            if not improved:
+                step *= 0.7
+        return pts, cur
+
+    # ---------- stage A: global Powell ----------
+    def global_powell(theta, temps=(1e-2 * area_T, 2e-3 * area_T, 4e-4 * area_T)):
+        if not _HAVE_SCIPY:
+            return theta
+        for temp in temps:
+            if time.time() - t0 > TIME_BUDGET * 0.85:
+                break
+            try:
+                res = _scipy_minimize(
+                    softmin_obj, theta, args=(temp,),
+                    method="Powell",
+                    options={"maxiter": 300, "xtol": 1e-6, "ftol": 1e-8},
+                )
+                if np.all(np.isfinite(res.x)):
+                    theta = res.x
+            except Exception:
+                break
+        return theta
+
+    # ---------- deterministic starts ----------
+    rng = np.random.default_rng(12345)
+    bary_starts = [
+        np.array([
+            [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
+            [0.5, 0.5, 0.0], [0.5, 0.0, 0.5], [0.0, 0.5, 0.5],
+            [0.75, 0.25, 0.0], [0.25, 0.75, 0.0], [0.25, 0.25, 0.5],
+            [0.625, 0.125, 0.25], [0.125, 0.625, 0.25],
+        ]),
+    ]
+    # jittered lattice starts
+    for m in (3, 4):
+        lat_bary = []
+        for ii in range(m + 1):
+            for jj in range(m + 1 - ii):
+                kk = m - ii - jj
+                lat_bary.append([(m - ii) / m if False else 0, 0, 0])
+        # simpler: lattice in xy then convert
+        lat_xy = []
+        for ii in range(m + 1):
+            for jj in range(m + 1 - ii):
+                kk = m - ii - jj
+                lat_xy.append([(jj + 0.5 * kk) / m, kk * sqrt3 / 2.0 / m])
+        lat_xy = np.array(lat_xy)
+        if len(lat_xy) >= n:
+            lat_xy = lat_xy[:n]
+        else:
+            u = rng.random((n - len(lat_xy), 2))
+            su = np.sqrt(u[:, 0])
+            bb = np.stack([1 - su, su * (1 - u[:, 1]), su * u[:, 1]], axis=1)
+            lat_xy = np.vstack([lat_xy, bb @ V])
+        lat_xy = lat_xy + rng.normal(0.0, 0.01, size=lat_xy.shape)
+        bary_starts.append(np.clip(bary_of(proj_tri(lat_xy)), 1e-4, 1.0))
+
+    thetas = [to_theta(b) for b in bary_starts]
+    for _ in range(3):
+        thetas.append(rng.normal(scale=1.5, size=(n, 3)).ravel())
+
+    # fallback config (always valid)
+    base = np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.5, sqrt3 / 2.0],
+        [0.5, 0.0], [0.25, sqrt3 / 4.0], [0.75, sqrt3 / 4.0],
+        [0.25, sqrt3 / 12.0], [0.75, sqrt3 / 12.0],
+        [0.5, sqrt3 / 6.0], [0.125, sqrt3 / 8.0], [0.875, sqrt3 / 8.0],
+    ])
+    best_pts = base.copy()
+    best_val = min_area(base)
+
+    # ---------- main loop: alternate stages across starts ----------
+    si = 0
+    while time.time() - t0 < TIME_BUDGET:
+        if si < len(thetas):
+            theta = np.array(thetas[si], dtype=float)
+        else:
+            theta = rng.normal(scale=1.5, size=(n, 3)).ravel()
+        si += 1
+
+        # Stage A: global softmin
+        theta = global_powell(theta)
+        pts = unpack(theta)
+        val = min_area(pts)
+        if val > best_val:
+            best_val, best_pts = val, pts.copy()
+
+        # Stage B: worst-triplet refinement (iterative, argmin updates each round)
+        for _ in range(4):
+            if time.time() - t0 > TIME_BUDGET * 0.97:
+                break
+            pts, val = refine_worst_triplet(pts)
+            if val > best_val:
+                best_val, best_pts = val, pts.copy()
+            # feed polished points back as logits for another global stage
+            if _HAVE_SCIPY and time.time() - t0 < TIME_BUDGET * 0.9:
+                bary = np.clip(bary_of(pts), 1e-4, 1.0)
+                theta = global_powell(to_theta(bary),
+                                     temps=(1e-3 * area_T, 2e-4 * area_T))
+                pts = unpack(theta)
+                val = min_area(pts)
+                if val > best_val:
+                    best_val, best_pts = val, pts.copy()
+
+        if time.time() - t0 > TIME_BUDGET:
+            break
+
+    # ---------- validity safety ----------
+    best_pts = np.asarray(best_pts, dtype=float)
+    if best_pts.shape != (n, 2) or not np.all(np.isfinite(best_pts)):
+        best_pts = base
+    best_pts = proj_tri(best_pts)
+    return best_pts
+
+
+# EVOLVE-BLOCK-END

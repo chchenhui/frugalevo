@@ -1,0 +1,46 @@
+<NAME>
+lpt_replicate_experts
+</NAME>
+<DESCRIPTION>
+Replace the naive `weight/logcnt` argmax heuristic in `replicate_experts` with a proper LPT-style greedy over post-replication loads. Currently the heuristic keeps duplicating the hottest expert even when its per-replica load `w/c` has already dropped, wasting redundancy budget. Instead, at each step we evaluate the *resulting* per-replica load `w/(c+1)` for every logical expert (i.e., what its load would become if we gave it one more replica) and pick the expert with the highest resulting load — which is exactly the replica placement that minimizes the current maximum per-replica load across all replicas. This mirrors the proven LPT `balanced_packing` structure (iterative argmax/argmin over candidate loads) and directly targets the weakest metric, expert balancedness (0.25). The loop is over the (small) number of redundant experts only, and each iteration is a single batched op across all layers, so runtime impact is negligible compared to the existing implementation (same loop count, same per-iteration cost).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+=======
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    # LPT-style greedy over post-replication loads: for each redundant slot,
+    # pick the logical expert whose resulting per-replica load w / (c + 1)
+    # would be the highest, i.e., the placement that minimizes the current
+    # maximum per-replica load across all replicas (mirroring the LPT
+    # structure used in `balanced_packing`).
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / (logcnt + 1)).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+>>>>>>> REPLACE
+</DIFF>

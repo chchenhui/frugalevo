@@ -1,0 +1,155 @@
+<NAME>
+sparse_lp_annealing_multistart
+</NAME>
+<DESCRIPTION>
+The current program spends most of its 1.8s budget in a dense LP (O(n²) rows built with Python loops and a dense A_ub matrix for every evaluation). Profiling insight from prior variants shows the vectorized sparse LP (program 2) solves the same radii problem dramatically faster. I make three coordinated changes:
+
+1. **Vectorized sparse LP**: Replace the dense pairwise-constraint construction in `lp_radii` with a `csr_matrix` built from `triu_indices`. Each of the ~hundreds of LP solves during the hill-climb (plus the 12×3 = 36 candidate evaluations) becomes much cheaper, so the same time budget yields roughly 2-3× more search iterations — directly attacking the "wasted evaluations" problem in the plateau analysis.
+
+2. **Annealing acceptance inside each hill-climb start**: The current climb only accepts strictly improving moves, so it stalls on local optima. I add a Metropolis criterion (accept mildly worse configurations with probability exp(Δ/T), T = 0.004) so the search can cross small barriers, plus a 25% probability of a purely isotropic Gaussian move for diversification. Because worse moves are now possible, I track the best-ever configuration per start separately from the current state.
+
+3. **More starts, slightly larger budget**: With the faster LP, use 6 multi-starts instead of 4 and extend the deadline to 2.0s (previous variants ran 2.21-2.53s without penalty), giving more independent basins of attraction from the ranked candidate layouts.
+</NAME>
+<DIFF>
+<<<<<<< SEARCH
+    def lp_radii(centers):
+        radii = compute_max_radii(centers)
+        try:
+            from scipy.optimize import linprog
+
+            A_ub = []
+            b_ub = []
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                    if d < 1e-9:
+                        continue
+                    row = np.zeros(n)
+                    row[i] = 1.0
+                    row[j] = 1.0
+                    A_ub.append(row)
+                    b_ub.append(d)
+            for i in range(n):
+                x, y = centers[i]
+                row = np.zeros(n)
+                row[i] = 1.0
+                A_ub.append(row)
+                b_ub.append(min(x, y, 1 - x, 1 - y))
+            res = linprog(c=-np.ones(n), A_ub=np.array(A_ub),
+                          b_ub=np.array(b_ub), bounds=[(0, None)] * n,
+                          method="highs")
+            if res.success and np.sum(res.x) > np.sum(radii):
+                radii = res.x
+        except Exception:
+            pass
+        return radii
+=======
+    def lp_radii(centers):
+        """Exact optimal radii at fixed centers via vectorized sparse LP:
+        maximize sum(r) s.t. r_i + r_j <= d_ij, r_i <= border distance.
+        Sparse CSR assembly avoids O(n^2) Python loops and dense matrices,
+        so each LP solve is much faster during the search."""
+        radii = compute_max_radii(centers)
+        try:
+            from scipy.optimize import linprog
+            from scipy.sparse import csr_matrix
+
+            ii, jj = np.triu_indices(n, 1)
+            d = np.linalg.norm(centers[ii] - centers[jj], axis=1)
+            keep = d > 1e-9
+            ii, jj, d = ii[keep], jj[keep], d[keep]
+            # Pairwise constraints r_i + r_j <= d_ij
+            m = len(d)
+            data = np.ones(2 * m + n)
+            rows_ = np.concatenate([np.arange(m), np.arange(m), m + np.arange(n)])
+            cols_ = np.concatenate([ii, jj, np.arange(n)])
+            A_ub = csr_matrix((data, (rows_, cols_)), shape=(m + n, n))
+            # Border constraints r_i <= min(x, y, 1-x, 1-y)
+            bd = np.minimum.reduce([centers[:, 0], centers[:, 1],
+                                    1.0 - centers[:, 0], 1.0 - centers[:, 1]])
+            b_ub = np.concatenate([d, bd])
+            res = linprog(c=-np.ones(n), A_ub=A_ub, b_ub=b_ub,
+                          bounds=[(0, None)] * n, method="highs")
+            if res.success and np.sum(res.x) > np.sum(radii):
+                radii = res.x
+        except Exception:
+            pass
+        return radii
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+        overall_deadline = time.time() + 1.8
+        n_starts = min(4, len(scored))
+=======
+        overall_deadline = time.time() + 2.0
+        n_starts = min(6, len(scored))
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+            step = 0.02
+            while time.time() < min(start_time + budget, overall_deadline):
+                dirs, scores = slack_dirs_and_scores(c, r)
+                w = np.maximum(-scores, 0.01)
+                w = w / w.sum()
+                idx = int(rng_s.choice(n, p=w))
+                trial = c.copy()
+                trial[idx] += (0.7 * dirs[idx] + 0.3 * rng_s.normal(size=2)) * step
+                trial = np.clip(trial, 0.005, 0.995)
+                if np.allclose(trial[idx], c[idx]):
+                    continue
+                radii_t = lp_radii(trial)
+                total_t = np.sum(radii_t)
+                if total_t > tot + 1e-9:
+                    c, r, tot = trial, radii_t, total_t
+                    step = min(step * 1.15, 0.05)
+                else:
+                    if rng_s.random() < 0.7:
+                        step = max(step * 0.92, 0.002)
+                    else:
+                        step = min(step * 1.4, 0.05)
+                if time.time() > overall_deadline:
+                    break
+            if tot > best[2]:
+                best = (c, r, tot)
+=======
+            step = 0.02
+            T = 0.004
+            # Track best-ever configuration separately from current state,
+            # since Metropolis moves may temporarily decrease the sum.
+            bc, br, bt = c.copy(), r.copy(), tot
+            while time.time() < min(start_time + budget, overall_deadline):
+                dirs, scores = slack_dirs_and_scores(c, r)
+                w = np.maximum(-scores, 0.01)
+                w = w / w.sum()
+                idx = int(rng_s.choice(n, p=w))
+                trial = c.copy()
+                if rng_s.random() < 0.75:
+                    # Slack-directed move along max-slack direction
+                    trial[idx] += (0.7 * dirs[idx] + 0.3 * rng_s.normal(size=2)) * step
+                else:
+                    # Isotropic Gaussian move for diversification
+                    trial[idx] += rng_s.normal(0.0, 1.4 * step, size=2)
+                trial = np.clip(trial, 0.005, 0.995)
+                if np.allclose(trial[idx], c[idx]):
+                    continue
+                radii_t = lp_radii(trial)
+                total_t = np.sum(radii_t)
+                if total_t > tot + 1e-9:
+                    c, r, tot = trial, radii_t, total_t
+                    if total_t > bt + 1e-9:
+                        bc, br, bt = trial.copy(), radii_t.copy(), total_t
+                    step = min(step * 1.15, 0.05)
+                elif rng_s.random() < np.exp((total_t - tot) / max(T, 1e-9)):
+                    # Metropolis: accept mildly worse moves to escape ridges
+                    c, r = trial, radii_t
+                else:
+                    if rng_s.random() < 0.7:
+                        step = max(step * 0.92, 0.002)
+                    else:
+                        step = min(step * 1.4, 0.05)
+                if time.time() > overall_deadline:
+                    break
+            if bt > best[2]:
+                best = (bc, br, bt)
+>>>>>>> REPLACE
+</DIFF>

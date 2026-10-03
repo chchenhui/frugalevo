@@ -1,0 +1,135 @@
+<NAME>
+global_replication_then_gpu_packing</NAME>
+<DESCRIPTION>
+The current algorithm replicates experts *within* each node (Step 2 runs `replicate_experts` on node-local expert subsets with only `num_physical_experts // num_nodes` slots per node). This caps the achievable balance: a hot expert living on one node cannot receive replicas proportional to its global load. Following the recommendation, I swap the order: first replicate globally over the full `num_physical_experts` pool, then (keeping the node-level group packing from Step 1 for network locality) adjust replica counts so each node holds exactly `num_physical_experts // num_nodes` replicas, and finally place replicas onto GPUs with an LPT-style greedy (min-load GPU with free slots) instead of the count-constrained `balanced_packing`. This removes the per-node replication granularity bottleneck, improves GPU balancedness, and replaces the O(n·m) Python `balanced_packing` loop for physical experts with a single greedy pass per layer/node (faster).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Step 2: construct redundant experts within nodes
+    # [num_layers * num_nodes, num_logical_experts // num_nodes]
+    tokens_per_mlog = weight.gather(-1, mlog2log).view(
+        -1, num_logical_experts // num_nodes)
+    phy2mlog, phyrank, mlogcnt = replicate_experts(
+        tokens_per_mlog, num_physical_experts // num_nodes)
+
+    # Step 3: pack physical_experts to GPUs
+    # [num_layers * num_nodes, num_physical_experts // num_nodes]
+    tokens_per_phy = (tokens_per_mlog / mlogcnt).gather(-1, phy2mlog)
+    pack_index, rank_in_pack = balanced_packing(tokens_per_phy,
+                                                num_gpus // num_nodes)
+    phy2pphy = pack_index * phy_experts_per_gpu + rank_in_pack
+    pphy2phy = inverse(phy2pphy)
+
+    pphy2mlog = phy2mlog.gather(
+        -1, pphy2phy)  # [num_layers * num_nodes, num_log_per_nodes]
+    pphy2mlog = (pphy2mlog.view(num_layers, num_nodes, -1) + torch.arange(
+        0,
+        num_logical_experts,
+        num_logical_experts // num_nodes,
+        device=group_pack_index.device,
+    ).view(1, -1, 1)).flatten(-2)
+    pphy2log = mlog2log.gather(-1, pphy2mlog)
+    pphyrank = phyrank.gather(-1, pphy2phy).view(num_layers, -1)
+    logcnt = mlogcnt.view(num_layers, -1).gather(-1, log2mlog)
+    return pphy2log, pphyrank, logcnt
+=======
+    # Step 2: replicate experts globally across the full physical pool.
+    # This removes the per-node replication granularity bottleneck.
+    _, _, logcnt = replicate_experts(weight, num_physical_experts)
+
+    # Node id of each logical expert (node assignment comes from Step 1).
+    node_of_log = log2mlog // (groups_per_node * group_size)
+
+    # Step 3: equalize replica counts per node, then greedily (LPT) place
+    # replicas onto GPUs with a fixed slot capacity per GPU.
+    w = weight.tolist()
+    nodes_of = node_of_log.tolist()
+    cnt = logcnt.tolist()
+    phy2log_out = []
+    phyrank_out = []
+    logcnt_out = torch.empty(num_layers, num_logical_experts,
+                             dtype=torch.int64)
+    for l in range(num_layers):
+        node_experts = [[] for _ in range(num_nodes)]
+        for e in range(num_logical_experts):
+            node_experts[nodes_of[l][e]].append(e)
+
+        # Equalize the number of physical experts per node.
+        for nd in range(num_nodes):
+            delta = phy_experts_per_node - sum(
+                cnt[l][e] for e in node_experts[nd])
+            if delta > 0:
+                for _ in range(delta):
+                    e = max(node_experts[nd],
+                            key=lambda e: w[l][e] /
+                            (cnt[l][e] * (cnt[l][e] + 1)))
+                    cnt[l][e] += 1
+            elif delta < 0:
+                for _ in range(-delta):
+                    cand = [e for e in node_experts[nd] if cnt[l][e] > 1]
+                    if not cand:
+                        break
+                    e = min(
+                        cand,
+                        key=lambda e: w[l][e] /
+                        (cnt[l][e] * (cnt[l][e] - 1)))
+                    cnt[l][e] -= 1
+
+        phy2log_l = [0] * num_physical_experts
+        phyrank_l = [0] * num_physical_experts
+        for nd in range(num_nodes):
+            # Each replica of expert e contributes load w/cnt[e].
+            reps = []
+            for e in node_experts[nd]:
+                reps.extend((w[l][e] / cnt[l][e], e, r)
+                            for r in range(cnt[l][e]))
+            reps.sort(key=lambda t: -t[0])
+            gpu_load = [0.0] * gpus_per_node
+            gpu_slots = [phy_experts_per_gpu] * gpus_per_node
+            for load, e, r in reps:
+                g = min((g for g in range(gpus_per_node)
+                         if gpu_slots[g] > 0),
+                        key=gpu_load.__getitem__)
+                pos = phy_experts_per_gpu - gpu_slots[g]
+                gpu_slots[g] -= 1
+                gpu_load[g] += load
+                pidx = (nd * gpus_per_node + g) * phy_experts_per_gpu + pos
+                phy2log_l[pidx] = e
+                phyrank_l[pidx] = r
+            # Fallback: fill any leftover slots with the hottest expert.
+            for g in range(gpus_per_node):
+                while gpu_slots[g] > 0:
+                    e = max(node_experts[nd],
+                            key=lambda e: w[l][e] / cnt[l][e])
+                    pos = phy_experts_per_gpu - gpu_slots[g]
+                    gpu_slots[g] -= 1
+                    pidx = (nd * gpus_per_node +
+                            g) * phy_experts_per_gpu + pos
+                    phy2log_l[pidx] = e
+                    phyrank_l[pidx] = cnt[l][e]
+                    cnt[l][e] += 1
+        phy2log_out.append(phy2log_l)
+        phyrank_out.append(phyrank_l)
+        logcnt_out[l] = torch.tensor(cnt[l], dtype=torch.int64)
+
+    pphy2log = torch.tensor(phy2log_out, dtype=torch.int64)
+    pphyrank = torch.tensor(phyrank_out, dtype=torch.int64)
+    return pphy2log, pphyrank, logcnt_out
+=======
+>>>>>>> REPLACE
+</DIFF>
+
+Also fix the unused variable definitions and add `gpus_per_node` / `phy_experts_per_node` which the new code uses:
+<DIFF>
+<<<<<<< SEARCH
+    assert num_gpus % num_nodes == 0
+    assert num_physical_experts % num_gpus == 0
+    phy_experts_per_gpu = num_physical_experts // num_gpus
+=======
+    assert num_gpus % num_nodes == 0
+    gpus_per_node = num_gpus // num_nodes
+    assert num_physical_experts % num_gpus == 0
+    phy_experts_per_gpu = num_physical_experts // num_gpus
+    phy_experts_per_node = num_physical_experts // num_nodes
+>>>>>>> REPLACE
+</DIFF>

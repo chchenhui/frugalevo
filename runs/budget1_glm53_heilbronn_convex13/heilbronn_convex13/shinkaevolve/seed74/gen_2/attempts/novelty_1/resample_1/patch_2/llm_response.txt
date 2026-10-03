@@ -1,0 +1,112 @@
+<NAME>
+heilbronn_13_local_search_constructor
+</NAME>
+<DESCRIPTION>
+The previous stub (`pass`) is replaced with a complete, deterministic constructor for the 13-point Heilbronn problem.
+
+Reasoning:
+1. **Anchored hull**: Points 0,1,2 are fixed at the vertices of a unit-area equilateral triangle. This guarantees a convex hull of area exactly 1, so `min_area_normalized` equals the raw minimum triangle area, and boundary/convexity constraints are trivially satisfied for all interior points (they are projected back into the triangle via clipped barycentric coordinates).
+2. **Objective**: Exact minimum over all C(13,3)=286 triangles, computed vectorized with numpy (cross products), so it is exact, not a smooth surrogate.
+3. **Optimization strategy**: A deterministic (seeded `np.random.default_rng`) batched stochastic hill-climb. At each step, the triangle currently achieving the minimum is identified, one of its (free) points is selected, K=48 Gaussian perturbations of that point are generated, projected into the triangle, and evaluated. Crucially, only the 66 triples containing the perturbed point need recomputation per candidate (the minimum over all other triples is precomputed once per state), making each step very cheap. Moves are accepted only if the global minimum triangle area does not decrease.
+4. **Annealing + restarts**: Perturbation scale anneals geometrically from 0.12 to 0.002 (coarse global exploration → fine local refinement). Five random restarts plus a final refinement pass on the best configuration guard against poor local optima while keeping runtime in a few seconds.
+5. **Determinism & robustness**: Fixed seed, pure numpy arithmetic, and a projection step guarantee reproducible, feasible, duplicate-free output every run. Returns a list of 13 [x, y] pairs.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    pass
+=======
+    import numpy as np
+    from itertools import combinations
+
+    n = 13
+    rng = np.random.default_rng(20240613)
+
+    # Unit-area equilateral triangle; three anchored vertices fix the hull
+    # (hull area = 1, so normalized min-area == raw min-area).
+    side = 2.0 / (3.0 ** 0.25)          # sqrt(3)/4 * side^2 = 1
+    height = (np.sqrt(3.0) / 2.0) * side
+    tri = np.array([[0.0, 0.0], [side, 0.0], [side / 2.0, height]])
+
+    # All 286 triples of point indices.
+    triples = np.array(list(combinations(range(n), 3)), dtype=np.int64)
+    t0, t1, t2 = triples[:, 0], triples[:, 1], triples[:, 2]
+
+    # For each FREE point (indices 3..12), precompute which triple rows
+    # contain it and which do not (used to avoid full recomputation).
+    rows_with = [np.where((triples == j).any(axis=1))[0] for j in range(3, n)]
+    rows_without = [np.where(~(triples == j).any(axis=1))[0] for j in range(3, n)]
+
+    def all_areas(P):
+        ax = P[t1, 0] - P[t0, 0]
+        ay = P[t1, 1] - P[t0, 1]
+        bx = P[t2, 0] - P[t0, 0]
+        by = P[t2, 1] - P[t0, 1]
+        return 0.5 * np.abs(ax * by - ay * bx)
+
+    # Barycentric projection back into the triangle.
+    u = tri[0] - tri[2]
+    v = tri[1] - tri[2]
+    det = u[0] * v[1] - u[1] * v[0]
+
+    def project(pts):
+        q = pts - tri[2]
+        w0 = (q[:, 0] * v[1] - q[:, 1] * v[0]) / det
+        w1 = (u[0] * q[:, 1] - u[1] * q[:, 0]) / det
+        w2 = 1.0 - w0 - w1
+        W = np.clip(np.stack([w0, w1, w2], axis=1), 0.0, None)
+        W /= W.sum(axis=1, keepdims=True)
+        return W @ tri
+
+    def local_search(P, steps, K=48, s0=0.12, s1=0.002):
+        P = P.copy()
+        areas = all_areas(P)
+        cur = areas.min()
+        for step in range(steps):
+            sig = s0 * (s1 / s0) ** (step / max(steps - 1, 1))
+            worst = int(np.argmin(areas))
+            members = triples[worst]
+            free_members = [int(p) for p in members if p >= 3]
+            if free_members:
+                j = int(free_members[rng.integers(0, len(free_members))])
+            else:
+                j = 3 + int(rng.integers(0, n - 3))
+            ridx = rows_with[j - 3]
+            other = rows_without[j - 3]
+            m_other = areas[other].min() if other.size else 0.0
+
+            # Batch of perturbed candidates for point j, projected into triangle.
+            cand = project(P[j] + rng.normal(0.0, sig, size=(K, 2)))
+            Aidx = triples[ridx]                     # (m,3)
+            is_j = (Aidx == j)                       # (m,3)
+            base = P[Aidx]                           # (m,3,2)
+            coords = np.where(is_j[None, :, :, None],
+                             cand[:, None, None, :],
+                             base[None])             # (K,m,3,2)
+            d1 = coords[:, :, 1] - coords[:, :, 0]
+            d2 = coords[:, :, 2] - coords[:, :, 0]
+            ar = 0.5 * np.abs(d1[:, :, 0] * d2[:, :, 1] - d1[:, :, 1] * d2[:, :, 0])
+            newmin = np.minimum(ar.min(axis=1), m_other)
+            k = int(np.argmax(newmin))
+            if newmin[k] >= cur:                     # non-decreasing accept
+                P[j] = cand[k]
+                areas = all_areas(P)
+                cur = areas.min()
+        return P, cur
+
+    best_P = None
+    best_val = -1.0
+    for r in range(5):
+        W = rng.random((n - 3, 3)) + 0.02
+        W /= W.sum(axis=1, keepdims=True)
+        P = np.vstack([tri, W @ tri])
+        P, val = local_search(P, 3500)
+        if val > best_val:
+            best_P, best_val = P, val
+
+    # Final refinement pass on the best configuration (fine scale).
+    best_P, best_val = local_search(best_P, 3000, s0=0.01, s1=0.0005)
+
+    points = [[float(x), float(y)] for x, y in best_P]
+    return points
+>>>>>>> REPLACE
+</DIFF>

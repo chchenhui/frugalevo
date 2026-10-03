@@ -1,0 +1,83 @@
+<NAME>
+steiner_shared_tree_broadcast</NAME>
+<DESCRIPTION>
+The current algorithm computes a fully independent shortest path for each destination, so any link common to multiple destinations is paid for repeatedly (once per destination, times each partition). A broadcast is fundamentally a multicast problem: data that reaches an intermediate node once can be fanned out to many destinations, so shared edges should only be paid once. We evolve the search into a greedy Steiner-tree heuristic: process destinations sequentially and run Dijkstra with cost discounts on edges already used by the growing broadcast tree. This makes later destinations strongly prefer reusing the existing broadcast backbone instead of paying for redundant parallel transfers. This directly reduces the number of distinct paid edges, which is the dominant term in total transfer cost. We also add a reachability pre-check so unreachable destinations are recorded rather than silently dropped, and use a deterministic RNG seed for reproducibility of the perturbed candidate search.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    for dst in dsts:
+        # Baseline cheapest path
+        try:
+            best_path = nx.dijkstra_path(h, src, dst, weight="cost")
+            best_cost = sum(h[best_path[i]][best_path[i + 1]]["cost"]
+                            for i in range(len(best_path) - 1))
+        except nx.NetworkXNoPath:
+            continue
+
+        # Explore a few perturbed-cost variants to find parallel routes that
+        # may dodge expensive shared links
+        rng = random.Random(hash((src, dst)) & 0xFFFFFFFF)
+        for _ in range(5):
+            ph = h.copy()
+            for _, _, d in ph.edges(data=True):
+                d["_w"] = d["cost"] * (0.5 + rng.random() * 1.5)
+            try:
+                p = nx.dijkstra_path(ph, src, dst, weight="_w")
+            except nx.NetworkXNoPath:
+                continue
+            c = sum(h[p[i]][p[i + 1]]["cost"] for i in range(len(p) - 1))
+            if c < best_cost:
+                best_path, best_cost = p, c
+
+        for i in range(0, len(best_path) - 1):
+            s, t = best_path[i], best_path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+=======
+    # Greedy Steiner-tree broadcast: edges already in the tree are heavily
+    # discounted so later destinations reuse the shared backbone instead of
+    # paying for redundant parallel transfers (each shared edge is paid once).
+    tree_edges = set()
+    reachable_dsts = []
+    for dst in dsts:
+        if not nx.has_path(h, src, dst):
+            # Record truly unreachable destinations instead of silently dropping
+            print(f"Destination {dst} is unreachable from {src}")
+            continue
+        reachable_dsts.append(dst)
+
+        def edge_weight(u, v, d):
+            c = d["cost"]
+            if (u, v) in tree_edges:
+                c *= 0.01  # reuse of broadcast backbone is nearly free
+            return c
+
+        best_path = nx.dijkstra_path(h, src, dst, weight=edge_weight)
+        best_cost = sum(h[best_path[i]][best_path[i + 1]]["cost"]
+                        for i in range(len(best_path) - 1)
+                        if (best_path[i], best_path[i + 1]) not in tree_edges)
+
+        # Perturbed variants may find a cheaper way to hook into the tree
+        rng = random.Random(hash((src, dst)) & 0xFFFFFFFF)
+        for _ in range(5):
+            ph = h.copy()
+            for _, _, d in ph.edges(data=True):
+                d["_w"] = d["cost"] * (0.5 + rng.random() * 1.5)
+            try:
+                p = nx.dijkstra_path(ph, src, dst, weight="_w")
+            except nx.NetworkXNoPath:
+                continue
+            c = sum(h[p[i]][p[i + 1]]["cost"]
+                    for i in range(len(p) - 1)
+                    if (p[i], p[i + 1]) not in tree_edges)
+            if c < best_cost:
+                best_path, best_cost = p, c
+
+        # Grow the shared broadcast tree with the chosen path
+        for i in range(0, len(best_path) - 1):
+            s, t = best_path[i], best_path[i + 1]
+            tree_edges.add((s, t))
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+>>>>>>> REPLACE
+</DIFF>

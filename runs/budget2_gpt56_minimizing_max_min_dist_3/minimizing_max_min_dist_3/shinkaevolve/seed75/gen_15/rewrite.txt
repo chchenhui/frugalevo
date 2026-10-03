@@ -1,0 +1,179 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct fourteen reproducible points in R^3 with a large ratio of
+    minimum to maximum pairwise Euclidean distance.
+
+    The construction is translation and scale normalized internally, but
+    no per-point spherical constraint is imposed.
+    """
+    n = 14
+    pi, pj = np.triu_indices(n, 1)
+    pair_count = len(pi)
+
+    def normalize(points: np.ndarray) -> np.ndarray:
+        """Remove translation and fix global RMS radius."""
+        points = points - np.mean(points, axis=0, keepdims=True)
+        scale = np.sqrt(np.mean(np.sum(points * points, axis=1)))
+        return points / max(float(scale), 1e-14)
+
+    def pair_squared(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        delta = points[pi] - points[pj]
+        return delta, np.einsum("ij,ij->i", delta, delta)
+
+    def score(points: np.ndarray) -> float:
+        _, values = pair_squared(points)
+        return float(np.min(values) / np.max(values))
+
+    def accumulate_pair_forces(delta: np.ndarray, coeff: np.ndarray) -> np.ndarray:
+        force = np.zeros((n, 3), dtype=float)
+        pair_force = 2.0 * coeff[:, None] * delta
+        np.add.at(force, pi, pair_force)
+        np.add.at(force, pj, -pair_force)
+        return force
+
+    def smooth_gradient(
+        points: np.ndarray,
+        beta: float,
+        active_mix: float,
+    ) -> np.ndarray:
+        """
+        Gradient of soft-min(log d^2)-soft-max(log d^2), augmented late
+        in the run by uniformly weighted active min/max contact forces.
+        """
+        delta, values = pair_squared(points)
+        values = np.maximum(values, 1e-14)
+        logs = np.log(values)
+
+        low_logits = -beta * logs
+        low_logits -= np.max(low_logits)
+        low = np.exp(low_logits)
+        low /= np.sum(low)
+
+        high_logits = beta * logs
+        high_logits -= np.max(high_logits)
+        high = np.exp(high_logits)
+        high /= np.sum(high)
+
+        gradient = accumulate_pair_forces(delta, (low - high) / values)
+
+        if active_mix > 0.0:
+            minimum = float(np.min(values))
+            maximum = float(np.max(values))
+
+            # The tolerance is deliberately modest: near contacts receive
+            # equal treatment rather than allowing one softmax pair to
+            # dominate all late-stage updates.
+            close_mask = values <= minimum * 1.018
+            far_mask = values >= maximum * 0.982
+
+            active = np.zeros(pair_count, dtype=float)
+            active[close_mask] = 1.0 / max(int(np.sum(close_mask)), 1)
+            active[far_mask] -= 1.0 / max(int(np.sum(far_mask)), 1)
+
+            active_gradient = accumulate_pair_forces(delta, active / values)
+            gradient = (1.0 - active_mix) * gradient + active_mix * active_gradient
+
+        # Project away translation and global scaling directions.
+        gradient -= np.mean(gradient, axis=0, keepdims=True)
+        radial = np.sum(gradient * points) / max(np.sum(points * points), 1e-14)
+        gradient -= radial * points
+        return gradient
+
+    def refine(initial: np.ndarray) -> tuple[np.ndarray, float]:
+        points = normalize(initial.copy())
+        velocity = np.zeros_like(points)
+
+        best_points = points.copy()
+        best_value = score(points)
+
+        stages = (
+            (5.0, 300, 0.052, 0.00),
+            (12.0, 380, 0.036, 0.00),
+            (28.0, 460, 0.023, 0.08),
+            (65.0, 520, 0.014, 0.22),
+            (145.0, 500, 0.008, 0.42),
+        )
+
+        for beta, iterations, initial_step, active_mix in stages:
+            for iteration in range(iterations):
+                direction = smooth_gradient(points, beta, active_mix)
+
+                velocity = 0.72 * velocity + direction
+                velocity -= np.mean(velocity, axis=0, keepdims=True)
+                radial = np.sum(velocity * points) / max(
+                    np.sum(points * points), 1e-14
+                )
+                velocity -= radial * points
+
+                norm = np.sqrt(np.mean(np.sum(velocity * velocity, axis=1)))
+                if norm > 3.0:
+                    velocity *= 3.0 / norm
+
+                progress = iteration / max(iterations - 1, 1)
+                step = initial_step * (1.0 - 0.74 * progress)
+                points = normalize(points + step * velocity)
+
+                if iteration % 10 == 0 or iteration == iterations - 1:
+                    value = score(points)
+                    if value > best_value:
+                        best_value = value
+                        best_points = points.copy()
+
+        return best_points, best_value
+
+    rng = np.random.default_rng(3029471)
+
+    cube = np.array(
+        [[a, b, c] for a in (-1.0, 1.0)
+         for b in (-1.0, 1.0)
+         for c in (-1.0, 1.0)],
+        dtype=float,
+    )
+    axes = np.vstack((np.eye(3), -np.eye(3))) * np.sqrt(3.0)
+    cube_axis = normalize(np.vstack((cube, axes)))
+
+    indices = np.arange(n, dtype=float)
+    golden = np.pi * (3.0 - np.sqrt(5.0))
+    z = 1.0 - 2.0 * (indices + 0.5) / n
+    radial = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    fibonacci = np.column_stack(
+        (radial * np.cos(golden * indices), radial * np.sin(golden * indices), z)
+    )
+
+    seeds = [cube_axis, normalize(fibonacci)]
+
+    # Perturbing structured configurations is especially useful because
+    # the optimum need not retain their full cube/octahedron symmetry.
+    for magnitude in (0.025, 0.055, 0.10, 0.16):
+        seeds.append(normalize(cube_axis + magnitude * rng.normal(size=(n, 3))))
+
+    for _ in range(12):
+        seeds.append(normalize(rng.normal(size=(n, 3))))
+
+    best_points = seeds[0]
+    best_value = score(best_points)
+
+    for seed in seeds:
+        candidate, value = refine(seed)
+        if value > best_value:
+            best_points = candidate
+            best_value = value
+
+    # A few deterministic close restarts around the best basin make the
+    # final active-contact phases less dependent on an early soft optimum.
+    for magnitude in (0.018, 0.040, 0.075):
+        candidate, value = refine(
+            normalize(best_points + magnitude * rng.normal(size=(n, 3)))
+        )
+        if value > best_value:
+            best_points = candidate
+            best_value = value
+
+    return np.asarray(normalize(best_points), dtype=float)
+
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,263 @@
+--- a/original.py
++++ b/original.py
+@@ -1,139 +1,176 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ try:
+     from scipy.optimize import minimize as _scipy_minimize
+     _HAVE_SCIPY = True
+ except Exception:
+     _HAVE_SCIPY = False
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+-    Construct an arrangement of n points on or inside an equilateral triangle with
+-    vertices (0,0), (1,0), (0.5, sqrt(3)/2) in order to maximize the area of the
+-    smallest triangle formed by these points. Here n = 11.
++    Construct an arrangement of n=11 points on or inside the equilateral triangle
++    with vertices (0,0), (1,0), (0.5, sqrt(3)/2) maximizing the minimum triangle
++    area over all point triplets.
+ 
+-    Uses a deterministic multi-start smooth-softmin local optimization. Points are
+-    parametrized as convex combinations of the triangle vertices (softmax weights),
+-    guaranteeing feasibility. A hardcoded fallback configuration is returned if the
+-    optimizer is unavailable or fails.
++    Novel approach ("active-set soft-min L-BFGS"):
++      * Points are parametrized by barycentric weights (n x 3), projected onto
++        the probability simplex (clip + renormalize) at every evaluation, so
++        every candidate is feasible by construction without softmax distortion.
++      * The objective is a temperature-annealed soft-min restricted to the
++        bottom-k triangle areas ("active set"). This focuses the optimizer on
++        the binding constraints only, which is crucial because with 165
++        triples the naive soft-min drowns the signal of the few worst ones.
++      * L-BFGS-B (numerical gradients, cheap in 33 dims) with progressively
++        lower temperatures provides a smooth-to-sharp optimization schedule.
++      * Deterministic multi-start: a hand-designed symmetric seed, reflected
++        perturbations of it, and several seeded random starts.
++      * Strictly-positive min-area guard with a rescue restart before any
++        fallback, preventing silent degenerate outputs.
+ 
+     Returns:
+-        points: np.ndarray of shape (11,2) with the x,y coordinates of the points.
++        np.ndarray of shape (11, 2) with the point coordinates.
+     """
+     n = 11
+     sqrt3 = np.sqrt(3.0)
+     V = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, sqrt3 / 2.0]])
+     area_T = sqrt3 / 4.0
+ 
+     from itertools import combinations
+-    triples = list(combinations(range(n), 3))
++    triples = np.array(list(combinations(range(n), 3)))   # (C,3)
++    C = triples.shape[0]
++
++    # ---------- geometry helpers ----------
++    def all_areas(pts):
++        p = pts[triples]                                   # (C,3,2)
++        cross = ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
++                 - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
++        return 0.5 * np.abs(cross)
+ 
+     def min_area(pts):
+-        p = pts[triples]                     # (C,3,2)
+-        cross = ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+-                 - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
+-        return 0.5 * np.min(np.abs(cross))
++        return float(np.min(all_areas(pts)))
+ 
+-    def unpack(theta):
+-        W = theta.reshape(n, 3)
+-        W = W - W.max(axis=1, keepdims=True)
+-        E = np.exp(W)
+-        W = E / E.sum(axis=1, keepdims=True)
++    def unpack(W):
++        """Barycentric weights -> points, with simplex projection."""
++        W = np.asarray(W, dtype=float).reshape(n, 3)
++        W = np.clip(W, 0.0, None)
++        s = W.sum(axis=1, keepdims=True)
++        s = np.where(s < 1e-12, 1.0, s)
++        W = W / s
+         return W @ V
+ 
+-    def softmin_obj(theta, temp):
++    # ---------- active-set soft-min objective ----------
++    K_ACTIVE = 25          # number of smallest triangles driving the objective
++
++    def active_softmin(theta, temp):
+         pts = unpack(theta)
+-        p = pts[triples]
+-        cross = ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+-                 - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
+-        a = 0.5 * np.abs(cross)
+-        # smooth lower bound on min(a): -temp*log(sum(exp(-a/temp)))
+-        return temp * np.log(np.sum(np.exp(-(a - a.min()) / temp))) - a.min()
++        a = all_areas(pts)
++        # bottom-k areas
++        part = np.partition(a, K_ACTIVE - 1)[:K_ACTIVE]
++        # soft-min of the active set: -temp*log(sum(exp(-a/temp)))
++        m = part.min()
++        e = np.exp(-(part - m) / temp)
++        return temp * np.log(e.sum()) - m
+ 
+-    # Deterministic starting configurations
+-    rng = np.random.default_rng(12345)
+-    starts = []
+-    # symmetric-ish start: vertices + edge points + interior points
++    # ---------- seeds ----------
++    rng = np.random.default_rng(20240517)
++
+     base = np.array([
+         [0.0, 0.0], [1.0, 0.0], [0.5, sqrt3 / 2.0],
+         [0.5, 0.0], [0.25, sqrt3 / 4.0], [0.75, sqrt3 / 4.0],
+         [0.25, sqrt3 / 12.0], [0.75, sqrt3 / 12.0],
+         [0.5, sqrt3 / 6.0], [0.125, sqrt3 / 8.0], [0.875, sqrt3 / 8.0],
+     ])
+-    # convert to logits (approximate inverse-softmax), exact vertices via large logits
+-    bary = np.array([
+-        [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
+-        [0.5, 0.5, 0.0], [0.5, 0.0, 0.5], [0.0, 0.5, 0.5],
+-        [0.75, 0.25, 0.0], [0.25, 0.75, 0.0], [0.25, 0.25, 0.5],
+-        [0.625, 0.125, 0.25], [0.125, 0.625, 0.25],
+-    ])
+-    starts.append(np.log(np.clip(bary, 1e-6, 1.0)).ravel())
++    base_val = min_area(base)
++    if base_val <= 0.0:
++        # safety: nudge interior points so the fallback is non-degenerate
++        for i in range(3, n):
++            base[i] = base[i] + 0.02 * rng.normal(size=2)
++        base[0], base[1], base[2] = V
++        base_val = min_area(base)
++
++    # barycentric coordinates of the seed
++    x, y = base[:, 0], base[:, 1]
++    wC = 2.0 * y / sqrt3
++    wB = x - 0.5 * wC
++    wA = 1.0 - wB - wC
++    base_W = np.stack([wA, wB, wC], axis=1)
++
++    starts = [base_W.ravel()]
++    # deterministic perturbations + mirror-paired perturbations
++    for _ in range(4):
++        W = np.clip(base_W + 0.05 * rng.normal(size=(n, 3)), 1e-4, None)
++        starts.append(W.ravel())
+     for _ in range(3):
+-        starts.append(rng.normal(scale=1.5, size=(n, 3)).ravel())
+-    # mirror-symmetric starts (x -> 1 - x): known near-optimal Heilbronn
+-    # configurations for equilateral triangles respect the triangle's
+-    # reflection symmetry; exploit this in the initializations.
+-    for _ in range(3):
+-        W = rng.normal(scale=1.5, size=(n, 3))
+-        # symmetrize: pair point i with its mirror across x = 0.5
+-        W[5] = W[0, [1, 0, 2]]   # mirror of point 0 (swap bary coords 0,1)
+-        W[7] = W[6, [1, 0, 2]]
+-        W[9] = W[8, [1, 0, 2]]
++        W = np.clip(base_W + 0.05 * rng.normal(size=(n, 3)), 1e-4, None)
++        # enforce reflection pairs across x = 0.5 (swap barycentric A,B)
++        for i in range(0, n, 2):
++            if i + 1 < n:
++                W[i + 1] = W[i][[1, 0, 2]]
++        starts.append(W.ravel())
++    # uniform-random starts
++    for _ in range(4):
++        W = rng.random((n, 3)) + 0.05
++        W /= W.sum(axis=1, keepdims=True)
+         starts.append(W.ravel())
+ 
++    # ---------- optimization ----------
++    temps = (2e-2 * area_T, 4e-3 * area_T, 8e-4 * area_T, 2e-4 * area_T)
++
++    def run_start(theta0, iters=(300, 250, 200, 150)):
++        theta = np.asarray(theta0, dtype=float).ravel()
++        if not _HAVE_SCIPY:
++            return unpack(theta)
++        for temp, it in zip(temps, iters):
++            try:
++                res = _scipy_minimize(
++                    active_softmin, theta, args=(temp,),
++                    method="L-BFGS-B",
++                    options={"maxiter": it, "maxfun": 8 * it,
++                             "ftol": 1e-12, "gtol": 1e-10},
++                )
++                if np.all(np.isfinite(res.x)):
++                    theta = res.x
++            except Exception:
++                pass
++        return unpack(theta)
++
+     best_pts = base
+-    best_val = min_area(base)
++    best_val = base_val
+ 
+-    if _HAVE_SCIPY:
+-        for s in starts:
+-            theta = np.array(s, dtype=float)
+-            try:
+-                for temp in (1e-2 * area_T, 1e-3 * area_T, 1e-4 * area_T):
+-                    res = _scipy_minimize(
+-                        softmin_obj, theta, args=(temp,),
+-                        method="Powell",
+-                        options={"maxiter": 400, "xtol": 1e-6, "ftol": 1e-8},
+-                    )
+-                    if np.all(np.isfinite(res.x)):
+-                        theta = res.x
+-                pts = unpack(theta)
+-                val = min_area(pts)
+-                if val > best_val:
+-                    best_val = val
+-                    best_pts = pts
+-            except Exception:
++    for s in starts:
++        try:
++            cand = run_start(s)
++            if not np.all(np.isfinite(cand)):
+                 continue
++            v = min_area(cand)
++            if v > best_val:
++                best_val = v
++                best_pts = cand
++        except Exception:
++            continue
+ 
+-    # Final validity check (numerical safety) with strictly-positive
+-    # min-area guard: never return a degenerate configuration silently.
++    # ---------- strictly-positive guard with rescue restart ----------
+     best_pts = np.asarray(best_pts, dtype=float)
+     if (best_pts.shape != (n, 2) or not np.all(np.isfinite(best_pts))
+             or min_area(best_pts) <= 0.0):
+-        # one more rescue restart before falling back
+         ok = False
+-        if _HAVE_SCIPY:
+-            theta = rng.normal(scale=1.5, size=(n, 3)).ravel()
++        for _ in range(3):
+             try:
+-                for temp in (1e-3 * area_T, 1e-4 * area_T):
+-                    res = _scipy_minimize(
+-                        softmin_obj, theta, args=(temp,),
+-                        method="Powell",
+-                        options={"maxiter": 400, "xtol": 1e-6, "ftol": 1e-8},
+-                    )
+-                    if np.all(np.isfinite(res.x)):
+-                        theta = res.x
+-                cand = unpack(theta)
+-                if np.all(np.isfinite(cand)) and min_area(cand) > 0.0:
++                W = rng.random((n, 3)) + 0.05
++                W /= W.sum(axis=1, keepdims=True)
++                cand = run_start(W.ravel())
++                if (np.all(np.isfinite(cand)) and min_area(cand) > 0.0):
+                     best_pts = cand
+                     ok = True
++                    break
+             except Exception:
+-                ok = False
++                continue
+         if not ok:
+-            # hardcoded fallback is itself non-degenerate by construction
+-            best_pts = base
++            best_pts = base  # non-degenerate by construction
++
+     return best_pts
+ 
+ 
+ # EVOLVE-BLOCK-END

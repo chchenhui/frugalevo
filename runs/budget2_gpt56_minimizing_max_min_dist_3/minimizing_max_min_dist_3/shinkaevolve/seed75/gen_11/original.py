@@ -1,0 +1,81 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct a 14-point diameter-packing configuration in R^3.
+
+    The returned scale is arbitrary: only min(distance) / max(distance)
+    matters, so each trial is kept centered and at a fixed RMS radius.
+    """
+    n = 14
+    pair_i, pair_j = np.triu_indices(n, 1)
+    rng = np.random.default_rng(18473)
+
+    def normalized(x: np.ndarray) -> np.ndarray:
+        x = x - x.mean(axis=0, keepdims=True)
+        return x / np.sqrt(np.mean(np.sum(x * x, axis=1)))
+
+    def ratio(x: np.ndarray) -> float:
+        delta = x[pair_i] - x[pair_j]
+        dist2 = np.einsum("ij,ij->i", delta, delta)
+        return float(dist2.min() / dist2.max())
+
+    # A useful symmetric starting point: the eight cube vertices and six
+    # axis vertices.  The random starts allow the symmetry to break when
+    # that improves the true diameter ratio.
+    cube = np.array(
+        [[a, b, c] for a in (-1.0, 1.0)
+         for b in (-1.0, 1.0) for c in (-1.0, 1.0)]
+    )
+    axes = np.vstack((np.eye(3), -np.eye(3))) * np.sqrt(3.0)
+    seeds = [normalized(np.vstack((cube, axes)))]
+    seeds.extend(normalized(rng.normal(size=(n, 3))) for _ in range(17))
+
+    best = seeds[0].copy()
+    best_value = ratio(best)
+
+    # The gradient is that of a smooth version of "smallest distance minus
+    # largest distance".  Increasing sharpness makes its weights converge
+    # to the closest and furthest pairs respectively.
+    iterations = 2200
+    for seed in seeds:
+        points = seed.copy()
+        velocity = np.zeros_like(points)
+
+        for iteration in range(iterations):
+            sharpness = 10.0 + 150.0 * (iteration / (iterations - 1)) ** 2
+            delta = points[pair_i] - points[pair_j]
+            dist2 = np.einsum("ij,ij->i", delta, delta)
+
+            low = -sharpness * dist2
+            low -= low.max()
+            close_weight = np.exp(low)
+            close_weight /= close_weight.sum()
+
+            high = sharpness * dist2
+            high -= high.max()
+            far_weight = np.exp(high)
+            far_weight /= far_weight.sum()
+
+            # Repel near pairs and contract far pairs.
+            pair_force = 2.0 * (close_weight - far_weight)[:, None] * delta
+            gradient = np.zeros_like(points)
+            np.add.at(gradient, pair_i, pair_force)
+            np.add.at(gradient, pair_j, -pair_force)
+
+            step = 0.030 * (1.0 - 0.65 * iteration / iterations)
+            velocity = 0.82 * velocity + step * gradient
+            points = normalized(points + velocity)
+
+            if iteration % 20 == 0 or iteration == iterations - 1:
+                value = ratio(points)
+                if value > best_value:
+                    best_value = value
+                    best = points.copy()
+
+    return best
+
+
+# EVOLVE-BLOCK-END

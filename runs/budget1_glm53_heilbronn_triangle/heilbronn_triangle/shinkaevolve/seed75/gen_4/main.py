@@ -1,0 +1,101 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _min_triangle_area(pts):
+    """Fast vectorized computation of the minimum (absolute) triangle area."""
+    n = pts.shape[0]
+    i, j, k = np.triu_indices(n, 3)
+    ax, ay = pts[i, 0], pts[i, 1]
+    bx, by = pts[j, 0], pts[j, 1]
+    cx, cy = pts[k, 0], pts[k, 1]
+    areas = 0.5 * np.abs(
+        ax * (by - cy) + bx * (cy - ay) + cx * (ay - by)
+    )
+    return areas.min()
+
+
+def _inside_triangle(pts, tol=1e-12):
+    """Check all points lie inside/on the equilateral triangle with vertices
+    (0,0), (1,0), (0.5, sqrt(3)/2)."""
+    h = np.sqrt(3.0) / 2.0
+    x, y = pts[:, 0], pts[:, 1]
+    return (
+        (y >= -tol)
+        & (y <= h + tol)
+        & (y <= np.sqrt(3.0) * x + tol)
+        & (y <= -np.sqrt(3.0) * (x - 1.0) + tol)
+    )
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of 11 points on or inside the equilateral triangle
+    with vertices (0,0), (1,0), (0.5, sqrt(3)/2) to maximize the minimum
+    triangle area formed by any three points.
+
+    Returns:
+        points: np.ndarray of shape (11,2) with the x,y coordinates.
+    """
+    n = 11
+    h = np.sqrt(3.0) / 2.0
+    area_total = h / 2.0  # area of the containing triangle
+
+    # Deterministic symmetric seed: distribute points on a triangular lattice
+    # pattern (rows parallel to the base), which is a strong heuristic for
+    # the Heilbronn problem.
+    seed = np.array(
+        [
+            [0.0, 0.0],
+            [0.5, h],
+            [1.0, 0.0],
+            [0.25, h / 2.0],
+            [0.75, h / 2.0],
+            [0.5, 0.0],
+            [0.125, h / 4.0],
+            [0.875, h / 4.0],
+            [0.5, h / 4.0],
+            [0.375, 3.0 * h / 4.0],
+            [0.625, 3.0 * h / 4.0],
+        ]
+    )
+
+    rng = np.random.default_rng(12345)
+    pts = seed.copy()
+    best = pts.copy()
+    best_val = _min_triangle_area(pts)
+
+    if best_val > 0:
+        # Small-budget simulated annealing refinement (deterministic seed).
+        step = 0.02
+        cur = pts.copy()
+        cur_val = best_val
+        for it in range(2000):
+            i = rng.integers(0, n)
+            delta = rng.normal(0.0, step, size=2)
+            cand = cur.copy()
+            cand[i] += delta
+            if not _inside_triangle(cand[np.newaxis, :])[0]:
+                continue
+            cand_val = _min_triangle_area(cand)
+            if cand_val >= cur_val or rng.random() < 0.05:
+                cur, cur_val = cand, cand_val
+                if cand_val > best_val:
+                    best, best_val = cand.copy(), cand_val
+            if it % 500 == 499:
+                step *= 0.7
+        pts = best
+
+    # Final safety: clip any tiny numerical violations back inside.
+    for i in range(n):
+        x, y = pts[i]
+        pts[i, 0] = min(max(x, 0.0), 1.0)
+        y_max = min(h, np.sqrt(3.0) * pts[i, 0], -np.sqrt(3.0) * (pts[i, 0] - 1.0))
+        pts[i, 1] = min(max(y, 0.0), y_max)
+
+    # Return exactly 11 points, shape (11,2).
+    assert pts.shape == (n, 2)
+    return pts
+
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,88 @@
+<NAME>
+kalman_savitzky_golay_hybrid
+</NAME>
+<DESCRIPTION>
+Replace the exponential weighted moving average with a two-stage hybrid: (1) a 1D Kalman filter with adaptive measurement noise estimated from local residuals (handles non-stationary noise, zero phase lag), and (2) a short Savitzky-Golay smoothing pass (polynomial trend preservation, minimal lag). The Kalman filter provides responsiveness with minimal lag error, while the SG filter with low order preserves genuine trends and reduces slope changes/false reversals. Output length is preserved to match expected window-based alignment (len(x) - window_size + 1) by trimming from the front, since Kalman estimates align with the most recent sample.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+    # Create weights that emphasize recent samples
+    weights = np.exp(np.linspace(-2, 0, window_size))
+    weights = weights / np.sum(weights)
+
+    for i in range(output_length):
+        window = x[i : i + window_size]
+
+        # Weighted moving average with exponential weights
+        y[i] = np.sum(window * weights)
+
+    return y
+=======
+    n = len(x)
+    x = np.asarray(x, dtype=float)
+
+    # ---- Stage 1: Adaptive Kalman filter (constant-velocity model) ----
+    q = 0.05   # process noise (signal dynamics)
+    r_base = 0.5  # base measurement noise
+    delta = 1.0
+
+    # State: [level, velocity]
+    level = x[0]
+    vel = 0.0
+    P = np.array([[1.0, 0.0], [0.0, 1.0]])
+    H = np.array([1.0, 0.0])
+    F = np.array([[1.0, delta], [0.0, 1.0]])
+    Q = q * np.array([[delta**3 / 3.0, delta**2 / 2.0],
+                      [delta**2 / 2.0, delta]])
+
+    kf_out = np.empty(n)
+    r_hist = np.empty(n)
+    for i in range(n):
+        # Predict
+        level = level + delta * vel
+        P = F @ P @ F.T + Q
+
+        # Adaptive measurement noise from innovation magnitude
+        innov = x[i] - level
+        r = r_base + 0.5 * innov * innov
+        r_hist[i] = r
+
+        # Update
+        S = P[0, 0] + r
+        K = np.array([P[0, 0] / S, P[1, 0] / S])
+        level = level + K[0] * innov
+        vel = vel + K[1] * innov
+        P = (np.eye(2) - np.outer(K, H)) @ P
+        # symmetrize for numerical stability
+        P = 0.5 * (P + P.T)
+
+        kf_out[i] = level
+
+    # ---- Stage 2: Savitzky-Golay trend-preserving smoothing ----
+    half = max(2, window_size // 6)
+    if half % 2 == 0:
+        half += 1
+        if half < 3:
+            half = 3
+    half = half if half % 2 == 1 else half + 1
+    sg_win = 2 * (half // 2) + 1  # odd window
+    if sg_win >= 5:
+        # Fixed SG coefficients (order 2) via least squares
+        idx = np.arange(-(sg_win // 2), sg_win // 2 + 1)
+        A = np.vander(idx, 3, increasing=True)
+        coef, _, _, _ = np.linalg.lstsq(A.T @ A, A.T, rcond=None)
+        # smoothing coefficients = first row of (A^T A)^-1 A^T applied to data
+        pinv = np.linalg.pinv(A)
+        h = pinv[0, :]  # coefficients for the smoothed (constant) term
+        padded = np.pad(kf_out, (sg_win // 2, sg_win // 2), mode="edge")
+        smoothed = np.convolve(padded, h[::-1], mode="valid")
+        kf_out = smoothed[:n]
+
+    # ---- Trim to expected output length (align with window semantics) ----
+    output_length = n - window_size + 1
+    return kf_out[n - output_length:]
+>>>>>>> REPLACE
+</DIFF>

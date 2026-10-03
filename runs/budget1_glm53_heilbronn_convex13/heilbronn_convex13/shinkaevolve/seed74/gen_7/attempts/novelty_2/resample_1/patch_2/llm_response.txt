@@ -1,0 +1,274 @@
+<NAME>
+implement_heilbronn_13_solver
+</NAME>
+
+<DESCRIPTION>
+Replace the placeholder constructor with a deterministic Heilbronn solver for n=13. Strategy: (1) generate several structured initial configurations (perturbed circular ring with center point, triangular lattice, 3-fold symmetric arrangements); (2) evaluate all C(13,3)=286 triangle areas exactly; (3) run a smooth soft-min (LogSumExp) local refinement via scipy Nelder-Mead when available, falling back to a built-in coordinate-perturbation hill climber; (4) rescale so the convex hull has unit area and return the best configuration found. Fixed seeds, deterministic tie-breaking, validation of point count, finiteness, and uniqueness included.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def create_points():
+    # TODO: implement the Heilbronn triangle problem solver for 13 points
+    return []
+=======
+import math
+
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:
+    _HAS_NUMPY = False
+
+
+def create_points():
+    """
+    Construct 13 points maximizing the minimum triangle area (Heilbronn problem).
+    Deterministic: fixed seeds, fixed initial configurations, exact arithmetic paths.
+    Returns a list of 13 [x, y] pairs whose convex hull has unit area.
+    """
+    n = 13
+    if _HAS_NUMPY:
+        pts = _solve_with_numpy(n)
+    else:
+        pts = _solve_pure_python(n)
+    _validate(pts, n)
+    return pts
+
+
+# ------------------------- geometry helpers -------------------------
+
+def _hull_area(pts):
+    """Area of the convex hull of pts (pure Python, works with lists)."""
+    P = sorted(set((p[0], p[1]) for p in pts))
+    if len(P) < 3:
+        return 0.0
+
+    def cross(o, a, b):
+        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+
+    lower = []
+    for p in P:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(P):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = lower[:-1] + upper[:-1]
+    if len(hull) < 3:
+        return 0.0
+    a = 0.0
+    m = len(hull)
+    for i in range(m):
+        x1, y1 = hull[i]
+        x2, y2 = hull[(i+1) % m]
+        a += x1*y2 - x2*y1
+    return abs(a) / 2.0
+
+
+def _min_triangle_area(pts):
+    """Exact minimum area over all C(n,3) triangles."""
+    n = len(pts)
+    best = float("inf")
+    for i in range(n):
+        ax, ay = pts[i]
+        for j in range(i+1, n):
+            bx, by = pts[j]
+            for k in range(j+1, n):
+                cx, cy = pts[k]
+                a = abs((bx-ax)*(cy-ay) - (by-ay)*(cx-ax)) / 2.0
+                if a < best:
+                    best = a
+    return best
+
+
+def _normalize_unit_hull(pts):
+    """Scale configuration so its convex hull has area exactly 1."""
+    area = _hull_area(pts)
+    if area <= 0:
+        return None
+    s = 1.0 / math.sqrt(area)
+    return [[p[0]*s, p[1]*s] for p in pts]
+
+
+def _validate(pts, n):
+    assert len(pts) == n, "point count mismatch"
+    for p in pts:
+        assert all(isinstance(c, float) and math.isfinite(c) for c in p)
+    seen = set()
+    for p in pts:
+        key = (round(p[0], 9), round(p[1], 9))
+        assert key not in seen, "duplicate points"
+        seen.add(key)
+
+
+# ------------------------- initial configurations -------------------------
+
+def _initial_configs(n):
+    """Deterministic structured starting configurations (raw, pre-scaling)."""
+    cfgs = []
+
+    # 1) 12 points on a slightly irregular ring + center point
+    ring = []
+    for i in range(12):
+        t = 2.0 * math.pi * i / 12.0
+        r = 1.0 + 0.02 * math.sin(3.0 * t)  # 3-fold wobble, avoids degeneracy
+        ring.append([r * math.cos(t), r * math.sin(t)])
+    cfgs.append(ring + [[0.0, 0.0]])
+
+    # 2) 3-fold symmetric: 3 rotated copies of a 4-point motif + center
+    motif = [[0.30, 0.05], [0.95, 0.10], [0.62, 0.55], [0.20, 0.90]]
+    cfg = []
+    for i in range(3):
+        t = 2.0 * math.pi * i / 3.0
+        c, s = math.cos(t), math.sin(t)
+        for (x, y) in motif:
+            cfg.append([x*c - y*s, x*s + y*c])
+    cfg.append([0.0, 0.0])
+    cfgs.append(cfg)
+
+    # 3) Triangular lattice patch (rows of 1,2,3,4,3 points)
+    cfg = []
+    h = 0.18
+    rows = [1, 2, 3, 4, 3]
+    y = -2 * h
+    for r in rows:
+        x = -(r-1) * h
+        for i in range(r):
+            cfg.append([x + 2*i*h, y])
+        y += h
+    cfgs.append(cfg)
+
+    return cfgs
+
+
+# ------------------------- pure-python solver -------------------------
+
+def _solve_pure_python(n):
+    best_pts, best_val = None, -1.0
+    for cfg in _initial_configs(n):
+        pts = _refine(cfg, iters=400)
+        norm = _normalize_unit_hull(pts)
+        if norm is None:
+            continue
+        val = _min_triangle_area(norm)
+        if val > best_val:
+            best_val, best_pts = val, norm
+    return best_pts
+
+
+def _refine(pts, iters):
+    """Deterministic hill climbing with shrinking perturbation radius."""
+    pts = [[float(p[0]), float(p[1])] for p in pts]
+    best = _min_triangle_area(_normalize_unit_hull(pts) or pts)
+    radius = 0.05
+    step = 0.6180339887498949  # golden-ratio deterministic sequence
+    counter = 0
+    for it in range(iters):
+        improved = False
+        for idx in range(len(pts)):
+            for (dx, dy) in ((radius, 0), (-radius, 0), (0, radius), (0, -radius),
+                              (radius, radius), (-radius, -radius),
+                              (radius, -radius), (-radius, radius)):
+                counter += 1
+                trial = [list(p) for p in pts]
+                # deterministic pseudo-random jitter via golden ratio
+                jx = ((step * counter * 0.6180339887) % 1.0) - 0.5
+                jy = ((step * counter * 0.3819660113) % 1.0) - 0.5
+                trial[idx][0] += dx + 0.01 * jx
+                trial[idx][1] += dy + 0.01 * jy
+                norm = _normalize_unit_hull(trial)
+                if norm is None:
+                    continue
+                val = _min_triangle_area(norm)
+                if val > best + 1e-12:
+                    best = val
+                    pts = trial
+                    improved = True
+        if not improved:
+            radius *= 0.6
+            if radius < 1e-7:
+                break
+    return pts
+
+
+# ------------------------- numpy-accelerated solver -------------------------
+
+def _solve_with_numpy(n):
+    import numpy as np
+
+    def min_tri(X):
+        P = np.asarray(X, dtype=float)
+        i, j = np.triu_indices(len(P), 1)
+        d = P[j] - P[i]
+        # all pairwise differences once
+        areas = np.abs(np.cross(P[i][:, None, :] - P[j][:, None, :],
+                               P[k_idx][:, None, :])) if False else None
+        # vectorized C(n,3): use combinatorial indexing
+        N = len(P)
+        best = np.inf
+        # efficient: for each pair (i,j), area vs all k>j is |cross(d, P[k]-P[i])|/2
+        for a in range(N-1):
+            for b in range(a+1, N):
+                d0 = P[b, 0] - P[a, 0]
+                d1 = P[b, 1] - P[a, 1]
+                v = np.abs(d0 * (P[b+1:, 1] - P[a, 1]) -
+                           d1 * (P[b+1:, 0] - P[a, 0])) / 2.0
+                m = v.min() if v.size else np.inf
+                if m < best:
+                    best = m
+        return best
+
+    best_cfg, best_val = None, -1.0
+    for cfg in _initial_configs(n):
+        X = np.array(cfg, dtype=float)
+        # Nelder-Mead on a smooth soft-min surrogate, then exact evaluation
+        try:
+            from scipy.optimize import minimize
+
+            def soft_obj(flat):
+                P = flat.reshape(-1, 2)
+                if _hull_area([list(p) for p in P]) <= 0:
+                    return 1e6
+                # soft-min via log-sum-exp over triangle areas (negated: maximize)
+                N = len(P)
+                vals = []
+                for a in range(N-2):
+                    for b in range(a+1, N-1):
+                        d0 = P[b, 0] - P[a, 0]
+                        d1 = P[b, 1] - P[a, 1]
+                        v = np.abs(d0 * (P[b+1:, 1] - P[a, 1]) -
+                                   d1 * (P[b+1:, 0] - P[a, 0])) / 2.0
+                        vals.append(v)
+                V = np.concatenate(vals)
+                t = V.min()
+                soft = t + np.log(np.exp((V - t) * 40.0).mean()) / 40.0
+                return -soft
+
+            res = minimize(soft_obj, X.flatten(), method="Nelder-Mead",
+                           options={"maxiter": 3000, "xatol": 1e-9, "fatol": 1e-12})
+            Xc = res.x.reshape(-1, 2)
+            for cand in (Xc, X):
+                norm = _normalize_unit_hull([list(p) for p in cand])
+                if norm is None:
+                    continue
+                val = _min_triangle_area(norm)
+                if val > best_val:
+                    best_val, best_cfg = val, norm
+        except Exception:
+            pass
+
+    if best_cfg is None:
+        return _solve_pure_python(n)
+
+    # final polish with pure-python refiner (deterministic)
+    polished = _refine(best_cfg, iters=150)
+    norm = _normalize_unit_hull(polished)
+    if norm is not None and _min_triangle_area(norm) > best_val:
+        best_cfg = norm
+    return best_cfg
+>>>>>>> REPLACE
+</DIFF>

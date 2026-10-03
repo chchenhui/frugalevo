@@ -1,0 +1,107 @@
+<NAME>
+confirmed_adaptive_reversals
+</NAME>
+
+<DESCRIPTION>
+Replace the single-sample reversal decision with a residual-noise-calibrated alpha-beta tracker and a two-sample directional confirmation gate. The current MAD estimate measures the full window amplitude, which confuses genuine oscillation magnitude with measurement noise. Estimating robust residual noise after the local linear fit provides a more appropriate uncertainty scale for tracker gains and reversal thresholds.
+
+A reversal is accepted immediately for a sufficiently strong, slope-supported movement, preserving responsiveness at genuine turning points. Weak opposite movements must persist for two samples before changing direction, substantially reducing noise-driven slope changes and false reversals. Innovation clipping additionally prevents isolated observations from causing large tracker excursions. This retains causal newest-sample alignment and O(N·W) vectorized fitting plus O(N) tracking latency.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    measurements = clipped @ fit_matrix[0]
+    local_slopes = clipped @ fit_matrix[1]
+
+    y = np.empty(len(measurements))
+    level = measurements[0]
+    velocity = local_slopes[0]
+    y[0] = level
+
+    for i in range(1, len(measurements)):
+        prediction = level + velocity
+        innovation = measurements[i] - prediction
+
+        # Strong, consistent local slope is treated as evidence of a real
+        # movement and receives more gain than noise around a flat trend.
+        slope_evidence = abs(local_slopes[i]) / (abs(local_slopes[i]) + local_noise[i])
+        alpha = 0.42 + 0.30 * slope_evidence
+        candidate = prediction + alpha * innovation
+        step = candidate - level
+
+        # Small changes opposite to the established velocity are usually
+        # noise-induced reversals.  The band scales with current volatility,
+        # so it relaxes automatically when the signal becomes more active.
+        reversal_band = 0.16 * local_noise[i] + 0.08 * abs(velocity)
+        if step * velocity < 0.0 and abs(step) < reversal_band:
+            candidate = level
+            step = 0.0
+
+        velocity = 0.72 * velocity + 0.28 * step
+        level = candidate
+        y[i] = level
+
+    return y
+=======
+    measurements = clipped @ fit_matrix[0]
+    local_slopes = clipped @ fit_matrix[1]
+
+    # Window amplitude is not measurement noise for an oscillating signal.
+    # Estimate noise from deviations around the fitted local trend instead.
+    coefficients = clipped @ fit_matrix.T
+    fitted_windows = coefficients[:, :1] + coefficients[:, 1:] * t[None, :]
+    residual_mad = np.median(np.abs(clipped - fitted_windows), axis=1)
+    tracker_noise = np.maximum(1.4826 * residual_mad, 0.08 * local_noise)
+
+    y = np.empty(len(measurements))
+    level = measurements[0]
+    velocity = local_slopes[0]
+    pending_direction = 0
+    pending_count = 0
+    y[0] = level
+
+    for i in range(1, len(measurements)):
+        prediction = level + velocity
+        noise_scale = tracker_noise[i]
+
+        # Bound isolated innovations while allowing the bound to expand in
+        # volatile regions.  This is a lightweight robust Kalman-style update.
+        innovation = measurements[i] - prediction
+        innovation = np.clip(innovation, -4.0 * noise_scale, 4.0 * noise_scale)
+
+        slope_evidence = abs(local_slopes[i]) / (abs(local_slopes[i]) + noise_scale)
+        alpha = 0.38 + 0.34 * slope_evidence
+        candidate = prediction + alpha * innovation
+        step = candidate - level
+
+        # A Schmitt-style confirmation gate rejects one-sample direction flips.
+        # Strong fitted-slope evidence bypasses confirmation at real turns.
+        reversal_band = 0.22 * noise_scale + 0.10 * abs(velocity)
+        opposite = step * velocity < 0.0
+        strong_turn = abs(local_slopes[i]) > 0.55 * noise_scale and abs(step) > reversal_band
+
+        if opposite and not strong_turn:
+            direction = 1 if step > 0.0 else -1
+            if direction == pending_direction:
+                pending_count += 1
+            else:
+                pending_direction = direction
+                pending_count = 1
+
+            if pending_count < 2 or abs(step) < reversal_band:
+                candidate = level
+                step = 0.0
+            else:
+                pending_count = 0
+        else:
+            pending_direction = 0
+            pending_count = 0
+
+        beta = 0.18 + 0.16 * slope_evidence
+        velocity = (1.0 - beta) * velocity + beta * step
+        level = candidate
+        y[i] = level
+
+    return y
+>>>>>>> REPLACE
+</DIFF>

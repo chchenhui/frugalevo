@@ -1,0 +1,245 @@
+<NAME>
+incremental_triangle_eval_speedup</NAME>
+<DESCRIPTION>
+The recommendation from the previous round is still the best lever: the current code recomputes all 286 triangle areas (via fancy indexing, ~286×3×2 array) AND runs the Python-loop monotone-chain hull for every single candidate — a huge waste. Two key insights:
+
+1. **Single-vertex moves**: if only vertex `v` moves, only the 66 triangles containing `v` change area. Precompute, for each vertex, the index arrays of triangles containing/not containing it. Cache the full 286-area vector; on a candidate move, evaluate only the 66 affected triangles plus a vectorized `min` over the 220 untouched cached areas.
+
+2. **Hull caching**: if `v` is not a hull vertex and the perturbed point stays inside the cached hull polygon, the hull area is unchanged — check with a vectorized point-in-convex-polygon cross-product test. Only recompute the (Python-loop) hull when `v` was a hull vertex or the point escapes the hull. Also, dropping `_rescale` during the search (score is scale-normalized anyway) avoids needless full recomputes.
+
+This gives roughly a 4x+ per-candidate speedup, converting directly into many more hill-climb iterations and restarts within the same time budget — the proven route to higher scores. Determinism preserved via the fixed seed and fixed time budget split.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _score(pts):
+    ha = _hull_area(pts)
+    if ha <= 1e-12:
+        return 0.0
+    return _areas(pts).min() / ha
+
+
+def _rescale(pts):
+    ha = _hull_area(pts)
+    if ha > 1e-12:
+        pts = pts / np.sqrt(ha)
+    return pts
+=======
+def _score(pts):
+    ha = _hull_area(pts)
+    if ha <= 1e-12:
+        return 0.0
+    return _areas(pts).min() / ha
+
+
+# Precomputed triangle-index partitions per vertex:
+# _WITH[v]    = indices (into _TRI) of the 66 triangles containing v
+# _WITHOUT[v] = indices of the 220 triangles not containing v
+_HAS = np.zeros((_N, len(_TRI)), dtype=bool)
+for _k, (_i, _j, _l) in enumerate(_TRI):
+    _HAS[_i, _k] = True
+    _HAS[_j, _k] = True
+    _HAS[_l, _k] = True
+_WITH = [np.where(_HAS[v])[0] for v in range(_N)]
+_WITHOUT = [np.where(~_HAS[v])[0] for v in range(_N)]
+
+
+def _hull_idx(pts):
+    """Monotone chain returning (hull vertex indices, hull area)."""
+    order = np.argsort(pts[:, 0], kind="stable")
+    keep = np.ones(len(order), dtype=bool)
+    P = pts[order]
+    keep[1:] = np.any(P[1:] != P[:-1], axis=1)
+    Pu = order[keep]
+    if len(Pu) < 3:
+        return np.array([], dtype=int), 0.0
+
+    def cross(o, a, b):
+        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+
+    def half(seq):
+        h = []
+        for p in seq:
+            while len(h) >= 2 and cross(pts[h[-2]], pts[h[-1]], pts[p]) <= 0:
+                h.pop()
+            h.append(int(p))
+        return h
+
+    lower = half(Pu)
+    upper = half(Pu[::-1])
+    hull = lower[:-1] + upper[:-1]
+    if len(hull) < 3:
+        return np.array([], dtype=int), 0.0
+    H = pts[np.array(hull)]
+    x, y = H[:, 0], H[:, 1]
+    area = 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+    return np.array(hull, dtype=int), area
+
+
+def _inside_hull(pt, H):
+    """Vectorized point-in-convex-polygon test (boundary counts as inside)."""
+    nxt = np.roll(H, -1, axis=0)
+    ex = nxt[:, 0] - H[:, 0]
+    ey = nxt[:, 1] - H[:, 1]
+    c = ex * (pt[1] - H[:, 1]) - ey * (pt[0] - H[:, 0])
+    return bool(np.all(c >= -1e-12) or np.all(c <= 1e-12))
+
+
+def _areas_subset(pts, rows):
+    p = pts[_TRI[rows]]
+    a = p[:, 0]
+    v1 = p[:, 1] - a
+    v2 = p[:, 2] - a
+    return np.abs(v1[:, 0]*v2[:, 1] - v1[:, 1]*v2[:, 0]) * 0.5
+
+
+def _fast_climb(pts, rng, deadline, sigma0=0.05):
+    """Adaptive hill climb with incremental evaluation.
+
+    Moves are single-vertex only, so just 66 triangle areas change per
+    candidate and the hull is recomputed only when a hull vertex moves
+    or the moved point escapes the cached hull polygon.
+    """
+    hull_idx, ha = _hull_idx(pts)
+    if ha <= 1e-12:
+        return pts, 0.0
+    areas = _areas(pts)
+    sc = areas.min() / ha
+    sigma = sigma0
+    hull_set = set(hull_idx.tolist())
+
+    while time.time() < deadline and sigma > 1e-6:
+        improved = False
+        for _ in range(80):
+            cand = pts.copy()
+            if rng.random() < 0.5:
+                # bottleneck-targeted: move a vertex of the smallest triangle
+                k = int(np.argmin(areas))
+                i, j, l = _TRI[k]
+                v = int((i, j, l)[int(rng.integers(3))])
+            else:
+                v = int(rng.integers(_N))
+            cand[v] += rng.normal(0, sigma, 2)
+            if not np.all(np.isfinite(cand[v])):
+                continue
+
+            # --- incremental hull area ---
+            if v in hull_set:
+                nh, nha = _hull_idx(cand)
+                if nha <= 1e-12:
+                    continue
+                cha, chg_hull = nha, True
+            elif _inside_hull(cand[v], pts[hull_idx]):
+                cha, chg_hull = ha, False
+            else:
+                nh, nha = _hull_idx(cand)
+                if nha <= 1e-12:
+                    continue
+                cha, chg_hull = nha, True
+
+            # --- incremental triangle areas (only triangles containing v) ---
+            new_v = _areas_subset(cand, _WITH[v])
+            cmin = min(float(areas[_WITHOUT[v]].min()), float(new_v.min()))
+            csc = cmin / cha
+            if csc > sc + 1e-12:
+                pts, sc = cand, csc
+                areas[_WITH[v]] = new_v
+                ha = cha
+                if chg_hull:
+                    hull_idx = nh
+                    hull_set = set(nh.tolist())
+                improved = True
+        if improved:
+            sigma = min(sigma * 1.15, sigma0)
+        else:
+            sigma *= 0.5
+    return pts, sc
+>>>>>>> REPLACE
+<DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def heilbronn_convex13() -> np.ndarray:
+    rng = np.random.default_rng(seed=42)
+    t_start = time.time()
+    time_limit = 2.4
+
+    inits = _make_inits(rng)
+    best_pts, best_sc = None, -1.0
+
+    for init in inits:
+        if time.time() - t_start > time_limit:
+            break
+        pts = _rescale(np.asarray(init, dtype=float).copy())
+        sc = _score(pts)
+        sigma = 0.05
+        t_seed = time.time()
+        seed_budget = (time_limit - (t_seed - t_start)) / max(1, len(inits))
+
+        while time.time() - t_start < time_limit and time.time() - t_seed < seed_budget and sigma > 1e-6:
+            improved = False
+            for _ in range(40):
+                cand = pts.copy()
+                if rng.random() < 0.5:
+                    # bottleneck-targeted move: perturb a vertex of min triangle
+                    k = int(np.argmin(_areas(pts)))
+                    i, j, l = _TRI[k]
+                    v = int(rng.choice([i, j, l]))
+                    cand[v] += rng.normal(0, sigma, 2)
+                else:
+                    k = int(rng.integers(1, 4))
+                    idxs = rng.choice(_N, size=k, replace=False)
+                    cand[idxs] += rng.normal(0, sigma, (k, 2))
+                cand = _rescale(cand)
+                csc = _score(cand)
+                if csc > sc + 1e-12:
+                    pts, sc = cand, csc
+                    improved = True
+            if not improved:
+                sigma *= 0.5
+            else:
+                sigma *= 1.15
+                sigma = min(sigma, 0.05)
+
+        if sc > best_sc:
+            best_sc = sc
+            best_pts = pts.copy()
+
+    best_pts = np.asarray(best_pts, dtype=float)
+    if not np.all(np.isfinite(best_pts)):
+        t = np.linspace(0, 2*np.pi, _N, endpoint=False)
+        best_pts = np.column_stack([np.cos(t), np.sin(t)])
+    return best_pts
+=======
+def heilbronn_convex13() -> np.ndarray:
+    rng = np.random.default_rng(seed=42)
+    t_start = time.time()
+    time_limit = 2.6
+
+    inits = _make_inits(rng)
+    best_pts, best_sc = None, -1.0
+
+    per_seed = time_limit / (len(inits) + 2)
+    for init in inits:
+        if time.time() - t_start > time_limit:
+            break
+        deadline = min(t_start + time_limit, time.time() + per_seed)
+        pts = np.asarray(init, dtype=float).copy()
+        pts, sc = _fast_climb(pts, rng, deadline, sigma0=0.05)
+        if sc > best_sc:
+            best_sc, best_pts = sc, pts.copy()
+
+    # Second phase: perturbed restarts around the best configuration
+    while time.time() - t_start < time_limit - 0.05:
+        kick = best_pts + rng.normal(0, 0.04, best_pts.shape)
+        deadline = min(t_start + time_limit,
+                       time.time() + max(0.1, (time_limit - (time.time() - t_start)) / 4))
+        pts, sc = _fast_climb(kick.copy(), rng, deadline, sigma0=0.03)
+        if sc > best_sc:
+            best_sc, best_pts = sc, pts.copy()
+
+    best_pts = np.asarray(best_pts, dtype=float)
+    if not np.all(np.isfinite(best_pts)):
+        t = np.linspace(0, 2*np.pi, _N, endpoint=False)
+        best_pts = np.column_stack([np.cos(t), np.sin(t)])
+    return best_pts
+>>>>>>> REPLACE
+</DIFF>

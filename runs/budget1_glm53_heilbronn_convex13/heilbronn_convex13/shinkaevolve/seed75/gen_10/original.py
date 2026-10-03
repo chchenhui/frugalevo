@@ -1,0 +1,189 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from itertools import combinations
+
+TRI_IDX = np.array(list(combinations(range(13), 3)), dtype=np.int64)
+NT = TRI_IDX.shape[0]
+
+
+def _convex_hull_area(pts):
+    P = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+    keep = np.ones(len(P), dtype=bool)
+    if len(P) > 1:
+        keep[1:] = np.any(P[1:] != P[:-1], axis=1)
+    P = P[keep]
+    if len(P) < 3:
+        return 0.0
+    def cross(o, a, b):
+        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+    lo = []
+    for p in P:
+        while len(lo) >= 2 and cross(lo[-2], lo[-1], p) <= 0:
+            lo.pop()
+        lo.append(p)
+    up = []
+    for p in reversed(P):
+        while len(up) >= 2 and cross(up[-2], up[-1], p) <= 0:
+            up.pop()
+        up.append(p)
+    hull = lo[:-1] + up[:-1]
+    if len(hull) < 3:
+        return 0.0
+    H = np.array(hull)
+    x, y = H[:, 0], H[:, 1]
+    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def _cross_all(pts):
+    p = pts[TRI_IDX]
+    a = p[:, 0]
+    v1 = p[:, 1] - a
+    v2 = p[:, 2] - a
+    cr = v1[:, 0]*v2[:, 1] - v1[:, 1]*v2[:, 0]
+    return cr
+
+
+def _score(pts):
+    ha = _convex_hull_area(pts)
+    if ha <= 1e-12:
+        return 0.0
+    return 0.5 * np.abs(_cross_all(pts)).min() / ha
+
+
+def _softmin_grad(pts, temp):
+    """Gradient of -(1/T)*LSE(-cr/T) w.r.t. points, plus softmin value.
+    Works with signed cross products; objective is symmetric-ish since
+    we optimize the (positive) softmin of |cr| approximated by cr^2."""
+    p = pts[TRI_IDX]           # (NT,3,2)
+    a, b, c = p[:, 0], p[:, 1], p[:, 2]
+    # signed area*2 for ordered triple; use abs via cr^2 for smoothness
+    v1x, v1y = b[:, 0]-a[:, 0], b[:, 1]-a[:, 1]
+    v2x, v2y = c[:, 0]-a[:, 0], c[:, 1]-a[:, 1]
+    cr = v1x*v2y - v1y*v2x              # (NT,)
+    acr = np.abs(cr) + 1e-12
+    # softmin over acr: w_i ∝ exp(-acr_i/T)
+    logits = -acr / temp
+    logits -= logits.max()
+    w = np.exp(logits)
+    w /= w.sum()
+    val = float((w * acr).sum())
+    # d(acr)/d(cr) = sign(cr)
+    dacr_dcr = np.sign(cr)
+    # gradient of cr wrt a,b,c
+    ga = np.stack([-v2y + v1y*0 + (v1y*0), v2x - v1x*0], axis=1)  # placeholder
+    # cr = v1x*v2y - v1y*v2x with v1=b-a, v2=c-a
+    # dcr/da = (-1)*(v2y) - (v1y)*(-1)*(-1)... compute directly:
+    # cr = (bx-ax)(cy-ay) - (by-ay)(cx-ax)
+    # da = (-(cy-ay) + (by-ay), (cx-ax) - (bx-ax))
+    da = np.stack([-(c[:, 1]-a[:, 1]) + (b[:, 1]-a[:, 1]),
+                   (c[:, 0]-a[:, 0]) - (b[:, 0]-a[:, 0])], axis=1)
+    db = np.stack([c[:, 1]-a[:, 1], -(c[:, 0]-a[:, 0])], axis=1)
+    dc = np.stack([-(b[:, 1]-a[:, 1]), b[:, 0]-a[:, 0]], axis=1)
+    # chain: d val/d cr = w * dacr_dcr  (approx: d softmin val wrt acr ~ w)
+    g = w * dacr_dcr
+    grad = np.zeros_like(pts)
+    for off, gi in ((0, da), (1, db), (2, dc)):
+        np.add.at(grad, TRI_IDX[:, off], g[:, None] * gi)
+    return val, grad
+
+
+def _adam_run(pts, deadline, steps_cap=400, lr=0.01, temp0=0.05, temp1=0.002):
+    pts = pts.copy()
+    m = np.zeros_like(pts); v = np.zeros_like(pts)
+    b1, b2, eps = 0.9, 0.999, 1e-8
+    tstep = 0
+    n_steps = steps_cap
+    for k in range(n_steps):
+        if time.time() > deadline:
+            break
+        frac = k / max(1, n_steps - 1)
+        temp = temp0 * (temp1 / temp0) ** frac
+        val, grad = _softmin_grad(pts, temp)
+        tstep += 1
+        m = b1*m + (1-b1)*grad
+        v = b2*v + (1-b2)*grad*grad
+        mh = m / (1 - b1**tstep)
+        vh = v / (1 - b2**tstep)
+        pts = pts + lr * mh / (np.sqrt(vh) + eps)
+    return pts, _score(pts)
+
+
+def _seeds(rng):
+    n = 13
+    t = np.linspace(0, 2*np.pi, n, endpoint=False)
+    seeds = []
+    seeds.append(np.column_stack([np.cos(t), np.sin(t)]))
+    seeds.append(np.column_stack([1.3*np.cos(t), 0.75*np.sin(t)]))
+    t12 = np.linspace(0, 2*np.pi, 12, endpoint=False)
+    seeds.append(np.vstack([np.column_stack([np.cos(t12), np.sin(t12)]), [[0.0, 0.0]]]))
+    t7 = np.linspace(0, 2*np.pi, 7, endpoint=False)
+    t6 = np.linspace(0, 2*np.pi, 6, endpoint=False) + np.pi/6
+    seeds.append(np.vstack([np.column_stack([np.cos(t7), np.sin(t7)]),
+                            0.5*np.column_stack([np.cos(t6), np.sin(t6)])]))
+    u = np.linspace(0, 2*np.pi, n, endpoint=False)
+    seeds.append(np.column_stack([np.sign(np.cos(u))*np.abs(np.cos(u))**0.5,
+                                  np.sign(np.sin(u))*np.abs(np.sin(u))**0.5]))
+    s = np.column_stack([np.cos(t), np.sin(t)])
+    seeds.append(s + rng.normal(0, 0.08, s.shape))
+    seeds.append(rng.random((n, 2)))
+    return seeds
+
+
+def _rescale_unit_hull(pts):
+    ha = _convex_hull_area(pts)
+    if ha > 1e-12:
+        pts = pts / np.sqrt(ha)
+    return pts
+
+
+def heilbronn_convex13() -> np.ndarray:
+    rng = np.random.default_rng(seed=42)
+    t_start = time.time()
+    time_limit = 3.0
+    n = 13
+
+    seeds = _seeds(rng)
+    results = []  # (score, pts)
+
+    # Phase 1: seed sweep with Adam softmin (~45% of budget)
+    phase1_end = t_start + time_limit * 0.45
+    per = max(0.02, (phase1_end - t_start) / len(seeds))
+    for k, s in enumerate(seeds):
+        dl = min(t_start + (k + 1) * per, phase1_end)
+        if time.time() >= dl:
+            continue
+        steps = 120
+        pts, sc = _adam_run(s, dl, steps_cap=steps, lr=0.02,
+                            temp0=0.08, temp1=0.003)
+        results.append((sc, pts))
+
+    results.sort(key=lambda r: -r[0])
+    if not results:
+        t = np.linspace(0, 2*np.pi, n, endpoint=False)
+        return np.column_stack([np.cos(t), np.sin(t)])
+    top2 = results[:2]
+
+    # Phase 2: alternate short re-anneals between top-2 basins (~55%)
+    turn = 0
+    while time.time() - t_start < time_limit - 0.06:
+        remaining = time_limit - (time.time() - t_start)
+        slice_t = min(0.18, remaining)
+        dl = time.time() + slice_t
+        sc0, p0 = top2[turn % 2]
+        kick = p0 + rng.normal(0, 0.03, p0.shape)
+        pts, sc = _adam_run(kick, dl, steps_cap=200, lr=0.008,
+                            temp0=0.05, temp1=0.0015)
+        if sc > top2[turn % 2][0]:
+            top2[turn % 2] = (sc, pts)
+        turn += 1
+
+    best_sc, best_pts = max(top2, key=lambda r: r[0])
+    best_pts = _rescale_unit_hull(np.asarray(best_pts, dtype=float))
+    if not np.all(np.isfinite(best_pts)) or best_pts.shape != (n, 2):
+        t = np.linspace(0, 2*np.pi, n, endpoint=False)
+        best_pts = np.column_stack([np.cos(t), np.sin(t)])
+    return best_pts
+
+
+# EVOLVE-BLOCK-END

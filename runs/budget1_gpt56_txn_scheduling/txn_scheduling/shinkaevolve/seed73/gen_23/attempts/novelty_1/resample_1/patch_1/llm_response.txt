@@ -1,0 +1,112 @@
+<NAME>
+pairwise_precedence_seeds
+</NAME>
+
+<DESCRIPTION>
+Add deterministic pairwise precedence probing before greedy construction. For each selected transaction pair, the simulator evaluates both possible two-transaction orders. If placing transaction A before B produces a lower conflict-aware makespan than B before A, A receives a precedence preference score and B receives the opposite score.
+
+Step-by-step:
+1. Probe both serial orders for transaction pairs using the exact simulator cost, so the signal reflects real read/write dependencies rather than transaction length or write counts.
+2. Aggregate pairwise advantages into net precedence and win/loss scores.
+3. Build several complete seed schedules by sorting transactions using different combinations of pairwise preference, pairwise wins, and singleton cost.
+4. Evaluate these full schedules and retain them if they improve upon greedy construction.
+5. Continue using the existing relocation, swap, and destroy/repair optimization, which can repair inconsistencies between pairwise preferences.
+
+This adds structured conflict-aware initial schedules that greedy prefix selection can miss, especially when the best placement of a transaction is determined by its relation to several other transactions rather than its immediate prefix cost.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Starting with different transactions is especially important for
+    # read/write hotspots: the first writer or reader can determine the
+    # critical dependency chain for the entire schedule.
+    starts = list(range(workload.num_txns))
+    random.shuffle(starts)
+    attempts = max(1, num_seqs)
+    best_cost = None
+    best_schedule = None
+
+    for attempt in range(attempts):
+        if attempt < len(starts):
+            start = starts[attempt]
+        else:
+            start = random.randrange(workload.num_txns)
+        cost, schedule = greedy_from(start)
+        if best_cost is None or cost < best_cost:
+            best_cost, best_schedule = cost, schedule
+=======
+    # Probe pairwise precedence directly with the simulator.  A low-cost
+    # two-transaction order is a useful conflict signal that greedy prefix
+    # construction cannot recover when its early prefix costs are tied.
+    n = workload.num_txns
+    preference = [0] * n
+    wins = [0] * n
+    singleton_cost = [sequence_cost([txn]) for txn in range(n)]
+
+    all_pairs = [(left, right)
+                 for left in range(n - 1)
+                 for right in range(left + 1, n)]
+    # Pair probes are inexpensive prefixes, but cap them for unusually large
+    # workloads while retaining a deterministic, evenly distributed sample.
+    pair_limit = 1500
+    if len(all_pairs) > pair_limit:
+        step = len(all_pairs) / float(pair_limit)
+        pairs = [all_pairs[int(index * step)] for index in range(pair_limit)]
+    else:
+        pairs = all_pairs
+
+    for left, right in pairs:
+        left_first = sequence_cost([left, right])
+        right_first = sequence_cost([right, left])
+        advantage = right_first - left_first
+        preference[left] += advantage
+        preference[right] -= advantage
+        if advantage > 0:
+            wins[left] += 1
+            wins[right] -= 1
+        elif advantage < 0:
+            wins[left] -= 1
+            wins[right] += 1
+
+    # Different stable rankings preserve several interpretations of pairwise
+    # evidence.  Randomized tertiary ties prevent transaction identifiers from
+    # becoming an accidental precedence rule.
+    pairwise_seeds = []
+    ranking_modes = (
+        lambda txn: (-preference[txn], -wins[txn], singleton_cost[txn]),
+        lambda txn: (-wins[txn], -preference[txn], singleton_cost[txn]),
+        lambda txn: (-preference[txn], singleton_cost[txn], -wins[txn]),
+        lambda txn: (singleton_cost[txn], -preference[txn], -wins[txn]),
+    )
+    for ranking in ranking_modes:
+        tie_break = list(range(n))
+        random.shuffle(tie_break)
+        tie_position = {txn: index for index, txn in enumerate(tie_break)}
+        pairwise_seeds.append(sorted(
+            range(n), key=lambda txn: ranking(txn) + (tie_position[txn],)
+        ))
+
+    # Starting with different transactions is especially important for
+    # read/write hotspots: the first writer or reader can determine the
+    # critical dependency chain for the entire schedule.
+    starts = list(range(n))
+    random.shuffle(starts)
+    attempts = max(1, num_seqs)
+    best_cost = None
+    best_schedule = None
+
+    for schedule in pairwise_seeds:
+        cost = sequence_cost(schedule)
+        if best_cost is None or cost < best_cost:
+            best_cost, best_schedule = cost, schedule
+
+    for attempt in range(attempts):
+        if attempt < len(starts):
+            start = starts[attempt]
+        else:
+            start = random.randrange(n)
+        cost, schedule = greedy_from(start)
+        if cost < best_cost:
+            best_cost, best_schedule = cost, schedule
+>>>>>>> REPLACE
+</DIFF>

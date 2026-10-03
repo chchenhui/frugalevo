@@ -1,0 +1,173 @@
+<NAME>
+active_powell_hybrid_heilbronn11</NAME>
+<DESCRIPTION>
+Crossover of the best-performing program (Powell softmax annealing, score 0.82) with the current program (active-set soft-min objective, L-BFGS, fast). Key combination ideas: (1) adopt the Powell optimizer with temperature annealing schedule from the highest-scoring script, since it achieved the best min-area; (2) keep the active-set bottom-k soft-min restriction from the current program, which sharpens the gradient signal on the binding constraints; (3) use the softmax parametrization (guaranteed feasibility, smooth) as in the Powell script, but seed starts from the current program's hand-designed symmetric seed and mirror-paired perturbations; (4) add a short L-BFGS-B polish pass at the final temperature for cheap local refinement; (5) keep the strict positive-area guard with rescue restarts and the non-degenerate hardcoded fallback. Determinism preserved via fixed seeds and deterministic starts.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+try:
+    from scipy.optimize import minimize as _scipy_minimize
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of n=11 points on or inside the equilateral triangle
+    with vertices (0,0), (1,0), (0.5, sqrt(3)/2) maximizing the minimum triangle
+    area over all point triplets.
+
+    Hybrid approach (crossover of Powell-softmax and active-set L-BFGS methods):
+      * Softmax parametrization of barycentric weights guarantees feasibility.
+      * Objective = temperature-annealed soft-min restricted to the bottom-k
+        ("active set") triangle areas, so the optimizer focuses on the binding
+        constraints only.
+      * Powell annealing schedule (strong global moves) followed by a short
+        L-BFGS-B polish at low temperature.
+      * Deterministic multi-start: hand-designed symmetric seed (as logits),
+        perturbed and mirror-symmetric starts, seeded random starts.
+      * Strictly-positive min-area guard with rescue restarts and a
+        non-degenerate hardcoded fallback.
+    """
+    n = 11
+    sqrt3 = np.sqrt(3.0)
+    V = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, sqrt3 / 2.0]])
+    area_T = sqrt3 / 4.0
+
+    triples = np.array(list(combinations(range(n), 3)), dtype=int)  # (C,3)
+
+    # ---------- geometry helpers ----------
+    def all_areas(pts):
+        p = pts[triples]                                   # (C,3,2)
+        cross = ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+                 - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
+        return 0.5 * np.abs(cross)
+
+    def min_area(pts):
+        return float(np.min(all_areas(pts)))
+
+    def unpack(theta):
+        """Softmax barycentric logits -> points (always feasible)."""
+        W = np.asarray(theta, dtype=float).reshape(n, 3)
+        W = W - W.max(axis=1, keepdims=True)
+        E = np.exp(W)
+        W = E / E.sum(axis=1, keepdims=True)
+        return W @ V
+
+    # ---------- active-set soft-min objective ----------
+    K_ACTIVE = 25
+
+    def active_softmin(theta, temp):
+        pts = unpack(theta)
+        a = all_areas(pts)
+        part = np.partition(a, K_ACTIVE - 1)[:K_ACTIVE]
+        m = part.min()
+        e = np.exp(-(part - m) / temp)
+        return temp * np.log(e.sum()) - m
+
+    # ---------- deterministic seeds ----------
+    rng = np.random.default_rng(12345)
+
+    base = np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.5, sqrt3 / 2.0],
+        [0.5, 0.0], [0.25, sqrt3 / 4.0], [0.75, sqrt3 / 4.0],
+        [0.25, sqrt3 / 12.0], [0.75, sqrt3 / 12.0],
+        [0.5, sqrt3 / 6.0], [0.125, sqrt3 / 8.0], [0.875, sqrt3 / 8.0],
+    ])
+
+    # barycentric coordinates of the seed -> logits
+    x, y = base[:, 0], base[:, 1]
+    wC = 2.0 * y / sqrt3
+    wB = x - 0.5 * wC
+    wA = 1.0 - wB - wC
+    bary = np.stack([wA, wB, wC], axis=1)
+
+    starts = [np.log(np.clip(bary, 1e-6, 1.0)).ravel()]
+    # perturbations around the symmetric seed
+    for _ in range(3):
+        W = np.log(np.clip(bary, 1e-4, 1.0)) + 0.3 * rng.normal(size=(n, 3))
+        starts.append(W.ravel())
+    # mirror-symmetric starts: pair point i with its reflection across x=0.5
+    for _ in range(2):
+        W = np.log(np.clip(bary, 1e-4, 1.0)) + 0.3 * rng.normal(size=(n, 3))
+        for i in range(0, n - 1, 2):
+            W[i + 1] = W[i][[1, 0, 2]]  # swap barycentric A,B = reflect
+        starts.append(W.ravel())
+    # random starts
+    for _ in range(3):
+        starts.append(rng.normal(scale=1.5, size=(n, 3)).ravel())
+
+    # ---------- optimization: Powell annealing + L-BFGS polish ----------
+    temps = (1e-2 * area_T, 1e-3 * area_T, 1e-4 * area_T)
+
+    def run_start(theta0):
+        theta = np.asarray(theta0, dtype=float).ravel()
+        if _HAVE_SCIPY:
+            for temp in temps:
+                try:
+                    res = _scipy_minimize(
+                        active_softmin, theta, args=(temp,),
+                        method="Powell",
+                        options={"maxiter": 400, "xtol": 1e-6, "ftol": 1e-8},
+                    )
+                    if np.all(np.isfinite(res.x)):
+                        theta = res.x
+                except Exception:
+                    pass
+            # cheap polish at the sharpest temperature
+            try:
+                res = _scipy_minimize(
+                    active_softmin, theta, args=(temps[-1],),
+                    method="L-BFGS-B",
+                    options={"maxiter": 150, "maxfun": 1200,
+                             "ftol": 1e-12, "gtol": 1e-10},
+                )
+                if np.all(np.isfinite(res.x)):
+                    theta = res.x
+            except Exception:
+                pass
+        return unpack(theta)
+
+    best_pts = base
+    best_val = min_area(base)
+
+    for s in starts:
+        try:
+            cand = run_start(s)
+            if not np.all(np.isfinite(cand)):
+                continue
+            v = min_area(cand)
+            if v > best_val:
+                best_val = v
+                best_pts = cand
+        except Exception:
+            continue
+
+    # ---------- strictly-positive guard with rescue restarts ----------
+    best_pts = np.asarray(best_pts, dtype=float)
+    if (best_pts.shape != (n, 2) or not np.all(np.isfinite(best_pts))
+            or min_area(best_pts) <= 0.0):
+        ok = False
+        for _ in range(3):
+            try:
+                cand = run_start(rng.normal(scale=1.5, size=(n, 3)).ravel())
+                if np.all(np.isfinite(cand)) and min_area(cand) > 0.0:
+                    best_pts = cand
+                    ok = True
+                    break
+            except Exception:
+                continue
+        if not ok:
+            best_pts = base  # non-degenerate by construction
+
+    return best_pts
+
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

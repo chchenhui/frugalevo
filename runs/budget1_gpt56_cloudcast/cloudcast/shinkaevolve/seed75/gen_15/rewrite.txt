@@ -1,0 +1,326 @@
+# EVOLVE-BLOCK-START
+import os
+import heapq
+from typing import Dict, List
+
+import networkx as nx
+import pandas as pd
+
+
+def _edge_cost(data):
+    """Return a safe non-negative edge cost, or infinity for unusable links."""
+    value = data.get("cost")
+    try:
+        value = float(value)
+        return value if value >= 0 else float("inf")
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def _clean_graph(src, G):
+    """Remove loops, inbound source links, and links without valid prices."""
+    h = nx.DiGraph()
+    h.add_nodes_from(G.nodes(data=True))
+
+    for u, v, data in G.edges(data=True):
+        if u == v or v == src:
+            continue
+        if _edge_cost(data) != float("inf"):
+            h.add_edge(u, v, **data)
+
+    return h
+
+
+def _exact_directed_steiner(src, terminals, G):
+    """
+    Exact directed Steiner arborescence DP.
+
+    dp[mask][v] is the least cost tree rooted at v that reaches every
+    terminal in mask.  States are combined at a relay node and then
+    propagated backwards over incoming links.
+    """
+    terminals = list(dict.fromkeys(terminals))
+    k = len(terminals)
+    if k == 0:
+        return set()
+
+    nodes = list(G.nodes())
+    if src not in G:
+        return None
+
+    node_index = {node: i for i, node in enumerate(nodes)}
+    n = len(nodes)
+    inf = float("inf")
+    full_mask = (1 << k) - 1
+
+    incoming = [[] for _ in range(n)]
+    for u, v, data in G.edges(data=True):
+        cost = _edge_cost(data)
+        if cost != inf:
+            incoming[node_index[v]].append((node_index[u], cost))
+
+    dp = [[inf] * n for _ in range(full_mask + 1)]
+    choice = [[None] * n for _ in range(full_mask + 1)]
+
+    for mask in range(1, full_mask + 1):
+        # A tree can branch at v into two independently served subsets.
+        if mask & (mask - 1):
+            sub = (mask - 1) & mask
+            while sub:
+                other = mask ^ sub
+                if other and sub < other:
+                    left = dp[sub]
+                    right = dp[other]
+                    current = dp[mask]
+                    current_choice = choice[mask]
+                    for vi in range(n):
+                        candidate = left[vi] + right[vi]
+                        if candidate < current[vi]:
+                            current[vi] = candidate
+                            current_choice[vi] = ("merge", sub, other)
+                sub = (sub - 1) & mask
+        else:
+            terminal_number = mask.bit_length() - 1
+            terminal = terminals[terminal_number]
+            if terminal in node_index:
+                vi = node_index[terminal]
+                dp[mask][vi] = 0.0
+                choice[mask][vi] = ("terminal", terminal_number)
+
+        # Shortest-path closure: move the root of a candidate subtree
+        # backwards through incoming graph edges.
+        distances = dp[mask][:]
+        heap = [(distances[vi], vi) for vi in range(n) if distances[vi] < inf]
+        heapq.heapify(heap)
+
+        while heap:
+            distance, current = heapq.heappop(heap)
+            if distance != distances[current]:
+                continue
+
+            for predecessor, edge_cost in incoming[current]:
+                candidate = distance + edge_cost
+                if candidate < distances[predecessor]:
+                    distances[predecessor] = candidate
+                    choice[mask][predecessor] = ("edge", current)
+                    heapq.heappush(heap, (candidate, predecessor))
+
+        dp[mask] = distances
+
+    source_index = node_index[src]
+    if dp[full_mask][source_index] == inf:
+        return None
+
+    selected_edges = set()
+    visited_states = set()
+
+    def recover(mask, vi):
+        state = (mask, vi)
+        if state in visited_states:
+            return
+        visited_states.add(state)
+
+        decision = choice[mask][vi]
+        if decision is None or decision[0] == "terminal":
+            return
+
+        if decision[0] == "merge":
+            recover(decision[1], vi)
+            recover(decision[2], vi)
+            return
+
+        if decision[0] == "edge":
+            next_vi = decision[1]
+            selected_edges.add((nodes[vi], nodes[next_vi]))
+            recover(mask, next_vi)
+
+    recover(full_mask, source_index)
+    return selected_edges
+
+
+def _greedy_multicast_tree(src, terminals, G):
+    """
+    Scalable fallback: repeatedly connect the destination with the smallest
+    marginal cost to the current tree. Existing tree edges have zero marginal
+    cost, encouraging reuse of relays and transit links.
+    """
+    selected_edges = set()
+    tree_nodes = {src}
+    remaining = set(terminals)
+
+    while remaining:
+        distances = {}
+        paths = {}
+
+        try:
+            distances, paths = nx.multi_source_dijkstra(
+                G,
+                list(tree_nodes),
+                weight=lambda u, v, data: 0.0 if (u, v) in selected_edges else _edge_cost(data),
+            )
+        except (nx.NetworkXNoPath, ValueError):
+            break
+
+        reachable = [dst for dst in remaining if dst in distances]
+        if not reachable:
+            break
+
+        destination = min(reachable, key=lambda dst: distances[dst])
+        path = paths[destination]
+
+        for u, v in zip(path, path[1:]):
+            selected_edges.add((u, v))
+            tree_nodes.add(u)
+            tree_nodes.add(v)
+
+        tree_nodes.add(destination)
+        remaining.remove(destination)
+
+    return selected_edges
+
+
+def _paths_from_tree(src, dsts, G, selected_edges):
+    """Convert a shared edge set back into source-to-destination edge paths."""
+    tree = nx.DiGraph()
+    tree.add_nodes_from(G.nodes(data=True))
+
+    for u, v in selected_edges:
+        if G.has_edge(u, v):
+            tree.add_edge(u, v, **G[u][v])
+
+    result = {}
+    for dst in dsts:
+        try:
+            node_path = nx.shortest_path(tree, src, dst)
+            result[dst] = [
+                [u, v, G[u][v]]
+                for u, v in zip(node_path, node_path[1:])
+            ]
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            # Preserve original behavior as closely as possible for terminals
+            # that cannot be reached through a shared tree.
+            try:
+                node_path = nx.dijkstra_path(G, src, dst, weight="cost")
+                result[dst] = [
+                    [u, v, G[u][v]]
+                    for u, v in zip(node_path, node_path[1:])
+                ]
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                result[dst] = []
+
+    return result
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    h = _clean_graph(src, G)
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    unique_dsts = [dst for dst in dict.fromkeys(dsts) if dst != src and dst in h]
+
+    # Exact DP is practical through nine terminals and is substantially more
+    # cost-effective than independent point-to-point shortest paths.
+    if len(unique_dsts) <= 9:
+        selected_edges = _exact_directed_steiner(src, unique_dsts, h)
+        if selected_edges is None:
+            selected_edges = _greedy_multicast_tree(src, unique_dsts, h)
+    else:
+        selected_edges = _greedy_multicast_tree(src, unique_dsts, h)
+
+    destination_paths = _paths_from_tree(src, dsts, h, selected_edges)
+
+    for dst in dsts:
+        path_edges = destination_paths.get(dst, [])
+        for partition in range(num_partitions):
+            for edge in path_edges:
+                bc_topology.append_dst_partition_path(dst, partition, edge)
+
+    return bc_topology
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]
+
+
+class BroadCastTopology:
+    def __init__(
+        self,
+        src: str,
+        dsts: List[str],
+        num_partitions: int = 4,
+        paths: Dict[str, SingleDstPath] = None,
+    ):
+        self.src = src
+        self.dsts = dsts
+        self.num_partitions = num_partitions
+
+        if paths is not None:
+            self.paths = paths
+            self.set_graph()
+        else:
+            self.paths = {
+                dst: {str(i): None for i in range(num_partitions)}
+                for dst in dsts
+            }
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        partition = str(partition)
+        self.paths[dst][partition] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    """
+    Default graph with capacity constraints and cost info.
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if cost_path is None:
+        cost = pd.read_csv(os.path.join(current_dir, "profiles/cost.csv"))
+    else:
+        cost = pd.read_csv(cost_path)
+
+    if throughput_path is None:
+        throughput = pd.read_csv(os.path.join(current_dir, "profiles/throughput.csv"))
+    else:
+        throughput = pd.read_csv(throughput_path)
+
+    G = nx.DiGraph()
+
+    for _, row in throughput.iterrows():
+        if row["src_region"] == row["dst_region"]:
+            continue
+        G.add_edge(
+            row["src_region"],
+            row["dst_region"],
+            cost=None,
+            throughput=num_vms * row["throughput_sent"] / 1e9,
+        )
+
+    for _, row in cost.iterrows():
+        if row["src"] in G and row["dest"] in G[row["src"]]:
+            G[row["src"]][row["dest"]]["cost"] = row["cost"]
+
+    no_cost_pairs = [
+        (src, dst)
+        for src, dst, data in G.edges(data=True)
+        if data.get("cost") is None
+    ]
+    print("Unable to get costs for: ", no_cost_pairs)
+
+    return G
+
+
+# EVOLVE-BLOCK-END

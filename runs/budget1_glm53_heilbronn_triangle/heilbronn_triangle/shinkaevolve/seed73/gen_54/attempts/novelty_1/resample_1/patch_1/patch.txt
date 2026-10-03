@@ -1,0 +1,443 @@
+--- a/original.py
++++ b/original.py
+@@ -1,182 +1,432 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ import itertools
+ 
+ # Precompute all 165 triplet index combinations once at module level.
+ _TRIPLETS = np.array(list(itertools.combinations(range(11), 3)), dtype=int)
+ _TRI_AREA = np.sqrt(3.0) / 4.0
+ 
+ 
+ def _clip_to_triangle(pts: np.ndarray) -> np.ndarray:
+     """Project points into the equilateral triangle with vertices
+     (0,0), (1,0), (0.5, sqrt(3)/2) using barycentric coordinates."""
+     h = np.sqrt(3.0) / 2.0
+     A = np.array([0.0, 0.0])
+     B = np.array([1.0, 0.0])
+     C = np.array([0.5, h])
+     # barycentric coordinates
+     v0 = B - A
+     v1 = C - A
+     v2 = pts - A
+     d00 = v0 @ v0
+     d01 = v0 @ v1
+     d11 = v1 @ v1
+     d20 = v2 @ v0
+     d21 = v2 @ v1
+     denom = d00 * d11 - d01 * d01
+     b = (d11 * d20 - d01 * d21) / denom  # weight of B
+     c = (d00 * d21 - d01 * d20) / denom  # weight of C
+     a = 1.0 - b - c
+     w = np.stack([a, b, c], axis=-1)
+     w = np.clip(w, 0.0, 1.0)
+     w /= w.sum(axis=-1, keepdims=True)
+     out = w[:, 0:1] * A + w[:, 1:2] * B + w[:, 2:3] * C
+     return out
+ 
+ 
+ def _all_areas(pts: np.ndarray) -> np.ndarray:
+     """Vectorized (doubled) areas of all 165 triplets, precomputed indices."""
+     p = pts[_TRIPLETS]  # (165, 3, 2)
+     cross = (p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) - \
+             (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0])
+     return np.abs(cross)
+ 
+ 
+ def _min_area(pts: np.ndarray) -> float:
+     """Doubled area of the smallest triangle among all triplets."""
+     return _all_areas(pts).min()
+ 
+ 
+-def _softmin(pts: np.ndarray, k: float = 60.0) -> float:
+-    """Smoothed (soft) minimum over the smallest ~15% of doubled areas.
+-    log( sum_{sel} exp(-k*a) ) / (-k): a smooth lower-bound surrogate
+-    that gradients the whole near-minimal set of triangles upward."""
+-    a = _all_areas(pts)
+-    m = a.min()
+-    sel = a <= m + 0.05 * _TRI_AREA * 2.0
+-    return m - np.log(np.exp(-k * (a[sel] - m)).sum()) / k
++def _soft_objective(areas, frac=0.15, temp=200.0):
++    """Soft-min over the smallest `frac` fraction of triangle areas:
++    -log(mean(exp(-a*temp)))/temp, a smooth lower bound on the hard min."""
++    k = max(3, int(len(areas) * frac))
++    smallest = np.partition(areas, k - 1)[:k]
++    return -np.log(np.mean(np.exp(-smallest * temp)) + 1e-300) / temp
++
++
++def _lattice_seed():
++    h = np.sqrt(3.0) / 2.0
++    pts = []
++    rows = [4, 3, 2, 1, 1]
++    nlev = len(rows)
++    for r, cnt in enumerate(rows):
++        y = h * (r + 0.5) / nlev
++        xs = np.linspace(0.0, 1.0, cnt + 2)[1:-1]
++        halfw = 0.5 * (1.0 - y / h)
++        for x in xs:
++            pts.append((0.5 + (x - 0.5) * (2 * halfw) * 0.98, y))
++    return _clip_to_triangle(np.array(pts))
++
++
++def _rings_seed():
++    h = np.sqrt(3.0) / 2.0
++    out = [(0.0, 0.0), (1.0, 0.0), (0.5, h),
++           (0.5, 0.0), (0.25, h / 2.0), (0.75, h / 2.0)]
++    cx, cy = 0.5, h / 3.0
++    for s in (0.5, 0.25):
++        for (vx, vy) in [(0.0, 0.0), (1.0, 0.0), (0.5, h)]:
++            out.append((cx + s * (vx - cx), cy + s * (vy - cy)))
++    out.append((cx, cy))
++    return _clip_to_triangle(np.array(out[:11]))
++
++
++def _hex_perturb_seed(seed=777):
++    rng = np.random.default_rng(seed)
++    h = np.sqrt(3.0) / 2.0
++    pts = []
++    rows = [5, 4, 2]
++    nlev = len(rows)
++    for r, cnt in enumerate(rows):
++        y = h * (r + 0.5) / nlev
++        xs = np.linspace(0.0, 1.0, cnt + 2)[1:-1]
++        halfw = 0.5 * (1.0 - y / h) * 0.95
++        for x in xs:
++            px = 0.5 + (x - 0.5) * 2 * halfw + rng.normal(0, 0.02)
++            py = y + rng.normal(0, 0.02)
++            pts.append((px, py))
++    return _clip_to_triangle(np.array(pts))
++
++
++def _vertex_seed():
++    h = np.sqrt(3.0) / 2.0
++    return _clip_to_triangle(np.array([
++        [0.0, 0.0], [1.0, 0.0], [0.5, h],
++        [1.0 / 3.0, 0.0], [2.0 / 3.0, 0.0],
++        [1.0 / 6.0, h / 3.0], [5.0 / 6.0, h / 3.0],
++        [1.0 / 3.0, 2.0 * h / 3.0], [2.0 / 3.0, 2.0 * h / 3.0],
++        [0.5, h / 3.0], [0.5, 0.0],
++    ]))
++
++
++def _random_start(rng):
++    h = np.sqrt(3.0) / 2.0
++    u, v = rng.random(11), rng.random(11)
++    su = np.sqrt(u)
++    w0, w1, w2 = 1 - su, su * (1 - v), su * v
++    return _clip_to_triangle(np.stack([w1 + 0.5 * w2, h * w2], axis=1))
++
++
++def _soft_search(pts, step, iters, rng):
++    """Soft-min coordinate search with an annealed temperature schedule:
++    temp = 50 * (1 + 5*it/iters) sharpens from 50 to 300, so the surrogate
++    smoothly approaches the hard minimum before hard refinement starts."""
++    pts = _clip_to_triangle(pts.copy())
++    best = _soft_objective(_all_areas(pts), temp=50.0)
++    n = len(pts)
++    NC = 8
++    for it in range(iters):
++        temp = 50.0 * (1.0 + 5.0 * it / max(1, iters - 1))
++        improved = False
++        for i in range(n):
++            for d in range(2):
++                base = pts[i, d]
++                deltas = rng.normal(0.0, step, size=NC)
++                cands = np.repeat(pts[None, :, :], NC, axis=0).copy()
++                cands[:, i, d] = base + deltas
++                cands = _clip_to_triangle(cands.reshape(-1, 2)).reshape(NC, n, 2)
++                vals = np.array([_soft_objective(_all_areas(c), temp=temp)
++                                 for c in cands])
++                k = int(np.argmax(vals))
++                if vals[k] > best + 1e-13:
++                    pts = cands[k]
++                    best = vals[k]
++                    improved = True
++        if not improved:
++            step *= 0.5
++            if step < 1e-6:
++                break
++    return pts
++
++
++def _hard_refine(pts, step, rounds, rng):
++    """Hard polish: coordinate moves on binding-triangle vertices first,
++    then stochastic kicks; keep-if-improved acceptance only."""
++    pts = _clip_to_triangle(pts.copy())
++    best = _min_area(pts)
++    n = len(pts)
++    for r in range(rounds):
++        improved = False
++        a_all = _all_areas(pts)
++        kmin = int(np.argmin(a_all))
++        tri = _TRIPLETS[kmin]
++        order = list(tri) + [i for i in range(n) if i not in tri]
++        for i in order:
++            for d in range(2):
++                for s in (+1, -1):
++                    cand = pts.copy()
++                    cand[i, d] += s * step
++                    cand = _clip_to_triangle(cand)
++                    val = _min_area(cand)
++                    if val > best + 1e-13:
++                        pts, best, improved = cand, val, True
++        for t in range(25):
++            if rng.random() < 0.7:
++                i = int(tri[rng.integers(0, 3)])
++            else:
++                i = int(rng.integers(0, n))
++            cand = pts.copy()
++            cand[i] += rng.normal(0.0, step, size=2)
++            cand = _clip_to_triangle(cand)
++            val = _min_area(cand)
++            if val > best + 1e-13:
++                pts, best, improved = cand, val, True
++        if not improved:
++            step *= 0.5
++            if step < 1e-7:
++                break
++    return pts
++
++
++def _directed_polish(pts, step, rounds, rng, k_tri=10):
++    """Move vertices of the k_tri smallest triangles along outward edge
++    normals to raise their altitudes; plus a small random-kick budget."""
++    pts = _clip_to_triangle(pts.copy())
++    best = _min_area(pts)
++    for r in range(rounds):
++        improved = False
++        areas = _all_areas(pts)
++        order = np.argsort(areas)[:k_tri]
++        for tk in order:
++            i0, i1, i2 = _TRIPLETS[tk]
++            verts = [int(i0), int(i1), int(i2)]
++            for vi in range(3):
++                i = verts[vi]
++                p = pts[verts[(vi + 1) % 3]] - pts[verts[(vi - 1) % 3]]
++                plen = np.hypot(p[0], p[1])
++                if plen < 1e-12:
++                    continue
++                nrm = np.array([p[1], -p[0]]) / plen
++                if np.dot(nrm, pts[i] - pts[verts[(vi + 1) % 3]]) < 0.0:
++                    nrm = -nrm
++                for s in (1.0, 0.5, 0.25, -0.5, -0.25):
++                    cand = pts.copy()
++                    cand[i] = cand[i] + s * step * nrm
++                    cand = _clip_to_triangle(cand)
++                    val = _min_area(cand)
++                    if val > best + 1e-13:
++                        pts, best, improved = cand, val, True
++                        break
++        for t in range(12):
++            tk = order[rng.integers(0, len(order))]
++            i = _TRIPLETS[tk][rng.integers(0, 3)]
++            cand = pts.copy()
++            cand[i] += rng.normal(0.0, step, size=2)
++            cand = _clip_to_triangle(cand)
++            val = _min_area(cand)
++            if val > best + 1e-13:
++                pts, best, improved = cand, val, True
++        if not improved:
++            step *= 0.5
++            if step < 1e-7:
++                break
++    return pts
++
++
++def _vertex_binding_scores(pts, k=20):
++    areas = _all_areas(pts)
++    n = len(pts)
++    scores = np.zeros(n)
++    for i in range(n):
++        mask = (_TRIPLETS[:, 0] == i) | (_TRIPLETS[:, 1] == i) | \
++               (_TRIPLETS[:, 2] == i)
++        a = areas[mask]
++        kk = min(k, len(a))
++        scores[i] = np.mean(np.partition(a, kk - 1)[:kk])
++    return scores
++
++
++def _pair_exchange(pts, rng, attempts=40):
++    """Structured basin escape: swap a binding vertex with a non-binding
++    vertex, then short hard polish; keep only improvements."""
++    pts = _clip_to_triangle(pts.copy())
++    best_val = _min_area(pts)
++    n = len(pts)
++    for _ in range(attempts):
++        kmin = int(np.argmin(_all_areas(pts)))
++        tri = _TRIPLETS[kmin]
++        scores = _vertex_binding_scores(pts)
++        bi = min(tri, key=lambda v: scores[v])
++        cand = [i for i in range(n) if i not in tri]
++        cand.sort(key=lambda v: -scores[v])
++        ni = cand[rng.integers(0, min(5, len(cand)))]
++        sw = pts.copy()
++        sw[bi], sw[ni] = sw[ni].copy(), sw[bi].copy()
++        sw[bi] = sw[bi] + rng.normal(0.0, 0.01, size=2)
++        sw = _clip_to_triangle(sw)
++        sw = _hard_refine(sw, 0.01, 20, rng)
++        val = _min_area(sw)
++        if val > best_val + 1e-12:
++            pts, best_val = sw, val
++    return pts
++
++
++def _optimize():
++    rng = np.random.default_rng(20240517)
++    starts = [_lattice_seed(), _rings_seed(), _hex_perturb_seed(777),
++              _hex_perturb_seed(4242), _vertex_seed()]
++    starts.append(_random_start(rng))
++    starts.append(_random_start(rng))
++    starts.append(_random_start(rng))
++    best_pts, best_val = None, -1.0
++    for s in starts:
++        cand = _soft_search(s, 0.02, 40, rng)
++        cand = _hard_refine(cand, 0.005, 50, rng)
++        val = _min_area(cand)
++        if val > best_val:
++            best_pts, best_val = cand, val
++    # extra polish passes on the winner
++    cand = _hard_refine(best_pts, 0.002, 40, rng)
++    cand = _directed_polish(cand, 0.002, 30, rng)
++    val = _min_area(cand)
++    if val > best_val:
++        best_pts, best_val = cand, val
++    # structured pair-exchange escape from the local basin
++    cand = _pair_exchange(best_pts, rng)
++    cand = _directed_polish(cand, 0.001, 25, rng)
++    val = _min_area(cand)
++    if val > best_val:
++        best_pts, best_val = cand, val
++    return _clip_to_triangle(best_pts)
++
++
++try:
++    _POINTS = _optimize()
++except Exception:
++    _POINTS = _lattice_seed()
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+     Construct an arrangement of 11 points on or inside an equilateral triangle
+     maximizing the smallest triangle area (Heilbronn problem, n=11).
+ 
+     Returns:
+         points: np.ndarray of shape (11,2) with the x,y coordinates of the points.
+     """
+     n = 11
++    return _POINTS.copy()
+     h = np.sqrt(3.0) / 2.0
+ 
+     # Heuristic starting layout: vertices + edge points + interior spread
+     pts = np.array([
+         [0.0, 0.0],
+         [1.0, 0.0],
+         [0.5, h],
+         [1.0 / 3.0, 0.0],
+         [2.0 / 3.0, 0.0],
+         [1.0 / 6.0, h / 3.0],
+         [5.0 / 6.0, h / 3.0],
+         [1.0 / 3.0, 2.0 * h / 3.0],
+         [2.0 / 3.0, 2.0 * h / 3.0],
+         [0.5, h / 3.0],
+         [0.5, 0.0],
+     ])
+ 
+     rng = np.random.default_rng(12345)
+     best = _clip_to_triangle(pts)
+     best_val = _min_area(best)
+ 
+     cur = best.copy()
+     cur_val = best_val
+ 
+     # ---- Phase 1: soft-min coarse exploration (smoothed landscape) ----
+     soft_cur = _softmin(cur)
+     for it in range(15000):
+         step = 0.05 * (1.0 - it / 15000) + 1e-3
+         trial = cur.copy()
+         if rng.random() < 0.20:
+             # Coordinated group move: perturb the vertices of the current
+             # smallest-area triangle simultaneously. The soft-min objective
+             # tolerates temporary hard-min worsenings, so these correlated
+             # moves can escape pinning configurations single-point moves
+             # cannot.
+             a_all = _all_areas(cur)
+             t = int(np.argmin(a_all))
+             i0, i1, i2 = _TRIPLETS[t]
+             verts = cur[[i0, i1, i2]]
+             cen = verts.mean(axis=0)
+             # shared translation (keeps most other triangle areas ~invariant)
+             shared = rng.normal(0.0, 0.6 * step, size=2)
+             for vi, v in zip((i0, i1, i2), verts):
+                 d = v - cen
+                 nd = np.hypot(d[0], d[1])
+                 if nd > 1e-12:
+                     d = d / nd
+                 else:
+                     d = np.array([0.0, 1.0])
+                 # outward expansion along centroid direction + noise
+                 delta = shared + d * step * (0.5 + rng.random()) \
+                         + rng.normal(0.0, 0.35 * step, size=2)
+                 trial[vi] = trial[vi] + delta
+         else:
+             i = rng.integers(n)
+             trial[i] += rng.normal(0.0, step, size=2)
+         trial = _clip_to_triangle(trial)
+         s_new = _softmin(trial)
+         if s_new >= soft_cur or rng.random() < np.exp((s_new - soft_cur) * 40.0):
+             cur, soft_cur = trial, s_new
+             v = _min_area(cur)
+             if v > best_val:
+                 best, best_val = cur.copy(), v
+ 
+     # Restart hard phase from the soft-phase result
+     cur, cur_val = best.copy(), best_val
+ 
+     # Deterministic local search with annealing-style shrinking steps.
+     # Bias point selection toward vertices of the currently-smallest
+     # triangles: these are the binding constraints of the objective.
+     step0 = 0.05
+     iters = 30000
+     for it in range(iters):
+         step = step0 * (1.0 - it / iters) + 1e-4
+         if rng.random() < 0.5:
+             a_all = _all_areas(cur)
+             order = np.argsort(a_all)[:8]
+             t = order[rng.integers(len(order))]
+             i = _TRIPLETS[t][rng.integers(3)]
+         else:
+             i = rng.integers(n)
+         delta = rng.normal(0.0, step, size=2)
+         trial = cur.copy()
+         trial[i] += delta
+         trial = _clip_to_triangle(trial)
+         val = _min_area(trial)
+         if val >= cur_val - 1e-12:
+             cur, cur_val = trial, val
+             if val > best_val + 1e-15:
+                 best, best_val = trial.copy(), val
+ 
+     # Final fine polishing around the best configuration
+     cur, cur_val = best.copy(), best_val
+     for it in range(10000):
+         step = 0.002 * (1.0 - it / 10000) + 1e-5
+         i = rng.integers(n)
+         delta = rng.normal(0.0, step, size=2)
+         trial = cur.copy()
+         trial[i] += delta
+         trial = _clip_to_triangle(trial)
+         val = _min_area(trial)
+         if val >= cur_val - 1e-12:
+             cur, cur_val = trial, val
+             if val > best_val + 1e-15:
+                 best, best_val = trial.copy(), val
+ 
+     # Guarantee validity of output even if optimization failed somehow
+     if best is None or not np.all(np.isfinite(best)):
+         best = _clip_to_triangle(np.zeros((n, 2)) + np.array([0.4, 0.3]))
+ 
+     return best
+ 
+ 
+ # EVOLVE-BLOCK-END

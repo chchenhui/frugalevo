@@ -1,0 +1,74 @@
+<NAME>
+rts_smoother_on_2state_kf</NAME>
+<DESCRIPTION>
+Prior programs show the 2-state [level, slope] Kalman with Q = 0.05·(median|diff|)² is a proven winner, and Gens 25/32 showed an RTS backward smoother pass reduces lag error (0.31 vs 0.35) and noise while matching correlation 0.94 — they lost only because of aggressive lead/hysteresis add-ons and the jitter-inducing 3-state model. This edit: (1) stores the filtered states and covariances (and predicted covariances) during the existing forward Kalman loop, (2) adds a standard RTS backward recursion on the [level, slope] state, and (3) feeds the smoothed level channel into the existing multi-scale SG stage, which stays unchanged. The RTS pass uses full forward+backward evidence, so it removes noise-induced wobble (fewer false reversals / slope changes) without adding lag the way a wider forward window would. We deliberately avoid slope-lead compensation, which hurt smoothness in Gens 25/26/28/32.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    kf_out = np.zeros(n)
+    kf_out[0] = x[0]
+    for i in range(1, n):
+        # Predict
+        s = F @ s
+        P = F @ P @ F.T + Q
+        # Adapt measurement noise to local volatility (robust to outliers)
+        R = max(r_arr[i] ** 2, 1e-12)
+        # Update
+        S = H @ P @ H.T + R
+        K = (P @ H.T) / S
+        innov = x[i] - (H @ s)[0]
+        # Robust gating: down-weight innovations beyond ~3 sigma
+        Sv = float(S[0, 0]) if np.ndim(S) else float(S)
+        if abs(innov) > 3.0 * np.sqrt(Sv):
+            R = R * 9.0
+            S = H @ P @ H.T + R
+            K = (P @ H.T) / S
+            innov = x[i] - (H @ s)[0]
+        s = s + (K.flatten() * innov)
+        P = P - K @ H @ P
+        kf_out[i] = s[0]
+=======
+    # Store forward pass for RTS smoothing
+    s_f = np.zeros((n, 2))       # filtered state after update
+    P_f = np.zeros((n, 2, 2))    # filtered covariance after update
+    P_pred = np.zeros((n, 2, 2)) # predicted covariance before update
+
+    kf_out = np.zeros(n)
+    kf_out[0] = x[0]
+    s_f[0] = s
+    P_f[0] = P
+    for i in range(1, n):
+        # Predict
+        s = F @ s
+        P = F @ P @ F.T + Q
+        P_pred[i] = P
+        # Adapt measurement noise to local volatility (robust to outliers)
+        R = max(r_arr[i] ** 2, 1e-12)
+        # Update
+        S = H @ P @ H.T + R
+        K = (P @ H.T) / S
+        innov = x[i] - (H @ s)[0]
+        # Robust gating: down-weight innovations beyond ~3 sigma
+        Sv = float(S[0, 0]) if np.ndim(S) else float(S)
+        if abs(innov) > 3.0 * np.sqrt(Sv):
+            R = R * 9.0
+            S = H @ P @ H.T + R
+            K = (P @ H.T) / S
+            innov = x[i] - (H @ s)[0]
+        s = s + (K.flatten() * innov)
+        P = P - K @ H @ P
+        s_f[i] = s
+        P_f[i] = P
+        kf_out[i] = s[0]
+
+    # --- Rauch-Tung-Striebel backward smoother (2-state, standard recursion) ---
+    # Uses full forward+backward evidence: removes noise-induced wobble
+    # without the lag a wider forward window would add.
+    smoothed = s_f.copy()
+    for i in range(n - 2, -1, -1):
+        Pp = P_pred[i + 1]
+        # G = P_f[i] F' Pp^{-1} via linear solve (numerically stable)
+        G = np.linalg.solve(Pp.T, (P_f[i] @ F.T).T).T
+        smoothed[i] = s_f[i] + G @ (smoothed[i + 1] - F @ s_f[i])
+    kf_out = smoothed[:, 0]
+>>>>>>> REPLACE
+</DIFF>

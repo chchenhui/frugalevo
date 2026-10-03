@@ -1,0 +1,176 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _clamp_to_triangle(pts):
+    """Project points back inside the unit equilateral triangle."""
+    s3 = np.sqrt(3.0)
+    x = np.clip(pts[:, 0], 0.0, 1.0)
+    y = pts[:, 1]
+    y = np.clip(y, 0.0, s3 * np.minimum(x, 1.0 - x))
+    return np.stack([x, y], axis=1)
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of 11 points on or inside the unit equilateral triangle
+    to maximize the smallest triangle area (Heilbronn problem, n = 11).
+
+    Strategy:
+      Phase 1: projected gradient ascent (Adam) on a soft-min (log-sum-exp)
+               objective over all 165 triangle areas, with annealed sharpness.
+      Phase 2: hard-min greedy local search that perturbs the vertices of the
+               smallest triangles, with a decaying step schedule.
+
+    Returns:
+        points: np.ndarray of shape (11,2).
+    """
+    n = 11
+    s3h = np.sqrt(3.0) / 2.0
+
+    # All point triples, vectorized index arrays.
+    tri = np.array([(i, j, k) for i in range(n) for j in range(i + 1, n)
+                    for k in range(j + 1, n)])  # (165, 3)
+    I, J, K = tri[:, 0], tri[:, 1], tri[:, 2]
+
+    def areas(pts):
+        ax, ay = pts[I, 0], pts[I, 1]
+        cr = (pts[J, 0] - ax) * (pts[K, 1] - ay) - (pts[J, 1] - ay) * (pts[K, 0] - ax)
+        return 0.5 * np.abs(cr), cr
+
+    def min_area(pts):
+        a, _ = areas(pts)
+        return a.min()
+
+    # Analytic gradient of each signed triangle area wrt its three vertices.
+    def area_grad(pts, cr):
+        """Grad of signed 2*area wrt points; returns (165, 3, 2) factor and sign."""
+        sg = np.sign(cr)
+        sg[sg == 0] = 1.0
+        g = np.zeros((len(tri), 3, 2))
+        # f = (xj-xi)(yk-yi) - (yj-yi)(xk-xi)
+        dxi = pts[J, 1] - pts[K, 1]
+        dyi = pts[K, 0] - pts[J, 0]
+        dxj = pts[K, 1] - pts[I, 1]
+        dyj = pts[I, 0] - pts[K, 0]
+        dxk = pts[J, 1] - pts[I, 1]
+        dyk = pts[I, 0] - pts[J, 0]
+        g[:, 0, 0], g[:, 0, 1] = dxi, dyi
+        g[:, 1, 0], g[:, 1, 1] = dxj, dyj
+        g[:, 2, 0], g[:, 2, 1] = dxk, dyk
+        return 0.5 * sg[:, None, None] * g
+
+    def softmin_optimize(pts, iters=3500, k0=40.0, k1=600.0, lr=0.004):
+        m = np.zeros_like(pts)
+        v = np.zeros_like(pts)
+        b1, b2, eps = 0.9, 0.999, 1e-8
+        for t in range(iters):
+            a, cr = areas(pts)
+            k = k0 * (k1 / k0) ** (t / iters)
+            w = np.exp(-k * (a - a.min()))
+            w /= w.sum()
+            g = area_grad(pts, cr)              # (165,3,2)
+            grad = np.einsum('t,tij->ij', w, g)  # weighted sum over triples
+            # scatter vertex gradients back to points
+            pgrad = np.zeros_like(pts)
+            np.add.at(pgrad, I, w[:, None] * g[:, 0])
+            np.add.at(pgrad, J, w[:, None] * g[:, 1])
+            np.add.at(pgrad, K, w[:, None] * g[:, 2])
+            # maximize: ascend
+            m = b1 * m + (1 - b1) * pgrad
+            v = b2 * v + (1 - b2) * pgrad ** 2
+            mh = m / (1 - b1 ** (t + 1))
+            vh = v / (1 - b2 ** (t + 1))
+            step = lr * mh / (np.sqrt(vh) + eps)
+            pts = _clamp_to_triangle(pts + step)
+        return pts
+
+    def polish(pts, iters=12000, scale=0.02, seed=12345):
+        rng = np.random.default_rng(seed)
+        cur = min_area(pts)
+        best_pts = pts.copy()
+        best = cur
+        for it in range(iters):
+            if best >= 0.0380:
+                break
+            a, _ = areas(pts)
+            t = int(np.argmin(a))
+            cand = pts.copy()
+            if rng.random() < 0.20:
+                # Coordinated group move: perturb all 3 vertices of the
+                # smallest triangle simultaneously with correlated deltas.
+                i0, i1, i2 = tri[t]
+                verts = pts[[i0, i1, i2]]
+                cen = verts.mean(axis=0)
+                # shared translation component (keeps other areas ~invariant)
+                shared = rng.normal(0.0, 0.6 * scale, 2)
+                for vi, v in zip((i0, i1, i2), verts):
+                    d = v - cen
+                    nd = np.hypot(*d)
+                    d = d / nd if nd > 1e-12 else np.array([0.25, s3h * 0.5])
+                    # outward expansion along centroid direction + noise
+                    delta = shared + d * scale * (0.5 + rng.random()) \
+                        + rng.normal(0.0, 0.35 * scale, 2)
+                    cand[vi] = cand[vi] + delta
+            else:
+                # single-point move on a vertex of the smallest triangle
+                pi = tri[t][rng.integers(3)]
+                cand[pi] += rng.normal(0.0, scale, 2)
+            cand = _clamp_to_triangle(cand)
+            ca = min_area(cand)
+            temp = 0.0015 * (1.0 - it / iters)
+            if ca >= cur - 1e-15 or rng.random() < np.exp((ca - cur) / max(temp, 1e-9)):
+                pts = cand
+                cur = ca
+                if ca > best:
+                    best = ca
+                    best_pts = cand.copy()
+            # never lose the incumbent: annealing state may worsen, best cannot
+            if it % 1500 == 1499:
+                scale *= 0.65
+        return best_pts
+
+    # Deterministic initial layouts (varied structured starts).
+    starts = [
+        np.array([
+            [0.0, 0.0], [1.0, 0.0], [0.5, s3h],
+            [0.25, 0.0], [0.75, 0.0],
+            [0.0, 0.5 * s3h], [1.0, 0.5 * s3h],
+            [0.125, 0.25 * s3h], [0.875, 0.25 * s3h],
+            [0.375, 0.25 * s3h], [0.625, 0.25 * s3h],
+        ]),
+        np.array([
+            [0.0, 0.0], [1.0, 0.0], [0.5, s3h],
+            [0.2, 0.0], [0.8, 0.0],
+            [0.1, 0.3 * s3h], [0.9, 0.3 * s3h],
+            [0.35, 0.15 * s3h], [0.65, 0.15 * s3h],
+            [0.35, 0.55 * s3h], [0.65, 0.55 * s3h],
+        ]),
+    ]
+    rng = np.random.default_rng(42)
+    for _ in range(2):  # two deterministic random starts
+        p = rng.random((n, 2))
+        p[:, 1] *= 0.8 * s3h
+        starts.append(_clamp_to_triangle(p))
+
+    best_pts = None
+    best_val = -1.0
+    for si, s in enumerate(starts):
+        pts = _clamp_to_triangle(np.asarray(s, dtype=float).copy())
+        try:
+            pts = softmin_optimize(pts)
+            pts = polish(pts, seed=12345 + si)
+        except Exception:
+            continue
+        val = min_area(pts)
+        if val > best_val:
+            best_val = val
+            best_pts = pts.copy()
+
+    if best_pts is None:
+        # Fallback: structured layout
+        best_pts = _clamp_to_triangle(np.asarray(starts[0], dtype=float))
+    return best_pts
+
+
+# EVOLVE-BLOCK-END

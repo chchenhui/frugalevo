@@ -1,0 +1,115 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+_N = 13
+
+# Precompute all triangle triple indices once (C(13,3) = 286).
+_TRIPLES = np.array([(i, j, k) for i in range(_N) for j in range(i + 1, _N)
+                     for k in range(j + 1, _N)], dtype=np.int64)
+
+
+def _min_triangle_area(points: np.ndarray) -> float:
+    """Exact minimum area among all C(n,3) triangles, vectorized."""
+    a = points[_TRIPLES[:, 0]]
+    b = points[_TRIPLES[:, 1]]
+    c = points[_TRIPLES[:, 2]]
+    areas = 0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+                         (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+    return float(areas.min())
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct 13 points inside a unit-area equilateral triangle (convex
+    region) maximizing the smallest triangle area. Three points are pinned
+    at the triangle vertices so the convex hull has area exactly 1; the
+    remaining 10 points are refined by a deterministic seeded
+    perturbation search (3-fold-symmetric initialization).
+
+    Returns:
+        points: np.ndarray of shape (13,2).
+    """
+    # Unit-area equilateral triangle. Side s: area = sqrt(3)/4 s^2 = 1.
+    s = 2.0 / 3.0 ** 0.25 * 3 ** 0.25  # s^2 = 4/sqrt(3)  =>  s = 2/3^(1/4)
+    s = (4.0 / np.sqrt(3.0)) ** 0.5
+    h = np.sqrt(3.0) / 2.0 * s
+    v0 = np.array([0.0, 0.0])
+    v1 = np.array([s, 0.0])
+    v2 = np.array([s / 2.0, h])
+    verts = np.array([v0, v1, v2])  # hull area = 1
+
+    # Barycentric coordinate helper: point = a*v0 + b*v1 + c*v2, a+b+c=1.
+    def bary_to_cart(bc):
+        # bc: (m,3)
+        return bc @ verts
+
+    def project(bc):
+        # clip negatives and renormalize so a,b,c >= 0, sum = 1
+        bc = np.maximum(bc, 0.0)
+        tot = bc.sum(axis=-1, keepdims=True)
+        tot = np.maximum(tot, 1e-12)
+        return bc / tot
+
+    # Initialization (barycentric): vertices + 3-fold symmetric interior set.
+    # center: (1/3,1/3,1/3)
+    init = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    # small inner triangle (rotated)
+    for i in range(3):
+        e = np.zeros(3)
+        e[i] = 0.30
+        e[(i + 1) % 3] = 0.45
+        e[(i + 2) % 3] = 0.25
+        init.append(e.tolist())
+    # mid ring: 3 points near edge midpoints
+    for i in range(3):
+        e = np.zeros(3)
+        e[i] = 0.10
+        e[(i + 1) % 3] = 0.45
+        e[(i + 2) % 3] = 0.45
+        init.append(e.tolist())
+    # outer ring: 3 points near vertices but inside
+    for i in range(3):
+        e = np.zeros(3)
+        e[i] = 0.72
+        e[(i + 1) % 3] = 0.16
+        e[(i + 2) % 3] = 0.12
+        init.append(e.tolist())
+    bc = np.array(init)  # 13 x 3
+    # order: keep vertices as first three (pinned)
+    pinned = bc[:3].copy()
+    free = bc[3:].copy()  # 10 x 3
+
+    def assemble(free):
+        return bary_to_cart(np.vstack([pinned, project(free)]))
+
+    pts = assemble(free)
+    best_val = _min_triangle_area(pts)
+
+    rng = np.random.default_rng(seed=20240713)
+    step = 0.05
+
+    # Deterministic adaptive perturbation search on the 10 free points.
+    while step > 1e-6:
+        improved = False
+        for _ in range(400):
+            cand_free = free + rng.normal(0.0, step, free.shape)
+            cand_pts = assemble(cand_free)
+            # ensure pinned vertices still form hull (they do: extreme pts)
+            val = _min_triangle_area(cand_pts)
+            if val > best_val + 1e-12:
+                free = project(cand_free)
+                best_val = val
+                pts = cand_pts
+                improved = True
+        if not improved:
+            step *= 0.5
+
+    # Final safety: verify finiteness and count.
+    assert pts.shape == (_N, 2)
+    if not np.all(np.isfinite(pts)):
+        # fallback: return initialization
+        return bary_to_cart(np.array(init))
+    return pts
+
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,162 @@
+<NAME>
+subgradient_minmax_heilbronn13
+</DESCRIPTION>
+The previous hill-climber (single-point perturbations) is too weak. The key improvement: maximize the *normalized* score directly by (1) rescaling the point set so the convex hull area is always 1 (making absolute min-triangle area equal the normalized score), and (2) using **subgradient ascent** on the min-triangle-area objective: at each step, find the argmin triangle among all 286 and move its three vertices in the direction that increases that triangle's area (the exact analytic gradient of 0.5·|cross|), with diminishing step sizes. This directly attacks the bottleneck triangle, converging orders of magnitude faster than blind perturbation. Multi-start over several deterministic seeds (regular 13-gon, ellipse, affine-stretched polygon, hashed seeds) guards against local optima, followed by a short fine-tuning perturbation phase. Everything is vectorized, seeded, and time-bounded for determinism and efficiency.
+</CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from itertools import combinations
+
+
+def _convex_hull_area(pts):
+    P = sorted(map(tuple, np.round(pts, 12)))
+    P = list(dict.fromkeys(P))
+    if len(P) < 3:
+        return 0.0
+    def cross(o, a, b):
+        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+    lower = []
+    for p in P:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(P):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = lower[:-1] + upper[:-1]
+    if len(hull) < 3:
+        return 0.0
+    H = np.array(hull)
+    x, y = H[:, 0], H[:, 1]
+    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def _min_triangle_area(pts, tri_idx):
+    p = pts[tri_idx]
+    a = p[:, 0]
+    v1 = p[:, 1] - a
+    v2 = p[:, 2] - a
+    cross = np.abs(v1[:, 0]*v2[:, 1] - v1[:, 1]*v2[:, 0])
+    return cross.min() * 0.5
+
+
+def _score(pts, tri_idx):
+    ha = _convex_hull_area(pts)
+    if ha <= 1e-12:
+        return 0.0
+    return _min_triangle_area(pts, tri_idx) / ha
+
+
+def _rescale_unit_hull(pts):
+    ha = _convex_hull_area(pts)
+    if ha > 1e-12:
+        pts = pts / np.sqrt(ha)
+    return pts
+
+
+def _subgradient_step(pts, tri_idx):
+    """Gradient step increasing the area of the currently smallest triangle."""
+    p = pts[tri_idx]
+    a = p[:, 0]
+    v1 = p[:, 1] - a
+    v2 = p[:, 2] - a
+    cross_val = v1[:, 0]*v2[:, 1] - v1[:, 1]*v2[:, 0]
+    areas = np.abs(cross_val)
+    k = int(np.argmin(areas))
+    s = 1.0 if cross_val[k] > 0 else -1.0
+    i, j, l = tri_idx[k]
+    A, B, C = pts[i], pts[j], pts[l]
+    # area = 0.5 * s * ((B-A) x (C-A)); derivative wrt points:
+    u = C - A   # = v2
+    w = B - A   # = v1
+    # dB = 0.5*s*perp(u); dC = -0.5*s*perp(w); dA = -(dB+dC)
+    perp = lambda v: np.array([-v[1], v[0]])
+    gB = 0.5 * s * perp(u)
+    gC = -0.5 * s * perp(w)
+    gA = -(gB + gC)
+    return i, gA, j, gB, l, gC
+
+
+def heilbronn_convex13() -> np.ndarray:
+    n = 13
+    rng = np.random.default_rng(seed=42)
+    tri_idx = np.array(list(combinations(range(n), 3)))
+
+    t = np.linspace(0, 2*np.pi, n, endpoint=False)
+    seeds = []
+    seeds.append(np.column_stack([np.cos(t), np.sin(t)]))
+    seeds.append(np.column_stack([1.3*np.cos(t), 0.75*np.sin(t)]))
+    s = np.column_stack([np.cos(t), np.sin(t)])
+    s += rng.normal(0, 0.05, s.shape)
+    seeds.append(s)
+    seeds.append(rng.random((n, 2)))
+    seeds.append(0.8*rng.random((n, 2)) + 0.1)
+
+    t_start = time.time()
+    time_limit = 2.5
+    best_pts, best_score = None, -1.0
+
+    per_seed = time_limit / len(seeds)
+
+    for seed_pts in seeds:
+        t_seed = time.time()
+        pts = _rescale_unit_hull(np.asarray(seed_pts, dtype=float).copy())
+        sc = _score(pts, tri_idx)
+        lr = 0.03
+        it = 0
+        local_best_pts, local_best_score = pts.copy(), sc
+
+        while time.time() - t_start < time_limit and time.time() - t_seed < per_seed:
+            it += 1
+            # several subgradient steps between checks
+            for _ in range(10):
+                i, gA, j, gB, l, gC = _subgradient_step(pts, tri_idx)
+                pts[i] += lr * gA
+                pts[j] += lr * gB
+                pts[l] += lr * gC
+                pts = _rescale_unit_hull(pts)
+            sc_new = _score(pts, tri_idx)
+            if sc_new > local_best_score + 1e-12:
+                local_best_score = sc_new
+                local_best_pts = pts.copy()
+            else:
+                pts = local_best_pts.copy()
+            lr *= 0.995
+            if lr < 1e-4:
+                break
+
+        # fine-tuning: small random multi-point perturbations
+        pts = local_best_pts.copy()
+        sc = local_best_score
+        sigma = 0.004
+        while time.time() - t_start < time_limit and time.time() - t_seed < per_seed * 1.3 and sigma > 1e-5:
+            improved = False
+            for _ in range(60):
+                cand = pts.copy()
+                k = int(rng.integers(1, 4))
+                idxs = rng.choice(n, size=k, replace=False)
+                cand[idxs] += rng.normal(0, sigma, (k, 2))
+                cand = _rescale_unit_hull(cand)
+                csc = _score(cand, tri_idx)
+                if csc > sc + 1e-12:
+                    pts, sc = cand, csc
+                    improved = True
+            sigma *= 0.6 if not improved else 1.2
+
+        if sc > best_score:
+            best_score = sc
+            best_pts = pts.copy()
+
+    best_pts = np.asarray(best_pts, dtype=float)
+    if not np.all(np.isfinite(best_pts)):
+        t = np.linspace(0, 2*np.pi, n, endpoint=False)
+        best_pts = np.column_stack([np.cos(t), np.sin(t)])
+    return best_pts
+
+
+# EVOLVE-BLOCK-END
+```

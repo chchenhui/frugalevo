@@ -1,0 +1,116 @@
+<NAME>
+anneal_min_tri11
+</NAME>
+<DESCRIPTION>
+Instead of returning zeros, this design uses a two-phase pipeline: (1) generate a deterministic structured seed configuration (boundary + interior lattice) inside the equilateral triangle, (2) run a fixed-seed simulated annealing optimizer whose objective is the normalized minimum triangle area over all 165 point triplets, computed vectorized with NumPy. The architecture is modularized into separate helper functions (area computation, boundary projection, annealing loop), improving maintainability while keeping the same zero-argument signature and (11,2) ndarray output.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+N_POINTS = 11
+TRI_AREA = np.sqrt(3.0) / 4.0  # area of unit equilateral triangle
+RNG_SEED = 20240517
+N_ITERS = 60000
+
+
+def _bary_to_xy(b):
+    """Convert barycentric-like coords (sum<=1) to xy inside the triangle."""
+    b = np.clip(b, 0.0, 1.0)
+    if b[0] + b[1] > 1.0:
+        b = b / (b[0] + b[1])
+    x = b[0] + 0.5 * b[1]
+    y = (np.sqrt(3.0) / 2.0) * b[1]
+    return np.array([x, y])
+
+
+def _seed_config():
+    """Deterministic structured seed: 3 vertices + points on edges + interior."""
+    pts = np.empty((N_POINTS, 2))
+    pts[0] = (0.0, 0.0)
+    pts[1] = (1.0, 0.0)
+    pts[2] = (0.5, np.sqrt(3.0) / 2.0)
+    # points along the three edges
+    t = [0.25, 0.5, 0.75]
+    k = 3
+    for tt in t:
+        pts[k] = (tt, 0.0); k += 1
+        pts[k] = (0.5 * (1 - tt), (np.sqrt(3) / 2) * (1 - tt)); k += 1
+        pts[k] = (1 - 0.5 * tt, (np.sqrt(3) / 2) * tt); k += 1
+    # remaining interior points
+    interior = [(0.25, 0.30), (0.55, 0.30)]
+    for c in interior:
+        pts[k] = _bary_to_xy(np.array(c)); k += 1
+    return pts
+
+
+def _min_tri_area(pts):
+    """Vectorized area of smallest triangle among all triplets (normalized)."""
+    n = len(pts)
+    i, j, k = np.array(np.meshgrid(np.arange(n), np.arange(n), np.arange(n)))
+    mask = (i < j) & (j < k)
+    i, j, k = i[mask], j[mask], k[mask]
+    a = pts[i]; b = pts[j]; c = pts[k]
+    areas = 0.5 * np.abs(
+        (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+        - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    )
+    return areas.min() / TRI_AREA
+
+
+def _project_inside(p):
+    """Clamp a point back inside the unit equilateral triangle."""
+    x, y = p
+    y = min(max(y, 0.0), np.sqrt(3) / 2.0)
+    x = min(max(x, y / np.sqrt(3)), 1.0 - y / np.sqrt(3))
+    return np.array([x, y])
+
+
+def _anneal(pts, n_iters=N_ITERS, seed=RNG_SEED):
+    rng = np.random.default_rng(seed)
+    best = pts.copy()
+    best_val = _min_tri_area(pts)
+    cur = pts.copy()
+    cur_val = best_val
+    step0 = 0.05
+    for it in range(n_iters):
+        temp = 1.0 - it / n_iters
+        step = step0 * temp + 0.002
+        idx = rng.integers(0, N_POINTS)
+        old = cur[idx].copy()
+        cand = old + rng.normal(0.0, step, size=2)
+        cand = _project_inside(cand)
+        cur[idx] = cand
+        val = _min_tri_area(cur)
+        if val >= cur_val or rng.random() < np.exp((val - cur_val) / (temp * 0.01 + 1e-9)):
+            cur_val = val
+            if val > best_val:
+                best_val = val
+                best = cur.copy()
+        else:
+            cur[idx] = old
+    return best
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of 11 points on or inside the unit equilateral
+    triangle maximizing the smallest triangle area (Heilbronn problem).
+
+    Returns:
+        points: np.ndarray of shape (11,2) of x,y coordinates.
+    """
+    try:
+        pts = _seed_config()
+        pts = _anneal(pts)
+    except Exception:
+        # Fallback: deterministic well-spread configuration
+        pts = _seed_config()
+    return np.asarray(pts, dtype=float)
+
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

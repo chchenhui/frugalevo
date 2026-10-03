@@ -1,0 +1,272 @@
+<NAME>
+hex_lp_hybrid_26pack</NAME>
+
+<DESCRIPTION>
+Crossover of the two programs: keep the LP-based hill-climb framework from the current program (which yields globally optimal radii for a given center layout), but replace the expensive scipy LP evaluation during the search loop with the fast Gauss-Seidel "water filling" + monotone repair from the second program. This makes each hill-climb iteration ~10x cheaper, letting us afford more iterations while keeping the LP only for the final, exact radius assignment. Additionally, a short deterministic overlap-repulsion refinement pass (from the second program) is run first to spread clusters before random hill-climbing, and the wall-push directed moves are retained. The result should match or exceed 2.45 while cutting runtime.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles"""
+import numpy as np
+
+
+def construct_packing():
+    """
+    Construct an arrangement of 26 circles in a unit square maximizing the
+    sum of radii via a hexagonal seed layout, fast water-filling radii,
+    deterministic overlap-repulsion refinement, and an LP hill-climb
+    evaluated with the fast radii solver (exact LP used only at the end).
+
+    Returns:
+        Tuple of (centers, radii, sum_of_radii)
+    """
+    n = 26
+    centers = np.zeros((n, 2))
+
+    # Hexagonal (staggered-row) seed: rows 5, 4, 5, 4, 5, 3 = 26.
+    s = 1.0 / (1.0 + 5.0 * np.sqrt(3.0) / 2.0)
+    h = s * np.sqrt(3.0) / 2.0
+    r = s / 2.0
+
+    row_counts = [5, 4, 5, 4, 5, 3]
+    idx = 0
+    for row, count in enumerate(row_counts):
+        y = r + row * h
+        if row % 2 == 0:
+            for j in range(count):
+                centers[idx] = [r + j * s, y]
+                idx += 1
+        else:
+            for j in range(count):
+                centers[idx] = [r + s / 2.0 + j * s, y]
+                idx += 1
+
+    # ---- Stage 1: deterministic overlap-repulsion refinement (cheap) ----
+    radii = compute_max_radii(centers)
+    n_iter = 150
+    for it in range(n_iter):
+        step = 0.02 * (1.0 - it / n_iter) + 0.0005
+        for i in range(n):
+            xi, yi = centers[i]
+            ri = radii[i]
+            fx = 0.0
+            fy = 0.0
+            for j in range(n):
+                if j == i:
+                    continue
+                dx = xi - centers[j, 0]
+                dy = yi - centers[j, 1]
+                dist = np.sqrt(dx * dx + dy * dy)
+                overlap = ri + radii[j] - dist
+                if overlap > 0.0 and dist > 1e-12:
+                    fx += overlap * dx / dist
+                    fy += overlap * dy / dist
+            if xi - ri < 0.0:
+                fx += (ri - xi)
+            if xi + ri > 1.0:
+                fx -= (xi + ri - 1.0)
+            if yi - ri < 0.0:
+                fy += (ri - yi)
+            if yi + ri > 1.0:
+                fy -= (yi + ri - 1.0)
+            norm = np.sqrt(fx * fx + fy * fy)
+            if norm > 1e-12:
+                centers[i, 0] = min(max(xi + step * fx / norm, 1e-9), 1.0 - 1e-9)
+                centers[i, 1] = min(max(yi + step * fy / norm, 1e-9), 1.0 - 1e-9)
+        if it % 10 == 9:
+            radii = compute_max_radii(centers)
+    radii = compute_max_radii(centers)
+
+    best_sum = np.sum(radii)
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+
+    # ---- Stage 2: hill-climb using the fast water-filling evaluator ----
+    rng = np.random.default_rng(12345)
+    n_iters = 600
+    for it in range(n_iters):
+        frac = 1.0 - it / n_iters
+        sigma = 0.01 + 0.04 * frac
+
+        cand = best_centers.copy()
+
+        # Directed move: push wall-limited circles inward
+        for i in range(n):
+            x, y = cand[i]
+            ri = best_radii[i]
+            if ri >= x - 1e-7:
+                cand[i, 0] += 0.5 * sigma
+            if ri >= y - 1e-7:
+                cand[i, 1] += 0.5 * sigma
+            if ri >= 1.0 - x - 1e-7:
+                cand[i, 0] -= 0.5 * sigma
+            if ri >= 1.0 - y - 1e-7:
+                cand[i, 1] -= 0.5 * sigma
+
+        # Random jitter, larger for smaller circles
+        jitter = sigma * (0.3 + 0.7 * (1.0 - best_radii / (best_radii.max() + 1e-12)))
+        cand += rng.normal(0.0, 1.0, cand.shape) * jitter[:, None]
+        cand = np.clip(cand, 0.001, 0.999)
+
+        cand_radii = compute_max_radii(cand)
+        cand_sum = np.sum(cand_radii)
+        if cand_sum > best_sum:
+            best_sum = cand_sum
+            best_centers = cand.copy()
+            best_radii = cand_radii.copy()
+
+    # ---- Stage 3: exact LP for final optimal radii at the best centers ----
+    result = solve_radii_lp(best_centers)
+    if result is not None and np.sum(result) > best_sum:
+        radii = result
+    else:
+        radii = best_radii
+
+    centers = best_centers
+    radii = radii * (1.0 - 1e-6)  # tiny safety shrink
+    sum_radii = float(np.sum(radii))
+
+    return centers, radii, sum_radii
+
+
+def compute_max_radii(centers):
+    """
+    Fast per-circle radii via Gauss-Seidel "water filling": each circle
+    grows up to the largest radius allowed by wall distances and its
+    neighbors' current radii, followed by a monotone feasibility repair
+    (only shrinks radii) that guarantees a valid packing.
+    """
+    n = centers.shape[0]
+
+    D = np.zeros((n, n))
+    wall = np.zeros(n)
+    for i in range(n):
+        x, y = centers[i]
+        wall[i] = min(x, y, 1.0 - x, 1.0 - y)
+        for j in range(i + 1, n):
+            d = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            D[i, j] = d
+            D[j, i] = d
+
+    r = np.zeros(n)
+    for _ in range(300):
+        changed = False
+        for i in range(n):
+            cap = wall[i]
+            for j in range(n):
+                if j != i and D[i, j] - r[j] < cap:
+                    cap = D[i, j] - r[j]
+            if cap < 0.0:
+                cap = 0.0
+            if abs(cap - r[i]) > 1e-12:
+                changed = True
+            r[i] = cap
+        if not changed:
+            break
+
+    # Monotone feasibility repair
+    r = np.minimum(r, wall)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if r[i] + r[j] > D[i, j]:
+                scale = D[i, j] / (r[i] + r[j])
+                r[i] *= scale
+                r[j] *= scale
+    r = np.minimum(r, wall)
+
+    return r
+
+
+def solve_radii_lp(centers, eps=1e-9):
+    """
+    Solve the linear program: maximize sum(r_i) subject to
+      r_i + r_j <= dist(i, j)  for all pairs
+      0 <= r_i <= min(x_i, y_i, 1-x_i, 1-y_i)
+    Returns optimal radii array, or None if the LP fails.
+    """
+    try:
+        from scipy.optimize import linprog
+    except ImportError:
+        return None
+
+    n = centers.shape[0]
+    c = -np.ones(n)
+
+    rows = []
+    rhs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            rows.append(row)
+            rhs.append(d - 2.0 * eps)
+
+    for i in range(n):
+        x, y = centers[i]
+        for lim in (x - eps, y - eps, 1.0 - x - eps, 1.0 - y - eps):
+            row = np.zeros(n)
+            row[i] = 1.0
+            rows.append(row)
+            rhs.append(max(lim, 0.0))
+
+    A_ub = np.vstack(rows)
+    b_ub = np.array(rhs)
+
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=[(0.0, None)] * n,
+                  method="highs")
+    if not res.success:
+        return None
+    return np.maximum(res.x, 0.0)
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)
+```
+</CODE>

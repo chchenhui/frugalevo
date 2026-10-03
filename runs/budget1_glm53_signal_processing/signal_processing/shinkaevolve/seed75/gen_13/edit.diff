@@ -1,0 +1,419 @@
+--- a/original.py
++++ b/original.py
+@@ -1,272 +1,318 @@
+ # EVOLVE-BLOCK-START
+ """
+ Real-Time Adaptive Signal Processing Algorithm for Non-Stationary Time Series
+ 
+-This algorithm implements a sliding window approach to filter volatile, non-stationary
+-time series data while minimizing noise and preserving signal dynamics.
++Approach: noise-adaptive constant-acceleration Kalman filter + Rauch-Tung-Striebel
++(RTS) fixed-interval smoother + piecewise slope-consistency trend refinement.
++This is a model-based optimal estimator rather than a windowed average, giving
++zero-phase, minimum-variance estimates with low lag and few spurious reversals.
+ """
+ import numpy as np
+ 
+ 
+ def adaptive_filter(x, window_size=20):
+     """
+-    Adaptive signal processing algorithm using sliding window approach.
++    Baseline: one-pass box filter (vectorized).
+ 
+     Args:
+         x: Input signal (1D array of real-valued samples)
+         window_size: Size of the sliding window (W samples)
+ 
+     Returns:
+         y: Filtered output signal with length = len(x) - window_size + 1
+     """
+     if len(x) < window_size:
+         raise ValueError(f"Input signal length ({len(x)}) must be >= window_size ({window_size})")
+ 
+-    # Initialize output array
+-    output_length = len(x) - window_size + 1
+-
+-    # One-pass box filter (vectorized) - much faster than the loop
+-    c = np.cumsum(np.insert(np.asarray(x, dtype=float), 0, 0.0))
++    x = np.asarray(x, dtype=float)
++    c = np.cumsum(np.insert(x, 0, 0.0))
+     y = (c[window_size:] - c[:-window_size]) / window_size
+-
+     return y
+ 
+ 
+-def enhanced_filter_with_trend_preservation(x, window_size=20):
+-    """
+-    Enhanced version with trend preservation using weighted moving average.
+-
+-    Args:
+-        x: Input signal (1D array of real-valued samples)
+-        window_size: Size of the sliding window
+-
+-    Returns:
+-        y: Filtered output signal
+-    """
+-    if len(x) < window_size:
+-        raise ValueError(f"Input signal length ({len(x)}) must be >= window_size ({window_size})")
+-
++def _robust_sigma(v):
++    """Robust standard deviation estimate via MAD."""
++    v = np.asarray(v, dtype=float)
++    med = np.median(v)
++    return max(1.4826 * np.median(np.abs(v - med)), 1e-9)
++
++
++def _rtcs_smooth(x, window_size):
++    """
++    Adaptive Kalman filter + RTS smoother + trend refinement.
++
++    State: [level, velocity, acceleration]; constant-acceleration model with
++    adaptive process/measurement noise from robust statistics of the data.
++    """
+     x = np.asarray(x, dtype=float)
+-    output_length = len(x) - window_size + 1
+-
+-    # --- Stage 1: adaptive constant-velocity Kalman filter (low lag, tracks trends) ---
+-    # Initial noise estimate from local high-frequency residuals (median abs diff)
+-    dx = np.diff(x)
+-    q_scale = np.median(np.abs(dx)) + 1e-12
+-    # Measurement noise R adapted per-step from local residual scale
+-    local_std = np.convolve(np.abs(dx), np.ones(3) / 3.0, mode="same")
+-    r_arr = np.concatenate([[q_scale], local_std]) + 1e-9
+-
+-    # State: [level, slope]; simple constant-velocity model
+-    F = np.array([[1.0, 1.0], [0.0, 1.0]])
+-    H = np.array([[1.0, 0.0]])
+-    Q = np.eye(2) * (q_scale ** 2) * 0.05  # process noise (allows trend changes)
+-    P = np.eye(2) * (r_arr[0] ** 2)
+-    s = np.array([x[0], 0.0])
+-
+     n = len(x)
+-    kf_out = np.zeros(n)
+-    kf_out[0] = x[0]
++
++    # ---- Adaptive noise estimation from robust local statistics ----
++    d1 = np.diff(x)                       # first differences -> velocity scale
++    d2 = np.diff(x, 2)                    # second differences -> acceleration scale
++    sigma_meas = _robust_sigma(d1) / np.sqrt(2.0)   # measurement noise std
++    sigma_acc = _robust_sigma(d2) / np.sqrt(6.0)    # acceleration (process) std
++
++    # Smoothing strength scales with window_size (longer window -> more smoothing)
++    scale = max(1.0, window_size / 4.0)
++    q_acc = (sigma_acc ** 2) * (0.5 * scale)
++    q_vel = (sigma_acc ** 2) * (0.05 * scale)
++    r_meas = (sigma_meas ** 2)
++
++    # ---- State-space model (constant acceleration) ----
++    F = np.array([
++        [1.0, 1.0, 0.5],
++        [0.0, 1.0, 1.0],
++        [0.0, 0.0, 1.0],
++    ])
++    H = np.array([[1.0, 0.0, 0.0]])
++    Q = np.diag([q_acc * 1e-3, q_vel, q_acc])
++    R = r_meas
++
++    # ---- Forward Kalman filter (store estimates & covariances) ----
++    xF = np.zeros((n, 3))
++    PF = np.zeros((n, 3, 3))
++    s = np.array([x[0], 0.0, 0.0])
++    P = np.eye(3) * sigma_meas ** 2
++    xF[0] = s
++    PF[0] = P
++
++    I3 = np.eye(3)
+     for i in range(1, n):
+         # Predict
+         s = F @ s
+         P = F @ P @ F.T + Q
+-        # Adapt measurement noise to local volatility (robust to outliers)
+-        R = max(r_arr[i] ** 2, 1e-12)
++        # Adaptive measurement noise: inflate when local volatility is high
++        lo = max(0, i - 5)
++        loc_scale = _robust_sigma(x[lo:i + 1] - np.median(x[lo:i + 1]))
++        R_i = R * max(0.5, min(3.0, loc_scale / sigma_meas))
+         # Update
+-        S = H @ P @ H.T + R
+-        K = (P @ H.T) / S
+-        innov = x[i] - (H @ s)[0]
+-        # Robust gating: down-weight innovations beyond ~3 sigma
+-        Sv = float(S[0, 0]) if np.ndim(S) else float(S)
+-        if abs(innov) > 3.0 * np.sqrt(Sv):
+-            R = R * 9.0
+-            S = H @ P @ H.T + R
+-            K = (P @ H.T) / S
+-            innov = x[i] - (H @ s)[0]
+-        s = s + (K.flatten() * innov)
+-        P = P - K @ H @ P
+-        kf_out[i] = s[0]
+-
+-    # --- Stage 2: stronger zero-phase Savitzky-Golay smoothing (kills slope reversals, no lag) ---
+-    sg_half = max(2, window_size // 2)
+-    sg_len = 2 * sg_half + 1
+-    poly = min(3, sg_len - 1)
+-    t_off = np.arange(-sg_half, sg_half + 1, dtype=float)
+-    A = np.vstack([t_off ** k for k in range(poly + 1)]).T
+-    ATA_inv = np.linalg.pinv(A.T @ A)
+-    coeffs = (ATA_inv @ A.T)[0]  # row for value at center -> zero-phase
+-
+-    def _zero_phase_smooth(sig, half, kernel):
+-        m = len(sig)
+-        if m < 2 * half + 1:
+-            return sig.copy()
+-        left = 2 * sig[0] - sig[1 : half + 1][::-1]
+-        right = 2 * sig[-1] - sig[-2 : -half - 2 : -1][::-1]
+-        padded = np.concatenate([left, sig, right])
+-        out = np.convolve(padded, kernel, mode="valid")
+-        return out[:m] if len(out) >= m else sig.copy()
+-
+-    smoothed = _zero_phase_smooth(kf_out, sg_half, coeffs)
+-    # Second light zero-phase pass (short window) to further suppress slope reversals
+-    h2 = max(1, sg_half // 2)
+-    t2 = np.arange(-h2, h2 + 1, dtype=float)
+-    A2 = np.vstack([t2 ** k for k in range(3)]).T
+-    c2 = (np.linalg.pinv(A2.T @ A2) @ A2.T)[0]
+-    smoothed = _zero_phase_smooth(smoothed, h2, c2)
+-
+-    # --- Stage 3: trend (lag) compensation using Kalman slope estimate ---
+-    # Estimate local slope of the smoothed signal and push output forward by the
+-    # effective smoothing look-ahead to cancel residual group delay / attenuation.
+-    slope = np.gradient(smoothed)
+-    # slope of the Kalman level estimate (already available implicitly via gradient)
+-    # compensate by the SG half-window look-ahead (zero-phase => no delay, but the
+-    # double pass attenuates sharp corners; restore with a mild slope boost)
+-    lead = 0.5 * sg_half * 0.25  # conservative fraction of look-ahead
+-    smoothed = smoothed + lead * slope
+-
+-    # --- Trim to sliding-window output length, aligning end (minimal lag) ---
+-    y = smoothed[-output_length:] if len(smoothed) >= output_length else kf_out[-output_length:]
+-
++        S = float(H @ P @ H.T) + R_i
++        K = (P @ H.T / S).flatten()
++        innov = x[i] - s[0]
++        # Robust gating: heavily down-weight outlier innovations
++        if abs(innov) > 3.0 * np.sqrt(S):
++            S = float(H @ P @ H.T) + R_i * 9.0
++            K = (P @ H.T / S).flatten()
++            innov = x[i] - s[0]
++        s = s + K * innov
++        P = (I3 - np.outer(K, H)) @ P
++        xF[i] = s
++        PF[i] = P
++
++    # ---- Backward RTS smoother pass (optimal zero-phase estimate) ----
++    xs = xF.copy()
++    Ps = PF.copy()
++    for i in range(n - 2, -1, -1):
++        # Predicted quantities at i+1 from state at i
++        P_pred = F @ PF[i] @ F.T + Q
++        # Handle singular covariance robustly
++        try:
++            G = PF[i] @ F.T @ np.linalg.inv(P_pred)
++        except np.linalg.LinAlgError:
++            G = PF[i] @ F.T @ np.linalg.pinv(P_pred)
++        xs[i] = xF[i] + G @ (xs[i + 1] - F @ xF[i])
++        Ps[i] = PF[i] + G @ (Ps[i + 1] - P_pred) @ G.T
++
++    level = xs[:, 0].copy()
++    vel = xs[:, 1].copy()
++
++    # ---- Trend-stability refinement: suppress spurious slope sign flips ----
++    # Median-filter the velocity estimate (piecewise-consistent trend) and
++    # re-project level corrections so direction changes only occur when the
++    # smoothed trend is confident.
++    def _running_median(v, k):
++        if k <= 1 or len(v) < k:
++            return v.copy()
++        half = k // 2
++        pad = np.concatenate([np.full(half, v[0]), v, np.full(half, v[-1])])
++        out = np.empty_like(v)
++        for i in range(len(v)):
++            out[i] = np.median(pad[i:i + k])
++        return out
++
++    k = min(2 * (window_size // 3) + 1, max(3, (n // 4) * 2 + 1))
++    if k % 2 == 0:
++        k += 1
++    vel_trend = _running_median(vel, k)
++
++    # Rebuild level from the consistent trend: integrate the cleaned velocity,
++    # then align it to the smoothed level (remove integration drift via HP-like fit)
++    level_trend = np.cumsum(vel_trend)
++    # Remove linear drift between level_trend and level
++    t = np.arange(n, dtype=float)
++    A = np.vstack([np.ones(n), t]).T
++    coef, *_ = np.linalg.lstsq(A, level - level_trend, rcond=None)
++    level_trend = level_trend + A @ coef
++
++    # Blend: keep RTS level for accuracy, but pull slope dynamics from clean trend
++    alpha = 0.45
++    out = (1.0 - alpha) * level + alpha * level_trend
++
++    return out
++
++
++def enhanced_filter_with_trend_preservation(x, window_size=20):
++    """
++    Adaptive Kalman + RTS smoother trend-preserving filter.
++
++    Args:
++        x: Input signal (1D array of real-valued samples)
++        window_size: Size of the sliding window
++
++    Returns:
++        y: Filtered output signal with length = len(x) - window_size + 1
++    """
++    if len(x) < window_size:
++        raise ValueError(f"Input signal length ({len(x)}) must be >= window_size ({window_size})")
++
++    x = np.asarray(x, dtype=float)
++    output_length = len(x) - window_size + 1
++
++    out = _rtcs_smooth(x, window_size)
++
++    # Trim to sliding-window output length, aligned to the end (minimal lag,
++    # since the smoother is zero-phase the remaining alignment is optimal)
++    y = out[-output_length:] if len(out) >= output_length else out
+     return y
+ 
+ 
+ def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+     """
+     Main signal processing function that applies the selected algorithm.
+ 
+     Args:
+         input_signal: Input time series data
+         window_size: Window size for processing
+         algorithm_type: Type of algorithm to use ("basic" or "enhanced")
+ 
+     Returns:
+         Filtered signal
+     """
+     if algorithm_type == "enhanced":
+         return enhanced_filter_with_trend_preservation(input_signal, window_size)
+     else:
+         return adaptive_filter(input_signal, window_size)
+ 
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+     """
+     Generate synthetic test signal with known characteristics.
+ 
+     Args:
+         length: Length of the signal
+         noise_level: Standard deviation of noise to add
+         seed: Random seed for reproducibility
+ 
+     Returns:
+         Tuple of (noisy_signal, clean_signal)
+     """
+     np.random.seed(seed)
+     t = np.linspace(0, 10, length)
+ 
+     # Create a complex signal with multiple components
+     clean_signal = (
+         2 * np.sin(2 * np.pi * 0.5 * t)  # Low frequency component
+         + 1.5 * np.sin(2 * np.pi * 2 * t)  # Medium frequency component
+         + 0.5 * np.sin(2 * np.pi * 5 * t)  # Higher frequency component
+         + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)  # Decaying oscillation
+     )
+ 
+     # Add non-stationary behavior
+     trend = 0.1 * t * np.sin(0.2 * t)  # Slowly varying trend
+     clean_signal += trend
+ 
+     # Add random walk component for non-stationarity
+     random_walk = np.cumsum(np.random.randn(length) * 0.05)
+     clean_signal += random_walk
+ 
+     # Add noise
+     noise = np.random.normal(0, noise_level, length)
+     noisy_signal = clean_signal + noise
+ 
+     return noisy_signal, clean_signal
+ 
+ 
+ def run_signal_processing(noisy_signal=None, signal_length=1000, noise_level=0.3, window_size=20):
+     """
+     Run the signal processing algorithm on a test signal.
+ 
+     Args:
+         noisy_signal: Input signal to filter (if provided, use this; otherwise generate)
+         signal_length: Length if generating signal (for backward compatibility)
+         noise_level: Noise level if generating signal (for backward compatibility)
+         window_size: Window size for processing
+ 
+     Returns:
+         Dictionary containing results and metrics
+     """
+     # Use provided signal or generate test signal (for backward compatibility)
+     if noisy_signal is not None:
+         # Filter the provided signal
+         filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+         clean_signal = None  # Not available when using provided signal
+     else:
+         # Generate test signal (for __main__ and backward compatibility)
+         noisy_signal, clean_signal = generate_test_signal(signal_length, noise_level)
+         filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+ 
+     # Calculate basic metrics (only if we have clean_signal from generation)
+     if len(filtered_signal) > 0 and clean_signal is not None:
+         # Align signals for comparison (account for processing delay)
+         delay = window_size - 1
+         aligned_clean = clean_signal[delay:]
+         aligned_noisy = noisy_signal[delay:]
+ 
+         # Ensure same length
+         min_length = min(len(filtered_signal), len(aligned_clean))
+         filtered_signal = filtered_signal[:min_length]
+         aligned_clean = aligned_clean[:min_length]
+         aligned_noisy = aligned_noisy[:min_length]
+ 
+         # Calculate correlation with clean signal
+         correlation = np.corrcoef(filtered_signal, aligned_clean)[0, 1] if min_length > 1 else 0
+ 
+         # Calculate noise reduction
+         noise_before = np.var(aligned_noisy - aligned_clean)
+         noise_after = np.var(filtered_signal - aligned_clean)
+         noise_reduction = (noise_before - noise_after) / noise_before if noise_before > 0 else 0
+ 
+         return {
+             "filtered_signal": filtered_signal,
+             "clean_signal": aligned_clean,
+             "noisy_signal": aligned_noisy,
+             "correlation": correlation,
+             "noise_reduction": noise_reduction,
+             "signal_length": min_length,
+         }
+     elif len(filtered_signal) > 0:
+         # When using provided signal (no clean_signal available), just return filtered signal
+         return {
+             "filtered_signal": filtered_signal,
+             "clean_signal": None,
+             "noisy_signal": None,
+             "correlation": 0,
+             "noise_reduction": 0,
+             "signal_length": len(filtered_signal),
+         }
+     else:
+         return {
+             "filtered_signal": [],
+             "clean_signal": [],
+             "noisy_signal": [],
+             "correlation": 0,
+             "noise_reduction": 0,
+             "signal_length": 0,
+         }
+ 
+ 
+ if __name__ == "__main__":
+     # Test the algorithm
+     results = run_signal_processing()
+     print("Signal processing completed!")
+     print(f"Correlation with clean signal: {results['correlation']:.3f}")
+     print(f"Noise reduction: {results['noise_reduction']:.3f}")
+     print(f"Processed signal length: {results['signal_length']}")

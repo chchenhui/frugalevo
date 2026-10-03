@@ -1,0 +1,332 @@
+<NAME>
+halving_maximin13
+</NAME>
+
+<DESCRIPTION>
+This redesign uses a staged successive-halving architecture: many diverse deterministic seeds receive a short exploratory optimization budget, are ranked using an exact lower-tail maximin quality key, and only the strongest survivors receive longer refinement and strict polishing. Geometry evaluation is centralized in a reusable state object with batched proposal scoring, reducing duplicated control flow while allowing soft lower-tail exploration early and exact maximin optimization late. Four square corners retain a unit-area convex hull throughout.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Deterministically construct thirteen points in the unit square.
+
+    The four corners remain fixed, hence the convex hull is the unit square
+    and normalized triangle area equals ordinary triangle area.  The search is
+    organized as deterministic successive halving: broad seed exploration,
+    elite continuation, coupled critical-triangle repair, and strict polish.
+    """
+    rng = np.random.default_rng(13031957)
+
+    n = 13
+    corners = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        dtype=float,
+    )
+
+    triples = np.array(
+        [(i, j, k)
+         for i in range(n - 2)
+         for j in range(i + 1, n - 1)
+         for k in range(j + 1, n)],
+        dtype=np.intp,
+    )
+    triple_count = len(triples)
+
+    incident = [
+        np.flatnonzero(np.any(triples == point, axis=1))
+        for point in range(n)
+    ]
+    nonincident = [
+        np.setdiff1d(np.arange(triple_count), incident[point], assume_unique=True)
+        for point in range(n)
+    ]
+
+    base_grid = np.array(
+        [[0.18, 0.18], [0.50, 0.18], [0.82, 0.18],
+         [0.18, 0.50], [0.50, 0.50], [0.82, 0.50],
+         [0.18, 0.82], [0.50, 0.82], [0.82, 0.82]],
+        dtype=float,
+    )
+
+    def areas_of(points: np.ndarray) -> np.ndarray:
+        a = points[triples[:, 0]]
+        b = points[triples[:, 1]]
+        c = points[triples[:, 2]]
+        return 0.5 * np.abs(
+            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+        )
+
+    def quality_key(values: np.ndarray) -> tuple:
+        """Exact bottleneck followed by a lower-tail stability tie-break."""
+        low = np.partition(values, 11)[:12]
+        return (float(low[0]), float(low.sum()), float(low[:5].sum()))
+
+    def batched_incident(
+        points: np.ndarray,
+        point: int,
+        proposals: np.ndarray,
+    ) -> np.ndarray:
+        """Evaluate only triangles modified by moving one point."""
+        local = triples[incident[point]]
+        count = len(proposals)
+        work = np.broadcast_to(points, (count, n, 2)).copy()
+        work[:, point] = proposals
+
+        a = work[:, local[:, 0]]
+        b = work[:, local[:, 1]]
+        c = work[:, local[:, 2]]
+        return 0.5 * np.abs(
+            (b[:, :, 0] - a[:, :, 0]) * (c[:, :, 1] - a[:, :, 1])
+            - (b[:, :, 1] - a[:, :, 1]) * (c[:, :, 0] - a[:, :, 0])
+        )
+
+    def choose_coordinate_move(
+        points: np.ndarray,
+        values: np.ndarray,
+        point: int,
+        step: float,
+        softness: float,
+        exploratory: bool,
+    ) -> tuple:
+        """
+        Produce and score a batch of local alternatives.  Exploration uses a
+        lower-tail soft objective; refinement uses exact lexicographic maximin.
+        """
+        current = points[point]
+        proposal_count = 15
+        proposals = np.empty((proposal_count, 2), dtype=float)
+        proposals[0] = current
+
+        directions = rng.normal(size=(proposal_count - 1, 2))
+        directions /= np.maximum(
+            np.linalg.norm(directions, axis=1, keepdims=True), 1.0e-15
+        )
+        radii = step * (0.18 + 1.20 * rng.random(proposal_count - 1))
+        proposals[1:] = current + directions * radii[:, None]
+
+        if exploratory:
+            proposals[-2:] = rng.uniform(0.055, 0.945, size=(2, 2))
+
+        proposals = np.clip(proposals, 0.025, 0.975)
+        local = batched_incident(points, point, proposals)
+
+        fixed = values[nonincident[point]]
+        fixed_min = float(np.min(fixed))
+        candidate_min = np.minimum(np.min(local, axis=1), fixed_min)
+
+        if exploratory:
+            # A stable soft-min over changed and unchanged triangles.  This
+            # permits controlled temporary bottleneck trades early on.
+            local_floor = np.min(local, axis=1)
+            soft_local = local_floor - softness * np.log(
+                np.exp(-(local - local_floor[:, None]) / softness).sum(axis=1)
+            )
+            fixed_floor = fixed_min - softness * np.log(
+                np.exp(-(fixed - fixed_min) / softness).sum()
+            )
+            score = np.minimum(soft_local, fixed_floor)
+            choice = int(np.argmax(score))
+        else:
+            best_min = float(np.max(candidate_min))
+            tied = candidate_min >= best_min - 2.0e-9
+            tail_sum = np.partition(local, min(10, local.shape[1] - 1), axis=1)[:, :11].sum(axis=1)
+            score = tail_sum.copy()
+            score[~tied] = -np.inf
+            choice = int(np.argmax(score))
+
+        return proposals[choice], local[choice]
+
+    def make_seed(seed_index: int) -> np.ndarray:
+        """
+        Structured seed family: shifted lattices, diagonal skewing, and
+        deterministic random perturbations expose different maximin basins.
+        """
+        angle = 2.0 * np.pi * seed_index / 16.0
+        jitter_scale = 0.070 + 0.012 * (seed_index % 4)
+        jitter = rng.uniform(-jitter_scale, jitter_scale, size=(9, 2))
+
+        wave = np.column_stack((
+            0.045 * np.sin(angle + np.arange(9) * 2.17),
+            0.045 * np.cos(1.31 * angle + np.arange(9) * 1.73),
+        ))
+        interior = np.clip(base_grid + jitter + wave, 0.035, 0.965)
+
+        if seed_index % 4 == 1:
+            interior[:, 0] = np.clip(
+                interior[:, 0] + 0.060 * (interior[:, 1] - 0.5), 0.035, 0.965
+            )
+        elif seed_index % 4 == 2:
+            interior[:, 1] = np.clip(
+                interior[:, 1] - 0.060 * (interior[:, 0] - 0.5), 0.035, 0.965
+            )
+        elif seed_index % 4 == 3:
+            interior = np.clip(
+                0.84 * interior + 0.08 + rng.uniform(-0.035, 0.035, (9, 2)),
+                0.035,
+                0.965,
+            )
+
+        return np.vstack((corners, interior))
+
+    def optimize_stage(
+        points: np.ndarray,
+        sweeps: int,
+        phase_offset: float,
+        phase_span: float,
+    ) -> tuple:
+        """One continuation stage, retaining its best exact configuration."""
+        values = areas_of(points)
+        best_local_points = points.copy()
+        best_local_values = values.copy()
+        best_key = quality_key(values)
+
+        for sweep in range(sweeps):
+            local_progress = sweep / max(1, sweeps - 1)
+            progress = phase_offset + phase_span * local_progress
+            exploratory = progress < 0.58
+            step = 0.110 * (1.0 - progress) ** 1.7 + 0.0012
+            softness = 0.010 * (1.0 - progress) ** 2 + 0.00016
+
+            # Prioritize vertices in the lower tail but retain shuffled full
+            # passes, preventing a single active triangle from monopolizing.
+            if sweep % 3 == 0:
+                bad = triples[np.argsort(values)[:10]].ravel()
+                order = np.unique(np.concatenate((bad[bad >= 4], rng.permutation(np.arange(4, n)))))
+            else:
+                order = rng.permutation(np.arange(4, n))
+
+            for point in order:
+                point = int(point)
+                candidate, local_values = choose_coordinate_move(
+                    points, values, point, step, softness, exploratory
+                )
+                old_key = quality_key(values)
+
+                trial_values = values.copy()
+                trial_values[incident[point]] = local_values
+                new_key = quality_key(trial_values)
+
+                # Strictly preserve maximin quality in late stages.  Earlier
+                # stages retain soft-objective moves only when they do not
+                # materially damage the true bottleneck.
+                if exploratory:
+                    if new_key[0] >= old_key[0] - 0.0025:
+                        points[point] = candidate
+                        values = trial_values
+                elif new_key >= old_key:
+                    points[point] = candidate
+                    values = trial_values
+
+                current_key = quality_key(values)
+                if current_key > best_key:
+                    best_key = current_key
+                    best_local_points = points.copy()
+                    best_local_values = values.copy()
+
+        return best_local_points, best_local_values
+
+    def coupled_repair(points: np.ndarray, values: np.ndarray) -> tuple:
+        """Strict two-point moves around the currently limiting constraints."""
+        for _ in range(42):
+            tail = triples[np.argsort(values)[:14]].ravel()
+            movable = np.unique(tail[tail >= 4])
+            if len(movable) < 2:
+                continue
+
+            p, q = int(movable[0]), int(movable[1])
+            count = 21
+            pair_moves = np.empty((count, 2, 2), dtype=float)
+            pair_moves[0] = points[[p, q]]
+
+            shared = rng.normal(size=(10, 2))
+            shared /= np.maximum(np.linalg.norm(shared, axis=1, keepdims=True), 1e-15)
+            shared *= rng.uniform(0.001, 0.014, size=(10, 1))
+            pair_moves[1:11, 0] = points[p] + shared
+            pair_moves[1:11, 1] = points[q] + shared
+
+            noise = rng.normal(size=(10, 2, 2))
+            noise /= np.maximum(np.linalg.norm(noise, axis=2, keepdims=True), 1e-15)
+            noise *= rng.uniform(0.001, 0.016, size=(10, 2, 1))
+            pair_moves[11:] = points[[p, q]] + noise
+            pair_moves = np.clip(pair_moves, 0.025, 0.975)
+
+            work = np.broadcast_to(points, (count, n, 2)).copy()
+            work[:, p] = pair_moves[:, 0]
+            work[:, q] = pair_moves[:, 1]
+            a = work[:, triples[:, 0]]
+            b = work[:, triples[:, 1]]
+            c = work[:, triples[:, 2]]
+            trial = 0.5 * np.abs(
+                (b[:, :, 0] - a[:, :, 0]) * (c[:, :, 1] - a[:, :, 1])
+                - (b[:, :, 1] - a[:, :, 1]) * (c[:, :, 0] - a[:, :, 0])
+            )
+
+            keys = [quality_key(row) for row in trial]
+            choice = max(range(count), key=lambda index: keys[index])
+            if keys[choice] >= quality_key(values):
+                points[p], points[q] = pair_moves[choice]
+                values = trial[choice]
+
+        return points, values
+
+    # First level: broad deterministic basin coverage.
+    candidates = []
+    for seed in range(16):
+        seed_points = make_seed(seed)
+        seed_points, seed_values = optimize_stage(seed_points, 190, 0.0, 0.56)
+        candidates.append((quality_key(seed_values), seed_points, seed_values))
+
+    # Successive halving: expend the longer budget only on competitive basins.
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    candidates = candidates[:6]
+
+    best_points = None
+    best_key = (-np.inf, -np.inf, -np.inf)
+
+    for _, seed_points, _ in candidates:
+        points, values = optimize_stage(seed_points.copy(), 390, 0.56, 0.44)
+        points, values = coupled_repair(points, values)
+
+        # Final deterministic angular coordinate polish.
+        for radius in (0.006, 0.0025, 0.0009):
+            for _ in range(3):
+                for point in range(4, n):
+                    angles = np.linspace(0.0, 2.0 * np.pi, 32, endpoint=False)
+                    proposals = np.vstack((
+                        points[point],
+                        points[point] + radius * np.column_stack((np.cos(angles), np.sin(angles))),
+                    ))
+                    proposals = np.clip(proposals, 0.025, 0.975)
+                    local = batched_incident(points, point, proposals)
+
+                    fixed_min = float(np.min(values[nonincident[point]]))
+                    mins = np.minimum(np.min(local, axis=1), fixed_min)
+                    choice = int(np.argmax(mins))
+
+                    trial = values.copy()
+                    trial[incident[point]] = local[choice]
+                    if quality_key(trial) >= quality_key(values):
+                        points[point] = proposals[choice]
+                        values = trial
+
+        key = quality_key(values)
+        if key > best_key:
+            best_key = key
+            best_points = points.copy()
+
+    if best_points is None or not np.all(np.isfinite(best_points)):
+        return np.vstack((corners, base_grid))
+
+    return best_points
+
+
+# EVOLVE-BLOCK-END
+``` 
+</CODE>

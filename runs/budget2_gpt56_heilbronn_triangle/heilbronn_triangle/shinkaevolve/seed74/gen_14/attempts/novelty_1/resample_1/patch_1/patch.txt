@@ -1,0 +1,285 @@
+--- a/original.py
++++ b/original.py
+@@ -1,93 +1,227 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+-    Deterministically construct eleven points using a maximin-area search.
+-
+-    The first three points are the vertices of the containing equilateral
+-    triangle.  Every other point is represented by two barycentric parameters,
+-    so feasibility is preserved without penalty terms.
++    Deterministically construct eleven points maximizing their minimum
++    normalized triangle area inside the reference equilateral triangle.
++
++    Optimization uses simplex coordinates (u, v), where u >= 0, v >= 0,
++    u + v <= 1.  These map affinely to the requested Cartesian triangle.
+     """
+-    height = np.sqrt(3.0) / 2.0
+-    anchors = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, height]])
++    n = 11
++    height = np.sqrt(3.0) * 0.5
++    rng = np.random.default_rng(110271)
++
+     triples = np.array(
+-        [(i, j, k) for i in range(11) for j in range(i + 1, 11)
+-         for k in range(j + 1, 11)],
+-        dtype=int,
++        [(i, j, k)
++         for i in range(n)
++         for j in range(i + 1, n)
++         for k in range(j + 1, n)],
++        dtype=np.intp,
+     )
+ 
++    affected = [
++        np.flatnonzero(np.any(triples == point, axis=1))
++        for point in range(n)
++    ]
++
+     def decode(z: np.ndarray) -> np.ndarray:
+-        # (a, b) maps to (1-b)*(1-a)*(0,0) + (1-b)*a*(1,0) + b*(.5,h).
++        """Convert eight (a, b) box parameters to Cartesian coordinates."""
+         q = np.asarray(z, dtype=float).reshape(8, 2)
+-        a, b = q[:, 0], q[:, 1]
+-        return np.vstack((anchors, np.column_stack((a * (1.0 - b) + 0.5 * b,
+-                                                      height * b))))
+-
+-    def areas(points: np.ndarray) -> np.ndarray:
+-        p, q, r = points[triples[:, 0]], points[triples[:, 1]], points[triples[:, 2]]
+-        return 0.5 * np.abs((q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1])
+-                            - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0]))
++        a = np.clip(q[:, 0], 0.0, 1.0)
++        b = np.clip(q[:, 1], 0.0, 1.0)
++        result = np.empty((n, 2), dtype=float)
++        result[:3] = ((0.0, 0.0), (1.0, 0.0), (0.5, height))
++        result[3:, 0] = a * (1.0 - b) + 0.5 * b
++        result[3:, 1] = height * b
++        return result
++
++    def simplex_from_z(z: np.ndarray) -> np.ndarray:
++        """Decode to normalized affine simplex coordinates."""
++        q = np.asarray(z, dtype=float).reshape(8, 2)
++        points = np.empty((n, 2), dtype=float)
++        points[:3] = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
++        points[3:, 0] = q[:, 0] * (1.0 - q[:, 1])
++        points[3:, 1] = q[:, 1]
++        return points
++
++    def z_from_simplex(points: np.ndarray) -> np.ndarray:
++        """Encode normalized simplex coordinates in the box parameterization."""
++        uv = np.clip(points[3:], 0.0, 1.0)
++        b = np.clip(uv[:, 1], 0.0, 1.0)
++        denominator = np.maximum(1.0 - b, 1.0e-12)
++        a = np.clip(uv[:, 0] / denominator, 0.0, 1.0)
++        return np.column_stack((a, b)).ravel()
++
++    def simplex_areas(points: np.ndarray) -> np.ndarray:
++        left = points[triples[:, 1]] - points[triples[:, 0]]
++        right = points[triples[:, 2]] - points[triples[:, 0]]
++        return np.abs(left[:, 0] * right[:, 1] - left[:, 1] * right[:, 0])
++
++    def changed_areas(
++        points: np.ndarray, point_index: int, indices: np.ndarray
++    ) -> np.ndarray:
++        t = triples[indices]
++        left = points[t[:, 1]] - points[t[:, 0]]
++        right = points[t[:, 2]] - points[t[:, 0]]
++        return np.abs(left[:, 0] * right[:, 1] - left[:, 1] * right[:, 0])
+ 
+     def quality(z: np.ndarray) -> float:
+-        return float(np.min(areas(decode(z))))
+-
+-    rng = np.random.default_rng(110271)
++        return float(np.min(simplex_areas(simplex_from_z(z))))
++
++    def merit(values: np.ndarray) -> tuple[float, float]:
++        low = np.partition(values, 13)[:14]
++        minimum = float(low[0])
++        return minimum, float(minimum + 0.065 * low.mean())
++
+     best_z = rng.random(16)
+     best_value = quality(best_z)
+ 
+     try:
+         from scipy.optimize import differential_evolution, minimize
+ 
+-        # Global exploration is important here because the minimum of 165
+-        # absolute-area functions has many narrow, nonsmooth local optima.
+         global_result = differential_evolution(
+             lambda z: -quality(z),
+             bounds=[(0.0, 1.0)] * 16,
+             seed=110271,
+             popsize=20,
+             maxiter=450,
+             tol=2.0e-8,
+             polish=False,
+             updating="immediate",
+-        )
+-        if global_result.success or np.isfinite(global_result.fun):
+-            best_z = np.clip(global_result.x, 0.0, 1.0)
+-            best_value = quality(best_z)
+-
+-        # Epigraph polishing directly maximizes the smallest triangle area.
+-        # The inequality vector contains one condition for every triplet.
+-        start = np.concatenate((best_z, [best_value]))
++            workers=1,
++        )
++        if np.isfinite(global_result.fun):
++            candidate = np.clip(global_result.x, 0.0, 1.0)
++            candidate_value = quality(candidate)
++            if candidate_value > best_value:
++                best_z = candidate
++                best_value = candidate_value
++    except Exception:
++        pass
++
++    # Incremental barycentric annealing is substantially cheaper than
++    # repeatedly evaluating all coordinates and is particularly effective at
++    # balancing the many nearly-active triangle constraints after global search.
++    points = simplex_from_z(best_z)
++    area_values = simplex_areas(points)
++    current_minimum, current_merit = merit(area_values)
++
++    for iteration in range(52000):
++        progress = iteration / 51999.0
++
++        if rng.random() < 0.70:
++            count = 12 if progress < 0.55 else 6
++            low_indices = np.argpartition(area_values, count)[:count]
++            triangle = triples[int(low_indices[rng.integers(count)])]
++            point_index = int(triangle[rng.integers(3)])
++            if point_index < 3:
++                point_index = int(rng.integers(3, n))
++        else:
++            point_index = int(rng.integers(3, n))
++
++        old_position = points[point_index].copy()
++        changed = affected[point_index]
++        old_values = area_values[changed].copy()
++
++        old_weights = np.array(
++            (1.0 - old_position[0] - old_position[1],
++             old_position[0], old_position[1]),
++            dtype=float,
++        )
++
++        scale = 0.038 * (1.0 - progress) ** 1.75 + 0.00016
++        if rng.random() < 0.10 and progress < 0.65:
++            target = rng.dirichlet((1.0, 1.0, 1.0))
++            blend = 0.10 * (1.0 - progress) + 0.012
++            weights = (1.0 - blend) * old_weights + blend * target
++        else:
++            weights = old_weights + rng.normal(0.0, scale, size=3)
++
++        weights = np.maximum(weights, 1.0e-9)
++        weights /= weights.sum()
++        points[point_index] = weights[1:]
++        area_values[changed] = changed_areas(points, point_index, changed)
++
++        candidate_minimum, candidate_merit = merit(area_values)
++        temperature = 0.0032 * (1.0 - progress) ** 2.1 + 1.0e-7
++        delta = candidate_merit - current_merit
++
++        if delta >= 0.0 or rng.random() < np.exp(max(-55.0, delta / temperature)):
++            current_minimum = candidate_minimum
++            current_merit = candidate_merit
++            if current_minimum > best_value + 1.0e-14:
++                best_z = z_from_simplex(points)
++                best_value = current_minimum
++        else:
++            points[point_index] = old_position
++            area_values[changed] = old_values
++
++    # Strict final local improvement retains only genuine maximin gains.
++    points = simplex_from_z(best_z)
++    area_values = simplex_areas(points)
++    current_minimum, current_merit = merit(area_values)
++
++    for iteration in range(18000):
++        point_index = int(rng.integers(3, n))
++        changed = affected[point_index]
++        old_position = points[point_index].copy()
++        old_values = area_values[changed].copy()
++
++        weights = np.array(
++            (1.0 - old_position[0] - old_position[1],
++             old_position[0], old_position[1]),
++            dtype=float,
++        )
++        scale = 0.0040 * (1.0 - iteration / 18000.0) + 0.00004
++        weights += rng.normal(0.0, scale, size=3)
++        weights = np.maximum(weights, 1.0e-10)
++        weights /= weights.sum()
++
++        points[point_index] = weights[1:]
++        area_values[changed] = changed_areas(points, point_index, changed)
++        candidate_minimum, candidate_merit = merit(area_values)
++
++        if (candidate_minimum > current_minimum + 1.0e-13 or
++                (abs(candidate_minimum - current_minimum) <= 1.0e-13 and
++                 candidate_merit > current_merit + 1.0e-14)):
++            current_minimum = candidate_minimum
++            current_merit = candidate_merit
++        else:
++            points[point_index] = old_position
++            area_values[changed] = old_values
++
++    candidate_z = z_from_simplex(points)
++    candidate_value = quality(candidate_z)
++    if candidate_value > best_value:
++        best_z = candidate_z
++        best_value = candidate_value
++
++    # A final epigraph solve can resolve residual active-constraint slack.
++    try:
++        from scipy.optimize import minimize
++
++        def constraints(w: np.ndarray) -> np.ndarray:
++            return simplex_areas(simplex_from_z(w[:-1])) - w[-1]
++
+         polished = minimize(
+             lambda w: -w[-1],
+-            start,
++            np.concatenate((best_z, [best_value])),
+             method="SLSQP",
+-            bounds=[(0.0, 1.0)] * 16 + [(0.0, 0.5)],
+-            constraints=[{"type": "ineq",
+-                          "fun": lambda w: areas(decode(w[:-1])) - w[-1]}],
+-            options={"maxiter": 2500, "ftol": 1.0e-12, "disp": False},
+-        )
+-        candidate = np.clip(polished.x[:-1], 0.0, 1.0)
+-        if np.isfinite(candidate).all() and quality(candidate) > best_value:
+-            best_z = candidate
++            bounds=[(0.0, 1.0)] * 16 + [(0.0, 1.0)],
++            constraints=[{"type": "ineq", "fun": constraints}],
++            options={"maxiter": 1800, "ftol": 1.0e-12, "disp": False},
++        )
++        if np.isfinite(polished.x).all():
++            trial = np.clip(polished.x[:-1], 0.0, 1.0)
++            if quality(trial) > best_value:
++                best_z = trial
+     except Exception:
+-        # Dependency-free deterministic fallback: stochastic coordinate
+-        # perturbations with decreasing radius and strict maximin acceptance.
+-        step = 0.22
+-        for iteration in range(50000):
+-            candidate = best_z.copy()
+-            coordinate = rng.integers(16)
+-            candidate[coordinate] = np.clip(
+-                candidate[coordinate] + rng.normal(scale=step), 0.0, 1.0
+-            )
+-            value = quality(candidate)
+-            if value > best_value:
+-                best_z, best_value = candidate, value
+-            if iteration % 1000 == 999:
+-                step *= 0.93
++        pass
+ 
+     return decode(best_z)
+ 
+ 
+ # EVOLVE-BLOCK-END

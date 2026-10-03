@@ -1,0 +1,305 @@
+--- a/original.py
++++ b/original.py
+@@ -1,124 +1,218 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+-    Construct an arrangement of n points on or inside a convex region in order to maximize the area of the
+-    smallest triangle formed by these points. Here n = 11.
+-
+-    Returns:
+-        points: np.ndarray of shape (11,2) with the x,y coordinates of the points.
++    Return 11 deterministic points in/on the equilateral reference triangle.
++
++    The optimization is performed in affine barycentric coordinates (b, c):
++        (x, y) = b * (1, 0) + c * (1/2, sqrt(3)/2).
++    In these coordinates, absolute determinants are normalized triangle areas.
+     """
+-    # Keep the affine hull extremities fixed.  In barycentric coordinates
+-    # (b, c), the physical point is b*(1, 0) + c*(1/2, sqrt(3)/2), and the
+-    # normalized area of a triangle is simply its determinant in (b, c).
+     if hasattr(heilbronn_triangle11, "_cached_points"):
+         return heilbronn_triangle11._cached_points.copy()
+ 
++    n = 11
++    dim = 16
+     h = np.sqrt(3.0) / 2.0
+     triples = np.asarray(
+-        [(i, j, k) for i in range(11) for j in range(i + 1, 11)
+-         for k in range(j + 1, 11)],
+-        dtype=int,
++        [(i, j, k) for i in range(n) for j in range(i + 1, n)
++         for k in range(j + 1, n)],
++        dtype=np.intp,
+     )
+ 
+-    def barycentric_from_unit(z: np.ndarray) -> np.ndarray:
+-        """Map independent unit-square variables into the unit simplex."""
+-        q = np.empty((11, 2), dtype=float)
++    def from_unit(z: np.ndarray) -> np.ndarray:
++        """Map sixteen independent unit variables to eight simplex points."""
++        z = np.asarray(z, dtype=float)
++        q = np.empty((n, 2), dtype=float)
+         q[:3] = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
+         u = z[0::2]
+         q[3:, 0] = u
+         q[3:, 1] = (1.0 - u) * z[1::2]
+         return q
+ 
+-    def minimum_area(q: np.ndarray) -> float:
++    def min_area(q: np.ndarray) -> float:
+         a = q[triples[:, 0]]
+         b = q[triples[:, 1]]
+         c = q[triples[:, 2]]
+-        return float(np.min(np.abs(
+-            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+-            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+-        )))
+-
+-    # This is also a valid deterministic answer in minimal installations.
+-    # The irrational-looking sequence avoids the many collinearities of a
+-    # triangular lattice.
++        det = ((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
++               - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
++        return float(np.min(np.abs(det)))
++
++    def objective(z):
++        """
++        Vectorized DE objective.  SciPy supplies shape (dimension, population)
++        under vectorized=True, while scalar callers supply shape (dimension,).
++        """
++        z = np.asarray(z)
++        if z.ndim == 1:
++            return -min_area(from_unit(z))
++
++        pop = z.T
++        count = pop.shape[0]
++        q = np.empty((count, n, 2), dtype=float)
++        q[:, :3, :] = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
++        u = pop[:, 0::2]
++        q[:, 3:, 0] = u
++        q[:, 3:, 1] = (1.0 - u) * pop[:, 1::2]
++
++        a = q[:, triples[:, 0], :]
++        b = q[:, triples[:, 1], :]
++        c = q[:, triples[:, 2], :]
++        det = ((b[:, :, 0] - a[:, :, 0]) * (c[:, :, 1] - a[:, :, 1])
++               - (b[:, :, 1] - a[:, :, 1]) * (c[:, :, 0] - a[:, :, 0]))
++        return -np.min(np.abs(det), axis=1)
++
++    # A deterministic, valid answer if SciPy is not available.
+     fallback_z = np.mod(
+-        np.arange(1, 17, dtype=float) * np.array(
+-            [0.6180339887498949, 0.4142135623730950] * 8
+-        ),
++        np.arange(1, dim + 1, dtype=float)
++        * np.array([0.6180339887498949, 0.4142135623730950] * 8),
+         1.0,
+     )
++    best_q = from_unit(fallback_z)
++    best_value = min_area(best_q)
+ 
+     try:
+         from scipy.optimize import differential_evolution, minimize
+ 
+-        result = differential_evolution(
+-            lambda z: -minimum_area(barycentric_from_unit(z)),
+-            bounds=[(0.0, 1.0)] * 16,
++        bounds = [(0.0, 1.0)] * dim
++
++        # Stage one: broad, vectorized global order-type search.
++        broad = differential_evolution(
++            objective,
++            bounds=bounds,
+             seed=11031987,
+-            popsize=24,
+-            maxiter=1400,
+-            tol=2.0e-8,
++            popsize=18,
++            maxiter=620,
++            tol=1.0e-7,
+             atol=1.0e-10,
+-            mutation=(0.45, 1.15),
+-            recombination=0.82,
++            mutation=(0.42, 1.18),
++            recombination=0.86,
+             polish=False,
+-            updating="immediate",
+-        )
+-        q = barycentric_from_unit(result.x)
+-
+-        # Once DE has selected orientations for the close triples, SLSQP is
+-        # an effective deterministic local maximin polish in direct simplex
+-        # coordinates.  Retaining those orientations prevents an accidental
+-        # crossing through a zero-area configuration.
+-        signs_a = q[triples[:, 0]]
+-        signs_b = q[triples[:, 1]]
+-        signs_c = q[triples[:, 2]]
+-        signs = np.sign(
+-            (signs_b[:, 0] - signs_a[:, 0]) * (signs_c[:, 1] - signs_a[:, 1])
+-            - (signs_b[:, 1] - signs_a[:, 1]) * (signs_c[:, 0] - signs_a[:, 0])
+-        )
+-        signs[signs == 0.0] = 1.0
+-
+-        def polish_objective(w: np.ndarray) -> float:
+-            return -w[-1]
+-
+-        def polish_constraints(w: np.ndarray) -> np.ndarray:
+-            r = np.empty((11, 2), dtype=float)
+-            r[:3] = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
+-            r[3:] = w[:-1].reshape(8, 2)
+-            aa, bb, cc = r[triples[:, 0]], r[triples[:, 1]], r[triples[:, 2]]
+-            oriented = signs * (
+-                (bb[:, 0] - aa[:, 0]) * (cc[:, 1] - aa[:, 1])
+-                - (bb[:, 1] - aa[:, 1]) * (cc[:, 0] - aa[:, 0])
++            updating="deferred",
++            workers=1,
++            vectorized=True,
++        )
++        archive_z = np.asarray(broad.x, dtype=float)
++        archive_q = from_unit(archive_z)
++        archive_value = min_area(archive_q)
++        if archive_value > best_value:
++            best_q, best_value = archive_q, archive_value
++
++        # Stage two: archive-seeded restart.  Most population members retain
++        # the first-stage structure, while fresh members can still alter it.
++        rng = np.random.RandomState(771103)
++        population_size = 18 * dim
++        seeded = rng.uniform(0.0, 1.0, size=(population_size, dim))
++        structured_count = int(0.82 * population_size)
++
++        perturb = rng.normal(0.0, 0.11, size=(structured_count, dim))
++        seeded[:structured_count] = np.clip(
++            archive_z[None, :] + perturb, 0.0, 1.0
++        )
++
++        # Preserve an exact elite and several tiny perturbations.
++        seeded[0] = archive_z
++        seeded[1:9] = np.clip(
++            archive_z[None, :] + rng.normal(0.0, 0.025, size=(8, dim)),
++            0.0,
++            1.0,
++        )
++
++        restart = differential_evolution(
++            objective,
++            bounds=bounds,
++            seed=2147483,
++            init=seeded,
++            popsize=18,
++            maxiter=520,
++            tol=7.0e-8,
++            atol=1.0e-10,
++            mutation=(0.36, 0.98),
++            recombination=0.90,
++            polish=False,
++            updating="deferred",
++            workers=1,
++            vectorized=True,
++        )
++
++        restart_q = from_unit(restart.x)
++        restart_value = min_area(restart_q)
++        if restart_value > best_value:
++            best_q, best_value = restart_q, restart_value
++
++        def polish(q0: np.ndarray) -> np.ndarray:
++            """
++            In a selected orientation cell, optimize the explicit lower bound
++            t on every triple determinant.  Recomputing signs per archive
++            member permits each global-search basin its own local refinement.
++            """
++            aa = q0[triples[:, 0]]
++            bb = q0[triples[:, 1]]
++            cc = q0[triples[:, 2]]
++            det0 = ((bb[:, 0] - aa[:, 0]) * (cc[:, 1] - aa[:, 1])
++                    - (bb[:, 1] - aa[:, 1]) * (cc[:, 0] - aa[:, 0]))
++            signs = np.sign(det0)
++            signs[signs == 0.0] = 1.0
++
++            def constraints(w: np.ndarray) -> np.ndarray:
++                q = np.empty((n, 2), dtype=float)
++                q[:3] = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
++                q[3:] = w[:-1].reshape(8, 2)
++
++                a = q[triples[:, 0]]
++                b = q[triples[:, 1]]
++                c = q[triples[:, 2]]
++                oriented = signs * (
++                    (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
++                    - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
++                )
++                simplex_slack = 1.0 - q[3:, 0] - q[3:, 1]
++                return np.concatenate((oriented - w[-1], simplex_slack))
++
++            start = np.r_[q0[3:].ravel(), min_area(q0)]
++            result = minimize(
++                lambda w: -w[-1],
++                start,
++                method="SLSQP",
++                bounds=[(0.0, 1.0)] * dim + [(0.0, 0.5)],
++                constraints={"type": "ineq", "fun": constraints},
++                options={
++                    "maxiter": 1800,
++                    "ftol": 3.0e-12,
++                    "disp": False,
++                },
+             )
+-            return np.concatenate((oriented - w[-1], 1.0 - r[3:].sum(axis=1)))
+-
+-        start = np.r_[q[3:].ravel(), minimum_area(q)]
+-        polished = minimize(
+-            polish_objective,
+-            start,
+-            method="SLSQP",
+-            bounds=[(0.0, 1.0)] * 16 + [(0.0, 1.0)],
+-            constraints={"type": "ineq", "fun": polish_constraints},
+-            options={"maxiter": 2500, "ftol": 1.0e-11},
+-        )
+-        if polished.success:
+-            candidate = np.empty((11, 2), dtype=float)
+-            candidate[:3] = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
+-            candidate[3:] = polished.x[:-1].reshape(8, 2)
+-            if minimum_area(candidate) >= minimum_area(q) - 1.0e-10:
+-                q = candidate
++            if not result.success:
++                return q0
++
++            q = np.empty((n, 2), dtype=float)
++            q[:3] = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
++            q[3:] = result.x[:-1].reshape(8, 2)
++
++            # Verify against the original absolute-area objective.
++            if min_area(q) >= min_area(q0) - 2.0e-10:
++                return q
++            return q0
++
++        # Independently polish both global-search basins and retain the best.
++        for candidate in (archive_q, restart_q, best_q.copy()):
++            refined = polish(candidate)
++            refined_value = min_area(refined)
++            if refined_value > best_value:
++                best_q, best_value = refined, refined_value
++
+     except Exception:
+-        q = barycentric_from_unit(fallback_z)
+-
+-    points = np.empty((11, 2), dtype=float)
+-    points[:, 0] = q[:, 0] + 0.5 * q[:, 1]
+-    points[:, 1] = h * q[:, 1]
++        # The deterministic fallback remains feasible even on minimal installs.
++        pass
++
++    points = np.empty((n, 2), dtype=float)
++    points[:, 0] = best_q[:, 0] + 0.5 * best_q[:, 1]
++    points[:, 1] = h * best_q[:, 1]
++
+     heilbronn_triangle11._cached_points = points.copy()
+     return points
+ 
+ 
+ # EVOLVE-BLOCK-END

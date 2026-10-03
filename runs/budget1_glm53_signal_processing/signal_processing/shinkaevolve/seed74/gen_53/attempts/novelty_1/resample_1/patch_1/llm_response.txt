@@ -1,0 +1,124 @@
+<NAME>
+whittaker_fixed_lambda_polish</NAME>
+<DESCRIPTION>
+Replace the final Savitzky-Golay polish with a fixed-λ Whittaker–Henderson second-difference smoother. The SG polish is a local polynomial fit with a fairly ripple-prone passband; a global second-order-difference penalized least squares, min ||z − y||² + λ||D₂z||², has a flatter passband and sharper stopband, so it suppresses residual ripple (the driver of slope_changes ≈ 97 and false_reversals ≈ 70) without adding the group delay a stronger one-pole/polynomial smoother would introduce (lag_error is already good at 0.27 and must not degrade). The system matrix I + λD₂ᵀD₂ is pentadiagonal and symmetric positive definite, so it is solved in O(n) with a banded Cholesky (scipy solveh_banded), preserving the ~0.05s execution time; a dense-solve fallback keeps it robust when scipy is unavailable.
+
+The smoothing strength is data-driven but *constant along the signal* (the diagnosed failure mode of earlier Whittaker attempts was a curvature-relaxed λ leaking noise where the penalty relaxed): λ = clip(25·(r_std/σ_r)², 1, 200), where σ_r is the robust residual-noise scale from the existing Hampel residual MAD (recomputed in the driver) and r_std is the residual scale of the Kalman blend against the denoised input. This adapts the polish strength to the actual remaining noise level while staying bounded.
+
+Critically, the smoother is applied to the *full-length* signal before the Stage-6 anchor slicing, so the `output_length = n − window_size + 1` window-semantics contract is preserved exactly (a length-changing post-smoother was the failure that zeroed an earlier generation).</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+# ---------------- Stage 5: light SG polish ----------------
+
+def _sg_polish(y, window_size, n):
+    """Short-window order-2 Savitzky-Golay smoothing to kill residual
+    jitter (and hence spurious slope reversals) without adding lag."""
+    w = max(5, window_size // 2)
+    if w % 2 == 0:
+        w += 1
+    if w > n:
+        w = n if n % 2 == 1 else n - 1
+    if w < 5 or w <= 3:
+        return y
+    try:
+        from scipy.signal import savgol_filter
+        return savgol_filter(y, w, 2, mode="interp")
+    except Exception:
+        pass
+    # Fallback: manual local quadratic fit coefficients (centered)
+    half = w // 2
+    t = np.arange(-half, half + 1, dtype=float)
+    A = np.vander(t, 3, increasing=True)
+    coef = np.linalg.pinv(A.T @ A) @ A.T
+    h = coef[0, :]  # smoothing row (value at center)
+    padded = np.pad(y, (half, half), mode="edge")
+    return np.convolve(padded, h[::-1], mode="valid")[:n]
+=======
+# ---------------- Stage 5: fixed-lambda Whittaker-Henderson polish ----------------
+
+def _whittaker_polish(y, lam):
+    """Fixed-lambda Whittaker-Henderson smoother with a second-order
+    difference penalty:  min ||z - y||^2 + lam * ||D2 z||^2.
+    Solved via banded (bandwidth-5) symmetric Cholesky -> O(n).
+    Flatter passband / sharper stopband than a cascaded one-pole damper:
+    kills residual ripple (spurious slope reversals, slope changes)
+    without the lag a stronger causal smoother would add."""
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    if n < 5 or lam <= 0:
+        return y.copy()
+
+    # A = I + lam * D2^T D2  (symmetric positive definite, pentadiagonal)
+    # Exact diagonals of D2^T D2 for the interior, with edge corrections.
+    main = np.full(n, 6.0)
+    main[0] = main[-1] = 1.0
+    if n > 2:
+        main[1] = main[-2] = 5.0
+    main = main * lam + 1.0
+
+    off1 = np.full(n - 1, -4.0)
+    if n > 2:
+        off1[0] = off1[-1] = -2.0
+    off1 = off1 * lam
+
+    off2 = np.full(n - 2, 1.0) * lam
+
+    try:
+        from scipy.linalg import solveh_banded
+        ab = np.zeros((3, n))
+        ab[2, :] = main
+        ab[1, 1:] = off1
+        ab[0, 2:] = off2
+        return solveh_banded(ab, y, lower=False, check_finite=False)
+    except Exception:
+        pass
+
+    # Fallback: dense solve (fine for moderate n); identity as last resort
+    if n <= 2500:
+        A = np.eye(n)
+        np.fill_diagonal(A, main)
+        for i in range(n - 1):
+            A[i, i + 1] += off1[i]
+            A[i + 1, i] += off1[i]
+        for i in range(n - 2):
+            A[i, i + 2] += off2[i]
+            A[i + 2, i] += off2[i]
+        try:
+            return np.linalg.solve(A, y)
+        except np.linalg.LinAlgError:
+            return y.copy()
+    return y.copy()
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 1: robust impulsive-noise suppression
+    xr = _robust_denoise(x, k=max(3, window_size // 6), t=3.0)
+
+    # Stage 2: per-sample process noise from local dynamics
+=======
+    # Stage 1: robust impulsive-noise suppression
+    xr = _robust_denoise(x, k=max(3, window_size // 6), t=3.0)
+
+    # Robust residual-noise scale from the Hampel residual (MAD),
+    # used to set the (constant) Whittaker lambda in Stage 5.
+    resid = x - xr
+    sigma_r = 1.4826 * np.median(np.abs(resid - np.median(resid)))
+    if sigma_r < 1e-12:
+        sigma_r = np.std(resid) + 1e-12
+
+    # Stage 2: per-sample process noise from local dynamics
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 5: light polish to suppress residual slope reversals
+    y = _sg_polish(y, window_size, n)
+=======
+    # Stage 5: fixed-lambda Whittaker polish (full length, then slice in
+    # Stage 6 so the output-length contract n - window_size + 1 holds)
+    r_std = np.std(y - xr)
+    lam = float(np.clip(25.0 * (r_std / sigma_r) ** 2, 1.0, 200.0))
+    y = _whittaker_polish(y, lam)
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,158 @@
+<NAME>
+seeded_multistart_hillclimb_heilbronn</NAME>
+<DESCRIPTION>
+The previous attempt failed, likely because the baseline point arrangement (points placed on a circle) yields a very poor minimum triangle area — for 13 points on a near-circular boundary the smallest triangle (three adjacent vertices) has normalized area of only ~0.017, well below the 0.0309 benchmark. This edit replaces the naive pattern with a deterministic, seeded multi-start hill-climbing optimizer:
+
+1. Multiple structured initializations are generated: a regular 13-gon (safe baseline), a triangular-lattice-like arrangement, a hexagonal/radial configuration, and several seeded random configurations.
+2. Each start is refined by a pattern search that biases perturbations toward the vertices participating in the current smallest triangle (the binding constraint), since moving those points is the only way to raise the minimum. Displacements that increase the normalized score (min triangle area / convex hull area) are accepted; the step size decays adaptively on rejection.
+3. The objective is exactly the reported metric: minimum area over all 286 triangles divided by the convex hull area, so the optimizer directly maximizes `min_area_normalized`.
+4. Everything is driven by a fixed `random.Random` seed, so results are fully deterministic and reproducible. A runtime budget guard keeps evaluation fast, and the best-of-all-starts result is returned with a guaranteed fallback to the polygonal baseline if optimization underperforms, ensuring valid, finite, unique 13-point output in all cases.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Baseline: distribute points using a simple deterministic pattern
+    # TODO: improve this arrangement to maximize the minimum triangle area
+    points = []
+    for i in range(n):
+        angle = 2.0 * math.pi * i / n
+        points.append((0.5 + 0.45 * math.cos(angle), 0.5 + 0.45 * math.sin(angle)))
+    return points
+=======
+    import random as _random
+    import time as _time
+
+    rng = _random.Random(20240513)
+    _T0 = _time.time()
+    _BUDGET = 6.0  # seconds of optimization effort
+
+    def _cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    def _hull_area(pts):
+        p = sorted(set((round(x, 12), round(y, 12)) for x, y in pts))
+        if len(p) < 3:
+            return 1e-12
+        lower = []
+        for q in p:
+            while len(lower) >= 2 and _cross(lower[-2], lower[-1], q) <= 0:
+                lower.pop()
+            lower.append(q)
+        upper = []
+        for q in reversed(p):
+            while len(upper) >= 2 and _cross(upper[-2], upper[-1], q) <= 0:
+                upper.pop()
+            upper.append(q)
+        hull = lower[:-1] + upper[:-1]
+        if len(hull) < 3:
+            return 1e-12
+        return abs(sum(_cross((0.0, 0.0), hull[i], hull[(i + 1) % len(hull)])
+                       for i in range(len(hull)))) / 2.0
+
+    def _min_tri(pts):
+        m = float("inf")
+        arg = (0, 1, 2)
+        np_ = len(pts)
+        for i in range(np_ - 2):
+            ax, ay = pts[i]
+            for j in range(i + 1, np_ - 1):
+                bx, by = pts[j]
+                abx, aby = bx - ax, by - ay
+                for k in range(j + 1, np_):
+                    cx, cy = pts[k]
+                    a = abs(abx * (cy - ay) - aby * (cx - ax)) * 0.5
+                    if a < m:
+                        m = a
+                        arg = (i, j, k)
+        return m, arg
+
+    def _score(pts):
+        ha = _hull_area(pts)
+        if ha <= 1e-12:
+            return 0.0, (0, 1, 2)
+        m, arg = _min_tri(pts)
+        return m / ha, arg
+
+    # ---- initializations ----
+    starts = []
+    # regular polygon baseline
+    poly = [(0.5 + 0.45 * math.cos(2 * math.pi * i / n),
+             0.5 + 0.45 * math.sin(2 * math.pi * i / n)) for i in range(n)]
+    starts.append([list(p) for p in poly])
+    # radial rings: 6 outer + 6 inner + center
+    ring = []
+    for i in range(6):
+        a = math.pi / 3 * i
+        ring.append([0.5 + 0.45 * math.cos(a), 0.5 + 0.45 * math.sin(a)])
+    for i in range(6):
+        a = math.pi / 3 * i + math.pi / 6
+        ring.append([0.5 + 0.22 * math.cos(a), 0.5 + 0.22 * math.sin(a)])
+    ring.append([0.5, 0.5])
+    starts.append(ring)
+    # jittered polygon + jittered rings + random starts
+    for s in range(10):
+        if s < 4:
+            base = poly
+        elif s < 8:
+            base = [tuple(p) for p in starts[1]]
+        else:
+            base = [(0.5, 0.5)] * n
+        st = []
+        for (bx, by) in base:
+            if s >= 8:
+                st.append([0.05 + 0.9 * rng.random(), 0.05 + 0.9 * rng.random()])
+            else:
+                st.append([bx + rng.gauss(0, 0.06), by + rng.gauss(0, 0.06)])
+        starts.append(st)
+
+    def _optimize(pts, step0):
+        pts = [list(p) for p in pts]
+        cur, arg = _score(pts)
+        best, best_pts = cur, [list(p) for p in pts]
+        step = step0
+        it = 0
+        while _time.time() - _T0 < _BUDGET and step > 1e-5 and it < 20000:
+            it += 1
+            if rng.random() < 0.75:
+                i = arg[rng.randrange(3)]  # move a vertex of the worst triangle
+            else:
+                i = rng.randrange(n)
+            dx, dy = rng.gauss(0, step), rng.gauss(0, step)
+            old = pts[i]
+            pts[i] = [old[0] + dx, old[1] + dy]
+            s2, arg2 = _score(pts)
+            if s2 > cur + 1e-12:
+                cur, arg = s2, arg2
+                if s2 > best:
+                    best = s2
+                    best_pts = [list(p) for p in pts]
+                step = min(step * 1.05, 0.08)
+            else:
+                pts[i] = old
+                step *= 0.995
+        return best, best_pts
+
+    best_score, best_points = _score(starts[0])
+    best_points = [list(p) for p in starts[0]]
+    for idx, st in enumerate(starts):
+        if _time.time() - _T0 > _BUDGET:
+            break
+        sc, refined = _optimize(st, 0.05 if idx < 2 else 0.03)
+        if sc > best_score:
+            best_score = sc
+            best_points = refined
+
+    # ensure uniqueness / finiteness
+    out, seen = [], set()
+    for p in best_points:
+        p = [float(p[0]), float(p[1])]
+        key = (round(p[0], 9), round(p[1], 9))
+        j = 0
+        while key in seen and j < 50:
+            p[0] += 1e-6 * (j + 1)
+            key = (round(p[0], 9), round(p[1], 9))
+            j += 1
+        seen.add(key)
+        out.append((p[0], p[1]))
+    return out
+>>>>>>> REPLACE
+</DIFF>

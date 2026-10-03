@@ -1,0 +1,422 @@
+--- a/original.py
++++ b/original.py
+@@ -1,206 +1,226 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
++_N = 13
++_FIXED = 4
++_TRIPLES = np.asarray(
++    [(i, j, k) for i in range(_N - 2) for j in range(i + 1, _N - 1)
++     for k in range(j + 1, _N)],
++    dtype=np.intp,
++)
++
++
+ def heilbronn_convex13() -> np.ndarray:
+     """
+-    Deterministically search for a 13-point Heilbronn configuration.
+-
+-    The returned points lie in the unit square.  Since the objective is divided
+-    by convex-hull area, restricting the search to this fixed convex container
+-    does not impose a meaningful scale restriction.
++    Deterministically construct a maximin thirteen-point configuration.
++
++    Four points are fixed at the corners of the unit square.  Thus the convex
++    hull has exactly unit area throughout optimization, all other points are
++    automatically feasible, and a doubled triangle determinant is identical
++    to the normalized triangle-area score.
+     """
+-    n = 13
+     rng = np.random.default_rng(13051957)
+-    triples = np.asarray(
+-        [(i, j, k) for i in range(n - 2) for j in range(i + 1, n - 1)
+-         for k in range(j + 1, n)],
+-        dtype=np.intp,
+-    )
+-
+-    def hull_area(p: np.ndarray) -> float:
+-        """Twice-area monotone-chain hull, with a harmless zero-area guard."""
+-        ordered = p[np.lexsort((p[:, 1], p[:, 0]))]
+-        lower = []
+-        for q in ordered:
+-            while len(lower) >= 2:
+-                a, b = lower[-2], lower[-1]
+-                if (b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0]) > 1e-12:
+-                    break
+-                lower.pop()
+-            lower.append(q)
+-        upper = []
+-        for q in ordered[::-1]:
+-            while len(upper) >= 2:
+-                a, b = upper[-2], upper[-1]
+-                if (b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0]) > 1e-12:
+-                    break
+-                upper.pop()
+-            upper.append(q)
+-        polygon = np.asarray(lower[:-1] + upper[:-1])
+-        if len(polygon) < 3:
+-            return 0.0
+-        return abs(np.dot(polygon[:, 0], np.roll(polygon[:, 1], -1)) -
+-                   np.dot(polygon[:, 1], np.roll(polygon[:, 0], -1))) * 0.5
+-
+-    def evaluate(p: np.ndarray) -> tuple[float, float]:
+-        a, b, c = p[triples[:, 0]], p[triples[:, 1]], p[triples[:, 2]]
+-        areas = 0.5 * np.abs(
+-            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+-            (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+-        )
+-        area_hull = hull_area(p)
+-        if area_hull <= 1e-10:
+-            return 0.0, 0.0
+-        normalized = areas / area_hull
+-        # The lower-tail term makes moves that improve several critical
+-        # triangles acceptable before the strict minimum itself changes.
+-        tail = np.partition(normalized, 11)[:12]
+-        return float(normalized.min()), float(normalized.min() + 0.12 * tail.mean())
+-
+-    def critical_vertex_weights(p: np.ndarray) -> np.ndarray:
+-        """Sampling weights concentrated on vertices of active small triangles."""
+-        a, b, c = p[triples[:, 0]], p[triples[:, 1]], p[triples[:, 2]]
+-        double_areas = np.abs(
+-            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+-            (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+-        )
+-        active = triples[np.argpartition(double_areas, 17)[:18]].ravel()
+-        weights = np.bincount(active, minlength=n).astype(float)
+-        # Preserve occasional exploration of non-critical vertices.
+-        weights += 0.4
+-        return weights / weights.sum()
+-
+-    best_points = None
+-    best_score = -np.inf
+-
+-    # Use several independent basin-discovery runs, then spend the remaining
+-    # budget reheating the strongest configuration found.  For this highly
+-    # nonsmooth objective, a good active-triangle sign pattern is much more
+-    # valuable than another completely unrelated late random restart.
+-    for restart in range(6):
+-        exploratory = restart < 4
+-        if exploratory:
+-            current = rng.random((n, 2))
+-            iterations = 12000
+-            initial_sigma = 0.115
+-            initial_temperature = 0.0035
+-        else:
+-            # A deterministic small perturbation makes the two continuations
+-            # explore distinct neighboring sign-pattern changes.
+-            current = best_points + rng.normal(0.0, 0.010, size=(n, 2))
+-            np.clip(current, 0.0, 1.0, out=current)
+-            iterations = 18000
+-            initial_sigma = 0.058
+-            initial_temperature = 0.0019
+-
+-        current_score, current_energy = evaluate(current)
+-
+-        for step in range(iterations):
+-            progress = step / (iterations - 1.0)
+-            sigma = initial_sigma * (1.0 - progress) ** 1.7 + 0.0025
+-            candidate = current.copy()
+-            # Coupled active-triangle moves explicitly push one vertex away
+-            # from its opposite edge.  A simultaneous tangential move of a
+-            # second vertex helps alter neighboring active constraints without
+-            # immediately undoing the intended area increase.
+-            if rng.random() < 0.16:
+-                pa = current[triples[:, 0]]
+-                pb = current[triples[:, 1]]
+-                pc = current[triples[:, 2]]
+-                double_areas = np.abs(
+-                    (pb[:, 0] - pa[:, 0]) * (pc[:, 1] - pa[:, 1]) -
+-                    (pb[:, 1] - pa[:, 1]) * (pc[:, 0] - pa[:, 0])
+-                )
+-                active = np.argpartition(double_areas, 17)[:18]
+-                triangle = triples[active[rng.integers(len(active))]]
+-                moved_position = int(rng.integers(3))
+-                moved = int(triangle[moved_position])
+-                other_position = (moved_position + int(rng.integers(1, 3))) % 3
+-                other = int(triangle[other_position])
+-                third = int(triangle[3 - moved_position - other_position])
+-
+-                # Gradient of the signed doubled area with respect to `moved`.
+-                q = current[other]
+-                r = current[third]
+-                signed_area = ((q[0] - current[moved, 0]) *
+-                               (r[1] - current[moved, 1]) -
+-                               (q[1] - current[moved, 1]) *
+-                               (r[0] - current[moved, 0]))
+-                normal = np.array([q[1] - r[1], r[0] - q[0]])
+-                normal *= 1.0 if signed_area >= 0.0 else -1.0
+-                normal /= max(np.linalg.norm(normal), 1e-12)
+-                tangent = current[third] - current[other]
+-                tangent /= max(np.linalg.norm(tangent), 1e-12)
+-
+-                candidate[moved] += 0.90 * sigma * normal
+-                candidate[moved] += rng.normal(0.0, 0.12 * sigma, size=2)
+-                candidate[other] += ((1.0 if rng.random() < 0.5 else -1.0) *
+-                                     0.32 * sigma * tangent)
+-                candidate[other] += rng.normal(0.0, 0.08 * sigma, size=2)
+-            else:
+-                changed = 1 if rng.random() < 0.82 else 2
+-                # Most successful improvements repair one of the triangles
+-                # that currently realizes (or nearly realizes) the minimum.
+-                if rng.random() < 0.78:
+-                    indices = rng.choice(
+-                        n, size=changed, replace=False,
+-                        p=critical_vertex_weights(current),
+-                    )
+-                else:
+-                    indices = rng.choice(n, size=changed, replace=False)
+-                candidate[indices] += rng.normal(0.0, sigma, size=(changed, 2))
+-            np.clip(candidate, 0.0, 1.0, out=candidate)
+-
+-            candidate_score, candidate_energy = evaluate(candidate)
+-            temperature = initial_temperature * (1.0 - progress) ** 2 + 0.000015
+-            if (candidate_energy >= current_energy or
+-                    rng.random() < np.exp((candidate_energy - current_energy) / temperature)):
+-                current = candidate
+-                current_score, current_energy = candidate_score, candidate_energy
+-
+-            if current_score > best_score:
+-                best_score = current_score
+-                best_points = current.copy()
+-
+-    # Deterministic pattern search is considerably more reliable than random
+-    # last-mile moves on the piecewise-linear minimum-area landscape.
+-    current = best_points.copy()
+-    current_score, current_energy = evaluate(current)
+-    directions = np.array(
+-        [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
+-         [1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0]],
++
++    # Counter-clockwise square: its hull area is one.
++    corners = np.array(
++        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+         dtype=float,
+     )
+-    directions[4:] /= np.sqrt(2.0)
+-
+-    for level in range(42):
+-        sigma = 0.018 * (0.87 ** level) + 0.00008
+-        improved = False
+-        # Prioritize the vertices that participate in active constraints.
+-        order = np.argsort(-critical_vertex_weights(current))
+-        for index in order:
+-            local_best = None
+-            local_score, local_energy = current_score, current_energy
+-            for direction in directions:
+-                candidate = current.copy()
+-                candidate[index] += sigma * direction
+-                np.clip(candidate, 0.0, 1.0, out=candidate)
+-                candidate_score, candidate_energy = evaluate(candidate)
+-                if (candidate_score > local_score + 1e-14 or
+-                        (abs(candidate_score - local_score) <= 1e-14 and
+-                         candidate_energy > local_energy + 1e-14)):
+-                    local_best = candidate
+-                    local_score, local_energy = candidate_score, candidate_energy
+-            if local_best is not None:
+-                current = local_best
+-                current_score, current_energy = local_score, local_energy
+-                improved = True
+-        # At very fine scales, one complete non-improving poll is sufficient.
+-        if not improved and sigma < 0.0003:
+-            break
+-
+-    return current
++
++    def areas(points: np.ndarray) -> np.ndarray:
++        t = points[_TRIPLES]
++        return np.abs(
++            (t[:, 1, 0] - t[:, 0, 0]) * (t[:, 2, 1] - t[:, 0, 1])
++            - (t[:, 1, 1] - t[:, 0, 1]) * (t[:, 2, 0] - t[:, 0, 0])
++        )
++
++    def tail_energy(values: np.ndarray, count: int) -> float:
++        """Strict minimum plus a weighted active-constraint continuation."""
++        tail = np.partition(values, count - 1)[:count]
++        weights = np.linspace(3.8, 1.0, count)
++        return float(0.70 * tail[0] +
++                     0.30 * np.dot(tail, weights) / weights.sum())
++
++    def active_weights(values: np.ndarray, count: int) -> np.ndarray:
++        active = _TRIPLES[np.argpartition(values, count - 1)[:count]].ravel()
++        weights = np.bincount(active, minlength=_N).astype(float)
++        weights[:_FIXED] = 0.0
++        weights[_FIXED:] += 0.22
++        return weights / weights.sum()
++
++    def gradient(points: np.ndarray, tri_index: int,
++                 vertex: int) -> np.ndarray:
++        """Unit gradient increasing absolute doubled area at one vertex."""
++        i, j, k = _TRIPLES[tri_index]
++        a, b, c = points[i], points[j], points[k]
++        signed = ((b[0] - a[0]) * (c[1] - a[1]) -
++                  (b[1] - a[1]) * (c[0] - a[0]))
++        sign = 1.0 if signed >= 0.0 else -1.0
++        if vertex == i:
++            edge = c - b
++        elif vertex == j:
++            edge = a - c
++        else:
++            edge = b - a
++        direction = sign * np.array((-edge[1], edge[0]))
++        norm = float(np.hypot(direction[0], direction[1]))
++        return direction / max(norm, 1.0e-14)
++
++    def initial_points(restart: int) -> np.ndarray:
++        points = np.empty((_N, 2), dtype=float)
++        points[:_FIXED] = corners
++
++        # Jittered lattice starts cover the square more evenly than pure
++        # random starts; alternating them with random starts preserves basin
++        # diversity.
++        if restart % 3 != 2:
++            grid = np.array([
++                [1.0 / 6.0, 1.0 / 6.0], [0.50, 1.0 / 6.0],
++                [5.0 / 6.0, 1.0 / 6.0], [1.0 / 6.0, 0.50],
++                [0.50, 0.50], [5.0 / 6.0, 0.50],
++                [1.0 / 6.0, 5.0 / 6.0], [0.50, 5.0 / 6.0],
++                [5.0 / 6.0, 5.0 / 6.0],
++            ])
++            points[_FIXED:] = grid + rng.normal(0.0, 0.052, grid.shape)
++        else:
++            points[_FIXED:] = rng.uniform(0.055, 0.945, size=(9, 2))
++        np.clip(points[_FIXED:], 0.012, 0.988, out=points[_FIXED:])
++        return points
++
++    best_points = None
++    best_value = -np.inf
++
++    try:
++        # Fixed hull avoids costly hull reconstruction, allowing numerous
++        # independent active-set basin searches within the same time budget.
++        for restart in range(11):
++            points = initial_points(restart)
++            current_areas = areas(points)
++            current_value = float(current_areas.min())
++            current_energy = tail_energy(current_areas, 22)
++
++            for step in range(10500):
++                progress = step / 10499.0
++                cooling = (1.0 - progress) ** 1.55
++                active_count = 26 if progress < 0.42 else (
++                    15 if progress < 0.80 else 8
++                )
++                active = np.argpartition(
++                    current_areas, active_count - 1
++                )[:active_count]
++                trial = points.copy()
++                scale = 0.082 * cooling + 0.00055
++
++                # Correlated two-point moves specifically resolve neighboring
++                # active constraints which cannot be lifted by a lone vertex.
++                if rng.random() < 0.145:
++                    tri_index = int(active[rng.integers(active_count)])
++                    tri = _TRIPLES[tri_index]
++                    movable = tri[tri >= _FIXED]
++                    if len(movable) >= 2:
++                        moved, other = rng.choice(movable, 2, replace=False)
++                        moved, other = int(moved), int(other)
++                        normal = gradient(points, tri_index, moved)
++                        tangent = np.array((-normal[1], normal[0]))
++                        tangent *= 1.0 if rng.random() < 0.5 else -1.0
++                        trial[moved] += (0.88 * scale * normal +
++                                         rng.normal(0.0, 0.13 * scale, 2))
++                        trial[other] += (0.31 * scale * tangent +
++                                         rng.normal(0.0, 0.09 * scale, 2))
++                    else:
++                        index = int(movable[0])
++                        trial[index] += rng.normal(0.0, scale, 2)
++                else:
++                    tri_index = int(active[rng.integers(active_count)])
++                    tri = _TRIPLES[tri_index]
++                    movable = tri[tri >= _FIXED]
++                    if rng.random() < 0.80 and len(movable):
++                        index = int(movable[rng.integers(len(movable))])
++                    else:
++                        weights = active_weights(current_areas, active_count)
++                        index = int(rng.choice(_N, p=weights))
++                    guided = gradient(points, tri_index, index)
++                    noise = rng.normal(size=2)
++                    noise /= max(float(np.hypot(noise[0], noise[1])), 1e-14)
++                    mix = 0.48 + 0.39 * progress
++                    direction = mix * guided + (1.0 - mix) * noise
++                    direction /= max(
++                        float(np.hypot(direction[0], direction[1])), 1e-14
++                    )
++                    trial[index] += scale * direction
++
++                np.clip(trial[_FIXED:], 0.0, 1.0, out=trial[_FIXED:])
++                trial_areas = areas(trial)
++                trial_energy = tail_energy(trial_areas, active_count)
++                temperature = 0.00175 * cooling * cooling + 0.0000018
++                delta = trial_energy - current_energy
++
++                if delta >= 0.0 or rng.random() < np.exp(delta / temperature):
++                    points = trial
++                    current_areas = trial_areas
++                    current_energy = trial_energy
++                    current_value = float(trial_areas.min())
++
++                if current_value > best_value:
++                    best_value = current_value
++                    best_points = points.copy()
++
++        # Strict maximin polishing: retain only moves that improve the actual
++        # grading metric, with tail energy breaking exact minimum ties.
++        points = best_points.copy()
++        current_areas = areas(points)
++        value = float(current_areas.min())
++        energy = tail_energy(current_areas, 8)
++
++        directions = np.array(
++            [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
++             [1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0]],
++            dtype=float,
++        )
++        directions[4:] /= np.sqrt(2.0)
++
++        for level in range(34):
++            step_size = 0.014 * (0.84 ** level) + 0.000025
++            changed = False
++            order = np.argsort(-active_weights(current_areas, 10))
++            for index in order:
++                if index < _FIXED:
++                    continue
++                chosen = None
++                local_value, local_energy = value, energy
++                for direction in directions:
++                    candidate = points.copy()
++                    candidate[index] += step_size * direction
++                    np.clip(candidate[index], 0.0, 1.0, out=candidate[index])
++                    candidate_areas = areas(candidate)
++                    candidate_value = float(candidate_areas.min())
++                    candidate_energy = tail_energy(candidate_areas, 8)
++                    if (candidate_value > local_value + 1e-14 or
++                            (abs(candidate_value - local_value) <= 1e-14 and
++                             candidate_energy > local_energy + 1e-14)):
++                        chosen = (candidate, candidate_areas)
++                        local_value, local_energy = (
++                            candidate_value, candidate_energy
++                        )
++                if chosen is not None:
++                    points, current_areas = chosen
++                    value, energy = local_value, local_energy
++                    changed = True
++            if not changed and step_size < 0.00020:
++                break
++
++        return points
++
++    except (FloatingPointError, ValueError, RuntimeError):
++        fallback = np.empty((_N, 2), dtype=float)
++        fallback[:_FIXED] = corners
++        fallback[_FIXED:] = np.array([
++            [0.18, 0.18], [0.50, 0.18], [0.82, 0.18],
++            [0.18, 0.50], [0.50, 0.50], [0.82, 0.50],
++            [0.18, 0.82], [0.50, 0.82], [0.82, 0.82],
++        ])
++        return fallback
+ 
+ 
+ # EVOLVE-BLOCK-END

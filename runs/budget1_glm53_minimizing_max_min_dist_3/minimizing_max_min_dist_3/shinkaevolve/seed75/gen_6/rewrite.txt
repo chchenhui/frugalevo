@@ -1,0 +1,84 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.optimize import minimize
+
+
+def _score(points):
+    d = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=-1)
+    iu = np.triu_indices(len(points), 1)
+    dm = d[iu].min()
+    dx = d[iu].max()
+    return dm / dx
+
+
+def _repulsion_init(rng, n=14, iters=800):
+    # random points on unit sphere, spread by inverse-distance repulsion
+    pts = rng.randn(n, 3)
+    pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+    for it in range(iters):
+        step = 0.02 * (0.99 ** it)
+        diff = pts[:, None, :] - pts[None, :, :]
+        dist = np.linalg.norm(diff, axis=-1) + 1e-9
+        np.fill_diagonal(dist, np.inf)
+        force = (diff / dist[:, :, None] ** 3).sum(axis=1)
+        pts += step * force
+        pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+    return pts
+
+
+def _smooth_objective(flat, n=14, t=0.05):
+    pts = flat.reshape(n, 3)
+    d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+    iu = np.triu_indices(n, 1)
+    dv = d[iu]
+    # soft min and max (log-sum-exp)
+    a = dv / t
+    soft_min = t * (-a.max() + np.log(np.exp(-a + a.max()).sum()))
+    b = dv / t
+    soft_max = t * (b.max() + np.log(np.exp(b - b.max()).sum()))
+    return -soft_min / soft_max
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    n = 14
+    rng = np.random.default_rng(42)
+    best_pts = None
+    best_s = -1.0
+    for trial in range(24):
+        pts = _repulsion_init(rng, n)
+        if trial % 3 == 0:
+            pts *= rng.uniform(0.6, 1.4)
+        x0 = pts.ravel()
+        # small jitter of scale to explore
+        x0 = x0 + 0.02 * rng.standard_normal(x0.shape[0])
+        res = minimize(_smooth_objective, x0, method="L-BFGS-B",
+                       options={"maxiter": 400, "maxfun": 2000})
+        cand = res.x.reshape(n, 3)
+        # polish with random pairwise perturbations on exact score
+        s = _score(cand)
+        for _ in range(300):
+            i, j = rng.integers(0, n, 2)
+            pert = 0.01 * rng.standard_normal(3)
+            cand2 = cand.copy()
+            cand2[i] += pert
+            cand2[j] -= pert * 0.5
+            s2 = _score(cand2)
+            if s2 > s:
+                cand, s = cand2, s2
+        if s > best_s:
+            best_s = s
+            best_pts = cand.copy()
+    # normalize: center and scale so max distance = 1
+    c = best_pts.mean(axis=0)
+    pts = best_pts - c
+    d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+    dx = d.max()
+    pts = pts / dx
+    return pts
+
+
+# EVOLVE-BLOCK-END
+
+if __name__ == "__main__":
+    p = min_max_dist_dim3_14()
+    print(p.shape, np.isfinite(p).all())

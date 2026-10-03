@@ -1,0 +1,91 @@
+<NAME>
+adaptive_diverse_beam
+</NAME>
+
+<DESCRIPTION>
+Replace independent append-only greedy restarts with a conflict-cost beam search over transaction prefixes.
+
+1. Each beam state is a partial transaction order scored by the simulator’s exact prefix makespan objective.
+2. At every depth, the search expands every retained prefix with every remaining transaction, allowing it to compare competing conflict orientations rather than committing permanently to one greedy choice.
+3. The beam preserves diversity by first retaining the best prefix for distinct first transactions and, in the early levels, distinct first two-transaction orientations. This avoids losing schedules whose initial prefix looks equivalent but produces better downstream conflict overlap.
+4. The beam grows adaptively when the score at the cutoff is tied, because tied prefix costs are precisely where greedy selection has insufficient information about future read/write conflicts.
+5. The existing local search and destroy/repair phases remain unchanged and refine the best complete beam schedule, so this improves construction quality without rewriting the optimizer.
+
+This should find better global transaction orders when multiple prefix choices have similar immediate makespans but different future serialization consequences.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Use distinct starting transactions where possible.  A transaction that
+    # is poor as the first choice can otherwise never be recovered by an
+    # append-only greedy construction.
+    starts = list(range(num_txns))
+    random.shuffle(starts)
+    attempts = max(1, num_seqs)
+
+    best_cost = float("inf")
+    best_order = None
+    for attempt in range(attempts):
+        cost, order = greedy_order(starts[attempt % num_txns])
+        if cost < best_cost:
+            best_cost, best_order = cost, order
+=======
+    # Keep several exact-cost prefixes alive instead of committing each restart
+    # to a single greedy choice.  Prefixes with equal current makespan often
+    # differ substantially in the conflicts they expose to later transactions.
+    base_beam_width = min(
+        num_txns, max(6, min(12, max(1, num_seqs)))
+    )
+    beam = [(schedule_cost([txn]), [txn]) for txn in range(num_txns)]
+
+    for depth in range(1, num_txns):
+        expanded = []
+        for _, prefix in beam:
+            used = set(prefix)
+            for txn in range(num_txns):
+                if txn not in used:
+                    candidate = prefix + [txn]
+                    expanded.append((schedule_cost(candidate), candidate))
+
+        # Randomizing before the stable cost sort makes equally good prefixes
+        # reproducibly diverse across calls without biasing better costs.
+        random.shuffle(expanded)
+        expanded.sort(key=lambda state: state[0])
+
+        width = base_beam_width
+        # If the nominal cutoff is tied, retain more of that ambiguity.  Such
+        # ties are common for independent early operations and are exactly
+        # where future conflict structure matters most.
+        if len(expanded) > width and expanded[width - 1][0] == expanded[width][0]:
+            cutoff_cost = expanded[width - 1][0]
+            while width < len(expanded) and expanded[width][0] == cutoff_cost:
+                width += 1
+            width = min(width, min(len(expanded), 2 * base_beam_width))
+
+        # Preserve structurally different openings before filling remaining
+        # slots by score.  At depth one this means distinct starting
+        # transactions; at depth two it means distinct conflict orientations.
+        diversity_size = 2 if depth >= 2 else 1
+        selected = []
+        seen_openings = set()
+        for state in expanded:
+            opening = tuple(state[1][:diversity_size])
+            if opening not in seen_openings:
+                selected.append(state)
+                seen_openings.add(opening)
+                if len(selected) == width:
+                    break
+
+        selected_ids = {tuple(state[1]) for state in selected}
+        for state in expanded:
+            if len(selected) == width:
+                break
+            if tuple(state[1]) not in selected_ids:
+                selected.append(state)
+                selected_ids.add(tuple(state[1]))
+
+        beam = selected
+
+    best_cost, best_order = min(beam, key=lambda state: state[0])
+>>>>>>> REPLACE
+</DIFF>

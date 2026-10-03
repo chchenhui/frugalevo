@@ -1,0 +1,178 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _score(points: np.ndarray) -> float:
+    """Evaluator metric: (dmin / dmax)^2."""
+    d = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=-1)
+    iu = np.triu_indices(len(points), k=1)
+    dm = d[iu]
+    dmin = dm.min()
+    dmax = dm.max()
+    if dmax <= 0:
+        return 0.0
+    return (dmin / dmax) ** 2
+
+
+def _refine_on_sphere(points: np.ndarray, iters: int = 400,
+                      cutoff_frac: float = 1.15) -> np.ndarray:
+    """Force-directed refinement: repel pairs closer than a cutoff,
+    then renormalize onto the unit sphere each step."""
+    pts = points / np.linalg.norm(points, axis=1, keepdims=True)
+    n = len(pts)
+    for it in range(iters):
+        diff = pts[:, None, :] - pts[None, :, :]
+        dist = np.sqrt((diff ** 2).sum(-1) + 1e-12)
+        iu = np.triu_indices(n, k=1)
+        du = dist[iu]
+
+        # adaptively shrinking cutoff around the current minimum
+        target = max(du.min(), 1e-6)
+        cutoff = min(target * cutoff_frac, du.max() * 0.99)
+
+        grad = np.zeros_like(pts)
+        close = du < cutoff
+        idx_i, idx_j = iu[0][close], iu[1][close]
+        w = (cutoff - du[close]) / cutoff
+        push = (w / du[close])[:, None] * diff[idx_i, idx_j]
+        np.add.at(grad, idx_i, push)
+        np.add.at(grad, idx_j, -push)
+
+        # also mild global repulsion to prevent clustering
+        w_all = 1.0 / (du ** 2 + 1e-3)
+        push_all = (w_all / du)[:, None] * diff[iu[0], iu[1]]
+        np.add.at(grad, iu[0], push_all * 0.002)
+        np.add.at(grad, iu[1], -push_all * 0.002)
+
+        step = 0.05 / (1.0 + it * 0.01)
+        pts = pts + step * grad
+        norms = np.linalg.norm(pts, axis=1, keepdims=True)
+        pts = pts / norms
+    return pts
+
+
+def _initial_candidates(rng: np.random.Generator, n: int, k: int = 6):
+    """Generate diverse starting configurations: random spheres,
+    slightly perturbed shells, and one from a low-discrepancy set."""
+    cands = []
+    for _ in range(k - 1):
+        p = rng.standard_normal((n, 3))
+        p /= np.linalg.norm(p, axis=1, keepdims=True)
+        cands.append(p)
+    # low-discrepancy-ish start (Fibonacci spiral)
+    g = np.pi * (3 - np.sqrt(5))
+    t = (np.arange(n) + 0.5) / n
+    z = 1 - 2 * t
+    r = np.sqrt(np.maximum(0.0, 1 - z ** 2))
+    phi = g * np.arange(n)
+    fib = np.stack([r * np.cos(phi), r * np.sin(phi), z], axis=1)
+    cands.append(fib)
+    return cands
+
+
+def _free_space_polish(points: np.ndarray) -> np.ndarray:
+    """SLSQP maximin in free space: max t s.t. d^2 >= t^2 and d^2 <= 1.
+
+    Since the ratio is scale-invariant, bounding dmax <= 1 loses nothing
+    and gives a well-posed maximin program that can leave the sphere.
+    """
+    from scipy.optimize import minimize
+    n = len(points)
+    X = points - points.mean(axis=0)
+    d2m = ((X[:, None, :] - X[None, :, :]) ** 2).sum(-1)[np.triu_indices(n, 1)].max()
+    X = X / np.sqrt(d2m)
+    IJ = np.triu_indices(n, k=1)
+
+    def d2(Xa):
+        return ((Xa[IJ[0]] - Xa[IJ[1]]) ** 2).sum(1)
+
+    t0 = np.sqrt(d2(X).min())
+    z0 = np.concatenate([X.ravel(), [t0]])
+
+    def cons(z):
+        Xz = z[:3 * n].reshape(n, 3)
+        dd = d2(Xz)
+        return np.concatenate([z[-1] ** 2 - dd, dd - 1.0])
+
+    res = minimize(lambda z: -z[-1], z0, method="SLSQP",
+                   constraints=[{"type": "ineq", "fun": cons}],
+                   options={"maxiter": 400, "ftol": 1e-12})
+    Xp = res.x[:3 * n].reshape(n, 3)
+    if not np.isfinite(Xp).all():
+        return X
+    return Xp
+
+
+def _fallback() -> np.ndarray:
+    rng = np.random.default_rng(0)
+    p = rng.standard_normal((14, 3))
+    return p / np.linalg.norm(p, axis=1, keepdims=True)
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Constructs 14 points in 3D maximizing (dmin/dmax)^2 via
+    multi-restart force-directed optimization on the unit sphere,
+    followed by free-space SLSQP maximin polish.
+    """
+    try:
+        n = 14
+        rng = np.random.default_rng(12345)
+
+        best_pts = None
+        best_sc = -1.0
+        for cand in _initial_candidates(rng, n):
+            for jitter_seed in range(3):
+                jrng = np.random.default_rng(1000 + jitter_seed)
+                p = cand + 0.05 * jrng.standard_normal(cand.shape)
+                p = _refine_on_sphere(p)
+                sc = _score(p)
+                if sc > best_sc:
+                    best_sc = sc
+                    best_pts = p.copy()
+
+        # final gentle polish on the best configuration
+        polished = _refine_on_sphere(best_pts, iters=300, cutoff_frac=1.05)
+        if _score(polished) >= best_sc:
+            best_pts = polished
+            best_sc = _score(polished)
+
+        # free-space SLSQP polish (can escape the sphere, which the
+        # sphere-projected dynamics cannot do)
+        try:
+            pol = _free_space_polish(best_pts)
+            s = _score(pol)
+            if s > best_sc and np.isfinite(pol).all():
+                best_sc, best_pts = s, pol.copy()
+        except Exception:
+            pass
+
+        # a couple of perturb -> relax -> polish rounds around the best
+        for rep in range(3):
+            jrng = np.random.default_rng(7000 + rep)
+            p = best_pts + 0.03 * jrng.standard_normal(best_pts.shape)
+            p = _refine_on_sphere(p, iters=150, cutoff_frac=1.10)
+            try:
+                p = _free_space_polish(p)
+            except Exception:
+                pass
+            s = _score(p)
+            if s > best_sc and np.isfinite(p).all():
+                best_sc, best_pts = s, p.copy()
+
+        if best_pts is None or not np.isfinite(best_pts).all() \
+                or best_pts.shape != (n, 3):
+            return _fallback()
+
+        # normalize so dmax = 1 (ratio invariant, keeps output tidy)
+        iu = np.triu_indices(n, k=1)
+        dmx = np.linalg.norm(
+            best_pts[:, None, :] - best_pts[None, :, :], axis=-1)[iu].max()
+        if dmx > 0:
+            best_pts = best_pts / dmx
+        return np.asarray(best_pts, dtype=float)
+    except Exception:
+        return _fallback()
+
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,77 @@
+<NAME>
+multiscale_sg_blended_polish
+</NAME>
+<DESCRIPTION>
+The current program uses a single fixed-scale zero-phase SG polish, which forces one smoothing strength everywhere: it either over-smooths quiet regions (hurting lag/responsiveness) or under-smooths volatile ones (hurting smoothness and false reversals). The best prior generation (0.65, slope_changes 65.8, false_reversals 44.4) used a volatility-blended multi-scale SG polish, and the current program already computes a local volatility proxy (r_arr) and keeps the stable fixed-Q Kalman + solve-based RTS smoother. This edit replaces the single-scale SG in Stage 2 with the multi-scale volatility-blended variant (soft Gaussian membership in volatility space centered at the 20/50/80 percentiles, three kernel scales), while keeping the confidence-gated trend lead of Stage 3 intact. This targets the weakest metrics — smoothness (0.23) and reversals (45.4) — by widening the effective kernel only where local volatility genuinely demands it, without adding lag in quiet regions. Q remains strictly fixed at 0.05·q_scale² and the RTS gain stays solve-based, per confirmed prior findings; no Q-scheduling, no 3-state model.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # --- Stage 2: zero-phase Savitzky-Golay smoothing (kills slope reversals, no lag) ---
+    sg_half = max(1, window_size // 4)
+    sg_len = 2 * sg_half + 1
+    poly = min(2, sg_len - 1)
+    # Convolve via simple polynomial-fitting kernel equivalent: use local quadratic fit
+    # Build SG coefficients for polynomial order 2
+    t_off = np.arange(-sg_half, sg_half + 1, dtype=float)
+    A = np.vstack([t_off ** k for k in range(poly + 1)]).T
+    ATA_inv = np.linalg.pinv(A.T @ A)
+    coeffs = (ATA_inv @ A.T)[0]  # row for value at center -> zero-phase
+    padded = np.concatenate([
+        2 * kf_out[0] - kf_out[1 : sg_half + 1][::-1],
+        kf_out,
+        2 * kf_out[-1] - kf_out[-2 : -sg_half - 2 : -1][::-1] if n > sg_half + 1 else kf_out[-1:],
+    ])
+    smoothed = np.convolve(padded, coeffs[::-1], mode="valid")
+    if len(smoothed) < n:
+        smoothed = kf_out  # degenerate case fallback
+=======
+    # --- Stage 2: volatility-blended multi-scale zero-phase SG smoothing ---
+    # Wide kernels where volatility is high (smoothness, few false reversals),
+    # narrow kernels in quiet regions (responsiveness, low lag). Soft Gaussian
+    # membership in volatility space avoids seams.
+    def _sg_coeffs(h):
+        """Order-2 SG kernel (value at center -> zero phase) for half-width h."""
+        t_off = np.arange(-h, h + 1, dtype=float)
+        A = np.vstack([t_off ** k for k in range(3)]).T
+        return (np.linalg.pinv(A.T @ A) @ A.T)[0]
+
+    def _sg_smooth(sig, h):
+        """Reflect-pad and convolve with the SG kernel; returns len(sig)."""
+        c = _sg_coeffs(h)[::-1]
+        if n > h + 1:
+            pad = np.concatenate([
+                2 * sig[0] - sig[1:h + 1][::-1],
+                sig,
+                2 * sig[-1] - sig[n - 2:n - h - 2:-1][::-1],
+            ])
+        else:
+            pad = sig
+        out = np.convolve(pad, c, mode="valid")
+        if len(out) != len(sig):
+            return sig  # degenerate-length fallback
+        return out
+
+    sg_half = max(2, window_size // 4)
+    cand = sorted({max(1, sg_half // 2), sg_half,
+                   min(max(1, n // 2 - 1), 3 * sg_half // 2)})
+    halves = [h for h in cand if 2 * h + 1 <= max(3, n)]
+    if len(halves) == 0:
+        halves = [1]
+
+    v = np.maximum(r_arr, 1e-12)
+    if len(halves) == 1 or n < 2 * max(halves) + 1:
+        smoothed = _sg_smooth(kf_out, halves[0])
+    else:
+        centers = np.percentile(v, [20.0, 50.0, 80.0])[:len(halves)]
+        spread = max(centers[-1] - centers[0], 1e-9)
+        W = np.stack([
+            np.exp(-0.5 * ((v - c) / spread) ** 2) for c in centers
+        ])
+        W = W / (W.sum(axis=0, keepdims=True) + 1e-12)
+        smoothed = np.zeros(n)
+        for j, h in enumerate(halves):
+            smoothed += W[j] * _sg_smooth(kf_out, h)
+    if len(smoothed) < n:
+        smoothed = kf_out  # degenerate case fallback
+>>>>>>> REPLACE
+</DIFF>

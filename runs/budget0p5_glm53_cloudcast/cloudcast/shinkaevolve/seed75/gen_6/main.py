@@ -1,0 +1,193 @@
+# EVOLVE-BLOCK-START
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+
+
+def _build_steiner_tree(src, dsts, G, num_partitions):
+    """
+    Takahashi-Matsuyama style Steiner tree heuristic.
+    Edges already in the tree are treated as (nearly) free, so traffic to
+    multiple destinations shares links instead of paying for them repeatedly.
+    Returns: dict dst -> path (list of nodes) from src to dst through the tree.
+    """
+    h = G.copy()
+    # remove incoming edges of src and self loops (same as original)
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    # working copy where tree edges cost ~0 so they can be reused for free
+    w = h.copy()
+    for u, v, d in w.edges(data=True):
+        if d.get("cost") is None:
+            d["cost"] = 0
+        d["_orig_cost"] = d.get("cost", 0)
+
+    in_tree = {src}
+    tree_edges = set()
+    dst_paths = {}
+
+    remaining = set(dsts)
+    while remaining:
+        # find the closest remaining dst to the current tree using
+        # multi-source dijkstra on the reduced-cost graph
+        dist, paths = nx.multi_source_dijkstra(w, list(in_tree))
+        best_dst = None
+        best_cost = float("inf")
+        for dst in remaining:
+            if dst in dist and dist[dst] < best_cost:
+                best_cost = dist[dst]
+                best_dst = dst
+        if best_dst is None:
+            # unreachable in reduced graph; try original graph as fallback
+            try:
+                path = nx.dijkstra_path(h, src, best_dst if best_dst else list(remaining)[0], weight="cost")
+            except Exception:
+                path = None
+            if path:
+                d0 = list(remaining)[0]
+                dst_paths[d0] = path
+                remaining.discard(d0)
+                continue
+            # give up on remaining
+            break
+        path = paths[best_dst]
+        # add path edges to the tree, mark them free for future reuse
+        for i in range(len(path) - 1):
+            s, t = path[i], path[i + 1]
+            if (s, t) not in tree_edges:
+                tree_edges.add((s, t))
+            w[s][t]["cost"] = 0
+            in_tree.add(t)
+            in_tree.add(s)
+        dst_paths[best_dst] = path
+        remaining.discard(best_dst)
+
+    # fill in unreachable dsts with plain shortest path (best effort)
+    for dst in dsts:
+        if dst not in dst_paths:
+            try:
+                dst_paths[dst] = nx.dijkstra_path(h, src, dst, weight="cost")
+            except Exception:
+                dst_paths[dst] = None
+
+    return dst_paths, tree_edges
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    dst_paths, tree_edges = _build_steiner_tree(src, dsts, G, num_partitions)
+
+    for dst in dsts:
+        path = dst_paths.get(dst)
+        if path is None:
+            continue
+        for i in range(len(path) - 1):
+            s, t = path[i], path[i + 1]
+            edge_data = G[s][t]
+            for j in range(num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, edge_data])
+
+    return bc_topology
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]  # [[src, dst, edge data]]
+
+
+class BroadCastTopology:
+    def __init__(self, src: str, dsts: List[str], num_partitions: int = 4, paths: Dict[str, SingleDstPath] = None):
+        self.src = src  # single str
+        self.dsts = dsts  # list of strs
+        self.num_partitions = num_partitions
+
+        # dict(dst) --> dict(partition) --> list(nx.edges)
+        # example: {dst1: {partition1: [src->node1, node1->dst1], partition 2: [src->dst1]}}
+        if paths is not None:
+            self.paths = paths
+            self.set_graph()
+        else:
+            self.paths = {dst: {str(i): None for i in range(num_partitions)} for dst in dsts}
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        """
+        Set paths for partition = partition to reach dst
+        """
+        partition = str(partition)
+        self.paths[dst][partition] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        """
+        Append path for partition = partition to reach dst
+        """
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+    def set_graph(self):
+        pass
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    """
+    Default graph with capacity constraints and cost info
+    nodes: regions, edges: links
+    per edge:
+        throughput: max tput achievable (gbps)
+        cost: $/GB
+        flow: actual flow (gbps), must be < throughput, default = 0
+    """
+    # Use relative path from this file's location
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if cost_path is None:
+        cost = pd.read_csv(os.path.join(current_dir, "profiles/cost.csv"))
+    else:
+        cost = pd.read_csv(cost_path)
+
+    if throughput_path is None:
+        throughput = pd.read_csv(os.path.join(current_dir, "profiles/throughput.csv"))
+    else:
+        throughput = pd.read_csv(throughput_path)
+
+    G = nx.DiGraph()
+    for _, row in throughput.iterrows():
+        if row["src_region"] == row["dst_region"]:
+            continue
+        G.add_edge(row["src_region"], row["dst_region"], cost=None, throughput=num_vms * row["throughput_sent"] / 1e9)
+
+    for _, row in cost.iterrows():
+        if row["src"] in G and row["dest"] in G[row["src"]]:
+            G[row["src"]][row["dest"]]["cost"] = row["cost"]
+
+    # some pairs not in the cost grid
+    no_cost_pairs = []
+    for edge in G.edges.data():
+        src, dst = edge[0], edge[1]
+        if edge[-1]["cost"] is None:
+            no_cost_pairs.append((src, dst))
+    print("Unable to get costs for: ", no_cost_pairs)
+
+    return G
+
+
+# EVOLVE-BLOCK-END
+
+# Helper functions that won't be evolved
+def create_broadcast_topology(src: str, dsts: List[str], num_partitions: int = 4):
+    """Create a broadcast topology instance"""
+    return BroadCastTopology(src, dsts, num_partitions)
+
+def run_search_algorithm(src: str, dsts: List[str], G, num_partitions: int):
+    """Run the search algorithm and return the topology"""
+    return search_algorithm(src, dsts, G, num_partitions)

@@ -1,0 +1,74 @@
+<NAME>
+multi_path_load_balanced_broadcast</NAME>
+
+<DESCRIPTION>
+The current algorithm computes a single Dijkstra shortest path from src to each dst and assigns ALL partitions of that dst to the same path. This (1) overloads a single route with all num_partitions flows, and (2) ignores network diversity. A better strategy is to compute k-shortest (lowest-cost) candidate paths per dst and spread partitions across those paths. To balance load across networks, we dynamically inflate the cost of edges as they get used (congestion-aware pricing): each time an edge carries a partition, its effective cost is increased multiplicatively, so subsequent paths tend to reuse different, less-utilized links. This exploits multi-network topologies, reduces redundant transfers over hot links, and spreads load, lowering overall cost and improving throughput feasibility. We use nx.shortest_simple_paths to get candidate paths in cost order, and assign partitions round-robin among the best candidates while tracking per-edge utilization.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Congestion-aware multi-path broadcast:
+    # 1) enumerate several low-cost candidate paths per dst,
+    # 2) spread partitions across them,
+    # 3) inflate edge costs as they carry load so later picks
+    #    diversify across networks (load balancing).
+    edge_load = {}
+    congestion_factor = 1.5
+    max_candidates = min(4, num_partitions)
+
+    for dst in dsts:
+        try:
+            candidates = []
+            gen = nx.shortest_simple_paths(h, src, dst, weight="cost")
+            for p in gen:
+                candidates.append(p)
+                if len(candidates) >= max_candidates:
+                    break
+        except nx.NetworkXNoPath:
+            continue
+
+        if not candidates:
+            continue
+
+        # rank candidates by their (load-inflated) effective cost
+        def effective_cost(path):
+            c = 0.0
+            for i in range(len(path) - 1):
+                s, t = path[i], path[i + 1]
+                base = h[s][t].get("cost") or 0.0
+                c += base * (congestion_factor ** edge_load.get((s, t), 0))
+            return c
+
+        # assign partitions round-robin over cheapest (effective) candidates
+        sorted_cands = sorted(candidates, key=effective_cost)
+        for j in range(bc_topology.num_partitions):
+            path = sorted_cands[j % len(sorted_cands)]
+            for i in range(len(path) - 1):
+                s, t = path[i], path[i + 1]
+                edge_load[(s, t)] = edge_load.get((s, t), 0) + 1
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+        # re-rank candidates for the next dst using updated edge loads
+        # (handled implicitly since effective_cost reads edge_load live)
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,407 @@
+# EVOLVE-BLOCK-START
+#pragma GCC optimize("O3,unroll-loops")
+
+#include <bits/stdc++.h>
+using namespace std;
+
+static constexpr int MAXN = 40;
+static constexpr int MAXV = 1600;
+static constexpr int MAXL = 100000;
+
+static constexpr int DR[4] = {0, 1, 0, -1};
+static constexpr int DC[4] = {1, 0, -1, 0};
+static constexpr char MV[4] = {'R', 'D', 'L', 'U'};
+
+int N, V;
+int dirt[MAXV];
+int nxtCell[MAXV][4];
+int distAll[MAXV][MAXV];
+signed char firstDir[MAXV][MAXV];
+
+mt19937 rng((unsigned)chrono::high_resolution_clock::now().time_since_epoch().count());
+
+inline int tri(long long x) {
+    return (int)(x * (x - 1) / 2);
+}
+
+inline int idOf(int r, int c) {
+    return r * N + c;
+}
+
+inline char opposite(char c) {
+    if (c == 'R') return 'L';
+    if (c == 'L') return 'R';
+    if (c == 'U') return 'D';
+    return 'U';
+}
+
+inline int dirOf(char c) {
+    if (c == 'R') return 0;
+    if (c == 'D') return 1;
+    if (c == 'L') return 2;
+    return 3;
+}
+
+struct State {
+    string route;
+    vector<int> pos;
+    array<long long, MAXV> gapTerm{};
+    double score = 1e100;
+
+    void reserveMemory() {
+        route.reserve(MAXL);
+        pos.reserve(MAXL + 1);
+    }
+};
+
+void buildAllPairsShortestPaths() {
+    static int q[MAXV];
+
+    for (int s = 0; s < V; ++s) {
+        fill(distAll[s], distAll[s] + V, -1);
+        distAll[s][s] = 0;
+
+        int head = 0, tail = 0;
+        q[tail++] = s;
+
+        while (head < tail) {
+            int u = q[head++];
+            for (int d = 0; d < 4; ++d) {
+                int v = nxtCell[u][d];
+                if (v < 0 || distAll[s][v] != -1) continue;
+
+                distAll[s][v] = distAll[s][u] + 1;
+                firstDir[s][v] = (u == s ? d : firstDir[s][u]);
+                q[tail++] = v;
+            }
+        }
+    }
+}
+
+void appendShortestPath(string& out, int from, int to) {
+    while (from != to) {
+        int d = firstDir[from][to];
+        out.push_back(MV[d]);
+        from = nxtCell[from][d];
+    }
+}
+
+bool evaluate(State& st) {
+    const int L = (int)st.route.size();
+    if (L <= 0 || L > MAXL) {
+        st.score = 1e100;
+        return false;
+    }
+
+    st.pos.clear();
+    st.pos.push_back(0);
+
+    static int first[MAXV];
+    static int last[MAXV];
+    static long long terms[MAXV];
+    static unsigned char seen[MAXV];
+
+    fill(first, first + V, -1);
+    fill(last, last + V, -1);
+    fill(terms, terms + V, 0LL);
+    fill(seen, seen + V, 0);
+
+    seen[0] = 1;
+    int cur = 0;
+
+    for (int t = 1; t <= L; ++t) {
+        int d = dirOf(st.route[t - 1]);
+        int to = nxtCell[cur][d];
+        if (to < 0) {
+            st.score = 1e100;
+            return false;
+        }
+        cur = to;
+        st.pos.push_back(cur);
+        seen[cur] = 1;
+
+        if (first[cur] < 0) {
+            first[cur] = last[cur] = t;
+        } else {
+            long long gap = t - last[cur];
+            terms[cur] += gap * (gap - 1) / 2;
+            last[cur] = t;
+        }
+    }
+
+    if (cur != 0) {
+        st.score = 1e100;
+        return false;
+    }
+
+    long long numerator = 0;
+    for (int x = 0; x < V; ++x) {
+        if (!seen[x] || first[x] < 0) {
+            st.score = 1e100;
+            return false;
+        }
+        long long gap = first[x] + L - last[x];
+        terms[x] += gap * (gap - 1) / 2;
+        st.gapTerm[x] = terms[x];
+        numerator += terms[x] * dirt[x];
+    }
+
+    st.score = (double)numerator / L;
+    return true;
+}
+
+string makeDFSRoute(int seed) {
+    vector<unsigned char> used(V, 0);
+    string out;
+    out.reserve(2 * V + 100);
+
+    function<void(int)> dfs = [&](int u) {
+        used[u] = 1;
+        array<pair<int, int>, 4> cand;
+        int cnt = 0;
+
+        for (int k = 0; k < 4; ++k) {
+            int d = (k + seed) & 3;
+            int v = nxtCell[u][d];
+            if (v >= 0 && !used[v]) {
+                int noise = (int)(rng() % 220);
+                cand[cnt++] = {-(dirt[v] * 4 + noise), d};
+            }
+        }
+
+        sort(cand.begin(), cand.begin() + cnt);
+        for (int i = 0; i < cnt; ++i) {
+            int d = cand[i].second;
+            int v = nxtCell[u][d];
+            if (used[v]) continue;
+            out.push_back(MV[d]);
+            dfs(v);
+            out.push_back(MV[(d + 2) & 3]);
+        }
+    };
+
+    dfs(0);
+    return out;
+}
+
+int selectDirtyTarget(const State& st, int topCount) {
+    vector<pair<long long, int>> ranking;
+    ranking.reserve(V);
+
+    for (int x = 0; x < V; ++x) {
+        ranking.push_back({st.gapTerm[x] * dirt[x], x});
+    }
+
+    topCount = min(topCount, V);
+    nth_element(ranking.begin(), ranking.begin() + topCount, ranking.end(),
+                [](const auto& a, const auto& b) {
+                    return a.first > b.first;
+                });
+
+    uniform_int_distribution<int> pick(0, topCount - 1);
+    return ranking[pick(rng)].second;
+}
+
+bool mutate(const State& cur, State& cand) {
+    const int L = (int)cur.route.size();
+    uniform_int_distribution<int> opPick(0, 99);
+
+    for (int attempt = 0; attempt < 12; ++attempt) {
+        cand.route = cur.route;
+        int op = opPick(rng);
+
+        if (op < 17) {
+            // Insert a two-step local detour.
+            if (L + 2 > MAXL) continue;
+            int p = (int)(rng() % (L + 1));
+            int u = cur.pos[p];
+
+            int available[4], cnt = 0;
+            for (int d = 0; d < 4; ++d) if (nxtCell[u][d] >= 0) available[cnt++] = d;
+            if (!cnt) continue;
+
+            int d = available[rng() % cnt];
+            cand.route.insert(cand.route.begin() + p, MV[d]);
+            cand.route.insert(cand.route.begin() + p + 1, MV[(d + 2) & 3]);
+            return true;
+        }
+
+        if (op < 32) {
+            // Remove a local backtrack, sampled without constructing an index list.
+            if (L < 2) continue;
+            bool found = false;
+            int p = 0;
+            for (int z = 0; z < 24; ++z) {
+                int t = (int)(rng() % (L - 1));
+                if (cur.pos[t] == cur.pos[t + 2]) {
+                    p = t;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) continue;
+            cand.route.erase(p, 2);
+            return true;
+        }
+
+        if (op < 57) {
+            // Replace a route segment with its shortest path.
+            if (L < 3) continue;
+            int a = (int)(rng() % L);
+            int b = a + 1 + (int)(rng() % min(L - a, 180));
+            int u = cur.pos[a], v = cur.pos[b];
+            int shortest = distAll[u][v];
+            if (shortest >= b - a) continue;
+
+            string rep;
+            rep.reserve(shortest);
+            appendShortestPath(rep, u, v);
+            cand.route.replace(a, b - a, rep);
+            return true;
+        }
+
+        if (op < 67) {
+            // Reverse a closed-valid route section.
+            if (L < 2) continue;
+            int a = (int)(rng() % L);
+            int b = a + 1 + (int)(rng() % min(L - a, 350));
+            reverse(cand.route.begin() + a, cand.route.begin() + b);
+            for (int i = a; i < b; ++i) cand.route[i] = opposite(cand.route[i]);
+            return true;
+        }
+
+        if (op < 84) {
+            // Insert a targeted revisit at one occurrence of a dirty cell.
+            int target = selectDirtyTarget(cur, max(8, N));
+            int chosen = -1, occurrences = 0;
+            for (int i = 0; i <= L; ++i) {
+                if (cur.pos[i] == target) {
+                    ++occurrences;
+                    if ((int)(rng() % occurrences) == 0) chosen = i;
+                }
+            }
+            if (chosen < 0 || L + 2 > MAXL) continue;
+
+            int u = target;
+            int ds[4], cnt = 0;
+            for (int d = 0; d < 4; ++d) if (nxtCell[u][d] >= 0) ds[cnt++] = d;
+            if (!cnt) continue;
+
+            int d = ds[rng() % cnt];
+            cand.route.insert(cand.route.begin() + chosen, MV[d]);
+            cand.route.insert(cand.route.begin() + chosen + 1, MV[(d + 2) & 3]);
+            return true;
+        }
+
+        // Force a dirty target into a short segment.
+        if (L < 2) continue;
+        int target = selectDirtyTarget(cur, max(5, N / 2));
+        int a = (int)(rng() % L);
+        int b = a + 1 + (int)(rng() % min(L - a, 35));
+        int u = cur.pos[a], v = cur.pos[b];
+
+        int newLen = distAll[u][target] + distAll[target][v];
+        if (newLen <= 0 || L - (b - a) + newLen > MAXL) continue;
+
+        string rep;
+        rep.reserve(newLen);
+        appendShortestPath(rep, u, target);
+        appendShortestPath(rep, target, v);
+        cand.route.replace(a, b - a, rep);
+        return true;
+    }
+
+    return false;
+}
+
+int main(int argc, char** argv) {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    double timeLimit = 1.93;
+    if (argc > 1) timeLimit = stod(argv[1]);
+    const auto start = chrono::steady_clock::now();
+
+    cin >> N;
+    V = N * N;
+
+    vector<string> h(N - 1), v(N);
+    for (int i = 0; i < N - 1; ++i) cin >> h[i];
+    for (int i = 0; i < N; ++i) cin >> v[i];
+
+    for (int r = 0; r < N; ++r)
+        for (int c = 0; c < N; ++c)
+            cin >> dirt[idOf(r, c)];
+
+    for (int x = 0; x < V; ++x)
+        for (int d = 0; d < 4; ++d)
+            nxtCell[x][d] = -1;
+
+    for (int r = 0; r < N; ++r) {
+        for (int c = 0; c < N; ++c) {
+            int u = idOf(r, c);
+
+            if (c + 1 < N && v[r][c] == '0') {
+                nxtCell[u][0] = idOf(r, c + 1);
+                nxtCell[idOf(r, c + 1)][2] = u;
+            }
+            if (r + 1 < N && h[r][c] == '0') {
+                nxtCell[u][1] = idOf(r + 1, c);
+                nxtCell[idOf(r + 1, c)][3] = u;
+            }
+        }
+    }
+
+    buildAllPairsShortestPaths();
+
+    State current, best, candidate;
+    current.reserveMemory();
+    best.reserveMemory();
+    candidate.reserveMemory();
+
+    // Multiple weighted DFS seeds produce a stronger initial route.
+    for (int seed = 0; seed < 10; ++seed) {
+        State initial;
+        initial.reserveMemory();
+        initial.route = makeDFSRoute(seed);
+        evaluate(initial);
+
+        if (initial.score < best.score) {
+            best = initial;
+            current = initial;
+        }
+    }
+
+    uniform_real_distribution<double> real01(0.0, 1.0);
+    long long iter = 0;
+
+    while (true) {
+        if ((++iter & 127) == 0) {
+            double elapsed = chrono::duration<double>(chrono::steady_clock::now() - start).count();
+            if (elapsed >= timeLimit) break;
+        }
+
+        if (!mutate(current, candidate)) continue;
+        if (!evaluate(candidate)) continue;
+
+        if (candidate.score < best.score) best = candidate;
+
+        if (candidate.score <= current.score) {
+            current = candidate;
+            continue;
+        }
+
+        double elapsed = chrono::duration<double>(chrono::steady_clock::now() - start).count();
+        double progress = min(1.0, elapsed / timeLimit);
+        double temperature = 35000.0 * pow(0.002, progress);
+
+        double delta = candidate.score - current.score;
+        if (exp(-delta / max(temperature, 1.0)) > real01(rng)) {
+            current = candidate;
+        }
+    }
+
+    cout << best.route << '\n';
+    return 0;
+}
+# EVOLVE-BLOCK-END

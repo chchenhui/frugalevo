@@ -1,0 +1,166 @@
+<NAME>
+minimax_postplacement_greedy
+</NAME>
+
+<DESCRIPTION>
+Replace the current-state KVPR greedy rule with a minimax rule that evaluates the KVPR after placing each model. The previous implementation selected the GPU with the smallest current pressure, which can place a large/high-rate model onto a GPU where its resulting KVPR is very high.
+
+The revised placement tries several inexpensive ordering strategies, retains the feasible placement with the lowest maximum KVPR, and then applies improving single-model moves. Each candidate placement is evaluated using the actual objective: the maximum KVPR across all GPUs after the assignment. This directly aligns the heuristic with the optimization target while retaining strict memory-capacity checks.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        A placement of models to GPUs
+    """
+
+    # Greedy KVPR-minimizing placement based on Algorithm 1 (without τ check)
+    # 1) Sort models by r_j / s_j in descending order
+    sorted_models = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
+
+    # 2) Initialize per-GPU states
+    placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+    shared_kv = [GPU_MEM_SIZE for _ in range(gpu_num)]  # remaining memory per GPU
+    weighted_req_rate = [0.0 for _ in range(gpu_num)]   # sum of r_j / s_j per GPU
+
+    # 3) Assign each model to the GPU that minimizes current KVPR while fitting in memory
+    for model in sorted_models:
+        best_idx = None
+        best_ratio = float('inf')
+
+        for gpu_id in range(gpu_num):
+            if model.model_size <= shared_kv[gpu_id] and shared_kv[gpu_id] > 0:
+                current_ratio = weighted_req_rate[gpu_id] / shared_kv[gpu_id]
+                if current_ratio < best_ratio:
+                    best_ratio = current_ratio
+                    best_idx = gpu_id
+
+        # Failure: if no GPU can fit, raise an error instead of overcommitting
+        if best_idx is None:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on any GPU. "
+                f"Remaining per-GPU memory: {shared_kv}"
+            )
+
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    return placement
+=======
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a memory-feasible placement that minimizes maximum KV cache pressure.
+    """
+
+    def pressure(load, remaining):
+        if remaining > 0:
+            return load / remaining
+        return float("inf") if load > 0 else 0.0
+
+    def greedy(order):
+        placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+        remaining = [GPU_MEM_SIZE] * gpu_num
+        loads = [0.0] * gpu_num
+        scores = [0.0] * gpu_num
+
+        for model in order:
+            demand = model.req_rate / model.slo
+            best_gpu = None
+            best_key = None
+
+            for gpu_id in range(gpu_num):
+                if model.model_size > remaining[gpu_id]:
+                    continue
+
+                new_remaining = remaining[gpu_id] - model.model_size
+                new_score = pressure(loads[gpu_id] + demand, new_remaining)
+                objective = max(
+                    new_score,
+                    max(scores[:gpu_id] + scores[gpu_id + 1:], default=0.0),
+                )
+                # On equal objective values, pack more tightly to preserve capacity.
+                key = (objective, new_score, new_remaining)
+
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_gpu = gpu_id
+
+            if best_gpu is None:
+                return None
+
+            placement[best_gpu].append(model)
+            loads[best_gpu] += demand
+            remaining[best_gpu] -= model.model_size
+            scores[best_gpu] = pressure(loads[best_gpu], remaining[best_gpu])
+
+        return placement, loads, remaining, scores
+
+    model_pressure = lambda m: m.req_rate / m.slo
+    orders = [
+        sorted(models, key=model_pressure, reverse=True),
+        sorted(models, key=lambda m: m.model_size, reverse=True),
+        sorted(
+            models,
+            key=lambda m: model_pressure(m) / max(1e-12, GPU_MEM_SIZE - m.model_size),
+            reverse=True,
+        ),
+    ]
+
+    candidates = [result for result in (greedy(order) for order in orders) if result]
+    if not candidates:
+        raise ValueError(
+            f"Unable to place all models on {gpu_num} GPUs with {GPU_MEM_SIZE} GB each."
+        )
+
+    placement, loads, remaining, scores = min(
+        candidates, key=lambda result: max(result[3], default=0.0)
+    )
+
+    # Move a model whenever doing so strictly reduces the global maximum KVPR.
+    while True:
+        current_max = max(scores, default=0.0)
+        best_move = None
+        best_max = current_max
+
+        for source in range(gpu_num):
+            for model in placement[source]:
+                demand = model_pressure(model)
+                for target in range(gpu_num):
+                    if source == target or model.model_size > remaining[target]:
+                        continue
+
+                    new_loads = loads[:]
+                    new_remaining = remaining[:]
+                    new_loads[source] -= demand
+                    new_remaining[source] += model.model_size
+                    new_loads[target] += demand
+                    new_remaining[target] -= model.model_size
+                    new_max = max(
+                        pressure(new_loads[gpu], new_remaining[gpu])
+                        for gpu in range(gpu_num)
+                    )
+
+                    if new_max < best_max - 1e-12:
+                        best_max = new_max
+                        best_move = (source, target, model, new_loads, new_remaining)
+
+        if best_move is None:
+            break
+
+        source, target, model, loads, remaining = best_move
+        placement[source].remove(model)
+        placement[target].append(model)
+        scores = [pressure(loads[gpu], remaining[gpu]) for gpu in range(gpu_num)]
+
+    return placement
+>>>>>>> REPLACE
+</DIFF>

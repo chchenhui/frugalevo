@@ -1,0 +1,109 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Deterministically search for a 13-point maximin configuration.
+
+    The three first points are the vertices of a reference triangle.  All
+    remaining points are represented in barycentric coordinates, so the
+    returned points always belong to this convex region.  Since the reference
+    triangle is the hull, its area is fixed and maximizing the minimum
+    determinant is precisely maximizing normalized triangle area.
+    """
+    n = 13
+    rng = np.random.default_rng(seed=13031957)
+    triples = np.array(
+        [(i, j, k) for i in range(n - 2) for j in range(i + 1, n - 1)
+         for k in range(j + 1, n)],
+        dtype=np.intp,
+    )
+    corners = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+
+    def random_triangle_point() -> np.ndarray:
+        """Sample uniformly from the fixed reference triangle."""
+        uv = rng.random(2)
+        if uv.sum() > 1.0:
+            uv = 1.0 - uv
+        return uv
+
+    def triangle_areas(p: np.ndarray) -> np.ndarray:
+        a = p[triples[:, 0]]
+        b = p[triples[:, 1]]
+        c = p[triples[:, 2]]
+        # This is twice Euclidean area.  The hull also has twice-area one.
+        return np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+                      - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+
+    def lower_tail_quality(values: np.ndarray) -> float:
+        """Weighted quality of the active lower tail of triangle constraints."""
+        tail = np.partition(values, 15)[:16]
+        weights = np.linspace(3.0, 1.0, 16)
+        return float(np.dot(tail, weights) / weights.sum())
+
+    best_points = None
+    best_value = -1.0
+
+    # Restarts are inexpensive because all 286 triangle areas are evaluated
+    # together by NumPy, while being important for this non-convex objective.
+    for restart in range(8):
+        points = np.empty((n, 2), dtype=float)
+        points[:3] = corners
+        points[3:] = np.array([random_triangle_point() for _ in range(n - 3)])
+        areas = triangle_areas(points)
+        value = float(areas.min())
+        quality = lower_tail_quality(areas)
+
+        for step in range(18000):
+            # The lower-tail active set supplies vertices for both single and
+            # coordinated moves.  The latter breaks bottleneck exchanges.
+            active_indices = np.argpartition(areas, 15)[:16]
+            active = triples[active_indices]
+            movable_pool = np.unique(active[active >= 3])
+
+            trial = points.copy()
+            progress = step / 18000.0
+            scale = 0.100 * (1.0 - progress) + 0.0020
+
+            if rng.random() < 0.18 and len(movable_pool) >= 2:
+                indices = rng.choice(movable_pool, size=2, replace=False)
+                for index in indices:
+                    candidate = trial[index] + rng.normal(
+                        0.0, 0.56 * scale, 2
+                    )
+                    candidate = np.maximum(candidate, 0.0)
+                    total = float(candidate.sum())
+                    if total > 1.0:
+                        candidate /= total
+                    trial[index] = candidate
+            else:
+                index = int(movable_pool[rng.integers(len(movable_pool))])
+                if rng.random() < 0.045 and progress < 0.35:
+                    trial[index] = random_triangle_point()
+                else:
+                    candidate = trial[index] + rng.normal(0.0, scale, 2)
+                    candidate = np.maximum(candidate, 0.0)
+                    total = float(candidate.sum())
+                    if total > 1.0:
+                        candidate /= total
+                    trial[index] = candidate
+
+            trial_areas = triangle_areas(trial)
+            trial_value = float(trial_areas.min())
+            trial_quality = lower_tail_quality(trial_areas)
+            temperature = 0.0017 * (1.0 - progress) ** 2 + 0.000008
+            delta = trial_quality - quality
+            if delta >= 0.0 or rng.random() < np.exp(delta / temperature):
+                points, areas, value, quality = (
+                    trial, trial_areas, trial_value, trial_quality
+                )
+
+            if value > best_value:
+                best_value = value
+                best_points = points.copy()
+
+    return best_points
+
+
+# EVOLVE-BLOCK-END

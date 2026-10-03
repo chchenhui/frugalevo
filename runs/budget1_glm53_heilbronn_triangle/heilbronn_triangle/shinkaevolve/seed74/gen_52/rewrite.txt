@@ -1,0 +1,173 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+_V0 = np.array([0.0, 0.0])
+_V1 = np.array([1.0, 0.0])
+_V2 = np.array([0.5, np.sqrt(3.0) / 2.0])
+_TRI_AREA = 0.5 * np.sqrt(3.0) / 2.0
+
+_TRIP = np.array(list(combinations(range(11), 3)), dtype=int)
+_IA = _TRIP[:, 0]
+_IB = _TRIP[:, 1]
+_IC = _TRIP[:, 2]
+_NTRIP = _TRIP.shape[0]
+_H = np.sqrt(3.0) / 2.0
+_INV = 1.0 / (2.0 * _TRI_AREA)
+
+
+def _areas(pts):
+    a = pts[_IA]
+    b = pts[_IB]
+    c = pts[_IC]
+    cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    return np.abs(cross) * _INV
+
+
+def _min_area(pts):
+    return float(_areas(pts).min())
+
+
+def _clip(pts):
+    out = pts.copy()
+    y = out[:, 1]
+    x = out[:, 0]
+    l2 = y / _H
+    l1 = x - 0.5 * l2
+    l0 = 1.0 - l1 - l2
+    bad = (l0 < 0) | (l1 < 0) | (l2 < 0)
+    if np.any(bad):
+        for i in np.where(bad)[0]:
+            lam = np.maximum([l0[i], l1[i], l2[i]], 0.0)
+            lam /= lam.sum()
+            out[i] = lam[0] * _V0 + lam[1] * _V1 + lam[2] * _V2
+    return out
+
+
+def _initial(seed):
+    rng = np.random.default_rng(seed)
+    pts = []
+    k = 3
+    for i in range(k + 1):
+        for j in range(k + 1 - i):
+            l = k - i - j
+            pts.append((i * _V0 + j * _V1 + l * _V2) / k)
+    pts.append(np.array([0.5, _H / 3.0]))
+    pts = np.array(pts)
+    return _clip(pts + rng.normal(0.0, 0.02, pts.shape))
+
+
+def _boundary_initial(seed):
+    rng = np.random.default_rng(seed)
+    pts = [_V0.copy(), _V1.copy(), _V2.copy()]
+    cen = np.array([0.5, _H / 3.0])
+    # 8 points: 3 + 2 + 2 on edges, golden-ratio spacing, plus one interior
+    g = (np.sqrt(5.0) - 1.0) / 2.0
+    for k in range(3):
+        t = ((k * g + 0.21) % 1.0) * 0.72 + 0.14
+        pts.append(_V0 + t * (_V1 - _V0))
+    for k in range(2):
+        t = ((k * g * g + 0.55) % 1.0) * 0.72 + 0.14
+        pts.append(_V1 + t * (_V2 - _V1))
+    for k in range(2):
+        t = ((k * g * g * g + 0.77) % 1.0) * 0.72 + 0.14
+        pts.append(_V2 + t * (_V0 - _V2))
+    pts.append(cen + rng.normal(0.0, 0.01, 2))
+    pts = np.array(pts)
+    return _clip(pts + rng.normal(0.0, 0.008, pts.shape))
+
+
+def _soft_score(areas, lam):
+    """Smooth surrogate: converges to -min(area) as lam grows."""
+    return -np.log(np.sum(np.exp(-lam * areas))) / lam
+
+
+def _anneal_soft(pts, rng, iters=6000):
+    cur = _clip(pts)
+    areas = _areas(cur)
+    cur_v = float(areas.min())
+    best, best_v = cur.copy(), cur_v
+    T0, Tmin = 0.010, 1e-5
+    lam0, lam1 = 40.0, 400.0
+    for it in range(iters):
+        frac = it / iters
+        T = T0 * (1.0 - frac) + Tmin
+        lam = lam0 * (lam1 / lam0) ** frac
+        step = 0.03 * (1.0 - frac) ** 2 + 0.002
+        cand = cur.copy()
+        idx = int(rng.integers(0, 11))
+        cand[idx] += step * rng.normal(0.0, 1.0, 2)
+        cand = _clip(cand)
+        ca = _areas(cand)
+        if ca.min() > best_v:
+            best_v = float(ca.min())
+            best = cand.copy()
+        # Metropolis on soft score
+        ds = _soft_score(ca, lam) - _soft_score(areas, lam)
+        if ds >= 0 or rng.random() < np.exp(ds / max(T, 1e-12)):
+            cur, areas = cand, ca
+    return best, best_v
+
+
+def _polish(best, best_v):
+    n_dirs = 16
+    ang = 2.0 * np.pi * np.arange(n_dirs) / n_dirs
+    dirs = np.stack([np.cos(ang), np.sin(ang)], axis=1)
+    full = np.concatenate([dirs, -dirs], axis=0)
+    step = 0.003
+    while step > 1e-5:
+        improved = False
+        for i in range(11):
+            for d in full:
+                cand = best.copy()
+                cand[i] += step * d
+                cand = _clip(cand)
+                v = _min_area(cand)
+                if v > best_v + 1e-12:
+                    best_v, best, improved = v, cand, True
+        if not improved:
+            step *= 0.5
+    return best, best_v
+
+
+def _refine(pts, rng):
+    best, best_v = _anneal_soft(pts, rng)
+    # two reheating cycles from best
+    for _ in range(2):
+        if best_v >= 0.030:
+            break
+        start = _clip(best + rng.normal(0.0, 0.006, best.shape))
+        b2, v2 = _anneal_soft(start, rng, iters=3000)
+        if v2 > best_v:
+            best_v, best = v2, b2
+    best, best_v = _polish(best, best_v)
+    return best, best_v
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of 11 points on or inside the equilateral triangle with
+    vertices (0,0), (1,0), (0.5, sqrt(3)/2), maximizing the minimum triangle area.
+
+    Deterministic multistart soft-min simulated annealing with greedy polish.
+    Falls back to the initial configuration if refinement fails.
+    """
+    best_pts = None
+    best_val = -1.0
+    try:
+        for seed in range(12):
+            rng = np.random.default_rng(1234 + seed)
+            if seed % 2 == 0:
+                init = _initial(1234 + seed)
+            else:
+                init = _boundary_initial(1234 + seed)
+            pts, val = _refine(init, rng)
+            if val > best_val:
+                best_val = val
+                best_pts = pts
+    except Exception:
+        if best_pts is None:
+            best_pts = _initial(1234)
+    return np.asarray(best_pts, dtype=float)
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,127 @@
+<NAME>
+hard_constraint_slsqlp_polish</NAME>
+<DESCRIPTION>
+The softmin/softmax surrogate in `_neg_obj` only approaches the true objective as beta→∞, so L-BFGS-B converges to borderline plateaus just below the true optimum (min_max_ratio 0.21 vs the ~0.24 reference). The decisive improvement is to add a hard-constrained SLSQP stage that directly maximizes t subject to d_ij² ≥ t and d_ij² ≤ 1 (all pairwise distances simultaneously bounded, which is *exactly* the min-max ratio problem). SLSQP handles analytic constraint Jacobians, so this is cheap for 14 points (91 pairs, 43 variables). We then apply escalating-tolerance passes with small perturbation restarts (as recommended), always keeping the better configuration, so every pass is risk-free.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def min_max_dist_dim3_14() -> np.ndarray:
+=======
+def _slsqp_stage(pts, beta_unused=None):
+    """Directly maximize min pairwise distance subject to max pairwise
+    distance <= 1, via hard inequality constraints (exactly the true
+    objective). Returns improved points (or the input if no gain)."""
+    if not HAVE_SCIPY:
+        return pts
+    n = len(pts)
+    idx_i, idx_j = np.triu_indices(n, 1)
+    m = len(idx_i)
+    pts = pts - pts.mean(axis=0)
+    # normalize so max pair dist == 1
+    d2 = np.sum((pts[:, None] - pts[None]) ** 2, axis=-1)
+    dx = np.sqrt(d2[np.triu_indices(n, 1)].max())
+    if dx <= 0:
+        return pts
+    pts = pts / dx
+    d2 = np.sum((pts[:, None] - pts[None]) ** 2, axis=-1)
+    t0 = d2[np.triu_indices(n, 1)].min()
+
+    def unpack(x):
+        return x[:3 * n].reshape(n, 3), x[3 * n]
+
+    def obj(x):
+        g = np.zeros(3 * n + 1)
+        g[-1] = -1.0
+        return -x[-1], g
+
+    rows_i = 3 * idx_i
+    rows_j = 3 * idx_j
+
+    def cons_f(x):
+        p, t = unpack(x)
+        dd = np.sum((p[:, None] - p[None]) ** 2, axis=-1)[idx_i, idx_j]
+        return np.concatenate([dd - t, 1.0 - dd])
+
+    def cons_j(x):
+        p, _ = unpack(x)
+        diff = p[idx_i] - p[idx_j]
+        J = np.zeros((2 * m, 3 * n + 1))
+        for k in range(m):
+            i3, j3 = rows_i[k], rows_j[k]
+            J[k, i3:i3 + 3] = 2.0 * diff[k]
+            J[k, j3:j3 + 3] = -2.0 * diff[k]
+            J[k, -1] = -1.0
+            J[m + k, i3:i3 + 3] = -2.0 * diff[k]
+            J[m + k, j3:j3 + 3] = 2.0 * diff[k]
+        return J
+
+    cons = {"type": "ineq", "fun": cons_f, "jac": cons_j}
+    x0 = np.concatenate([pts.ravel(), [t0]])
+    try:
+        res = minimize(obj, x0, jac=True, method="SLSQP",
+                       constraints=[cons],
+                       options={"maxiter": 300, "ftol": 1e-12})
+        cand, _ = unpack(res.x)
+        cand = cand - cand.mean(axis=0)
+        return cand
+    except Exception:
+        return pts
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+>>>>>>> REPLACE
+```
+
+
+The second edit inserts the escalating SLSQP polish passes after stage 2 and upgrades stage 3 to also run the hard-constraint stage:
+
+```python
+=======
+The second edit:
+<DIFF>
+<<<<<<< SEARCH
+    # stage 3: greedy local polish: perturb best config and re-optimize
+    if best_pts is not None:
+        rng = np.random.RandomState(123)
+        for _ in range(8):
+            cand = best_pts + 0.02 * rng.randn(n, 3)
+            for beta in [150.0, 400.0]:
+                cand = _opt(cand.ravel().copy(), n, beta, False, 250)
+                cand = cand - cand.mean(axis=0)
+            s = _true_score(cand)
+            if s > best:
+                best = s
+                best_pts = cand
+=======
+    # stage 3: hard-constraint SLSQP polish with escalating tolerance
+    # passes and perturbation restarts (keep-the-better acceptance).
+    if best_pts is not None:
+        for tol, mit in ((1e-12, 250), (1e-14, 300)):
+            cand = _slsqp_stage(best_pts)
+            s = _true_score(cand)
+            if s > best:
+                best = s
+                best_pts = cand
+            if s < best:
+                cand = best_pts + 1e-6 * np.random.RandomState(7).standard_normal(n, 3)
+                cand = _slsqp_stage(cand)
+                s2 = _true_score(cand)
+                if s2 > best:
+                    best = s2
+                    best_pts = cand
+
+    # stage 4: perturbed multi-restarts with hard-constraint finish
+    if best_pts is not None:
+        rng = np.random.RandomState(123)
+        for _ in range(6):
+            cand = best_pts + 0.02 * rng.randn(n, 3)
+            for beta in [150.0, 400.0]:
+                cand = _opt(cand.ravel().copy(), n, beta, False, 250)
+                cand = cand - cand.mean(axis=0)
+            cand = _slsqp_stage(cand)
+            s = _true_score(cand)
+            if s > best:
+                best = s
+                best_pts = cand
+>>>>>>> REPLACE
+</DIFF>

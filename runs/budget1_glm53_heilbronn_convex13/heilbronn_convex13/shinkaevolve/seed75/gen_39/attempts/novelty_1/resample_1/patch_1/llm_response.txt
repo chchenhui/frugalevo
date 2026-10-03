@@ -1,0 +1,175 @@
+<NAME>
+incremental_triangle_scoring</NAME>
+<DESCRIPTION>
+The main cost in `_hillclimb` is the full `_score` call (286 triangle areas + Python-loop hull area) for every candidate, even though ~75%+ of moves perturb a single vertex. For a single-vertex move only 66 of the 286 triangles change area; the other 220 can be read from a cached array. Similarly, if the moved vertex is not on the convex hull, the hull area is unchanged and the Python monotone-chain hull computation can be skipped entirely. This edit adds precomputed per-vertex triangle masks and an incremental scoring helper, and rewrites `_hillclimb` to keep a cached `base_areas` array + cached hull area/hull vertex set, updating only the 66 touching triangles for single-vertex moves (full recompute only for coordinated 3-vertex moves and when a hull vertex moves). This roughly 4x speedup in the inner loop converts directly into more hillclimb iterations and restarts within the fixed 3s budget, which is the dominant driver of the achieved min-area.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+TRI_IDX = np.array(list(combinations(range(13), 3)))
+=======
+TRI_IDX = np.array(list(combinations(range(13), 3)))
+# Per-vertex masks over the 286 triangles: triangles touching vertex i vs not.
+TRI_MASK = [np.any(TRI_IDX == i, axis=1) for i in range(13)]
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def _score(pts):
+    ha = _convex_hull_area(pts)
+    if ha <= 1e-12:
+        return 0.0
+    return 0.5 * _cross_all(pts).min() / ha
+=======
+def _score(pts):
+    ha = _convex_hull_area(pts)
+    if ha <= 1e-12:
+        return 0.0
+    return 0.5 * _cross_all(pts).min() / ha
+
+
+def _hull_vertices(pts):
+    """Indices of points on the convex hull (quick monotone chain)."""
+    order = np.lexsort((pts[:, 1], pts[:, 0]))
+    P = pts[order]
+    keep = np.ones(len(P), dtype=bool)
+    if len(P) > 1:
+        keep[1:] = np.any(P[1:] != P[:-1], axis=1)
+    P = P[keep]
+    o = order[keep]
+    if len(P) < 3:
+        return set(range(len(pts)))
+    def cross(a, b, c):
+        return (b[0]-a[0])*(c[1]-a[1]) - (b[1]-a[1])*(c[0]-a[0])
+    def half(seq):
+        st = []
+        for k in seq:
+            while len(st) >= 2 and cross(st[-2], st[-1], P[k]) <= 0:
+                st.pop()
+            st.append(k)
+        return st[:-1]
+    lo = half(list(range(len(P))))
+    up = half(list(range(len(P)-1, -1, -1)))
+    return set(int(o[k]) for k in lo + up)
+
+
+def _score_move(pts, i, base_areas, hull_area):
+    """Incremental score for a config differing from base only at vertex i.
+
+    Returns (score, areas, hull_area): only the 66 triangles touching
+    vertex i are recomputed; hull_area is recomputed only if needed.
+    """
+    if hull_area is None or hull_area <= 1e-12:
+        hull_area = _convex_hull_area(pts)
+        if hull_area <= 1e-12:
+            return 0.0, base_areas, 0.0
+    m = TRI_MASK[i]
+    areas = base_areas.copy()
+    p = pts[TRI_IDX[m]]
+    a = p[:, 0]
+    v1 = p[:, 1] - a
+    v2 = p[:, 2] - a
+    areas[m] = np.abs(v1[:, 0]*v2[:, 1] - v1[:, 1]*v2[:, 0])
+    return 0.5 * areas.min() / hull_area, areas, hull_area
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def _hillclimb(pts, rng, deadline, sigma0=0.12):
+    pts = pts.copy()
+    sc = _score(pts)
+    sigma = sigma0
+    while time.time() < deadline:
+        improved = False
+        pool = None
+        for _ in range(150):
+            cand = pts.copy()
+            if rng.random() < 0.20:
+                # coordinated move: perturb all 3 vertices of the
+                # current minimum triangle together with correlated
+                # small sigma; strict-improvement acceptance below
+                # prevents degenerate drift.
+                cr = _cross_all(pts)
+                tri = TRI_IDX[int(np.argmin(cr))]
+                sgn = rng.normal(0, 1, 2)
+                for i in tri:
+                    mag = rng.normal(0, min(sigma, 0.05), 1)[0]
+                    cand[i] += mag * sgn + rng.normal(0, 0.25 * min(sigma, 0.05), 2)
+            elif rng.random() < 0.75:
+                if pool is None:
+                    pool = _bottleneck_pool(pts, k=5)
+                i = int(rng.choice(pool))
+                cand[i] += rng.normal(0, sigma, 2)
+            else:
+                i = int(rng.integers(13))
+                cand[i] += rng.normal(0, sigma, 2)
+            csc = _score(cand)
+            if csc > sc + 1e-12:
+                pts, sc = cand, csc
+                pool = None  # recompute bottleneck pool
+                improved = True
+        if improved:
+            sigma = min(sigma * 1.3, 0.3)
+        else:
+            sigma *= 0.55
+        if sigma < 1e-5:
+            break
+    return pts, sc
+=======
+def _hillclimb(pts, rng, deadline, sigma0=0.12):
+    pts = pts.copy()
+    hull_area = _convex_hull_area(pts)
+    base_areas = _cross_all(pts)
+    sc = _score(pts)
+    hull_set = _hull_vertices(pts)
+    sigma = sigma0
+    while time.time() < deadline:
+        improved = False
+        pool = None
+        for _ in range(600):
+            single = True
+            if rng.random() < 0.20:
+                # coordinated move: perturb all 3 vertices of the
+                # current minimum triangle together with correlated
+                # small sigma; strict-improvement acceptance below
+                # prevents degenerate drift.
+                cr = base_areas
+                tri = TRI_IDX[int(np.argmin(cr))]
+                cand = pts.copy()
+                single = False
+                sgn = rng.normal(0, 1, 2)
+                for i in tri:
+                    mag = rng.normal(0, min(sigma, 0.05), 1)[0]
+                    cand[i] += mag * sgn + rng.normal(0, 0.25 * min(sigma, 0.05), 2)
+            else:
+                if rng.random() < 0.75:
+                    if pool is None:
+                        pool = _bottleneck_pool(pts, k=5)
+                    i = int(rng.choice(pool))
+                else:
+                    i = int(rng.integers(13))
+                cand = pts.copy()
+                cand[i] += rng.normal(0, sigma, 2)
+            if single and i not in hull_set:
+                # Only 66 triangles change; hull unchanged.
+                csc, new_areas, ha = _score_move(cand, i, base_areas, hull_area)
+                new_hull = False
+            else:
+                ha = _convex_hull_area(cand)
+                if ha <= 1e-12:
+                    continue
+                new_areas = _cross_all(cand)
+                csc = 0.5 * new_areas.min() / ha
+                new_hull = True
+            if csc > sc + 1e-12:
+                pts, sc = cand, csc
+                base_areas = new_areas
+                hull_area = ha
+                if new_hull:
+                    hull_set = _hull_vertices(pts)
+                pool = None  # recompute bottleneck pool
+                improved = True
+        if improved:
+            sigma = min(sigma * 1.3, 0.3)
+        else:
+            sigma *= 0.55
+        if sigma < 1e-5:
+            break
+    return pts, sc
+>>>>>>> REPLACE
+</DIFF>

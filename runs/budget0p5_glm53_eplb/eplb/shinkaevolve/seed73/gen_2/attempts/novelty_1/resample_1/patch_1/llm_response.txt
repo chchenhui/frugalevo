@@ -1,0 +1,54 @@
+<NAME>
+vectorized_snake_packing</NAME>
+<DESCRIPTION>
+The main bottleneck is `balanced_packing`: a nested Python loop over all layers and groups, using a `min(...)` generator scan per item (O(n·m) per layer, plus `.cpu()` sync per layer). This makes speed_score 0.00.
+
+Instead, exploit a classic result for equal-cardinality bin packing: sort items in descending order per layer, then assign them to packs in a "snake" (boustrophedon) round-robin order — pack indices go 0,1,...,m-1 for the first pass, then m-1,...,1,0 for the second pass, alternating. On sorted-descending weights this pairs the heaviest items with the lightest within each pack, giving balance quality comparable to greedy LPT (which is what the current code approximates), while being fully vectorizable with `torch.scatter_` across all layers at once. This eliminates the entire Python loop and per-layer CPU syncs, dramatically reducing execution time while keeping balancedness essentially intact. This directly boosts `speed_score` (currently 0.00) and the `times_algorithm` component of the combined score.
+</DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    # Sort items per layer in descending weight order, then assign them to
+    # packs in "snake" (boustrophedon) round-robin order. On sorted items
+    # this pairs heavy items with light ones within each pack, yielding
+    # near-optimal balance for the equal-cardinality packing problem while
+    # being fully vectorizable (no Python loops over layers/groups).
+    indices = weight.float().sort(-1, descending=True).indices
+    pos = torch.arange(num_groups, dtype=torch.int64, device=weight.device)
+    rank_sorted = pos // num_packs  # which slot within the pack
+    within = pos % num_packs
+    # Alternate direction every pass so heavy heads pair with light tails.
+    reverse = (rank_sorted % 2) == 1
+    pack_sorted = torch.where(reverse, num_packs - 1 - within, within)
+    pack_sorted = pack_sorted.view(1, -1).expand(num_layers, num_groups)
+    rank_sorted = rank_sorted.view(1, -1).expand(num_layers, num_groups)
+    pack_index = torch.empty(num_layers,
+                             num_groups,
+                             dtype=torch.int64,
+                             device=weight.device)
+    rank_in_pack = torch.empty_like(pack_index)
+    pack_index.scatter_(-1, indices, pack_sorted)
+    rank_in_pack.scatter_(-1, indices, rank_sorted)
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,166 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using greedy cost sampling strategy.
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    def get_greedy_cost_sampled(num_samples, sample_rate):
+        # greedy with random starting point
+        start_txn = random.randint(0, workload.num_txns - 1)
+        txn_seq = [start_txn]
+        remaining_txns = [x for x in range(0, workload.num_txns)]
+        remaining_txns.remove(start_txn)
+        running_cost = workload.txns[start_txn][0][3]
+        # min_costs = []
+        # key_map, total_cost = workload.get_incremental_seq_cost(start_txn, {}, 0)
+        for i in range(0, workload.num_txns - 1):
+            min_cost = 100000 # MAX
+            min_relative_cost = 10
+            min_txn = -1
+            # min_index = 0
+            holdout_txns = []
+            done = False
+            key_maps = []
+
+            sample = random.random()
+            if sample > sample_rate:
+                idx = random.randint(0, len(remaining_txns) - 1)
+                t = remaining_txns[idx]
+                txn_seq.append(t)
+                remaining_txns.pop(idx)
+                continue
+
+            for j in range(0, num_samples):
+                idx = 0
+                if len(remaining_txns) > 1:
+                    idx = random.randint(0, len(remaining_txns) - 1)
+                else:
+                    done = True
+                t = remaining_txns[idx]
+                holdout_txns.append(remaining_txns.pop(idx))
+                if workload.debug:
+                    print(remaining_txns, holdout_txns)
+                txn_len = workload.txns[t][0][3]
+                test_seq = txn_seq.copy()
+                test_seq.append(t)
+                cost = 0
+                cost = workload.get_opt_seq_cost(test_seq)
+                if cost < min_cost:
+                # if relative_cost < min_relative_cost:
+                    min_cost = cost
+                    min_txn = t
+                    # min_relative_cost = relative_cost
+                    # min_index = j
+                if done:
+                    break
+            assert(min_txn != -1)
+            running_cost = min_cost
+            txn_seq.append(min_txn)
+            holdout_txns.remove(min_txn)
+            remaining_txns.extend(holdout_txns)
+
+            if workload.debug:
+                print("min: ", min_txn, remaining_txns, holdout_txns, txn_seq)
+        if workload.debug:
+            print(txn_seq)
+            print(len(set(txn_seq)))
+        assert len(set(txn_seq)) == workload.num_txns
+        # print(txn_seq)
+
+        overall_cost = workload.get_opt_seq_cost(txn_seq)
+
+        return overall_cost, txn_seq
+
+    import math
+    import time
+    best_cost = float('inf')
+    best_seq = None
+    start_time = time.time()
+    time_limit = 30.0
+    greedy_deadline = start_time + time_limit * 0.6
+    trial = 0
+    while time.time() < greedy_deadline:
+        trial += 1
+        # alternate between fully greedy and randomized sampling
+        sample_rate = 1.0 if trial % 3 == 0 else random.uniform(0.5, 0.9)
+        cost, seq = get_greedy_cost_sampled(10, sample_rate)
+        if cost < best_cost:
+            best_cost = cost
+            best_seq = seq
+    # local improvement: adjacent swaps (first-improvement)
+    improved = True
+    while improved and time.time() - start_time < time_limit:
+        improved = False
+        cur_cost = workload.get_opt_seq_cost(best_seq)
+        for i in range(len(best_seq) - 1):
+            cand = best_seq.copy()
+            cand[i], cand[i + 1] = cand[i + 1], cand[i]
+            c = workload.get_opt_seq_cost(cand)
+            if c < cur_cost:
+                best_seq = cand
+                cur_cost = c
+                improved = True
+    best_cost = workload.get_opt_seq_cost(best_seq)
+    # simulated annealing refiner: low temperature, mostly-downhill
+    if best_seq is not None and time.time() - start_time < time_limit:
+        n = len(best_seq)
+        cur_seq = best_seq.copy()
+        cur_cost = best_cost
+        T0 = max(1.0, best_cost * 0.01)
+        alpha = 0.9995
+        T = T0
+        iters = 0
+        while time.time() - start_time < time_limit + 10:
+            iters += 1
+            T *= alpha
+            if T < 0.05:
+                T = 0.05
+            # random insertion move: take one txn, insert elsewhere
+            i = random.randint(0, n - 1)
+            j = random.randint(0, n - 1)
+            if i == j:
+                continue
+            cand = cur_seq.copy()
+            t = cand.pop(i)
+            cand.insert(j, t)
+            c = workload.get_opt_seq_cost(cand)
+            delta = c - cur_cost
+            if delta <= 0 or random.random() < math.exp(-delta / T):
+                cur_seq = cand
+                cur_cost = c
+                if c < best_cost:
+                    best_cost = c
+                    best_seq = cand.copy()
+    return best_cost, best_seq
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

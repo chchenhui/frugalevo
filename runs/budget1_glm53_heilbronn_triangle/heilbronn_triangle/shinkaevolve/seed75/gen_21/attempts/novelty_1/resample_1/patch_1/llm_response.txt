@@ -1,0 +1,242 @@
+<NAME>
+directed_worst_triplet_escape
+
+</NAME>
+<DESCRIPTION>
+The prior programs failed because SLSQP soft-min optimization got stuck (score 0.22) or crashed (score 0). Inspired by the barycentric-restart and worst-triplet-directed ideas in the context programs, I implement a fundamentally different approach: a pure numpy "worst-triplet escape" local search. Each iteration identifies the globally worst triangle, then attempts to move one of its three vertices *directly away from the line through the other two vertices* (the exact gradient direction of that triangle's area), at multiple step scales, plus random perturbations and occasional full-point relocations. This is wrapped in deterministic seeded restarts with a global-best tracker, and — following the recommendation — a final merge phase that combines the points least involved in small triangles from the two best restart configurations, followed by a polish pass. Everything is vectorized over all 165 triplets, robust to failures, with a guaranteed-valid barycentric fallback.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+SQRT3 = np.sqrt(3.0)
+TRI_AREA = SQRT3 / 4.0
+N = 11
+
+
+def _all_triples(n):
+    ii, jj, kk = np.meshgrid(np.arange(n), np.arange(n), np.arange(n), indexing='ij')
+    ii, jj, kk = ii.ravel(), jj.ravel(), kk.ravel()
+    m = (ii < jj) & (jj < kk)
+    return np.stack([ii[m], jj[m], kk[m]], axis=1)
+
+
+TRIPLES = _all_triples(N)
+
+
+def _areas(pts):
+    a = pts[TRIPLES[:, 0]]
+    b = pts[TRIPLES[:, 1]]
+    c = pts[TRIPLES[:, 2]]
+    cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    return 0.5 * np.abs(cross) / TRI_AREA
+
+
+def _score(pts):
+    return float(_areas(pts).min())
+
+
+def _clip_pt(p):
+    x = np.clip(p[0], 0.0, 1.0)
+    yhi = SQRT3 * x if x <= 0.5 else SQRT3 * (1.0 - x)
+    return np.array([x, np.clip(p[1], 0.0, yhi)])
+
+
+def _valid(pts):
+    if pts is None or np.any(~np.isfinite(pts)):
+        return False
+    x, y = pts[:, 0], pts[:, 1]
+    return bool(np.all(y >= -1e-9) and np.all(y <= SQRT3 * x + 1e-9)
+                and np.all(y <= SQRT3 * (1 - x) + 1e-9)
+                and np.min(np.linalg.norm(pts[:, None] - pts[None], axis=2) + np.eye(N) * 9) > 1e-7)
+
+
+def _random_start(rng):
+    # symmetric-ish start: vertices + edge midpoints + random interior
+    pts = np.zeros((N, 2))
+    base = np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.5, SQRT3 / 2],
+        [0.5, 0.0], [0.25, SQRT3 / 4], [0.75, SQRT3 / 4],
+    ])
+    pts[:6] = base
+    for i in range(6, N):
+        while True:
+            u, v = rng.random(), rng.random()
+            if u + v > 1:
+                u, v = 1 - u, 1 - v
+            # barycentric wrt (0,0),(1,0),(0.5,h)
+            b = 1 - u - v
+            p = np.array([v + 0.5 * b, b * SQRT3 / 2])
+            if np.min(np.linalg.norm(pts[:i] - p, axis=1)) > 0.08:
+                pts[i] = p
+                break
+    return pts
+
+
+def _local_search(pts, rng, budget):
+    """Worst-triplet escape local search. Returns (best_pts, best_score, iters_used)."""
+    pts = pts.copy()
+    cur = _score(pts)
+    best_pts, best = pts.copy(), cur
+    step = 0.02
+    stall = 0
+    it = 0
+    while it < budget and step > 1e-5:
+        it += 1
+        areas = _areas(pts)
+        w = int(np.argmin(areas))
+        i, j, k = TRIPLES[w]
+        vi = int((i, j, k)[rng.integers(3)])
+        # other two vertices of the worst triplet
+        others = [q for q in (i, j, k) if q != vi]
+        o1, o2 = pts[others[0]], pts[others[1]]
+        d = o2 - o1
+        L = np.hypot(*d)
+        if L < 1e-12:
+            perp = rng.normal(size=2)
+        else:
+            perp = np.array([-d[1], d[0]]) / L
+        # direction away from line through o1,o2 (increases that triangle's area)
+        rel = pts[vi] - o1
+        sgn = np.sign(perp @ rel)
+        if sgn == 0:
+            sgn = 1.0
+        escape = sgn * perp
+        improved = False
+        # try escape moves at several scales, plus random
+        for scale in (step, step / 2, 2 * step):
+            cand = pts.copy()
+            cand[vi] = _clip_pt(pts[vi] + scale * escape)
+            if _valid(np.delete(cand, vi, axis=0) * 0 + cand) and np.min(
+                    np.linalg.norm(np.delete(cand, vi, axis=0) - cand[vi], axis=1)) > 1e-8:
+                a = _score(cand)
+                if a > cur + 1e-14:
+                    pts, cur = cand, a
+                    improved = True
+                    break
+        if not improved:
+            cand = pts.copy()
+            cand[vi] = _clip_pt(pts[vi] + rng.normal(0.0, step, size=2))
+            if np.min(np.linalg.norm(np.delete(cand, vi, axis=0) - cand[vi], axis=1)) > 1e-8:
+                a = _score(cand)
+                if a > cur + 1e-14:
+                    pts, cur = cand, a
+                    improved = True
+        if improved:
+            stall = 0
+            if cur > best:
+                best, best_pts = cur, pts.copy()
+        else:
+            stall += 1
+            if stall % 20 == 0:
+                step *= 0.65
+            if stall % 60 == 0 and step < 0.01:
+                # teleport: relocate the point of the current worst triplet randomly
+                areas = _areas(pts)
+                w = int(np.argmin(areas))
+                vi = int(TRIPLES[w][rng.integers(3)])
+                u, v = rng.random(), rng.random()
+                if u + v > 1:
+                    u, v = 1 - u, 1 - v
+                b = 1 - u - v
+                cand = pts.copy()
+                cand[vi] = [v + 0.5 * b, b * SQRT3 / 2]
+                a = _score(cand)
+                if a > cur * 0.999:  # accept mild worsening to escape
+                    pts, cur = cand, a
+                    step = max(step, 0.02)
+    return best_pts, best, it
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    try:
+        rng = np.random.default_rng(20240517)
+        results = []
+        total_budget = 1400  # iterations per restart; total kept modest
+
+        for r in range(6):
+            start = _random_start(rng)
+            bp, bs, used = _local_search(start, rng, total_budget)
+            results.append((bs, bp))
+
+        results.sort(key=lambda t: -t[0])
+
+        # ---- Merge phase: combine least-constrained points from two best configs ----
+        try:
+            b1, p1 = results[0]
+            b2, p2 = results[1]
+            # rank points by the min area of triangles they participate in
+            def point_weakness(pts):
+                areas = _areas(pts)
+                weak = np.full(N, np.inf)
+                for t in range(len(TRIPLES)):
+                    a = areas[t]
+                    for idx in TRIPLES[t]:
+                        if a < weak[idx]:
+                            weak[idx] = a
+                return weak
+
+            w1 = point_weakness(p1)
+            w2 = point_weakness(p2)
+            order1 = np.argsort(-w1)  # strongest points first
+            order2 = np.argsort(-w2)
+            merged = np.zeros((N, 2))
+            used_pts = []
+            take1 = order1[:6]
+            take2 = order2[:5]
+            for idx in take1:
+                used_pts.append(p1[idx])
+            for idx in take2:
+                q = p2[idx]
+                # skip if too close to an already-taken point
+                if all(np.linalg.norm(q - u) > 0.05 for u in used_pts):
+                    used_pts.append(q)
+            # fill remaining with best restart's unused strongest points
+            for idx in order1:
+                if len(used_pts) >= N:
+                    break
+                if all(np.linalg.norm(p1[idx] - u) > 0.05 for u in used_pts):
+                    used_pts.append(p1[idx])
+            for i in range(N):
+                if i < len(used_pts):
+                    merged[i] = _clip_pt(used_pts[i])
+                else:
+                    merged[i] = _clip_pt(used_pts[i % len(used_pts)] + rng.normal(0, 0.03, 2))
+            merged = np.array([_clip_pt(p) for p in merged])
+            if _valid(merged):
+                mp, ms, _ = _local_search(merged, rng, total_budget)
+                results.append((ms, mp))
+        except Exception:
+            pass
+
+        results.sort(key=lambda t: -t[0])
+        best_score, best_pts = results[0]
+
+        # ---- Final fine polish on the overall best ----
+        fp, fs, _ = _local_search(best_pts, rng, 800)
+        if fs > best_score:
+            best_pts, best_score = fp, fs
+
+        # guarantee feasibility
+        best_pts = np.array([_clip_pt(p) for p in best_pts])
+        return best_pts
+    except Exception:
+        # Fallback: simple valid spread
+        s = SQRT3
+        fb = []
+        m = 4
+        for i in range(m + 1):
+            for j in range(m + 1 - i):
+                k = m - i - j
+                fb.append([(j + 0.5 * k) / m, (k * s / 2.0) / m])
+        arr = np.zeros((N, 2))
+        for idx in range(N):
+            arr[idx] = fb[idx % len(fb)]
+        return arr
+
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

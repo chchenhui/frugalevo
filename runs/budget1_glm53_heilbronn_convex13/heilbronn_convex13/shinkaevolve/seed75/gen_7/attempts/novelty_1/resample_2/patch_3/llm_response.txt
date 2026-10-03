@@ -1,0 +1,103 @@
+<NAME>
+heilbronn_multistart_softmin_optimization</NAME>
+<DESCRIPTION>
+The previous SEARCH text didn't match the actual file contents. Based on the visible editable region, the current implementation uses `np.random.default_rng(seed=42)` for a random placement. This edit replaces that portion (the visible tail of the solve logic) with a deterministic multi-start soft-min optimizer: L-BFGS-B refinement of a smooth LogSumExp soft-min of all 286 triangle areas, over multiple deterministic initializations (perturbed lattice + seeded randoms), scored by the true minimum triangle area normalized by convex hull area. Points are box-constrained to the unit square so the convex-hull constraint holds automatically.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        rng = np.random.default_rng(seed=42)
+        points = rng.random((n, 2))
+        return points
+=======
+        import time
+        import itertools
+        from scipy.optimize import minimize
+        from scipy.spatial import ConvexHull
+
+        tri = np.array(list(itertools.combinations(range(n), 3)))
+
+        def all_areas(flat):
+            pts = flat.reshape(n, 2)
+            a = pts[tri[:, 0]]
+            b = pts[tri[:, 1]]
+            c = pts[tri[:, 2]]
+            return 0.5 * np.abs(
+                (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+                - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+            )
+
+        def true_score(flat):
+            pts = flat.reshape(n, 2)
+            try:
+                hull_area = ConvexHull(pts).volume
+            except Exception:
+                return -1e9
+            if hull_area <= 1e-12:
+                return -1e9
+            return all_areas(flat).min() / hull_area
+
+        def soft_obj(flat, tau):
+            areas = all_areas(flat)
+            m = areas.min()
+            return tau * np.log(np.sum(np.exp((m - areas) / tau))) + m
+
+        def make_inits():
+            inits = []
+            # Triangular-ish lattice base
+            xs = np.linspace(0.06, 0.94, 4)
+            ys = np.linspace(0.06, 0.94, 4)
+            base = []
+            for i, x in enumerate(xs):
+                off = 0.06 if i % 2 else 0.0
+                for y in ys:
+                    base.append((min(max(x + off, 0.02), 0.98), y))
+            base = np.array(base[:n])
+            inits.append(base.ravel())
+            for seed in range(11):
+                r = np.random.default_rng(seed)
+                if seed % 2 == 0:
+                    p = base + r.normal(0, 0.08, base.shape)
+                else:
+                    p = r.random((n, 2)) * 0.9 + 0.05
+                inits.append(np.clip(p, 0.02, 0.98).ravel())
+            return inits
+
+        best_flat, best_val = None, -np.inf
+        deadline = time.time() + 20.0
+        for flat0 in make_inits():
+            if time.time() > deadline:
+                break
+            flat = flat0.copy()
+            for tau in (2e-2, 5e-3, 1e-3):
+                if time.time() > deadline:
+                    break
+                try:
+                    res = minimize(
+                        lambda f: soft_obj(f, tau),
+                        flat,
+                        method="L-BFGS-B",
+                        bounds=[(0.0, 1.0)] * (2 * n),
+                        options={"maxiter": 400, "ftol": 1e-12, "gtol": 1e-10},
+                    )
+                    if np.all(np.isfinite(res.x)):
+                        flat = res.x
+                except Exception:
+                    pass
+            # Avoid coincident points
+            pts = flat.reshape(n, 2)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if np.allclose(pts[i], pts[j], atol=1e-9):
+                        pts[j] = np.clip(pts[j] + 1e-4, 0.0, 1.0)
+            flat = pts.ravel()
+            val = true_score(flat)
+            if val > best_val:
+                best_val, best_flat = val, flat.copy()
+
+        if best_flat is None:
+            best_flat = make_inits()[0]
+
+        points = np.round(best_flat.reshape(n, 2), 9)
+        return points
+>>>>>>> REPLACE
+</DIFF>

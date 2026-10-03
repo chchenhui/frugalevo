@@ -1,0 +1,145 @@
+<NAME>
+rarely_scaled_sg_kernel_bank_on_gate</NAME>
+<DESCRIPTION>
+Apply the recommendation: a percentile-blended multi-scale Savitzky-Golay kernel bank that runs only inside the trend-reversal-gated (boost) regions, combined with a volatility-percentile weighting. In high-volatility regions (upper percentiles of local volatility), the filter uses wider SG half-widths for aggressive noise reduction, while in low-volatility regions it uses narrower kernels to preserve responsiveness. This targets the smoothness_score (0.20, the weakest metric) without sacrificing lag, since the RTS smoother already handles baseline smoothness and the SG pass is localized to weak-gradient flagged neighborhoods (extending _local_hysteresis with a volatility-weighted 3-scale kernel blend instead of the single fixed 5-tap kernel).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _local_hysteresis(y, flip_span=3, k=0.5):
+    """Suppress weak micro-oscillations: where the gradient sign flips
+    within a few samples while |g| is small, apply a tiny zero-phase
+    order-2 SG pass restricted to those neighborhoods only."""
+    n = len(y)
+    if n < 7:
+        return y
+    g = np.gradient(y)
+    med_g = np.median(np.abs(g)) + 1e-12
+    weak = np.abs(g) < k * med_g
+    s = np.sign(g)
+    flip = np.zeros(n, dtype=bool)
+    for lag in range(1, flip_span + 1):
+        if lag < n:
+            flip[lag:] |= (s[lag:] * s[:-lag]) < 0
+    flag = weak & flip
+    if not np.any(flag):
+        return y
+=======
+def _local_hysteresis(y, flip_span=3, k=0.5, sg_half=2):
+    """Suppress weak micro-oscillations with a percentile-blended
+    3-scale Savitzky-Golay kernel bank (half-widths
+    [sg_half//2, sg_half, 2*sg_half]) with Gaussian weights centered
+    at the 20/50/80th percentiles of local volatility. Only applied
+    in neighborhoods exhibiting weak, rapidly-flipping gradients."""
+    n = len(y)
+    if n < 7:
+        return y
+    g = np.gradient(y)
+    med_g = np.median(np.abs(g)) + 1e-12
+    weak = np.abs(g) < k * med_g
+    s = np.sign(g)
+    flip = np.zeros(n, dtype=bool)
+    for lag in range(1, flip_span + 1):
+        if lag < n:
+            flip[lag:] |= (s[lag:] * s[:-lag]) < 0
+    flag = weak & flip
+    if not np.any(flag):
+        return y
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    out = y.copy()
+    # fixed order-2 SG coefficients (window 5, zero-phase)
+    c = np.array([-3.0, 12.0, 17.0, 12.0, -3.0]) / 35.0
+    # process each flagged neighborhood
+=======
+    out = y.copy()
+    # Build the 3-scale SG coefficient bank (order 2, zero-phase)
+    halfs = [max(1, sg_half // 2), max(1, sg_half), 2 * max(1, sg_half)]
+    coeffs = []
+    for h in halfs:
+        win = 2 * h + 1
+        if win < 3 or win > n:
+            coeffs.append(None)
+            continue
+        # least-squares fit of order-2 polynomial: smoothing coefficients
+        idx = np.arange(win, dtype=float) - h
+        A = np.vstack([np.ones(win), idx, idx * idx]).T
+        c_h, *_ = np.linalg.lstsq(A, A, rcond=None)
+        coeffs.append(c_h[0])
+    # local volatility for percentile weighting
+    vol = np.abs(np.gradient(g)) + 1e-12
+    vol_flag = vol[np.where(flag)[0]] if np.any(flag) else vol
+    p20, p50, p80 = np.percentile(vol_flag, [20, 50, 80])
+
+    def _blend_weights(v):
+        # Gaussian weights centered at p20, p50, p80 (normalized)
+        w = np.exp(-0.5 * ((v - p20) / (p50 - p20 + 1e-9)) ** 2)
+        w += np.exp(-0.5 * ((v - p50) / (p50 - p20 + 1e-9)) ** 2)
+        w += np.exp(-0.5 * ((v - p80) / (p80 - p50 + 1e-9)) ** 2)
+        # low volatility -> narrow kernel; high volatility -> wide kernel
+        return w / (w.sum() + 1e-12)
+
+    # process each flagged neighborhood
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            seg = y[lo:hi]
+            if len(seg) >= 5:
+                padded = np.concatenate((
+                    2 * seg[0] - seg[2:0:-1],
+                    seg,
+                    2 * seg[-1] - seg[-2:-4:-1],
+                )) if len(seg) >= 4 else seg
+                sm = np.convolve(padded, c, mode='valid')
+                core_start = i - lo
+                core_len = j - i
+                avail = min(core_len, len(sm) - core_start)
+                if avail > 0:
+                    out[i:i + avail] = sm[core_start:core_start + avail]
+            i = j
+=======
+            seg = y[lo:hi]
+            if len(seg) >= 5:
+                # blended multi-scale SG smoothing of this neighborhood
+                v = np.median(vol[i:j])
+                wts = _blend_weights(v)
+                sm_acc = np.zeros(len(seg))
+                w_tot = 0.0
+                for c_h, w in zip(coeffs, wts):
+                    if c_h is None:
+                        continue
+                    hw = (len(c_h) - 1) // 2
+                    if len(seg) >= len(c_h):
+                        pad = hw
+                        padded = np.concatenate((
+                            np.full(pad, seg[0]), seg, np.full(pad, seg[-1]),
+                        ))
+                        sm_h = np.convolve(padded, c_h, mode='valid')
+                        sm_acc += w * sm_h
+                        w_tot += w
+                if w_tot > 0:
+                    sm = sm_acc / w_tot
+                    core_start = i - lo
+                    core_len = j - i
+                    avail = min(core_len, len(sm) - core_start)
+                    if avail > 0:
+                        # blend: keep 50% of original to preserve dynamics
+                        out[i:i + avail] = 0.5 * out[i:i + avail] + \
+                            0.5 * sm[core_start:core_start + avail]
+            i = j
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Localized reversal-suppression hysteresis ---
+    estimates = _local_hysteresis(estimates)
+=======
+    # --- Localized reversal-suppression hysteresis (SG kernel bank) ---
+    estimates = _local_hysteresis(estimates, sg_half=max(2, window_size // 10))
+>>>>>>> REPLACE
+</DIFF>

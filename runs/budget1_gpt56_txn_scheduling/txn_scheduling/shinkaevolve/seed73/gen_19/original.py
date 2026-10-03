@@ -1,0 +1,218 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Search transaction permutations using objective-guided beam construction,
+    diversified greedy starts, and conflict-aware local permutation search.
+    """
+    num_txns = workload.num_txns
+    if num_txns == 0:
+        return 0, []
+    if num_txns == 1:
+        return workload.get_opt_seq_cost([0]), [0]
+
+    cost_cache = {}
+
+    def sequence_cost(sequence):
+        key = tuple(sequence)
+        cost = cost_cache.get(key)
+        if cost is None:
+            cost = workload.get_opt_seq_cost(sequence)
+            cost_cache[key] = cost
+        return cost
+
+    # For small workloads, evaluate every ordering and return the true optimum.
+    if num_txns <= 8:
+        from itertools import permutations
+
+        best_cost = float("inf")
+        best_schedule = None
+        for schedule in permutations(range(num_txns)):
+            cost = sequence_cost(schedule)
+            if cost < best_cost:
+                best_cost = cost
+                best_schedule = list(schedule)
+        return best_cost, best_schedule
+
+    def candidate_pool(remaining, limit):
+        """Use all choices when practical, otherwise retain diverse choices."""
+        if len(remaining) <= limit:
+            return remaining[:]
+        return random.sample(remaining, limit)
+
+    def greedy_construct(start_txn):
+        schedule = [start_txn]
+        remaining = list(range(num_txns))
+        remaining.remove(start_txn)
+
+        while remaining:
+            # Full evaluation late in construction is valuable because the
+            # ordering effect is then most visible in the objective.
+            limit = len(remaining) if len(remaining) <= 40 else 32
+            candidates = candidate_pool(remaining, limit)
+
+            best_cost = float("inf")
+            best_choices = []
+            for txn in candidates:
+                cost = sequence_cost(schedule + [txn])
+                if cost < best_cost:
+                    best_cost = cost
+                    best_choices = [txn]
+                elif cost == best_cost:
+                    best_choices.append(txn)
+
+            chosen = random.choice(best_choices)
+            schedule.append(chosen)
+            remaining.remove(chosen)
+
+        return schedule
+
+    # Beam search retains alternate low-cost prefixes, avoiding the irreversible
+    # early choices made by a single greedy construction.
+    beam_width = min(12, max(4, num_seqs))
+    initial = []
+    for txn in range(num_txns):
+        initial.append((sequence_cost([txn]), (txn,)))
+    initial.sort(key=lambda entry: entry[0])
+    beam = initial[:beam_width]
+
+    for depth in range(1, num_txns):
+        expanded = {}
+        for _, prefix in beam:
+            used = set(prefix)
+            remaining = [txn for txn in range(num_txns) if txn not in used]
+            limit = len(remaining) if len(remaining) <= 28 else 18
+
+            for txn in candidate_pool(remaining, limit):
+                child = prefix + (txn,)
+                child_cost = sequence_cost(child)
+                old_cost = expanded.get(child)
+                if old_cost is None or child_cost < old_cost:
+                    expanded[child] = child_cost
+
+        ranked = sorted(
+            ((cost, schedule) for schedule, cost in expanded.items()),
+            key=lambda entry: entry[0],
+        )
+        beam = ranked[:beam_width]
+
+    completed = [(cost, list(schedule)) for cost, schedule in beam]
+
+    # Greedy starts complement the beam with paths that may have a temporarily
+    # expensive prefix but lead to a superior final conflict arrangement.
+    starts = list(range(num_txns))
+    random.shuffle(starts)
+    greedy_attempts = max(num_seqs, beam_width)
+    for attempt in range(greedy_attempts):
+        schedule = greedy_construct(starts[attempt % num_txns])
+        completed.append((sequence_cost(schedule), schedule))
+
+    completed.sort(key=lambda entry: entry[0])
+
+    def improve_locally(schedule, cost):
+        """
+        Steepest-descent variable-neighborhood search.  Insertions move a
+        transaction across a conflict chain; swaps catch complementary changes.
+        """
+        current = schedule[:]
+        current_cost = cost
+        rounds = 5 if num_txns <= 40 else 3
+
+        for _ in range(rounds):
+            best_schedule = current
+            best_cost = current_cost
+
+            if num_txns <= 36:
+                insertion_pairs = [
+                    (source, target)
+                    for source in range(num_txns)
+                    for target in range(num_txns)
+                    if source != target
+                ]
+                swap_pairs = [
+                    (left, right)
+                    for left in range(num_txns - 1)
+                    for right in range(left + 1, num_txns)
+                ]
+            else:
+                samples = max(12 * num_txns, 300)
+                insertion_pairs = [
+                    tuple(random.sample(range(num_txns), 2))
+                    for _ in range(samples)
+                ]
+                swap_pairs = [
+                    tuple(sorted(random.sample(range(num_txns), 2)))
+                    for _ in range(samples)
+                ]
+
+            for source, target in insertion_pairs:
+                candidate = current[:]
+                txn = candidate.pop(source)
+                candidate.insert(target, txn)
+                candidate_cost = sequence_cost(candidate)
+                if candidate_cost < best_cost:
+                    best_cost = candidate_cost
+                    best_schedule = candidate
+
+            for left, right in swap_pairs:
+                candidate = current[:]
+                candidate[left], candidate[right] = candidate[right], candidate[left]
+                candidate_cost = sequence_cost(candidate)
+                if candidate_cost < best_cost:
+                    best_cost = candidate_cost
+                    best_schedule = candidate
+
+            if best_cost >= current_cost:
+                break
+            current = best_schedule
+            current_cost = best_cost
+
+        return current_cost, current
+
+    # Refine several elite constructions rather than relying on only one
+    # potentially unlucky beam/greedy result.
+    elite_count = min(4, len(completed))
+    best_cost, best_schedule = completed[0]
+    seen = set()
+    for seed_cost, seed_schedule in completed[:elite_count]:
+        key = tuple(seed_schedule)
+        if key in seen:
+            continue
+        seen.add(key)
+        improved_cost, improved_schedule = improve_locally(seed_schedule, seed_cost)
+        if improved_cost < best_cost:
+            best_cost = improved_cost
+            best_schedule = improved_schedule
+
+    if workload.debug:
+        print("best:", best_cost, best_schedule)
+    return best_cost, best_schedule
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

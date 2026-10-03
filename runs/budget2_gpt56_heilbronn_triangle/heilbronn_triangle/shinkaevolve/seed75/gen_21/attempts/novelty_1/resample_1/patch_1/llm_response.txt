@@ -1,0 +1,131 @@
+<NAME>
+active_triple_gradient_polish
+</NAME>
+
+<DESCRIPTION>
+Augment the final local-search phase with constraint-gradient-informed proposals. The bottleneck in a Heilbronn layout is determined by a small set of active, near-minimal triples. For each iteration, this edit computes signed determinant gradients for the lowest-area triples, aggregates their normalized ascent directions for each movable point, and evaluates several projected directional steps alongside the existing random and coupled mutations.
+
+This specifically targets increases in the limiting triangle areas rather than relying only on isotropic jitter. Retaining random candidates is important because active constraints may conflict and because occasional stochastic moves can escape a locally balanced but suboptimal contact pattern.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _polish_layout(layout: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Deterministically improve a layout with batched maximin point moves."""
+    current = layout.copy()
+    current_area = float(np.min(_normalized_triangle_areas(current[None, ...])))
+
+    # A sequence of increasingly fine moves is more effective than applying
+    # late evolutionary mutations to all eight points simultaneously.
+    for scale, rounds in (
+        (0.030, 90),
+        (0.015, 110),
+        (0.007, 130),
+        (0.003, 150),
+        (0.0012, 170),
+    ):
+        batch_size = 48
+        for _ in range(rounds):
+            trials = np.broadcast_to(current, (batch_size, 8, 2)).copy()
+            indices = rng.integers(0, 8, size=batch_size)
+            trials[np.arange(batch_size), indices] += rng.normal(
+                0.0, scale, size=(batch_size, 2)
+            )
+
+            # A minority of coupled moves lets the search escape constraints
+            # involving two adjacent active triangles.
+            coupled = rng.random(batch_size) < 0.25
+            coupled_indices = rng.integers(0, 8, size=batch_size)
+            trials[np.arange(batch_size)[coupled], coupled_indices[coupled]] += (
+                rng.normal(0.0, scale * 0.65, size=(int(np.sum(coupled)), 2))
+            )
+            trials = _project_to_simplex(trials)
+
+            trial_areas = np.min(_normalized_triangle_areas(trials), axis=1)
+            winner = int(np.argmax(trial_areas))
+            if trial_areas[winner] > current_area + 1.0e-12:
+                current = trials[winner]
+                current_area = float(trial_areas[winner])
+
+    return current
+=======
+def _polish_layout(layout: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Deterministically improve a layout using active-triple ascent and noise."""
+    current = layout.copy()
+    current_area = float(np.min(_normalized_triangle_areas(current[None, ...])))
+
+    # The small-area triples are the active constraints of the maximin
+    # problem.  Their determinant gradients provide useful directed moves,
+    # while the remaining candidates retain the ability to escape conflicts
+    # between several active constraints.
+    for scale, rounds in (
+        (0.030, 90),
+        (0.015, 110),
+        (0.007, 130),
+        (0.003, 150),
+        (0.0012, 170),
+    ):
+        batch_size = 56
+        for _ in range(rounds):
+            trials = np.broadcast_to(current, (batch_size, 8, 2)).copy()
+
+            all_points = np.vstack((_FIXED_CORNERS, current))
+            triple_areas = _normalized_triangle_areas(current[None, ...])[0]
+            active = np.argsort(triple_areas)[:18]
+            direction = np.zeros((8, 2), dtype=float)
+
+            for triple_index in active:
+                ia, ib, ic = _TRIPLES[triple_index]
+                a, b, c = all_points[ia], all_points[ib], all_points[ic]
+                determinant = (
+                    (b[0] - a[0]) * (c[1] - a[1])
+                    - (b[1] - a[1]) * (c[0] - a[0])
+                )
+                sign = 1.0 if determinant >= 0.0 else -1.0
+                weight = 1.0 / max(triple_areas[triple_index], 0.002)
+                gradients = (
+                    np.array([b[1] - c[1], c[0] - b[0]]),
+                    np.array([c[1] - a[1], a[0] - c[0]]),
+                    np.array([a[1] - b[1], b[0] - a[0]]),
+                )
+                for point_index, gradient in zip((ia, ib, ic), gradients):
+                    if point_index >= 3:
+                        direction[point_index - 3] += sign * weight * gradient
+
+            norms = np.linalg.norm(direction, axis=1)
+            nonzero = norms > 1.0e-14
+            direction[nonzero] /= norms[nonzero, None]
+
+            # Several step lengths make the directed proposal robust to the
+            # nonsmooth switching of the currently limiting triangle.
+            directed_count = 12
+            multipliers = np.linspace(0.35, 1.7, directed_count)
+            trials[:directed_count] += multipliers[:, None, None] * scale * direction
+            trials[:directed_count] += rng.normal(
+                0.0, scale * 0.10, size=(directed_count, 8, 2)
+            )
+
+            random_start = directed_count
+            indices = rng.integers(0, 8, size=batch_size - random_start)
+            rows = np.arange(random_start, batch_size)
+            trials[rows, indices] += rng.normal(
+                0.0, scale, size=(batch_size - random_start, 2)
+            )
+
+            coupled = rng.random(batch_size - random_start) < 0.25
+            coupled_indices = rng.integers(0, 8, size=batch_size - random_start)
+            coupled_rows = rows[coupled]
+            trials[coupled_rows, coupled_indices[coupled]] += rng.normal(
+                0.0, scale * 0.65, size=(int(np.sum(coupled)), 2)
+            )
+            trials = _project_to_simplex(trials)
+
+            trial_areas = np.min(_normalized_triangle_areas(trials), axis=1)
+            winner = int(np.argmax(trial_areas))
+            if trial_areas[winner] > current_area + 1.0e-12:
+                current = trials[winner]
+                current_area = float(trial_areas[winner])
+
+    return current
+>>>>>>> REPLACE
+</DIFF>

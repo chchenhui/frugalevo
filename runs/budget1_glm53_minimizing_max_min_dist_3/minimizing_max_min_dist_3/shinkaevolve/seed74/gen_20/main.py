@@ -1,0 +1,168 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _pair_dists(P):
+    diff = P[:, None, :] - P[None, :, :]
+    D = np.sqrt(np.sum(diff * diff, axis=-1))
+    return D, diff
+
+
+def _ratio(P):
+    D, _ = _pair_dists(P)
+    iu = np.triu_indices(P.shape[0], 1)
+    dd = D[iu]
+    return dd.min() / dd.max()
+
+
+def _normalize(P):
+    D, _ = _pair_dists(P)
+    i, j = np.unravel_index(np.argmax(D), D.shape)
+    if D[i, j] <= 0:
+        return P
+    return P / D[i, j]
+
+
+def _grad_ascent(P, iters=600, beta0=4.0, beta1=40.0, sphere=False, lr=0.02):
+    """Maximize soft-min of pairwise distances with analytic gradients."""
+    n = P.shape[0]
+    P = P.copy()
+    if sphere:
+        P = P / np.linalg.norm(P, axis=1, keepdims=True)
+    v = np.zeros_like(P)
+    for t in range(iters):
+        frac = t / max(1, iters - 1)
+        beta = beta0 * (beta1 / beta0) ** frac
+        diff = P[:, None, :] - P[None, :, :]
+        D = np.sqrt(np.sum(diff * diff, axis=-1) + 1e-18)
+        iu = np.triu_indices(n, 1)
+        dvals = D[iu]
+        # softmin weights over pairs
+        z = -beta * dvals
+        z -= z.max()
+        w = np.exp(z)
+        w /= w.sum()
+        # grad of softmin wrt each point
+        G = np.zeros_like(P)
+        # accumulate pair weights into G
+        W = np.zeros((n, n))
+        W[iu] = w
+        W = W + W.T
+        # d softmin/d P = sum_j W[i,j] * (P_i - P_j)/D_ij  ... with sign:
+        # softmin increases as distances increase, gradient wrt P_i:
+        #   sum_j W[i,j] * (P_i - P_j)/D_ij
+        G = np.sum(W[:, :, None] * diff / D[:, :, None], axis=1)
+        # momentum ascent
+        v = 0.8 * v + lr * G
+        P = P + v
+        if sphere:
+            norms = np.linalg.norm(P, axis=1, keepdims=True)
+            P = P / norms
+    return P
+
+
+def _polish(P, iters=1500, seed=0, T0=0.05):
+    """Direct stochastic hill-climb on the true ratio."""
+    rng = np.random.default_rng(seed)
+    P = _normalize(P.copy())
+    best = P.copy()
+    bv = _ratio(P)
+    n = P.shape[0]
+    iu = np.triu_indices(n, 1)
+    cur = P.copy()
+    cv = bv
+    for it in range(iters):
+        T = T0 * (1.0 - it / iters) + 1e-4
+        cand = cur.copy()
+        D, _ = _pair_dists(cand)
+        dd = D[iu]
+        kmin = np.argmin(dd)
+        i0, j0 = iu[0][kmin], iu[1][kmin]
+        if rng.random() < 0.6:
+            idx = (i0, j0)[rng.integers(2)]
+            cand[idx] += rng.normal(0, T, 3)
+        else:
+            idx = rng.integers(n)
+            cand[idx] += rng.normal(0, T, 3)
+        # pull farthest pair together sometimes
+        if rng.random() < 0.3:
+            fi, fj = np.unravel_index(np.argmax(D), D.shape)
+            cand[fi] += (cand[fj] - cand[fi]) * 0.1 * rng.random()
+        cand = _normalize(cand)
+        v = _ratio(cand)
+        if v > cv or rng.random() < 0.05 * np.exp(-(cv - v) / max(T, 1e-9)):
+            cur, cv = cand, v
+            if v > bv:
+                bv, best = v, cand.copy()
+    return best, bv
+
+
+def _fib_sphere(n):
+    i = np.arange(n) + 0.5
+    phi = np.arccos(1 - 2 * i / n)
+    theta = np.pi * (1 + 5 ** 0.5) * i
+    return np.stack([np.cos(theta) * np.sin(phi),
+                     np.sin(theta) * np.sin(phi),
+                     np.cos(phi)], axis=1)
+
+
+def _heptagon_seeds():
+    seeds = []
+    for z1, z2, twist in ((0.75, -0.75, np.pi / 7), (0.55, -0.55, np.pi / 7),
+                          (0.85, -0.85, 0.0), (0.65, -0.65, np.pi / 5)):
+        pts = []
+        for k in range(7):
+            a1 = 2 * np.pi * k / 7
+            a2 = a1 + twist
+            pts.append([np.cos(a1), np.sin(a1), z1])
+            pts.append([np.cos(a2), np.sin(a2), z2])
+        seeds.append(np.array(pts, dtype=float))
+    return seeds
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    n, dim = 14, 3
+    seeds = []
+    seeds.extend(_heptagon_seeds())
+    seeds.append(_fib_sphere(n))
+
+    phi = (1 + 5 ** 0.5) / 2
+    ico = []
+    for a in (-1, 1):
+        for b in (-phi, phi):
+            ico.append((0, a, b))
+            ico.append((a, b, 0))
+            ico.append((b, 0, a))
+    ico = np.array(ico, dtype=float)
+    seeds.append(ico[:n])
+
+    rng = np.random.default_rng(2024)
+    for _ in range(10):
+        X = rng.normal(0, 1, (n, dim))
+        seeds.append(X / np.linalg.norm(X, axis=1, keepdims=True))
+
+    best_pts, best_val = None, -1.0
+    for s, P0 in enumerate(seeds):
+        # alternate sphere-constrained and free runs
+        sphere = (s % 2 == 0)
+        P = _grad_ascent(P0, iters=500, sphere=sphere, lr=0.03)
+        # fine sharpening phase: high beta
+        P = _grad_ascent(P, iters=250, beta0=40.0, beta1=80.0,
+                         sphere=sphere, lr=0.01)
+        v = _ratio(P)
+        if v > best_val:
+            best_val, best_pts = v, _normalize(P)
+
+    # targeted stochastic polish on the best configuration
+    P, v = _polish(best_pts, iters=2500, seed=7)
+    if v > best_val:
+        best_val, best_pts = v, P
+    # second polish from the best of both
+    P, v = _polish(best_pts, iters=2500, seed=8, T0=0.03)
+    if v > best_val:
+        best_val, best_pts = v, P
+
+    return _normalize(best_pts)
+
+
+# EVOLVE-BLOCK-END

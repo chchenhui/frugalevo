@@ -1,0 +1,385 @@
+--- a/original.py
++++ b/original.py
+@@ -1,328 +1,382 @@
+ # EVOLVE-BLOCK-START
+ """
+ Real-Time Adaptive Signal Processing Algorithm for Non-Stationary Time Series
+ 
+ Robust adaptive Whittaker-Henderson penalized least-squares smoother.
+ Solves  min ||sqrt(w) * (y - x)||^2 + sum_i lam_i * (D2 y)_i^2
+ with iteratively reweighted (Huber-style) data weights and local penalty
+ modulation driven by robust curvature statistics.
+ 
+ Zero-phase by construction (single global solve, no causal filtering).
+ Output contract: y[i] corresponds to input time i + window_size - 1,
+ len(y) = len(x) - window_size + 1.
+ """
+ import numpy as np
+ 
+ 
+ def _mad(v):
+     v = np.asarray(v, dtype=float)
+     m = np.median(v)
+     return np.median(np.abs(v - m)) / 0.6745
+ 
+ 
+ def _solve_penta(A, b):
+     """Dense solve with fallbacks; A is small enough (banded in structure)."""
+     try:
+         return np.linalg.solve(A, b)
+     except np.linalg.LinAlgError:
+         return np.linalg.lstsq(A, b, rcond=None)[0]
+ 
+ 
+ def whittaker_robust_filter(x, window_size=20, n_iter=3):
+     x = np.asarray(x, dtype=float).ravel()
+     n = x.size
+     if n < window_size:
+         raise ValueError(
+             f"Input signal length ({n}) must be >= window_size ({window_size})"
+         )
+     if n <= 3:
+         return x[window_size - 1:].copy() if n >= window_size else x.copy()
+ 
+     # ---------- Robust measurement-noise estimate ----------
+     sig_range = max(float(np.std(x)), 1e-12)
+     d1 = np.diff(x)
+     sigma_r = _mad(d1) / np.sqrt(2.0)
+     if not np.isfinite(sigma_r) or sigma_r <= 0.0:
+         sigma_r = sig_range
+     sigma_r = float(np.clip(sigma_r, 1e-4 * sig_range, sig_range))
+     R = sigma_r * sigma_r
+ 
+     # ---------- Robust dynamics estimate (signal acceleration) ----------
+     # Rough pre-smooth (short moving average) then second differences.
+     w_r = int(max(3, min(window_size, n // 3)))
+     if w_r % 2 == 0:
+         w_r += 1
+     rough = np.convolve(x, np.ones(w_r) / w_r, mode="valid")
+     if rough.size > 2:
+         d2 = rough[2:] - 2.0 * rough[1:-1] + rough[:-2]
+         mad2 = _mad(d2)
+         noise_d2 = (sigma_r / np.sqrt(w_r)) * np.sqrt(6.0)
+         var_acc = mad2 * mad2 - noise_d2 * noise_d2
+     else:
+         var_acc = 0.0
+     floor_acc = 0.08 * sigma_r
+     if var_acc < floor_acc * floor_acc:
+         var_acc = floor_acc * floor_acc
+     sigma_acc = float(min(np.sqrt(var_acc), 0.5 * sigma_r))
+ 
+     # Global smoothing parameter: ratio of noise level to dynamics level.
+     # lambda ~ R / sigma_acc^2  (larger lambda -> smoother).
+     lam_base = float(np.clip(R / max(sigma_acc * sigma_acc, 1e-18), 1.0, 5e3))
+ 
+     # ---------- Local penalty modulation ----------
+     # Relax the curvature penalty where the rough signal shows *genuine*
+     # curvature (|d2| >> noise d2): keeps fast dynamics and reduces lag.
+     if rough.size > 2:
+         d2r = np.abs(d2)
+         thresh = max(1.5 * noise_d2, 1e-12)
+         # Map each interior point's penalty scale from curvature magnitude
+         # by interpolation back onto the full grid.
+         lam_local = 1.0 / (1.0 + np.clip(d2r / thresh - 1.0, 0.0, 6.0) / 3.0)
+         lam_local = np.clip(lam_local, 0.15, 1.0)
+         # Expand to full grid (pad edges with nearest values).
+         off = (n - rough.size) // 2
+         lam_grid = np.ones(n)
+         lo = off
+         hi = off + rough.size
+         lam_grid[lo:hi] = 1.0  # default
+         # second-difference penalty lives on interior points of `rough`
+         # grid; distribute onto the full grid conservatively.
+         pen_grid = np.ones(n)
+         for j in range(rough.size):
+             i0 = lo + j
+             i1 = min(i0 + 1, n - 1)
+             if j < len(lam_local):
+                 pen_grid[i0] = min(pen_grid[i0], lam_local[j])
+                 pen_grid[i1] = min(pen_grid[i1], lam_local[j])
+     else:
+         pen_grid = np.ones(n)
+ 
+     # ---------- Build second-difference operator D2 (n-2 x n) ----------
+     m = n - 2
+     D = np.zeros((m, n))
+     idx = np.arange(m)
+     D[idx, idx] = 1.0
+     D[idx, idx + 1] = -2.0
+     D[idx, idx + 2] = 1.0
+     # Row penalty weight: geometric mean of neighboring grid penalties.
+     lam_rows = lam_base * np.sqrt(
+         pen_grid[:-2] * pen_grid[1:-1] * pen_grid[2:] + 1e-18
+     )
+     Dw = D * lam_rows[:, None]
+ 
+     # ---------- Iteratively reweighted penalized least squares ----------
+     w = np.ones(n)
+     y = x.copy()
+     for it in range(n_iter):
+         # Weighted normal equations: (W + Dw' Dw) y = W x
+         Wd = np.diag(w)
+         A = Wd + Dw.T @ Dw
+         b = w * x
+         y_new = _solve_penta(A, b)
+         if not np.all(np.isfinite(y_new)):
+             break
+         y = y_new
+         # Robust reweighting: Huber on residuals, scale-aware.
+         resid = x - y
+         s = _mad(resid)
+         if not np.isfinite(s) or s <= 0:
+             break
+         c = 2.5 * s
+         ar = np.abs(resid)
+         w_new = np.where(ar <= c, 1.0, c / np.maximum(ar, 1e-15))
+         # Never let weights collapse entirely.
+         w_new = np.clip(w_new, 0.05, 1.0)
+         if it < n_iter - 1:
+             # Smooth weight evolution slightly to avoid oscillatory trust.
+             w = 0.5 * w + 0.5 * w_new
+         else:
+             w = w_new
+ 
+     # ---------- Light zero-phase ripple damper (residual scale-aware) ----------
+     dy = np.diff(y)
+     if dy.size > 2:
+         r_std = _mad(dy) / np.sqrt(2.0)
+     else:
+         r_std = 0.0
+     if r_std > 0 and sigma_r > 0:
+         ratio = sigma_r / r_std
+         alpha = float(np.clip(0.60 + 0.35 * np.tanh(2.0 * ratio - 2.0), 0.60, 0.95))
+     else:
+         alpha = 1.0
+     if alpha < 0.999:
+         y = _bilateral_one_pole(y, alpha)
+ 
++    # ---------- Guarded zero-phase curvature clamp ----------
++    # Bounds second differences to kill alternating oscillations that
++    # survive displacement-level smoothing; forward+backward sweeps keep
++    # it zero-phase, and the corr >= 0.97 retry guards genuine dynamics.
++    y = _curvature_clamp(y)
++
+     # ---------- Slice to output contract ----------
+     y = y[window_size - 1:].copy()
+     expected = n - window_size + 1
+     if y.shape[0] != expected:
+         y = y[:expected]
+     return y
++
++
++def _curvature_clamp(y, c=1.5, max_retry=4):
++    """Zero-phase clamp on second differences (oscillation killer).
++
++    Limits |y[k+1] - 2 y[k] + y[k-1]| to slack * s2 where s2 is the
++    robust (MAD) second-difference scale of the current signal. A
++    forward sweep followed by a backward sweep makes the operation
++    zero-phase. If the clamped result deviates too much from the input
++    (corr < 0.97), slack is doubled and the clamp retried.
++    """
++    y = np.asarray(y, dtype=float)
++    n = y.size
++    if n < 3:
++        return y.copy()
++    d2 = y[2:] - 2.0 * y[1:-1] + y[:-2]
++    s2 = _mad(d2)
++    if not np.isfinite(s2) or s2 <= 0:
++        return y.copy()
++    y0 = y
++    slack = c
++    for _ in range(max_retry):
++        limit = slack * s2
++        # Forward sweep.
++        out = y0.copy()
++        for k in range(1, n - 1):
++            cur = out[k + 1] - 2.0 * out[k] + out[k - 1]
++            if abs(cur) > limit:
++                # Move the midpoint to satisfy the curvature bound.
++                out[k] = out[k + 1] + out[k - 1] - cur
++                out[k] = out[k + 1] + out[k - 1] - np.sign(cur) * limit
++                out[k] = 0.5 * (out[k + 1] + out[k - 1] - np.sign(cur) * limit)
++        # Backward sweep (mirrors the forward pass -> zero phase).
++        rev = out[::-1].copy()
++        for k in range(1, n - 1):
++            cur = rev[k + 1] - 2.0 * rev[k] + rev[k - 1]
++            if abs(cur) > limit:
++                rev[k] = 0.5 * (rev[k + 1] + rev[k - 1] - np.sign(cur) * limit)
++        out = rev[::-1]
++        # Guard: ensure we haven't distorted genuine dynamics.
++        a = out - np.mean(out)
++        b = y0 - np.mean(y0)
++        denom = np.sqrt((a @ a) * (b @ b))
++        corr = float(a @ b / denom) if denom > 0 else 1.0
++        if corr >= 0.97:
++            return out
++        slack *= 2.0
++    return y0
+ 
+ 
+ def _bilateral_one_pole(x, alpha):
+     """Forward then reversed one-pole smoothing — net zero phase delay."""
+     y = np.empty_like(x)
+     acc = x[0]
+     y[0] = acc
+     for i in range(1, len(x)):
+         acc = alpha * x[i] + (1.0 - alpha) * acc
+         y[i] = acc
+     acc = y[-1]
+     out = y.copy()
+     for i in range(len(x) - 2, -1, -1):
+         acc = alpha * y[i] + (1.0 - alpha) * acc
+         out[i] = acc
+     return out
+ 
+ 
+ def adaptive_filter(x, window_size=20):
+     """Baseline entry — routes to the robust Whittaker smoother."""
+     return enhanced_filter_with_trend_preservation(x, window_size)
+ 
+ 
+ def enhanced_filter_with_trend_preservation(x, window_size=20):
+     """Enhanced entry — robust adaptive penalized least-squares smoother."""
+     return whittaker_robust_filter(x, window_size)
+ 
+ 
+ def kalman_rts_filter(x, window_size=20):
+     """Compatibility alias — same Whittaker smoother."""
+     return whittaker_robust_filter(x, window_size)
+ 
+ 
+ def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+     """
+     Main signal processing function that applies the selected algorithm.
+ 
+     Args:
+         input_signal: Input time series data
+         window_size: Window size for processing
+         algorithm_type: Type of algorithm to use ("basic", "enhanced", or "rts")
+ 
+     Returns:
+         Filtered signal
+     """
+     return whittaker_robust_filter(input_signal, window_size)
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+     """
+     Generate synthetic test signal with known characteristics.
+ 
+     Args:
+         length: Length of the signal
+         noise_level: Standard deviation of noise to add
+         seed: Random seed for reproducibility
+ 
+     Returns:
+         Tuple of (noisy_signal, clean_signal)
+     """
+     np.random.seed(seed)
+     t = np.linspace(0, 10, length)
+ 
+     # Create a complex signal with multiple components
+     clean_signal = (
+         2 * np.sin(2 * np.pi * 0.5 * t)  # Low frequency component
+         + 1.5 * np.sin(2 * np.pi * 2 * t)  # Medium frequency component
+         + 0.5 * np.sin(2 * np.pi * 5 * t)  # Higher frequency component
+         + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)  # Decaying oscillation
+     )
+ 
+     # Add non-stationary behavior
+     trend = 0.1 * t * np.sin(0.2 * t)  # Slowly varying trend
+     clean_signal += trend
+ 
+     # Add random walk component for non-stationarity
+     random_walk = np.cumsum(np.random.randn(length) * 0.05)
+     clean_signal += random_walk
+ 
+     # Add noise
+     noise = np.random.normal(0, noise_level, length)
+     noisy_signal = clean_signal + noise
+ 
+     return noisy_signal, clean_signal
+ 
+ 
+ def run_signal_processing(noisy_signal=None, signal_length=1000, noise_level=0.3, window_size=20):
+     """
+     Run the signal processing algorithm on a test signal.
+ 
+     Args:
+         noisy_signal: Input signal to filter (if provided, use this; otherwise generate)
+         signal_length: Length if generating signal (for backward compatibility)
+         noise_level: Noise level if generating signal (for backward compatibility)
+         window_size: Window size for processing
+ 
+     Returns:
+         Dictionary containing results and metrics
+     """
+     # Use provided signal or generate test signal (for backward compatibility)
+     if noisy_signal is not None:
+         # Filter the provided signal
+         filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+         clean_signal = None  # Not available when using provided signal
+     else:
+         # Generate test signal (for __main__ and backward compatibility)
+         noisy_signal, clean_signal = generate_test_signal(signal_length, noise_level)
+         filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+ 
+     # Calculate basic metrics (only if we have clean_signal from generation)
+     if len(filtered_signal) > 0 and clean_signal is not None:
+         # Align signals for comparison (account for processing delay)
+         delay = window_size - 1
+         aligned_clean = clean_signal[delay:]
+         aligned_noisy = noisy_signal[delay:]
+ 
+         # Ensure same length
+         min_length = min(len(filtered_signal), len(aligned_clean))
+         filtered_signal = filtered_signal[:min_length]
+         aligned_clean = aligned_clean[:min_length]
+         aligned_noisy = aligned_noisy[:min_length]
+ 
+         # Calculate correlation with clean signal
+         correlation = np.corrcoef(filtered_signal, aligned_clean)[0, 1] if min_length > 1 else 0
+ 
+         # Calculate noise reduction
+         noise_before = np.var(aligned_noisy - aligned_clean)
+         noise_after = np.var(filtered_signal - aligned_clean)
+         noise_reduction = (noise_before - noise_after) / noise_before if noise_before > 0 else 0
+ 
+         return {
+             "filtered_signal": filtered_signal,
+             "clean_signal": aligned_clean,
+             "noisy_signal": aligned_noisy,
+             "correlation": correlation,
+             "noise_reduction": noise_reduction,
+             "signal_length": min_length,
+         }
+     elif len(filtered_signal) > 0:
+         # When using provided signal (no clean_signal available), just return filtered signal
+         return {
+             "filtered_signal": filtered_signal,
+             "clean_signal": None,
+             "noisy_signal": None,
+             "correlation": 0,
+             "noise_reduction": 0,
+             "signal_length": len(filtered_signal),
+         }
+     else:
+         return {
+             "filtered_signal": [],
+             "clean_signal": [],
+             "noisy_signal": [],
+             "correlation": 0,
+             "noise_reduction": 0,
+             "signal_length": 0,
+         }
+ 
+ 
+ if __name__ == "__main__":
+     # Test the algorithm
+     results = run_signal_processing()
+     print("Signal processing completed!")
+     print(f"Correlation with clean signal: {results['correlation']:.3f}")
+     print(f"Noise reduction: {results['noise_reduction']:.3f}")
+     print(f"Processed signal length: {results['signal_length']}")

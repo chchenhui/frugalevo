@@ -1,0 +1,301 @@
+--- a/original.py
++++ b/original.py
+@@ -1,243 +1,298 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ H = np.sqrt(3.0) / 2.0
+ N = 11
+ 
+ 
+ # ---------- geometry primitives ----------
+ 
+ def _triplets(n):
+     idx = np.array([(a, b, c) for a in range(n) for b in range(a + 1, n)
+                     for c in range(b + 1, n)], dtype=int)
+     return idx
+ 
+ 
+ _TRIP = _triplets(N)
+ _NT = len(_TRIP)
+ 
+ 
+ def _areas(pts):
+     p = pts[_TRIP]
+     ax, ay = p[:, 0, 0], p[:, 0, 1]
+     bx, by = p[:, 1, 0], p[:, 1, 1]
+     cx, cy = p[:, 2, 0], p[:, 2, 1]
+     return 0.5 * np.abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay))
+ 
+ 
+ def _min_area(pts):
+     a = _areas(pts)
+     return float(a.min()), int(np.argmin(a))
+ 
+ 
+ def _project(pts):
+     """Project into the triangle via barycentric clipping."""
+     x, y = pts[:, 0], pts[:, 1]
+     w1 = x - y / np.sqrt(3.0)
+     w2 = 2.0 * y / np.sqrt(3.0)
+     w0 = 1.0 - w1 - w2
+     w = np.stack([w0, w1, w2], axis=1)
+     w = np.clip(w, 0.0, None)
+     s = w.sum(axis=1, keepdims=True)
+     s[s == 0] = 1.0
+     w /= s
+     out = np.empty_like(pts)
+     out[:, 0] = w[:, 1] + 0.5 * w[:, 2]
+     out[:, 1] = H * w[:, 2]
+     return out
+ 
+ 
+ # ---------- objectives ----------
+ 
+ def _soft_val(areas, frac=0.15, k=400.0):
+     m = max(4, int(len(areas) * frac))
+     small = np.partition(areas, m - 1)[:m]
+     # log-sum-exp soft minimum: -log(mean(exp(-k*a)))/k
+     mx = small.max()
+     val = mx + np.log(np.mean(np.exp(-k * (small - mx)))) / k
+     return -val  # minimize
+ 
+ 
+ def _hard_val(areas):
+     return -float(areas.min())
+ 
+ 
+ # ---------- phase 1: soft-min coordinate descent ----------
+ 
+ def _soft_phase(pts, step, iters):
+     pts = _project(pts.copy())
+     best = _soft_val(_areas(pts))
+     for _ in range(iters):
+         improved = False
+         for i in range(N):
+             for d in range(2):
+                 for s in (+1, -1):
+                     cand = pts.copy()
+                     cand[i, d] += s * step
+                     cand = _project(cand)
+                     v = _soft_val(_areas(cand))
+                     if v < best - 1e-14:
+                         pts, best = cand, v
+                         improved = True
+         if not improved:
+             step *= 0.5
+             if step < 1e-5:
+                 break
+     return pts
+ 
+ 
+ # ---------- phase 2: hard-min polish ----------
+ 
+ def _hard_phase(pts, step, rounds):
+     pts = _project(pts.copy())
+     best, kmin = _min_area(pts)
+     for _ in range(rounds):
+         improved = False
+         tri = _TRIP[kmin]
+         order = list(tri) + [i for i in range(N) if i not in tri]
+         for i in order:
+             for d in range(2):
+                 for s in (+1, -1):
+                     cand = pts.copy()
+                     cand[i, d] += s * step
+                     cand = _project(cand)
+                     v, _ = _min_area(cand)
+                     if v > best + 1e-14:
+                         pts, best = cand, v
+                         improved = True
+         _, kmin = _min_area(pts)
+         if not improved:
+             step *= 0.5
+             if step < 1e-7:
+                 break
+     return pts
+ 
+ 
+ # ---------- seeds ----------
+ 
+ def _lattice_seed():
+     pts = []
+     rows = [4, 3, 2, 1, 1]
+     nlev = len(rows)
+     for r, cnt in enumerate(rows):
+         y = H * (r + 0.5) / nlev
+         halfw = 0.5 * (1.0 - y / H)
+         xs = np.linspace(-0.5, 0.5, cnt + 2)[1:-1]
+         for x in xs:
+             pts.append((0.5 + x * halfw * 0.96, y))
+     return _project(np.array(pts))
+ 
+ 
+ def _vertex_seed():
+     pts = [
+         (0.0, 0.0), (1.0, 0.0), (0.5, H),
+         (0.5, 0.0), (0.25, H / 2), (0.75, H / 2),
+         (0.5, H / 3), (0.5, 2 * H / 3),
+         (0.25, H / 6), (0.75, H / 6), (0.5, H / 6),
+     ]
+     return _project(np.array(pts, dtype=float))
+ 
+ 
+ def _random_seed(rng):
+     u, v = rng.random(N), rng.random(N)
+     su = np.sqrt(u)
+     w0, w1, w2 = 1 - su, su * (1 - v), su * v
+     return np.stack([w1 + 0.5 * w2, H * w2], axis=1)
+ 
+ 
+ # ---------- phase 3: group-move annealing ----------
+ import time as _time
+ 
+ def _anneal_group(pts, rng, t_budget=2.0, step0=0.008):
+     """Simulated annealing with correlated multi-point (group) moves.
+ 
+     With ~25% probability, 2-3 nearby points are perturbed simultaneously
+     with correlated Gaussian deltas; otherwise a single point moves. This
+     escapes local optima where single-point moves cannot improve.
+     """
+     import math
+     pts = _project(pts.copy())
+     cur, cur_val = pts.copy(), _min_area(pts)[0]
+     best, best_val = pts.copy(), cur_val
+     step = step0
+     T = step * 0.25          # temperature scale
+     deadline = _time.time() + t_budget
+     it = 0
+     while _time.time() < deadline:
+         it += 1
+         cand = cur.copy()
+         if rng.random() < 0.25:
+             # group move: pick a point and its 1-2 nearest neighbours,
+             # apply correlated deltas
+             i = int(rng.integers(N))
+             d2 = np.sum((cur - cur[i]) ** 2, axis=1)
+             near = np.argsort(d2)[1:1 + int(rng.integers(1, 3))]
+             group = np.concatenate(([i], near))
+             shared = rng.normal(0.0, step * 0.6, size=2)
+             for g in group:
+                 cand[g] += shared + rng.normal(0.0, step * 0.4, size=2)
+         else:
+             i = int(rng.integers(N))
+             cand[i] += rng.normal(0.0, step, size=2)
+         cand = _project(cand)
+         v = _min_area(cand)[0]
+         if v >= cur_val or rng.random() < math.exp((v - cur_val) / max(T, 1e-12)):
+             cur, cur_val = cand, v
+             if v > best_val:
+                 best, best_val = cand.copy(), v
+         if it % 3000 == 0:
+             step *= 0.85
+             T *= 0.85
+             if step < 1e-5:
+                 break
+     # final hard polish from the annealing winner
+     best = _hard_phase(best, 0.002, 40)
+     return best
+ 
+ 
++# ---------- targeted polish on k smallest triangles ----------
++
++def _targeted_polish(pts, k=10, step=0.004, max_sweeps=200):
++    """Deterministic sweep over the k smallest triangles; try gradient-like
++    moves (edge normals) for their vertices, accept strictly-improving."""
++    rng = np.random.default_rng(777)
++    pts = _project(pts.copy())
++    best, _ = _min_area(pts)
++    for _ in range(max_sweeps):
++        areas = _areas(pts)
++        small_idx = np.argsort(areas)[:k]
++        improved = False
++        for t in small_idx:
++            i, j, m = _TRIP[t]
++            for vi, vo in ((i, (j, m)), (j, (i, m)), (m, (i, j))):
++                # outward normal of the opposite edge = gradient of the
++                (unsigned) triangle area w.r.t. this vertex
++                e = pts[vo[1]] - pts[vo[0]]
++                nrm = np.array([-e[1], e[0]])
++                ln = np.hypot(*nrm)
++                if ln < 1e-15:
++                    continue
++                nrm /= ln
++                base = pts[vi]
++                for dr in (nrm, -nrm):
++                    for st in (step, 0.5 * step):
++                        cand = pts.copy()
++                        cand[vi] = base + dr * st
++                        cand = _project(cand)
++                        v, _ = _min_area(cand)
++                        if v > best + 1e-15:
++                            pts, best = cand, v
++                            improved = True
++                # small random probe around this vertex
++                cand = pts.copy()
++                cand[vi] = base + rng.normal(0.0, step, size=2)
++                cand = _project(cand)
++                v, _ = _min_area(cand)
++                if v > best + 1e-15:
++                    pts, best = cand, v
++                    improved = True
++            if improved:
++                # recompute small set lazily: areas changed
++                areas = _areas(pts)
++                small_idx = np.argsort(areas)[:k]
++        if not improved:
++            step *= 0.5
++            if step < 1e-7:
++                break
++    return pts
++
++
+ # ---------- pipeline ----------
+ 
+ def _optimize():
+     rng = np.random.default_rng(20240517)
+     starts = [_lattice_seed(), _vertex_seed()]
+     for _ in range(8):
+         starts.append(_random_seed(rng))
+     best_pts, best_val = None, -1.0
+     for s in starts:
+         c = _soft_phase(s, 0.02, 25)
+         c = _hard_phase(c, 0.004, 70)
++        c = _targeted_polish(c, k=10, step=0.004)
+         v, _ = _min_area(c)
+         if v > best_val:
+             best_pts, best_val = c, v
+     # group-move annealing refinements from the top starts
+     top = sorted(starts, key=lambda s: -_min_area(_hard_phase(
+         _soft_phase(s, 0.02, 10), 0.004, 30))[0])[:3]
+     cands = [best_pts] + top
+     for c0 in cands:
+         try:
+             c = _anneal_group(c0, rng, t_budget=1.2)
++            c = _targeted_polish(c, k=10, step=0.002)
+             v, _ = _min_area(c)
+             if v > best_val:
+                 best_pts, best_val = c, v
+         except Exception:
+             continue
++    best_pts = _targeted_polish(best_pts, k=12, step=0.001)
+     return _project(best_pts)
+ 
+ 
+ try:
+     _POINTS = _optimize()
+ except Exception:
+     _POINTS = _lattice_seed()
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+     Construct an arrangement of 11 points inside/on the equilateral triangle
+     (0,0),(1,0),(0.5,sqrt(3)/2) maximizing the minimum triangle area.
+ 
+     Returns:
+         points: np.ndarray of shape (11,2) with x,y coordinates.
+     """
+     return _POINTS.copy()
+ 
+ # EVOLVE-BLOCK-END

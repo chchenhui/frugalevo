@@ -1,0 +1,121 @@
+<NAME>
+bottleneck_gradient_reheat</NAME>
+<DESCRIPTION>
+All programs plateau around min_area 0.02 because single-point pattern search gets stuck in shallow local optima: moving one point at a time is myopic when the minimum-area (bottleneck) triangle constrains 3 points simultaneously. The known strong heuristic for Heilbronn-type problems is to move the points of the *smallest* triangles along their signed-area gradients (all three vertices of a bottleneck triangle together), which directly raises the constrained minimum. I add: (1) a vectorized bottleneck gradient move (move up to 3 bottleneck points along the gradient of their triangle areas), (2) an annealing reheat loop per seed that restarts from the best-so-far configuration when progress stalls (targeting the 0.02 plateau), and (3) keep the pattern-search polish as a final refinement. This directly addresses the plateau at 0.02 and should push combined_score above 1.0 while keeping determinism and modest runtime.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _refine(pts, rng, steps=(0.04, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005)):
+=======
+def _bottleneck_move(pts, rng, nb=8, step=0.02):
+    """Move up to 3 points from the smallest-area triangles along their
+    signed-area gradients (coordinated multi-point move)."""
+    a = pts[_TRIP[:, 0]]
+    b = pts[_TRIP[:, 1]]
+    c = pts[_TRIP[:, 2]]
+    cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    areas = 0.5 * np.abs(cross)
+    order = np.argsort(areas)[:nb]
+    s = np.where(cross >= 0, 1.0, -1.0)
+    gi = 0.5 * s * np.stack([c[:, 1] - b[:, 1], b[:, 0] - c[:, 0]], axis=1)
+    gj = 0.5 * s * np.stack([a[:, 1] - c[:, 1], c[:, 0] - a[:, 0]], axis=1)
+    gk = 0.5 * s * np.stack([b[:, 1] - a[:, 1], a[:, 0] - b[:, 0]], axis=1)
+    gmap = [gi, gj, gk]
+    # membership weights of points in bottleneck triangles
+    cnt = np.zeros(pts.shape[0])
+    for t in order:
+        cnt[_TRIP[t]] += 1.0
+    # pick 1-3 points, membership-weighted
+    k = 1 if rng.random() < 0.35 else (2 if rng.random() < 0.6 else 3)
+    top = list(np.argsort(-cnt)[:k])
+    dirs = np.zeros_like(pts)
+    touched = set()
+    for t in order:
+        for local, pi in enumerate(_TRIP[t]):
+            if pi in top and pi not in touched:
+                g = gmap[local][t]
+                nrm = np.hypot(g[0], g[1])
+                if nrm > 1e-15:
+                    dirs[pi] = g / nrm
+                touched.add(pi)
+    cand = pts + step * dirs
+    return _clip(cand)
+
+
+def _refine(pts, rng, steps=(0.04, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005)):
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    for s in steps:
+        improved = True
+        while improved:
+            improved = False
+            for i in range(best.shape[0]):
+                for d in dirs:
+                    cand = best.copy()
+                    cand[i] += s * d
+                    cand = _clip(cand)
+                    v = _min_area(cand)
+                    if v > best_val + 1e-12:
+                        best_val = v
+                        best = cand
+                        improved = True
+    return best, best_val
+=======
+    # Phase 1: coordinated bottleneck-gradient ascent with annealing reheats
+    for _ in range(3):  # up to 3 passes (reheat cycles)
+        b = best.copy()
+        cur = best_val
+        step = 0.02
+        sigma = 0.006
+        stall = 0
+        for _ in range(1200):
+            ok = False
+            s = step
+            for _ in range(5):
+                cand = _bottleneck_move(b, rng, step=s)
+                v = _min_area(cand)
+                if v > cur + 1e-14:
+                    b, cur = cand, v
+                    ok = True
+                    break
+                s *= 0.5
+            if ok:
+                stall = 0
+                step = min(step * 1.25, 0.02)
+                if cur > best_val:
+                    best_val, best = cur, b.copy()
+            else:
+                stall += 1
+                step *= 0.5
+                if step < 2e-5 or stall > 10:
+                    # annealing kick from best, restart temperature
+                    kick = _clip(best + rng.normal(0.0, sigma, best.shape))
+                    kv = _min_area(kick)
+                    if kv > best_val * 0.92 or kv > cur - 4.0 * sigma * sigma:
+                        b, cur = kick, kv
+                    sigma *= 0.75
+                    if sigma < 5e-4:
+                        break  # reheats exhausted
+                    step = 0.02
+                    stall = 0
+    # Phase 2: single-point pattern-search polish
+    for s in steps:
+        improved = True
+        while improved:
+            improved = False
+            for i in range(best.shape[0]):
+                for d in dirs:
+                    cand = best.copy()
+                    cand[i] += s * d
+                    cand = _clip(cand)
+                    v = _min_area(cand)
+                    if v > best_val + 1e-12:
+                        best_val = v
+                        best = cand
+                        improved = True
+    return best, best_val
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

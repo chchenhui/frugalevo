@@ -1,0 +1,471 @@
+# EVOLVE-BLOCK-START
+import heapq
+import math
+import os
+import random
+from typing import Dict, List
+
+import networkx as nx
+import pandas as pd
+
+
+EPSILON = 1e-12
+# The DP is exact and substantially improves shared-link selection for normal
+# broadcast jobs.  The multistart planner handles wider terminal sets safely.
+EXACT_TERMINAL_LIMIT = 16
+
+
+def _cost(data):
+    """Return a valid non-negative transfer price or infinity."""
+    try:
+        value = float(data.get("cost"))
+        if math.isfinite(value) and value >= 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    return math.inf
+
+
+def _prepare_network(src, G):
+    """Create a source-rooted graph containing only priced usable links."""
+    h = nx.DiGraph()
+    h.add_nodes_from(G.nodes(data=True))
+
+    for u, v, data in G.edges(data=True):
+        if u == v or v == src:
+            continue
+        price = _cost(data)
+        if math.isfinite(price):
+            copied = dict(data)
+            copied["cost"] = price
+            h.add_edge(u, v, **copied)
+
+    return h
+
+
+def _reverse_relaxation(h, nodes, node_index, seeds, seed_choices):
+    """
+    Propagate a terminal-subset topology backward over directed links.
+
+    A state at downstream node ``u`` can be rooted at predecessor ``v`` by
+    paying only the link v->u.
+    """
+    distances = list(seeds)
+    decisions = list(seed_choices)
+    heap = [(value, index) for index, value in enumerate(distances)
+            if math.isfinite(value)]
+    heapq.heapify(heap)
+
+    while heap:
+        distance, current_index = heapq.heappop(heap)
+        if distance > distances[current_index] + EPSILON:
+            continue
+
+        current = nodes[current_index]
+        for predecessor in h.predecessors(current):
+            predecessor_index = node_index[predecessor]
+            candidate = distance + h[predecessor][current]["cost"]
+
+            if candidate + EPSILON < distances[predecessor_index]:
+                distances[predecessor_index] = candidate
+                decisions[predecessor_index] = ("edge", current_index)
+                heapq.heappush(heap, (candidate, predecessor_index))
+
+    return distances, decisions
+
+
+def _exact_steiner_union(src, terminals, h):
+    """
+    Solve the directed rooted Steiner arborescence problem exactly.
+
+    dp[mask][node] is the lowest union cost of a topology rooted at node and
+    reaching every destination represented by mask.  Subsets can merge at a
+    relay, then a reverse shortest-path closure determines their cheapest
+    upstream attachment point.
+    """
+    if src not in h:
+        raise nx.NodeNotFound("Source is not present in the network")
+
+    nodes = list(h.nodes())
+    node_index = {node: index for index, node in enumerate(nodes)}
+    node_count = len(nodes)
+    terminal_count = len(terminals)
+    full_mask = (1 << terminal_count) - 1
+
+    dp = [[math.inf] * node_count for _ in range(full_mask + 1)]
+    decisions = [[None] * node_count for _ in range(full_mask + 1)]
+
+    for mask in range(1, full_mask + 1):
+        seeds = [math.inf] * node_count
+        seed_choices = [None] * node_count
+
+        if mask & (mask - 1) == 0:
+            terminal_position = mask.bit_length() - 1
+            terminal = terminals[terminal_position]
+            if terminal in node_index:
+                index = node_index[terminal]
+                seeds[index] = 0.0
+                seed_choices[index] = ("terminal",)
+        else:
+            # Keep the lowest terminal bit in one half, avoiding mirrored
+            # subset merges while retaining every possible split.
+            anchor = mask & -mask
+            subset = (mask - 1) & mask
+
+            while subset:
+                other = mask ^ subset
+                if other and subset & anchor:
+                    left = dp[subset]
+                    right = dp[other]
+                    for index in range(node_count):
+                        candidate = left[index] + right[index]
+                        if candidate + EPSILON < seeds[index]:
+                            seeds[index] = candidate
+                            seed_choices[index] = ("merge", subset, other)
+                subset = (subset - 1) & mask
+
+        dp[mask], decisions[mask] = _reverse_relaxation(
+            h, nodes, node_index, seeds, seed_choices
+        )
+
+    root_index = node_index[src]
+    if not math.isfinite(dp[full_mask][root_index]):
+        raise nx.NetworkXNoPath(
+            "No priced broadcast route from {} to: {}".format(
+                src, ", ".join(str(dst) for dst in terminals)
+            )
+        )
+
+    selected = set()
+    visited = set()
+
+    def unpack(mask, index):
+        marker = (mask, index)
+        if marker in visited:
+            return
+        visited.add(marker)
+
+        decision = decisions[mask][index]
+        if decision is None or decision[0] == "terminal":
+            return
+
+        if decision[0] == "merge":
+            unpack(decision[1], index)
+            unpack(decision[2], index)
+        else:
+            next_index = decision[1]
+            selected.add((nodes[index], nodes[next_index]))
+            unpack(mask, next_index)
+
+    unpack(full_mask, root_index)
+    return selected
+
+
+def _prune_union(src, terminals, edges):
+    """Discard links that do not contribute to root-to-terminal delivery."""
+    topology = nx.DiGraph()
+    topology.add_edges_from(edges)
+    protected = set(terminals)
+    protected.add(src)
+
+    changed = True
+    while changed:
+        changed = False
+        for node in list(topology.nodes()):
+            if node not in protected and topology.out_degree(node) == 0:
+                topology.remove_node(node)
+                changed = True
+
+    # Remove edges made redundant by alternate routes.  This also removes
+    # accidental cycles from greedy constructions.
+    for edge in sorted(list(topology.edges()), key=lambda item: str(item)):
+        topology.remove_edge(*edge)
+        valid = all(
+            dst == src or (
+                src in topology and dst in topology and
+                nx.has_path(topology, src, dst)
+            )
+            for dst in terminals
+        )
+        if not valid:
+            topology.add_edge(*edge)
+
+    return set(topology.edges())
+
+
+def _union_cost(h, edges):
+    return sum(h[u][v]["cost"] for u, v in edges)
+
+
+def _greedy_candidate(src, terminals, h, policy, source_distances, seed):
+    """
+    Construct one shared broadcast union.
+
+    Every new branch is attached from any already-delivered relay.  Therefore
+    common trunks cost once, while policy changes explore different branch
+    orders that can expose cheaper multi-cloud sharing opportunities.
+    """
+    rng = random.Random(seed)
+    pending = set(terminals)
+    tree_nodes = {src}
+    edges = set()
+
+    while pending:
+        distances, paths = nx.multi_source_dijkstra(
+            h, list(tree_nodes), weight="cost"
+        )
+        available = [dst for dst in pending if dst in distances]
+        if not available:
+            raise nx.NetworkXNoPath(
+                "No priced broadcast route from {} to: {}".format(
+                    src, ", ".join(str(dst) for dst in pending)
+                )
+            )
+
+        if policy == "nearest":
+            destination = min(
+                available, key=lambda dst: (distances[dst], str(dst))
+            )
+        elif policy == "farthest":
+            destination = max(
+                available, key=lambda dst: (
+                    distances[dst],
+                    source_distances.get(dst, math.inf),
+                    str(dst),
+                )
+            )
+        elif policy == "source_farthest":
+            destination = max(
+                available,
+                key=lambda dst: (
+                    source_distances.get(dst, -math.inf),
+                    -distances[dst],
+                    str(dst),
+                ),
+            )
+        elif policy == "shared_first":
+            destination = min(
+                available,
+                key=lambda dst: (
+                    distances[dst] /
+                    max(source_distances.get(dst, distances[dst]), EPSILON),
+                    distances[dst],
+                    str(dst),
+                ),
+            )
+        else:
+            # Randomized ties are deterministic per topology input and permit
+            # alternate branch orders without non-reproducible plans.
+            destination = min(
+                available,
+                key=lambda dst: (rng.random(), distances[dst], str(dst)),
+            )
+
+        branch = paths[destination]
+        for u, v in zip(branch, branch[1:]):
+            edges.add((u, v))
+            tree_nodes.add(u)
+            tree_nodes.add(v)
+        pending.remove(destination)
+
+    return _prune_union(src, terminals, edges)
+
+
+def _multistart_greedy_union(src, terminals, h):
+    """Evaluate complementary greedy branch orders and retain the best union."""
+    source_distances = nx.single_source_dijkstra_path_length(
+        h, src, weight="cost"
+    )
+
+    if any(dst not in source_distances for dst in terminals):
+        missing = [dst for dst in terminals if dst not in source_distances]
+        raise nx.NetworkXNoPath(
+            "No priced broadcast route from {} to: {}".format(
+                src, ", ".join(str(dst) for dst in missing)
+            )
+        )
+
+    policies = [
+        ("nearest", 0),
+        ("farthest", 0),
+        ("source_farthest", 0),
+        ("shared_first", 0),
+        ("random", 17),
+        ("random", 113),
+        ("random", 911),
+        ("random", 4099),
+    ]
+
+    best_edges = None
+    best_score = None
+
+    for policy, seed in policies:
+        candidate = _greedy_candidate(
+            src, terminals, h, policy, source_distances, seed
+        )
+        score = (
+            _union_cost(h, candidate),
+            len(candidate),
+            tuple(sorted((str(u), str(v)) for u, v in candidate)),
+        )
+        if best_score is None or score < best_score:
+            best_edges = candidate
+            best_score = score
+
+    return best_edges
+
+
+def _materialize_paths(src, dsts, edges, G):
+    """Convert a selected shared link union into API-compatible edge paths."""
+    topology_graph = nx.DiGraph()
+    topology_graph.add_node(src)
+
+    for u, v in edges:
+        topology_graph.add_edge(u, v, cost=_cost(G[u][v]))
+
+    paths = {}
+    for dst in dsts:
+        if dst == src:
+            paths[dst] = []
+            continue
+
+        try:
+            node_path = nx.shortest_path(
+                topology_graph, src, dst, weight="cost"
+            )
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            raise nx.NetworkXNoPath(
+                f"Shared broadcast topology does not reach destination {dst}"
+            )
+
+        paths[dst] = [
+            [u, v, G[u][v]]
+            for u, v in zip(node_path, node_path[1:])
+        ]
+
+    return paths
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Build a minimum-cost shared broadcast topology.
+
+    Exact directed-Steiner search is used when practical; otherwise several
+    pruned shared-prefix plans are compared to reduce redundant transfers.
+    """
+    topology = BroadCastTopology(src, dsts, num_partitions)
+    h = _prepare_network(src, G)
+
+    terminals = list(dict.fromkeys(dst for dst in dsts if dst != src))
+
+    if not terminals:
+        selected_edges = set()
+    elif len(terminals) <= EXACT_TERMINAL_LIMIT:
+        selected_edges = _exact_steiner_union(src, terminals, h)
+        selected_edges = _prune_union(src, terminals, selected_edges)
+    else:
+        selected_edges = _multistart_greedy_union(src, terminals, h)
+
+    paths = _materialize_paths(src, dsts, selected_edges, G)
+
+    for dst in dsts:
+        for partition in range(num_partitions):
+            topology.set_dst_partition_paths(
+                dst, partition, list(paths[dst])
+            )
+
+    return topology
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]
+
+
+class BroadCastTopology:
+    def __init__(
+        self,
+        src: str,
+        dsts: List[str],
+        num_partitions: int = 4,
+        paths: Dict[str, SingleDstPath] = None,
+    ):
+        self.src = src
+        self.dsts = dsts
+        self.num_partitions = num_partitions
+
+        if paths is not None:
+            self.paths = paths
+            self.set_graph()
+        else:
+            self.paths = {
+                dst: {str(i): None for i in range(num_partitions)}
+                for dst in dsts
+            }
+
+    def set_graph(self):
+        """Compatibility hook for callers constructing from saved paths."""
+        return self.paths
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        self.paths[dst][str(partition)] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    """
+    Build a directed cloud graph containing transfer price and throughput data.
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if cost_path is None:
+        cost = pd.read_csv(os.path.join(current_dir, "profiles/cost.csv"))
+    else:
+        cost = pd.read_csv(cost_path)
+
+    if throughput_path is None:
+        throughput = pd.read_csv(
+            os.path.join(current_dir, "profiles/throughput.csv")
+        )
+    else:
+        throughput = pd.read_csv(throughput_path)
+
+    G = nx.DiGraph()
+
+    for _, row in throughput.iterrows():
+        if row["src_region"] == row["dst_region"]:
+            continue
+        G.add_edge(
+            row["src_region"],
+            row["dst_region"],
+            cost=None,
+            throughput=num_vms * row["throughput_sent"] / 1e9,
+        )
+
+    for _, row in cost.iterrows():
+        if row["src"] in G and row["dest"] in G[row["src"]]:
+            G[row["src"]][row["dest"]]["cost"] = row["cost"]
+
+    no_cost_pairs = [
+        (u, v)
+        for u, v, data in G.edges(data=True)
+        if data.get("cost") is None
+    ]
+    print("Unable to get costs for: ", no_cost_pairs)
+
+    return G
+
+
+# EVOLVE-BLOCK-END

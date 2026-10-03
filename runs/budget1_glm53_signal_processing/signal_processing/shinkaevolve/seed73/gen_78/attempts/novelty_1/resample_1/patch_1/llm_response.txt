@@ -1,0 +1,106 @@
+<NAME>
+pre-wavelet_bidirectional_kalman_denoise</NAME>
+<DESCRIPTION>
+The current wavelet pipeline (0.68) already beats the Kalman+SG champion (0.64) on every metric except noise_reduction (0.37 vs 0.34 — comparable). The dominant remaining losses are slope_changes (20.0) and false_reversals (17.8) driven by residual high-frequency noise surviving the soft-thresholding. Adding a cheap bidirectional capped-NIS adaptive-Kalman pre-denoising stage before the wavelet decomposition lets the wavelet thresholds operate on a signal with a much better SNR: the Kalman pass suppresses broadband measurement noise with near-zero lag (capped Q prevents noise spikes from flooding the velocity state), while the wavelet/threshold stages handle the non-stationary structure. The bidirectional fusion (validated in prior generations as a no-smoothness-cost phase-error canceller) removes the causal pass's interior lag. Since the Kalman output is smoother, the MAD noise-scale estimate is applied to the raw input (preserved) so thresholds stay calibrated, and I slightly relax the noise-dominated scale shrink (0.5 → 0.6) to avoid over-flattening after the extra smoothing. Efficiency stays O(n) and execution_time was 0.00, so the extra pass is free.
+</DIFF>
+<<<<<<< SEARCH
+def _mad_sigma(d):
+    med = np.median(d)
+    return max(np.median(np.abs(d - med)) / 0.6745, 1e-12)
+=======
+def _mad_sigma(d):
+    med = np.median(d)
+    return max(np.median(np.abs(d - med)) / 0.6745, 1e-12)
+
+
+def _bidirectional_kalman_pre(x):
+    """Capped-NIS constant-velocity Kalman, forward pass fused 50/50 with a
+    time-reversed backward pass. The cap (max 4x baseline Q) prevents noise
+    spikes from flooding the velocity state; the bidirectional fusion cancels
+    the interior phase error of the causal pass at no smoothness cost.
+    Used as a cheap broadband pre-denoiser before the wavelet stage."""
+    def _fwd(sig):
+        n = len(sig)
+        if n < 2:
+            return sig.copy()
+        r = max(_robust_noise_std(sig) ** 2, 1e-8)
+        q_base = 0.01 * r
+        lvl, slope = sig[0], 0.0
+        p00 = p11 = max(r, 1.0)
+        p01 = 0.0
+        out = np.empty(n)
+        out[0] = lvl
+        for k in range(1, n):
+            # predict
+            lvl += slope
+            p00 = p00 + 2.0 * p01 + p11
+            p01 = p01 + p11
+            # capped NIS-adaptive Q
+            innov = sig[k] - lvl
+            S = p00 + r
+            nis = innov * innov / max(S, 1e-12)
+            mult = 1.0 + 3.0 * min(nis, 6.0) / 6.0  # in [1, 4]
+            q = q_base * mult
+            p00 += 0.25 * q
+            p01 += 0.5 * q
+            p11 += q
+            # update
+            S = p00 + r
+            k0 = p00 / S
+            k1 = p01 / S
+            lvl += k0 * innov
+            slope += k1 * innov
+            p00 = max((1.0 - k0) * p00, 1e-12)
+            p11 = max(p11 - k1 * p01, 1e-12)
+            p01 = (1.0 - k0) * p01
+            out[k] = lvl
+        return out
+
+    xf = np.asarray(x, dtype=float)
+    fwd = _fwd(xf)
+    bwd = _fwd(xf[::-1])[::-1]
+    return 0.5 * fwd + 0.5 * bwd
+>>>>>>> REPLACE
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Stage 1: robust noise scale ---
+    sigma = _robust_noise_std(xf)
+
+    # --- Stage 2+3: stationary wavelet decomposition + adaptive thresholds ---
+    # choose scales so the coarsest approximation spans ~ the window size
+    n_levels = int(np.clip(np.floor(np.log2(max(window_size, 4))), 1, 6))
+    details, approx = _atrous_decompose_fast(xf, n_levels)
+=======
+    # --- Stage 1: robust noise scale (from RAW input, keeps thresholds
+    # calibrated even after pre-denoising) ---
+    sigma = _robust_noise_std(xf)
+
+    # --- Stage 1b: bidirectional capped-NIS Kalman pre-denoise ---
+    # Suppresses broadband measurement noise with near-zero lag so the
+    # wavelet thresholds operate on a much higher-SNR signal; fewer
+    # noise-induced slope reversals survive the cascade.
+    if n >= 4:
+        xf = _bidirectional_kalman_pre(xf)
+
+    # --- Stage 2+3: stationary wavelet decomposition + adaptive thresholds ---
+    # choose scales so the coarsest approximation spans ~ the window size
+    n_levels = int(np.clip(np.floor(np.log2(max(window_size, 4))), 1, 6))
+    details, approx = _atrous_decompose_fast(xf, n_levels)
+>>>>>>> REPLACE
+
+<DIFF>
+<<<<<<< SEARCH
+        if mag < 0.5:
+            # noise-dominated: aggressively shrink
+            c_t = np.sign(c) * np.maximum(np.abs(c) - thr, 0.0)
+            c_t *= 0.5
+=======
+        if mag < 0.5:
+            # noise-dominated: aggressively shrink (mildly relaxed from 0.5
+            # because the Kalman pre-denoiser already removed broadband noise)
+            c_t = np.sign(c) * np.maximum(np.abs(c) - thr, 0.0)
+            c_t *= 0.6
+>>>>>>> REPLACE
+
+</DIFF>

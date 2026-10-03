@@ -1,0 +1,264 @@
+<NAME>
+direct_balance_feedback
+</NAME>
+
+<DESCRIPTION>
+This approach avoids reconstructing numeric weights from fragile additive estimates. Instead, it uses comparisons in two stages:
+
+1. It builds a small ordered pivot sample, classifies every item into weight quantile buckets, and uses the exponential-distribution prior to create coarse proxy weights.
+2. It constructs an initial LPT-style partition from those proxies, then spends all remaining useful queries directly on the actual objective: comparing two bag totals, selecting an item from the heavier bag whose proxy weight is close to half the estimated discrepancy, and testing the resulting transfer with the balance.
+
+Unlike the previous method, the final optimization decisions are validated against real group sums rather than inferred individual weights. This makes it much more robust to inaccurate weight reconstruction while still exploiting the known exponential input distribution for candidate selection.
+</DESCRIPTION>
+
+<CODE>
+```cpp
+// EVOLVE-BLOCK-START
+#include <bits/stdc++.h>
+using namespace std;
+
+static int N, D, Q;
+static int used_queries = 0;
+static mt19937 rng((uint32_t)chrono::steady_clock::now().time_since_epoch().count());
+
+static char ask(const vector<int>& L, const vector<int>& R) {
+    ++used_queries;
+    cout << L.size() << ' ' << R.size();
+    for (int x : L) cout << ' ' << x;
+    for (int x : R) cout << ' ' << x;
+    cout << endl;
+
+    char c;
+    cin >> c;
+    return c;
+}
+
+static char ask_groups(const vector<vector<int>>& groups, int a, int b) {
+    return ask(groups[a], groups[b]);
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    cin >> N >> D >> Q;
+
+    // Reserve a substantial portion of comparisons for direct partition feedback.
+    int ranking_budget = max(N / 2, (Q * 42) / 100);
+    ranking_budget = min(ranking_budget, Q - 2 * D);
+    ranking_budget = max(0, ranking_budget);
+
+    // Choose the largest pivot count whose sorting and classification fit the budget.
+    int K = 1;
+    for (int k = 2; k <= min(N, 32); ++k) {
+        int sort_cost = 0;
+        for (int i = 1; i < k; ++i) {
+            int x = i + 1;
+            int lg = 0;
+            while ((1 << lg) < x) ++lg;
+            sort_cost += lg;
+        }
+        int cls = 0;
+        int x = k + 1;
+        while ((1 << cls) < x) ++cls;
+        int total_cost = sort_cost + (N - k) * cls;
+        if (total_cost <= ranking_budget) K = k;
+    }
+
+    vector<int> perm(N);
+    iota(perm.begin(), perm.end(), 0);
+    shuffle(perm.begin(), perm.end(), rng);
+
+    vector<int> pivots;
+    pivots.reserve(K);
+
+    // Sort pivot items by binary insertion.
+    for (int z = 0; z < K; ++z) {
+        int item = perm[z];
+        int lo = 0, hi = (int)pivots.size();
+        while (lo < hi && used_queries < Q) {
+            int mid = (lo + hi) >> 1;
+            char r = ask({item}, {pivots[mid]});
+            if (r == '<' || r == '=') hi = mid;
+            else lo = mid + 1;
+        }
+        pivots.insert(pivots.begin() + lo, item);
+    }
+
+    vector<int> bucket(N, 0);
+    vector<char> is_pivot(N, false);
+    for (int i = 0; i < K; ++i) {
+        is_pivot[pivots[i]] = true;
+        bucket[pivots[i]] = i;
+    }
+
+    // Classify all non-pivots against the ordered sample.
+    for (int item = 0; item < N; ++item) {
+        if (is_pivot[item]) continue;
+        int lo = 0, hi = K;
+        while (lo < hi && used_queries < Q) {
+            int mid = (lo + hi) >> 1;
+            char r = ask({item}, {pivots[mid]});
+            if (r == '<' || r == '=') hi = mid;
+            else lo = mid + 1;
+        }
+        bucket[item] = lo;
+    }
+
+    // Exponential-distribution quantile proxy.
+    // Bucket b represents approximately percentile (b+0.5)/(K+1).
+    vector<double> proxy(N);
+    for (int i = 0; i < N; ++i) {
+        double p = (bucket[i] + 0.5) / (K + 1.0);
+        p = min(0.985, max(0.01, p));
+        proxy[i] = -log(1.0 - p);
+    }
+
+    vector<int> order(N);
+    iota(order.begin(), order.end(), 0);
+    shuffle(order.begin(), order.end(), rng);
+    stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        return proxy[a] > proxy[b];
+    });
+
+    vector<vector<int>> groups(D);
+    vector<int> belong(N, 0);
+    vector<double> estimated_sum(D, 0.0);
+
+    // LPT construction using the prior-based proxies.
+    for (int item : order) {
+        int best = 0;
+        for (int g = 1; g < D; ++g) {
+            if (estimated_sum[g] < estimated_sum[best]) best = g;
+        }
+        groups[best].push_back(item);
+        belong[item] = best;
+        estimated_sum[best] += proxy[item];
+    }
+
+    auto remove_item = [&](int g, int item) {
+        auto& v = groups[g];
+        for (int i = 0; i < (int)v.size(); ++i) {
+            if (v[i] == item) {
+                v[i] = v.back();
+                v.pop_back();
+                return;
+            }
+        }
+    };
+
+    auto select_transfer_item = [&](int heavy, int light) {
+        double gap = estimated_sum[heavy] - estimated_sum[light];
+        double target = max(0.01, gap * 0.5);
+
+        int chosen = groups[heavy][0];
+        double best_score = 1e100;
+
+        for (int x : groups[heavy]) {
+            // Favor an item near half the predicted imbalance,
+            // while retaining a mild preference for smaller safe moves.
+            double score = fabs(proxy[x] - target);
+            if (proxy[x] > target * 1.8) score += proxy[x] * 0.15;
+            if (score < best_score) {
+                best_score = score;
+                chosen = x;
+            }
+        }
+        return chosen;
+    };
+
+    // Direct balance-guided local improvement.
+    // Each successful/failed attempt consumes two meaningful comparisons:
+    // current pair orientation, then orientation after proposed transfer.
+    int iteration = 0;
+    while (used_queries + 2 <= Q) {
+        ++iteration;
+
+        int a, b;
+        if (iteration % 5 == 0) {
+            // Occasionally target proxy extremes to prevent random-pair stagnation.
+            a = 0;
+            b = 0;
+            for (int g = 1; g < D; ++g) {
+                if (estimated_sum[g] > estimated_sum[a]) a = g;
+                if (estimated_sum[g] < estimated_sum[b]) b = g;
+            }
+            if (a == b) {
+                a = rng() % D;
+                b = (a + 1 + rng() % (D - 1)) % D;
+            }
+        } else {
+            a = rng() % D;
+            b = rng() % D;
+            while (a == b) b = rng() % D;
+        }
+
+        if (groups[a].empty() || groups[b].empty()) continue;
+
+        char cmp = ask_groups(groups, a, b);
+        if (cmp == '=') {
+            estimated_sum[a] = estimated_sum[b] = (estimated_sum[a] + estimated_sum[b]) * 0.5;
+            continue;
+        }
+
+        int heavy = (cmp == '>') ? a : b;
+        int light = (cmp == '>') ? b : a;
+        if (groups[heavy].size() <= 1) continue;
+
+        int item = select_transfer_item(heavy, light);
+
+        vector<int> left_after = groups[heavy];
+        bool erased = false;
+        for (int i = 0; i < (int)left_after.size(); ++i) {
+            if (left_after[i] == item) {
+                left_after[i] = left_after.back();
+                left_after.pop_back();
+                erased = true;
+                break;
+            }
+        }
+        if (!erased || left_after.empty()) continue;
+
+        vector<int> right_after = groups[light];
+        right_after.push_back(item);
+
+        char after = ask(left_after, right_after);
+
+        if (after == '>') {
+            // The original heavy side remains heavy: this transfer certainly
+            // reduced its real discrepancy without crossing the target.
+            remove_item(heavy, item);
+            groups[light].push_back(item);
+            belong[item] = light;
+            estimated_sum[heavy] -= proxy[item];
+            estimated_sum[light] += proxy[item];
+        } else if (after == '=') {
+            remove_item(heavy, item);
+            groups[light].push_back(item);
+            belong[item] = light;
+            estimated_sum[heavy] -= proxy[item];
+            estimated_sum[light] += proxy[item];
+        } else {
+            // Overshot according to the real scale. Preserve the partition,
+            // but correct the proxy sums enough to discourage repeating it.
+            double mid = (estimated_sum[heavy] + estimated_sum[light]) * 0.5;
+            estimated_sum[heavy] = mid - proxy[item] * 0.20;
+            estimated_sum[light] = mid + proxy[item] * 0.20;
+        }
+    }
+
+    // The protocol requires exactly Q queries.
+    while (used_queries < Q) {
+        ask({0}, {1});
+    }
+
+    for (int i = 0; i < N; ++i) {
+        if (i) cout << ' ';
+        cout << belong[i];
+    }
+    cout << endl;
+    return 0;
+}
+// EVOLVE-BLOCK-END
+``` 
+</CODE>

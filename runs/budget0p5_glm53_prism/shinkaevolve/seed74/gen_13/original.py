@@ -1,0 +1,118 @@
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+    Uses a multi-start greedy + local search architecture.
+    """
+    if gpu_num <= 0:
+        raise ValueError("gpu_num must be positive")
+
+    total_size = sum(m.model_size for m in models)
+    if total_size > gpu_num * GPU_MEM_SIZE:
+        raise ValueError("Models cannot fit into GPU memory")
+
+    # ---- candidate orderings (multi-start seeds) ----
+    orderings = [
+        sorted(models, key=lambda m: m.req_rate / m.slo, reverse=True),
+        sorted(models, key=lambda m: m.model_size, reverse=True),
+        sorted(models, key=lambda m: -(m.req_rate / m.slo) / m.model_size),
+        sorted(models, key=lambda m: m.model_size),
+    ]
+
+    def greedy(order):
+        rem_mem = [GPU_MEM_SIZE] * gpu_num
+        load = [0.0] * gpu_num  # sum of r/s
+        placement = {g: [] for g in range(gpu_num)}
+        for m in order:
+            best_g, best_kvpr = None, float('inf')
+            for g in range(gpu_num):
+                if m.model_size <= rem_mem[g]:
+                    kvpr = (load[g] + m.req_rate / m.slo) / (rem_mem[g] - m.model_size)
+                    if kvpr < best_kvpr:
+                        best_kvpr, best_g = kvpr, g
+            if best_g is None:
+                return None
+            placement[best_g].append(m)
+            load[best_g] += m.req_rate / m.slo
+            rem_mem[best_g] -= m.model_size
+        return placement
+
+    def max_kvpr(placement):
+        worst = 0.0
+        for g, ms in placement.items():
+            rem = GPU_MEM_SIZE - sum(m.model_size for m in ms)
+            if rem <= 0:
+                # no room left for KV cache -> infinite pressure if any load
+                load = sum(m.req_rate / m.slo for m in ms)
+                if load > 0:
+                    return float('inf')
+                continue
+            load = sum(m.req_rate / m.slo for m in ms)
+            worst = max(worst, load / rem)
+        return worst
+
+    def local_search(placement):
+        best = placement
+        best_val = max_kvpr(best)
+        for _ in range(30):
+            improved = False
+            for m in models:
+                src = next(g for g, ms in best.items() if m in ms)
+                cur = best_val
+                for g in range(gpu_num):
+                    if g == src:
+                        continue
+                    rem = GPU_MEM_SIZE - sum(x.model_size for x in best[g])
+                    if m.model_size <= rem:
+                        cand = {k: list(v) for k, v in best.items()}
+                        cand[src].remove(m)
+                        cand[g].append(m)
+                        val = max_kvpr(cand)
+                        if val < cur:
+                            best, best_val = cand, val
+                            improved = True
+                            break
+            if not improved:
+                break
+        return best
+
+    best_placement, best_val = None, float('inf')
+    for order in orderings:
+        pl = greedy(order)
+        if pl is None:
+            raise ValueError("Unable to place all models in GPU memory")
+        pl = local_search(pl)
+        val = max_kvpr(pl)
+        if val < best_val:
+            best_val, best_placement = val, pl
+
+    return best_placement
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

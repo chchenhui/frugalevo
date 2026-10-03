@@ -1,0 +1,137 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+try:
+    from scipy.optimize import minimize
+    HAVE_SCIPY = True
+except Exception:
+    HAVE_SCIPY = False
+
+
+def _ratio_sq(pts):
+    d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+    iu = np.triu_indices(len(pts), 1)
+    dm = d[iu].min()
+    dx = d[iu].max()
+    if dx <= 0:
+        return 0.0
+    return (dm / dx) ** 2
+
+
+def _soft_objective(flat, n, T):
+    pts = flat.reshape(n, 3)
+    diff = pts[:, None, :] - pts[None, :, :]
+    d = np.sqrt(np.sum(diff * diff, axis=-1) + 1e-12)
+    iu = np.triu_indices(n, 1)
+    dv = d[iu]
+    # softmin / softmax via log-sum-exp
+    a = -dv / T
+    a -= a.max()
+    soft_min = -T * (np.log(np.sum(np.exp(a))) - a.max() + np.log(np.exp(a.max() - a.max())))
+    # careful: recompute properly
+    a = -dv / T
+    amax = a.max()
+    soft_min = -T * (amax + np.log(np.sum(np.exp(a - amax))))
+    b = dv / T
+    bmax = b.max()
+    soft_max = T * (bmax + np.log(np.sum(np.exp(b - bmax))))
+    return -(soft_min / soft_max)
+
+
+def _grad_soft(flat, n, T):
+    pts = flat.reshape(n, 3)
+    diff = pts[:, None, :] - pts[None, :, :]
+    d = np.sqrt(np.sum(diff * diff, axis=-1) + 1e-12)
+    i, j = np.triu_indices(n, 1)
+    dv = d[i, j]
+    a = -dv / T
+    amax = a.max()
+    w_min = np.exp(a - amax)
+    w_min /= w_min.sum()
+    b = dv / T
+    bmax = b.max()
+    w_max = np.exp(b - bmax)
+    w_max /= w_max.sum()
+    soft_min = -T * (amax + np.log(w_min.sum() * np.exp(amax - amax) + 0) + np.log(np.sum(np.exp(a - amax))))
+    soft_min = -T * (amax + np.log(np.sum(np.exp(a - amax))))
+    soft_max = T * (bmax + np.log(np.sum(np.exp(b - bmax))))
+    # gradient of -(soft_min/soft_max)
+    # d soft_min / d dv = w_min  (since soft_min = -T*lse(-dv/T))
+    # d soft_max / d dv = w_max
+    g = w_min / soft_max + (soft_min / soft_max ** 2) * w_max
+    # note: d(-soft_min/soft_max)/d dv = -(w_min*soft_max - soft_min*w_max)/soft_max^2
+    g = -(w_min * soft_max - soft_min * w_max) / (soft_max ** 2)
+    # chain: dv depends on pts[i], pts[j] with +/- unit vectors
+    grad = np.zeros((n, 3))
+    uv = diff[i, j] / d[i, j][:, None]
+    contrib = g[:, None] * uv
+    np.add.at(grad, i, contrib)
+    np.add.at(grad, j, -contrib)
+    return grad.ravel(), -soft_min / soft_max
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    n = 14
+    rng = np.random.default_rng(42)
+
+    starts = []
+    # structured starts
+    # icosahedron vertices
+    phi = (1 + np.sqrt(5)) / 2
+    ico = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    ], dtype=float) / np.sqrt(1 + phi ** 2)
+    starts.append(np.vstack([ico, [[0, 0, 1.2], [0, 0, -1.2]]]))
+    starts.append(np.vstack([ico, [[1.3, 0, 0], [-1.3, 0, 0]]]))
+    # cube vertices + 6 face pushes
+    c = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], dtype=float)
+    starts.append(np.vstack([c, [[1.5, 0, 0], [-1.5, 0, 0], [0, 1.5, 0], [0, -1.5, 0], [0, 0, 1.5], [0, 0, -1.5]]]))
+    # random starts
+    for _ in range(12):
+        starts.append(rng.standard_normal((n, 3)))
+
+    best_pts = None
+    best_val = -1.0
+
+    for s in starts:
+        pts = s.copy()
+        # anneal temperature
+        for T in (0.3, 0.15, 0.08, 0.04):
+            flat = pts.ravel()
+            if HAVE_SCIPY:
+                def fg(x):
+                    g, v = _grad_soft(x, n, T)
+                    return v, g
+                res = minimize(fg, flat, jac=True, method="L-BFGS-B",
+                               options={"maxiter": 200})
+                flat = res.x
+            else:
+                # simple gradient ascent fallback
+                g, v = _grad_soft(flat, n, T)
+                flat = flat + 0.05 * g
+                for _ in range(100):
+                    g, v = _grad_soft(flat, n, T)
+                    flat = flat + 0.02 * g
+            pts = flat.reshape(n, 3)
+            # renormalize scale for conditioning
+            c0 = pts.mean(axis=0)
+            pts = pts - c0
+            sc = np.linalg.norm(pts, axis=1).max()
+            if sc > 0:
+                pts = pts / sc
+        val = _ratio_sq(pts)
+        if val > best_val:
+            best_val = val
+            best_pts = pts.copy()
+
+    if best_pts is None:
+        best_pts = rng.standard_normal((n, 3))
+    if not np.all(np.isfinite(best_pts)):
+        best_pts = np.zeros((n, 3))
+        best_pts[:, 0] = np.arange(n)
+    return np.asarray(best_pts, dtype=float)
+
+
+# EVOLVE-BLOCK-END

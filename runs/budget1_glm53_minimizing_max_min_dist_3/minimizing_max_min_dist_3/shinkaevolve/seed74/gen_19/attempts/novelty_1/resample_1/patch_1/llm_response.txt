@@ -1,0 +1,169 @@
+<NAME>
+structured_starts_slsqp_diameter</NAME>
+<DESCRIPTION>
+Diversify initialization away from the 0.24 basin with several structured candidates (icosahedron + poles at varied heights and axes, Fibonacci-sphere spiral, cuboctahedron + poles, antiprism-like, and random sphere starts). For each start, run SLSQP maximizing the minimum squared distance t subject to all squared pairwise distances ≥ t and ≤ 1 (fixing the diameter to 1, which makes the min/max ratio directly = sqrt(t)). Track the best true ratio across all starts and return the normalized winner. This constrained formulation directly optimizes the exact objective instead of a softmin surrogate, and the varied structured starts escape the icosahedron+poles basin.</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _ratio(X):
+    D = np.linalg.norm(X[:, None] - X[None, :], axis=-1)
+    iu = np.triu_indices(len(X), 1)
+    d = D[iu]
+    return d.min() / d.max()
+
+
+def _fit_sphere(X):
+    """Center and scale so max pairwise distance = 1."""
+    P = X - X.mean(axis=0)
+    D = np.linalg.norm(P[:, None] - P[None, :], axis=-1)
+    mx = D.max()
+    if mx > 0:
+        P = P / mx
+    return P
+
+
+def _slsqp_maximize(X0, maxiter=250):
+    """Maximize t s.t. squared pair distances in [t, 1].  Diameter fixed to 1,
+    so ratio = sqrt(t)."""
+    from scipy.optimize import minimize
+    n = len(X0)
+    X0 = _fit_sphere(X0)
+    pairs = np.array([(i, j) for i in range(n) for j in range(i + 1, n)])
+    P, Q = pairs[:, 0], pairs[:, 1]
+
+    def obj(z):
+        return -z[-1]
+
+    def obj_grad(z):
+        g = np.zeros_like(z)
+        g[-1] = -1.0
+        return g
+
+    def c_lo(z):
+        X = z[:-1].reshape(n, 3)
+        d2 = ((X[P] - X[Q]) ** 2).sum(axis=1)
+        return d2 - z[-1]
+
+    def c_lo_jac(z):
+        X = z[:-1].reshape(n, 3)
+        g = np.zeros_like(z)
+        diff = X[P] - X[Q]  # (m,3)
+        np.add.at(g[:-1].reshape(n, 3), P, 2 * diff)
+        np.add.at(g[:-1].reshape(n, 3), Q, -2 * diff)
+        g[-1] = -1.0
+        return g
+
+    def c_hi(z):
+        X = z[:-1].reshape(n, 3)
+        return 1.0 - ((X[P] - X[Q]) ** 2).sum(axis=1)
+
+    def c_hi_jac(z):
+        X = z[:-1].reshape(n, 3)
+        g = np.zeros_like(z)
+        diff = X[P] - X[Q]
+        np.add.at(g[:-1].reshape(n, 3), P, -2 * diff)
+        np.add.at(g[:-1].reshape(n, 3), Q, 2 * diff)
+        return g
+
+    z0 = np.concatenate([X0.ravel(), [0.01]])
+    try:
+        res = minimize(obj, z0, jac=obj_grad,
+                       constraints=[{'type': 'ineq', 'fun': c_lo, 'jac': c_lo_jac},
+                                    {'type': 'ineq', 'fun': c_hi, 'jac': c_hi_jac}],
+                       method='SLSQP', options={'maxiter': maxiter, 'ftol': 1e-12})
+        return res.x[:-1].reshape(n, 3)
+    except Exception:
+        return X0
+
+
+def _icosahedron():
+    p = (1 + np.sqrt(5)) / 2
+    V = np.array([
+        [-1, p, 0], [1, p, 0], [-1, -p, 0], [1, -p, 0],
+        [0, -1, p], [0, 1, p], [0, -1, -p], [0, 1, -p],
+        [p, 0, -1], [p, 0, 1], [-p, 0, -1], [-p, 0, 1],
+    ], dtype=float)
+    return V
+
+
+def _fibonacci_sphere(n):
+    i = np.arange(n) + 0.5
+    phi = np.arccos(1 - 2 * i / n)
+    theta = np.pi * (1 + 5 ** 0.5) * i
+    return np.stack([np.cos(theta) * np.sin(phi),
+                     np.sin(theta) * np.sin(phi),
+                     np.cos(phi)], axis=1)
+
+
+def _rot(axis, ang):
+    axis = np.asarray(axis, float)
+    axis = axis / np.linalg.norm(axis)
+    K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+    return np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * (K @ K)
+
+
+def _structured_starts():
+    starts = []
+    ico = _icosahedron()
+    # icosahedron + poles at varied heights on several axes
+    for h in (0.6, 1.0, 1.6, 2.4, 3.0):
+        for axis in ([0, 0, 1], [1, 0, 0], [0, 1, 0], [1, 1, 1]):
+            a = np.array(axis, float) / np.linalg.norm(axis)
+            pts = np.vstack([ico, h * a, -h * a])
+            starts.append(pts @ _rot([1, 2, 3], 0.3))
+    # cuboctahedron + poles
+    v = []
+    for s1 in (-1, 1):
+        for s2 in (-1, 1):
+            v.append([s1, s2, 0]); v.append([s1, 0, s2]); v.append([0, s1, s2])
+    cub = np.array(v, float)
+    for h in (0.8, 1.2, 1.8):
+        starts.append(np.vstack([cub, [0, 0, h], [0, 0, -h]]))
+    # fibonacci sphere 14
+    starts.append(_fibonacci_sphere(14))
+    # antiprism-like: two 7-gons stacked
+    for h in (0.5, 0.8, 1.2):
+        t = np.arange(7)
+        top = np.stack([np.cos(2 * np.pi * t / 7), np.sin(2 * np.pi * t / 7), h * np.ones(7)], 1)
+        t2 = t + 0.5
+        bot = np.stack([np.cos(2 * np.pi * t2 / 7), np.sin(2 * np.pi * t2 / 7), -h * np.ones(7)], 1)
+        starts.append(np.vstack([top, bot]))
+    return starts
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    n, d = 14, 3
+    rng = np.random.default_rng(7)
+    candidates = _structured_starts()
+    for _ in range(4):
+        X = rng.standard_normal((n, d))
+        X /= np.linalg.norm(X, axis=1, keepdims=True)
+        candidates.append(X)
+
+    best_pts, best_ratio = None, -1.0
+    for X0 in candidates:
+        X = _slsqp_maximize(X0)
+        X = _fit_sphere(X)
+        r = _ratio(X)
+        if r > best_ratio:
+            best_ratio = r
+            best_pts = X
+        # second pass from the refined point
+        X2 = _slsqp_maximize(X, maxiter=150)
+        X2 = _fit_sphere(X2)
+        r2 = _ratio(X2)
+        if r2 > best_ratio:
+            best_ratio = r2
+            best_pts = X2
+
+    if best_pts is None:
+        best_pts = rng.standard_normal((n, d))
+    return _fit_sphere(best_pts)
+
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

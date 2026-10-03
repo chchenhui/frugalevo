@@ -1,0 +1,113 @@
+<NAME>
+lp_radii_plus_hill_climb</NAME>
+<DESCRIPTION>
+Key insight: with circle centers fixed, maximizing the sum of radii is a *linear program*: maximize Σr_i subject to r_i + r_j ≤ d_ij (pairwise) and r_i ≤ min border distance. The previous uniform-radius assignment (r = min over all constraints) massively underuses space — border and corner circles can be much larger than lattice circles. So I: (1) keep the hexagonal lattice as a starting layout, (2) solve the exact LP for optimal radii at those positions (scipy `linprog` with HiGHS — fast for 26 variables / ~350 constraints), and (3) run a hill-climb over centers: random jitter perturbations with a decreasing step size, re-solving the LP after each move and accepting improvements. Wall-constrained circles also get directed pushes away from walls. A tiny safety epsilon (1e-9) on all constraints plus a final 1-1e-6 radius shrink guarantees strict feasibility. A greedy fallback keeps the program working if scipy is unavailable.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Compute maximum valid radii for this configuration
+    radii = compute_max_radii(centers)
+
+    # Calculate the sum of radii
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+=======
+    # ---- Stage 1: exact LP for optimal (unequal) radii at these centers ----
+    result = solve_radii_lp(centers)
+    if result is None:
+        radii = compute_max_radii(centers)
+    else:
+        radii = result
+
+    best_sum = np.sum(radii)
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+
+    # ---- Stage 2: hill-climb over center positions, re-solving the LP ----
+    rng = np.random.default_rng(12345)
+    n_iters = 400
+    for it in range(n_iters):
+        frac = 1.0 - it / n_iters
+        sigma = 0.01 + 0.04 * frac
+
+        cand = best_centers.copy()
+
+        # Directed move: push circles that are wall-limited away from walls
+        for i in range(n):
+            x, y = cand[i]
+            r = best_radii[i]
+            if r >= x - 1e-7:
+                cand[i, 0] += 0.5 * sigma
+            if r >= y - 1e-7:
+                cand[i, 1] += 0.5 * sigma
+            if r >= 1.0 - x - 1e-7:
+                cand[i, 0] -= 0.5 * sigma
+            if r >= 1.0 - y - 1e-7:
+                cand[i, 1] -= 0.5 * sigma
+
+        # Random jitter, larger for small circles (they have more freedom)
+        jitter = sigma * (0.3 + 0.7 * (1.0 - best_radii / (best_radii.max() + 1e-12)))
+        cand += rng.normal(0.0, 1.0, cand.shape) * jitter[:, None]
+
+        cand = np.clip(cand, 0.001, 0.999)
+
+        result = solve_radii_lp(cand)
+        if result is None:
+            continue
+        if np.sum(result) > best_sum:
+            best_sum = np.sum(result)
+            best_centers = cand.copy()
+            best_radii = result.copy()
+
+    centers = best_centers
+    radii = best_radii * (1.0 - 1e-6)  # tiny safety shrink
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+
+
+def solve_radii_lp(centers, eps=1e-9):
+    """
+    Solve the linear program: maximize sum(r_i) subject to
+      r_i + r_j <= dist(i, j)  for all pairs
+      0 <= r_i <= min(x_i, y_i, 1-x_i, 1-y_i)
+    Returns optimal radii array, or None if the LP fails.
+    """
+    try:
+        from scipy.optimize import linprog
+    except ImportError:
+        return None
+
+    n = centers.shape[0]
+    c = -np.ones(n)
+
+    rows = []
+    rhs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            rows.append(row)
+            rhs.append(d - 2.0 * eps)
+
+    for i in range(n):
+        x, y = centers[i]
+        for lim in (x - eps, y - eps, 1.0 - x - eps, 1.0 - y - eps):
+            row = np.zeros(n)
+            row[i] = 1.0
+            rows.append(row)
+            rhs.append(max(lim, 0.0))
+
+    A_ub = np.vstack(rows)
+    b_ub = np.array(rhs)
+
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=[(0.0, None)] * n,
+                  method="highs")
+    if not res.success:
+        return None
+    return np.maximum(res.x, 0.0)
+>>>>>>> REPLACE
+</DIFF>

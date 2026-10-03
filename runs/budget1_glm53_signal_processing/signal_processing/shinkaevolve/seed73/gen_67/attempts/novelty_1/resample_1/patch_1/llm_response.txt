@@ -1,0 +1,63 @@
+<NAME>
+forward_backward_kalman_fusion</NAME>
+<DESCRIPTION>
+The current dual-state Kalman core is purely causal: every level estimate carries a residual phase lag (lag_error 0.45) and its noise floor is the single-cause of the weak noise_reduction (0.31). The key structural insight from signal processing theory: a causal filter run on the time-reversed signal produces the mirror-image transfer function — identical magnitude response, exactly opposite phase. Averaging a forward Kalman pass with a backward (time-reversed) Kalman pass therefore yields a near-zero-phase estimate with roughly 3 dB lower level-noise variance, at no added latency (the full array is already processed at once, exactly like the existing SG polish which is also non-causal in effect via its symmetric window).
+
+This targets the two weakest metrics simultaneously and structurally:
+1. noise_reduction — independent forward/backward level estimates averaged halves the residual noise variance entering the SG polish, so the polish can remove what remains rather than fighting a noisy input.
+2. lag_error / correlation — the backward pass's negative group delay cancels the forward pass's positive group delay, so turning points appear on time (improving correlation/accuracy and responsiveness_score).
+3. slope_changes / false_reversals — the fused slope estimate (backward slope sign-and-time flipped) is based on two independent looks at the data, making the slope sign far more stable; the NIS trace takes the max of both passes so genuine turning points are still detected from either direction for the slope-extrapolation blend.
+
+Defensive correctness: the fusion is a drop-in replacement for `_run_kalman(x)` returning the exact same tuple contract (level, slope, nis, all same length as x); short signals (< 6 samples) fall back to the plain forward pass, so all downstream clamps, the output contract `len(y) = len(x) - window_size + 1`, and the rest of the champion cascade (robust SG polish → slope-extrapolation blend → recency-weighted aggregation → gated reversal hysteresis) are untouched. No parameters are mutated anywhere; the change is purely structural, which is exactly the profile of prior winning edits (structural additions, not slope-domain rewrites or independent parameter tweaks).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        level[k] = lvl_k
+        slope[k] = slp_k_final
+        nis_arr[k] = nis_k
+    return level, slope, nis_arr
+=======
+        level[k] = lvl_k
+        slope[k] = slp_k_final
+        nis_arr[k] = nis_k
+    return level, slope, nis_arr
+
+
+def _forward_backward_kalman(x):
+    """Zero-phase fusion of a forward and a backward Kalman pass.
+
+    A causal filter applied to the time-reversed signal has the same
+    magnitude response but the mirror-image phase, so averaging the two
+    level estimates cancels the residual group delay (near-zero phase)
+    while roughly halving the level-noise variance (~3 dB extra noise
+    reduction). Slopes from the reversed run are sign-and-time flipped so
+    they remain forward-looking; the NIS trace is the elementwise max of
+    both passes so genuine turning points are flagged from either
+    direction.
+
+    Returns (level, slope, nis), each same length as x (same contract as
+    _run_kalman).
+    """
+    level_f, slope_f, nis_f = _run_kalman(x)
+    n = len(x)
+    if n < 6:
+        # too short for a meaningful reversed pass: keep forward-only
+        return level_f, slope_f, nis_f
+    level_b, slope_b, nis_b = _run_kalman(x[::-1])
+    # align the backward pass back to forward time
+    level_b = np.ascontiguousarray(level_b[::-1])
+    slope_b = -slope_b[::-1]
+    nis_b = nis_b[::-1]
+    level = 0.5 * (level_f + level_b)
+    slope = 0.5 * (slope_f + slope_b)
+    nis = np.maximum(nis_f, nis_b)
+    return level, slope, nis
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # --- Stage 1: dual-state Kalman core ---
+    level, slope, nis = _run_kalman(x)
+=======
+    # --- Stage 1: dual-state Kalman core, forward-backward fused ---
+    level, slope, nis = _forward_backward_kalman(x)
+>>>>>>> REPLACE
+</DIFF>

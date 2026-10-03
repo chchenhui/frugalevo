@@ -1,0 +1,353 @@
+# EVOLVE-BLOCK-START
+import os
+import heapq
+import math
+from typing import Dict, List, Tuple, Set, Optional
+
+import networkx as nx
+import pandas as pd
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]
+
+
+class BroadCastTopology:
+    def __init__(
+        self,
+        src: str,
+        dsts: List[str],
+        num_partitions: int = 4,
+        paths: Dict[str, SingleDstPath] = None,
+    ):
+        self.src = src
+        self.dsts = dsts
+        self.num_partitions = num_partitions
+
+        if paths is not None:
+            self.paths = paths
+            self.set_graph()
+        else:
+            self.paths = {
+                dst: {str(i): None for i in range(num_partitions)}
+                for dst in dsts
+            }
+
+    def set_graph(self):
+        # Kept for compatibility with callers that construct from saved paths.
+        return None
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        self.paths[dst][str(partition)] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+
+def _priced_transfer_graph(G, src):
+    """
+    Build the optimization graph once.  Invalid or unpriced links are excluded:
+    they cannot contribute to a reliable cost-minimizing broadcast plan.
+    """
+    graph = nx.DiGraph()
+    graph.add_nodes_from(G.nodes)
+
+    for u, v, data in G.edges(data=True):
+        if u == v or v == src:
+            continue
+
+        cost = data.get("cost")
+        try:
+            cost = float(cost)
+        except (TypeError, ValueError):
+            continue
+
+        if not math.isfinite(cost) or cost < 0:
+            continue
+
+        graph.add_edge(u, v, cost=cost)
+
+    return graph
+
+
+def _reverse_closure(graph, values, decisions):
+    """
+    Relax a subset-DP row over directed paths.
+
+    If an already computed subtree starts at node u, every predecessor of u may
+    reach that subtree by sending data over predecessor -> u.  A multi-source
+    Dijkstra traversal computes this closure in one pass and records the first
+    forwarding edge needed to reconstruct the selected multicast network.
+    """
+    queue = []
+    for node, value in values.items():
+        if math.isfinite(value):
+            heapq.heappush(queue, (value, node))
+
+    while queue:
+        current_cost, node = heapq.heappop(queue)
+        if current_cost != values[node]:
+            continue
+
+        for predecessor in graph.predecessors(node):
+            candidate = current_cost + graph[predecessor][node]["cost"]
+            if candidate + 1e-12 < values[predecessor]:
+                values[predecessor] = candidate
+                decisions[predecessor] = ("edge", node)
+                heapq.heappush(queue, (candidate, predecessor))
+
+
+def _exact_shared_network(graph, src, terminals):
+    """
+    Directed Steiner dynamic programming.
+
+    dp[mask][v] is the least cost of a directed broadcast network rooted at v
+    that reaches every terminal represented by mask.  States are composed by
+    joining independent terminal subsets at a node, then propagated backwards
+    over links with multi-source Dijkstra.  This directly optimizes shared
+    transit links instead of summing isolated source-to-destination paths.
+    """
+    nodes = list(graph.nodes)
+    node_count = len(nodes)
+    terminal_count = len(terminals)
+    index = {node: i for i, node in enumerate(nodes)}
+    full_mask = (1 << terminal_count) - 1
+
+    values = []
+    decisions = []
+
+    for mask in range(full_mask + 1):
+        row = {node: math.inf for node in nodes}
+        choice = {node: None for node in nodes}
+
+        if mask & (mask - 1) == 0:
+            terminal_index = mask.bit_length() - 1
+            terminal = terminals[terminal_index]
+            row[terminal] = 0.0
+            choice[terminal] = ("terminal", terminal)
+        else:
+            submask = (mask - 1) & mask
+            while submask:
+                other = mask ^ submask
+                # Evaluating each split once is sufficient.
+                if submask < other:
+                    left = values[submask]
+                    right = values[other]
+                    for node in nodes:
+                        combined = left[node] + right[node]
+                        if combined < row[node]:
+                            row[node] = combined
+                            choice[node] = ("merge", submask, other)
+                submask = (submask - 1) & mask
+
+        _reverse_closure(graph, row, choice)
+        values.append(row)
+        decisions.append(choice)
+
+    if not math.isfinite(values[full_mask].get(src, math.inf)):
+        return nx.DiGraph()
+
+    selected = nx.DiGraph()
+    selected.add_node(src)
+    expanded = set()
+
+    def expand(mask, node):
+        state = (mask, node)
+        if state in expanded:
+            return
+        expanded.add(state)
+
+        decision = decisions[mask][node]
+        if decision is None or decision[0] == "terminal":
+            return
+
+        if decision[0] == "merge":
+            expand(decision[1], node)
+            expand(decision[2], node)
+            return
+
+        if decision[0] == "edge":
+            next_node = decision[1]
+            selected.add_edge(
+                node,
+                next_node,
+                **dict(graph[node][next_node]),
+            )
+            expand(mask, next_node)
+
+    expand(full_mask, src)
+    return selected
+
+
+def _greedy_shared_network(graph, src, terminals):
+    """
+    Scalable fallback for large terminal sets.
+
+    It incrementally attaches the least-cost destination branch to the existing
+    multicast structure.  Unlike independent shortest paths, every newly
+    attached destination may start from any already broadcast-to node.
+    """
+    selected = nx.DiGraph()
+    selected.add_node(src)
+    pending = set(terminals)
+
+    while pending:
+        best = None
+        anchors = list(selected.nodes)
+
+        for anchor in anchors:
+            for dst in pending:
+                try:
+                    path = nx.dijkstra_path(graph, anchor, dst, weight="cost")
+                    cost = nx.path_weight(graph, path, weight="cost")
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    continue
+
+                if best is None or cost < best[0]:
+                    best = (cost, dst, path)
+
+        if best is None:
+            break
+
+        _, dst, path = best
+        for u, v in zip(path, path[1:]):
+            selected.add_edge(u, v, **dict(graph[u][v]))
+        pending.remove(dst)
+
+    return selected
+
+
+def _materialize_topology(topology, selected, original_graph, src, dsts):
+    """
+    Convert the selected shared network into the existing public
+    BroadCastTopology representation.  Each partition references the same
+    shared route, allowing downstream schedulers to overlap transmissions.
+    """
+    for dst in dsts:
+        if dst == src:
+            continue
+
+        try:
+            path = nx.shortest_path(selected, src, dst)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+
+        edges = [
+            [u, v, dict(original_graph[u][v])]
+            for u, v in zip(path, path[1:])
+        ]
+
+        for partition in range(topology.num_partitions):
+            topology.set_dst_partition_paths(dst, partition, list(edges))
+
+    return topology
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Plan a low-cost shared cloud broadcast topology.
+
+    Small and medium terminal sets use exact directed-Steiner subset DP.  Large
+    sets use a shared-branch greedy planner to retain predictable runtime.
+    """
+    topology = BroadCastTopology(src, dsts, num_partitions)
+
+    if not dsts or src not in G:
+        return topology
+
+    graph = _priced_transfer_graph(G, src)
+    if src not in graph:
+        return topology
+
+    unique_dsts = list(dict.fromkeys(dst for dst in dsts if dst != src))
+    reachable = [
+        dst for dst in unique_dsts
+        if dst in graph and nx.has_path(graph, src, dst)
+    ]
+
+    if not reachable:
+        return topology
+
+    # The exact algorithm is practical for normal multi-cloud broadcast jobs.
+    # Above this bound, the greedy shared-tree planner avoids exponential state
+    # growth while still aggressively reusing existing transfer branches.
+    if len(reachable) <= 11:
+        selected = _exact_shared_network(graph, src, reachable)
+    else:
+        selected = _greedy_shared_network(graph, src, reachable)
+
+    return _materialize_topology(topology, selected, G, src, dsts)
+
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    """
+    Build a directed cloud network with transfer cost and throughput metadata.
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if cost_path is None:
+        cost = pd.read_csv(os.path.join(current_dir, "profiles/cost.csv"))
+    else:
+        cost = pd.read_csv(cost_path)
+
+    if throughput_path is None:
+        throughput = pd.read_csv(
+            os.path.join(current_dir, "profiles/throughput.csv")
+        )
+    else:
+        throughput = pd.read_csv(throughput_path)
+
+    G = nx.DiGraph()
+
+    for _, row in throughput.iterrows():
+        src_region = row["src_region"]
+        dst_region = row["dst_region"]
+
+        if src_region == dst_region:
+            continue
+
+        G.add_edge(
+            src_region,
+            dst_region,
+            cost=None,
+            throughput=num_vms * row["throughput_sent"] / 1e9,
+        )
+
+    for _, row in cost.iterrows():
+        src_region = row["src"]
+        dst_region = row["dest"]
+
+        if G.has_edge(src_region, dst_region):
+            G[src_region][dst_region]["cost"] = row["cost"]
+
+    no_cost_pairs = [
+        (u, v)
+        for u, v, data in G.edges(data=True)
+        if data.get("cost") is None
+    ]
+    print("Unable to get costs for: ", no_cost_pairs)
+
+    return G
+
+
+# EVOLVE-BLOCK-END
+
+# Helper functions that won't be evolved
+def create_broadcast_topology(src: str, dsts: List[str], num_partitions: int = 4):
+    """Create a broadcast topology instance"""
+    return BroadCastTopology(src, dsts, num_partitions)
+
+def run_search_algorithm(src: str, dsts: List[str], G, num_partitions: int):
+    """Run the search algorithm and return the topology"""
+    return search_algorithm(src, dsts, G, num_partitions)

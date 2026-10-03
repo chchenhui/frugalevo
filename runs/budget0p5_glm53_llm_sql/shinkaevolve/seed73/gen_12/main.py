@@ -1,0 +1,213 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+from solver import Algorithm
+from typing import Tuple, List
+
+
+def _lcp(a: str, b: str) -> int:
+    """Longest common prefix length via binary search on slice equality (C-speed)."""
+    lo, hi = 0, min(len(a), len(b))
+    if a == b:
+        return len(a)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if a[:mid] == b[:mid]:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+class Evolved(Algorithm):
+    """
+    Character-Trie oriented reorder: builds a few cheap candidate per-row
+    column orderings, selects the best by the actual serial-Trie reuse
+    objective (sum of adjacent LCPs over sorted serialized rows), and
+    returns the permuted data plus valid per-row column orderings.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ---------- serialization helpers ----------
+
+    @staticmethod
+    def _ser_cell(v) -> str:
+        if v is None:
+            return ""
+        try:
+            if v != v:  # NaN check
+                return ""
+        except Exception:
+            pass
+        try:
+            r = pd.isna(v)
+            if isinstance(r, bool) and r:
+                return ""
+        except Exception:
+            pass
+        return str(v)
+
+    # ---------- scoring ----------
+
+    def _score(self, orders, ser_units, n):
+        """Serial-Trie reuse: sum of adjacent LCPs over sorted serialized rows."""
+        strs = ["".join(ser_units[u][i] for u in orders[i]) for i in range(n)]
+        strs.sort()
+        total = 0
+        prev = None
+        for s in strs:
+            if prev is not None:
+                total += _lcp(prev, s)
+            prev = s
+        return total
+
+    # ---------- candidate constructions ----------
+
+    def _unit_score(self, unit, ser, n):
+        """sum over values of len(v) * count * (count-1), length-weighted repetition."""
+        counts = {}
+        for i in range(n):
+            v = ser[unit][i]
+            c = counts.get(v, 0)
+            counts[v] = c + 1
+        s = 0
+        for v, c in counts.items():
+            if c > 1:
+                s += len(v) * c * (c - 1)
+        return s
+
+    def _base_order(self, units, unit_scores):
+        # deterministic: score desc, then name asc
+        return sorted(units, key=lambda u: (-unit_scores[u], str(u)))
+
+    def _conditional_tree(self, rows, units, ser, depth, unit_scores, max_depth):
+        """Recursive conditional prefix partition. Returns dict row -> unit order."""
+        if len(rows) < 2 or depth >= max_depth or not units:
+            base = self._base_order(units, unit_scores)
+            return {r: base for r in rows}
+        best_u = None
+        best_s = 0
+        for u in units:
+            counts = {}
+            for r in rows:
+                v = ser[u][r]
+                counts[v] = counts.get(v, 0) + 1
+            s = 0
+            for v, c in counts.items():
+                if c > 1:
+                    s += len(v) * c * (c - 1)
+            if s > best_s:
+                best_s = s
+                best_u = u
+        if best_u is None:
+            base = self._base_order(units, unit_scores)
+            return {r: base for r in rows}
+        rest = [u for u in units if u != best_u]
+        parts = {}
+        for r in rows:
+            parts.setdefault(ser[best_u][r], []).append(r)
+        out = {}
+        for rs in parts.values():
+            sub = self._conditional_tree(rs, rest, ser, depth + 1, unit_scores, max_depth)
+            for r, o in sub.items():
+                out[r] = [best_u] + o
+        return out
+
+    # ---------- main API ----------
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        df = df.copy()
+        cols = list(df.columns)
+        n = len(df)
+        if n == 0 or len(cols) == 0:
+            return df, [[] for _ in range(n)]
+
+        # Build merged units (col_merge groups must stay adjacent in each row order)
+        merged = []
+        merged_set = set()
+        for group in col_merge or []:
+            g = [c for c in group if c in df.columns]
+            if len(g) > 1:
+                merged.append(tuple(g))
+                merged_set.update(g)
+        single_units = [(c,) for c in cols if c not in merged_set]
+        units = single_units + merged
+        unit_names = [u[0] for u in units]
+        unit_key = {u[0]: u for u in units}
+
+        # Serialize cells once per column
+        ser_col = {c: [self._ser_cell(v) for v in df[c].tolist()] for c in cols}
+        # Serialize per unit (concatenation of its columns in given order)
+        ser_unit = {}
+        for u in units:
+            if len(u) == 1:
+                ser_unit[u[0]] = ser_col[u[0]]
+            else:
+                lists = [ser_col[c] for c in u]
+                ser_unit[u[0]] = ["".join(lst[i] for lst in lists) for i in range(n)]
+
+        unit_scores = {u[0]: self._unit_score(u[0], ser_unit, n) for u in units}
+
+        # Candidate A: global frequency-ranked ordering
+        candA = {i: self._base_order(unit_names, unit_scores) for i in range(n)}
+
+        candidates = [candA]
+
+        # Candidate B: recursive conditional grouping (bounded)
+        if n <= 20000 and len(units) <= 60:
+            try:
+                candB = self._conditional_tree(
+                    list(range(n)), unit_names, ser_unit, 0, unit_scores, max_depth=10
+                )
+                candidates.append(candB)
+            except Exception:
+                pass
+
+        # Candidate C: deterministic alphabetical tail
+        alpha = sorted(unit_names, key=str)
+        candC = {i: alpha for i in range(n)}
+        candidates.append(candC)
+
+        # Select by true serial-Trie objective, with bounded total cost
+        total_chars = sum(sum(len(s) for s in ser_unit[u]) for u in unit_names)
+        best = None
+        best_score = -1
+        if total_chars <= 8_000_000 and n <= 60000:
+            for cand in candidates:
+                try:
+                    s = self._score(cand, ser_unit, n)
+                except Exception:
+                    continue
+                if s > best_score:
+                    best_score = s
+                    best = cand
+        if best is None:
+            best = candA
+
+        # Expand units to per-row column orderings and build output rows
+        column_orderings = []
+        out_rows = []
+        for i in range(n):
+            order = []
+            for uname in best[i]:
+                order.extend(unit_key[uname])
+            column_orderings.append(list(order))
+            out_rows.append([df.iat[i, cols.index(c)] for c in order])
+
+        out_df = pd.DataFrame(out_rows, columns=cols, index=df.index)
+        out_df = out_df.astype(object)
+
+        return out_df, column_orderings
+
+# EVOLVE-BLOCK-END

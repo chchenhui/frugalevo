@@ -1,0 +1,299 @@
+--- a/original.py
++++ b/original.py
+@@ -1,125 +1,195 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+-import time
++from itertools import combinations
++
++N = 13
++IDX = np.array(list(combinations(range(N), 3)), dtype=int)  # (286,3)
++I0, I1, I2 = IDX[:, 0], IDX[:, 1], IDX[:, 2]
+ 
+ 
+-def _hull_area(points):
+-    """Area of convex hull (monotone chain)."""
+-    pts = sorted(map(tuple, points))
+-    if len(pts) <= 2:
+-        return 1e-12
+-
+-    def cross(o, a, b):
+-        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+-
+-    lower = []
+-    for p in pts:
+-        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+-            lower.pop()
+-        lower.append(p)
+-    upper = []
+-    for p in reversed(pts):
+-        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+-            upper.pop()
+-        upper.append(p)
+-    hull = lower[:-1] + upper[:-1]
+-    if len(hull) < 3:
+-        return 1e-12
+-    h = np.array(hull)
+-    x, y = h[:, 0], h[:, 1]
+-    return 0.5*abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
++def _areas(pts):
++    a = pts[I0]; b = pts[I1]; c = pts[I2]
++    return 0.5 * np.abs((b[:,0]-a[:,0])*(c[:,1]-a[:,1]) - (b[:,1]-a[:,1])*(c[:,0]-a[:,0]))
+ 
+ 
+-def _min_tri_area(points, tri_idx):
+-    p = points[tri_idx]  # (286,3,2)
+-    a = np.linalg.norm(p[:, 1] - p[:, 0], axis=1)
+-    b = np.linalg.norm(p[:, 2] - p[:, 1], axis=1)
+-    c = np.linalg.norm(p[:, 0] - p[:, 2], axis=1)
+-    s = 0.5*(a + b + c)
+-    # stable Heron
+-    area = np.sqrt(np.maximum(s*(s-a)*(s-b)*(s-c), 0.0))
+-    return area.min()
++def _hull_area(pts):
++    P = pts[np.lexsort((pts[:,1], pts[:,0]))]
++    keep = np.ones(len(P), bool)
++    keep[1:] = np.any(P[1:] != P[:-1], axis=1)
++    P = P[keep]
++    if len(P) < 3: return 1e-12
++    def build(seq):
++        h = []
++        for pt in seq:
++            while len(h) >= 2 and (
++                (h[-1][0]-h[-2][0])*(pt[1]-h[-2][1]) -
++                (h[-1][1]-h[-2][1])*(pt[0]-h[-2][0])) <= 0:
++                h.pop()
++            h.append(pt)
++        return h
++    hull = build(P)[:-1] + build(P[::-1])[:-1]
++    if len(hull) < 3: return 1e-12
++    h = np.asarray(hull)
++    x, y = h[:,0], h[:,1]
++    return 0.5*abs(np.dot(x, np.roll(y,-1)) - np.dot(y, np.roll(x,-1)))
+ 
+ 
+-def _score(points, tri_idx):
+-    ha = _hull_area(points)
+-    if ha < 1e-9:
+-        return 0.0
+-    return _min_tri_area(points, tri_idx) / ha
++def _score(pts, ha=None):
++    if ha is None: ha = _hull_area(pts)
++    if ha < 1e-12: return 0.0
++    return _areas(pts).min() / ha
+ 
+ 
+-def _optimize(seed_points, tri_idx, rng, iters=4000):
+-    pts = seed_points.copy()
+-    best = _score(pts, tri_idx)
+-    step = 0.08
+-    n = len(pts)
++def _worst_verts(pts, k_tri=10):
++    a = _areas(pts)
++    order = np.argsort(a)[:k_tri]
++    return np.unique(IDX[order].ravel()), a
++
++
++def _relax(pts, rng, iters, step0, step1, t0=0.0, t1=0.0, k_tri=10):
++    """Targeted moves: perturb only vertices of the worst triangles."""
++    pts = pts.copy()
++    ha = _hull_area(pts)
++    best = _areas(pts).min() / ha
++    best_pts = pts.copy()
++    cur = best
+     for it in range(iters):
+-        i = rng.integers(n)
+-        old = pts[i].copy()
+-        cand = old + rng.normal(0, step, size=2)
+-        pts[i] = cand
+-        s = _score(pts, tri_idx)
+-        if s >= best:
+-            best = s
++        f = it / iters
++        step = step0 * (step1/step0)**f
++        temp = t0 * (t1/t0)**f if t0 > 0 else 0.0
++        verts, _ = _worst_verts(pts, k_tri)
++        vi = verts[rng.integers(len(verts))]
++        old = pts[vi].copy()
++        # bias move away from centroid of other worst-triangle vertices
++        _, a = _worst_verts(pts, k_tri)
++        worst_set = IDX[np.argsort(a)[:k_tri]]
++        mask = np.any(worst_set == vi, axis=1)
++        others = pts[np.unique(worst_set[mask].ravel())]
++        direction = pts[vi] - others.mean(axis=0)
++        nrm = np.linalg.norm(direction)
++        if nrm > 1e-9:
++            direction = direction / nrm
++            cand = old + step * (0.6*direction + 0.4*rng.normal(0, 1, 2))
+         else:
+-            pts[i] = old
+-        if it % 500 == 499:
+-            step *= 0.75
+-            if step < 1e-4:
++            cand = old + rng.normal(0, step, 2)
++        pts[vi] = cand
++        ha2 = _hull_area(pts)
++        s = _areas(pts).min() / ha2 if ha2 > 1e-12 else 0.0
++        acc = s >= cur or (temp > 0 and rng.random() < np.exp((s-cur)/max(temp,1e-12)))
++        if acc:
++            cur = s; ha = ha2
++            if s > best:
++                best = s; best_pts = pts.copy()
++        else:
++            pts[vi] = old
++    return best_pts, best
++
++
++def _polish(pts, max_rounds=400):
++    """Fine greedy: exact coordinate + normal-direction moves on worst vertices."""
++    pts = pts.copy()
++    ha = _hull_area(pts)
++    best = _areas(pts).min() / ha
++    step = 0.004
++    for _ in range(max_rounds):
++        verts, a = _worst_verts(pts, 12)
++        improved = False
++        for vi in verts:
++            for mode in ("x", "y", "n"):
++                if mode in ("x", "y"):
++                    dirs = [np.eye(2)[0 if mode == "x" else 1]]
++                else:
++                    # push away from the line through the two other worst-tri verts
++                    worst_set = IDX[np.argsort(a)[:12]]
++                    m = np.any(worst_set == vi, axis=1)
++                    tri = worst_set[m][0]
++                    j, k2 = [int(x) for x in tri if x != vi]
++                    d = pts[k2] - pts[j]
++                    nn = np.hypot(*d) + 1e-12
++                    nd = np.array([-d[1], d[0]]) / nn
++                    side = d[0]*(pts[vi,1]-pts[j,1]) - d[1]*(pts[vi,0]-pts[j,0])
++                    if side < 0: nd = -nd
++                    dirs = [nd, -nd]
++                for d in dirs:
++                    for sgn in (1, -1):
++                        cand = pts.copy()
++                        cand[vi] = pts[vi] + sgn * step * d
++                        ha2 = _hull_area(cand)
++                        if ha2 < 1e-12: continue
++                        s = _areas(cand).min() / ha2
++                        if s > best + 1e-15:
++                            pts, best, ha = cand, s, ha2
++                            improved = True
++        if not improved:
++            step *= 0.5
++            if step < 1e-5:
+                 break
+     return pts, best
+ 
+ 
++def _seeds():
++    seeds = []
++    # double rings (hexagon + hexagon + center)
++    for r in (0.5, 0.58, 0.66, 0.42):
++        t = np.linspace(0, 2*np.pi, 7)[:-1]
++        outer = np.c_[np.cos(t), np.sin(t)]
++        inner = np.c_[r*np.cos(t+np.pi/6), r*np.sin(t+np.pi/6)]
++        seeds.append(np.vstack([outer, inner, [[0, 0]]]))
++    # triangle-based: 3 corners + 6 mid-edges + 3 inner + center
++    for rm, ri in ((0.55, 0.30), (0.62, 0.25), (0.48, 0.34)):
++        pts = np.zeros((N, 2))
++        for i in range(3):
++            a = np.pi/2 + i*2*np.pi/3
++            pts[i] = [np.cos(a), np.sin(a)]
++        for i in range(6):
++            a = np.pi/2 + np.pi/6 + i*np.pi/3
++            pts[3+i] = [rm*np.cos(a), rm*np.sin(a)]
++        for i in range(3):
++            a = np.pi/2 + np.pi/3 + i*2*np.pi/3
++            pts[9+i] = [ri*np.cos(a), ri*np.sin(a)]
++        seeds.append(pts)
++    # 12-ring + center
++    t = np.linspace(0, 2*np.pi, 13)[:-1]
++    seeds.append(np.vstack([np.c_[np.cos(t), np.sin(t)], [[0, 0]]]))
++    return seeds
++
++
+ def heilbronn_convex13() -> np.ndarray:
+     """
+-    Construct 13 points maximizing the smallest triangle area normalized by hull area.
+-    Deterministic multi-restart hill climbing.
++    Construct an arrangement of 13 points maximizing the smallest triangle
++    area normalized by convex hull area. Deterministic targeted relaxation
++    focused on the worst (smallest-area) triangles.
+     """
+-    n = 13
+-    idx = np.array([(i, j, k) for i in range(n) for j in range(i+1, n)
+-                    for k in range(j+1, n)])
+-    rng = np.random.default_rng(seed=42)
++    best_pts, best_val = None, -1.0
++    for si, seed in enumerate(_seeds()):
++        rng = np.random.default_rng(1000 + si)
++        pts, v = _relax(seed, rng, iters=1500, step0=0.06, step1=0.003,
++                        t0=0.003, t1=1e-6, k_tri=10)
++        # reheat pass
++        rng2 = np.random.default_rng(2000 + si)
++        pts2, v2 = _relax(pts, rng2, iters=800, step0=0.02, step1=0.001,
++                          t0=0.001, t1=1e-7, k_tri=8)
++        if v2 > v: pts, v = pts2, v2
++        pts, v = _polish(pts)
++        if v > best_val:
++            best_val, best_pts = v, pts
+ 
+-    seeds = []
+-    # symmetric seeds: rings of points
+-    for r_in, r_out in [(0.35, 1.0), (0.5, 1.0), (0.3, 0.9)]:
+-        for m in (4, 5, 6):
+-            if m + (13 - m) < 3:
+-                continue
+-            k = 13 - m
+-            ang1 = 2*np.pi*np.arange(m)/m
+-            ang2 = 2*np.pi*np.arange(k)/k + np.pi/k
+-            pts = np.vstack([r_in*np.c_[np.cos(ang1), np.sin(ang1)],
+-                             r_out*np.c_[np.cos(ang2), np.sin(ang2)]])
+-            seeds.append(pts)
+-    # random seeds
+-    for _ in range(8):
+-        seeds.append(rng.random((n, 2)))
++    # joint refinement pass from global best
++    pts = best_pts.copy()
++    for T, it in ((0.0008, 1200), (0.00005, 800)):
++        rng3 = np.random.default_rng(9999)
++        pts, v = _relax(pts, rng3, iters=it, step0=0.004, step1=0.0005,
++                        t0=T, t1=1e-8, k_tri=8)
++    pts, v = _polish(pts)
++    if v > best_val:
++        best_val, best_pts = v, pts
+ 
+-    best_pts, best_score = seeds[0], 0.0
+-    total_iters = 1200
+-    for sp in seeds:
+-        pts, s = _optimize(sp, idx, rng, iters=total_iters)
+-        if s > best_score:
+-            best_score, best_pts = s, pts
+-
+-    # final deterministic polish
+-    step = 0.02
+-    pts = best_pts.copy()
+-    cur = _score(pts, idx)
+-    for it in range(2000):
+-        i = rng.integers(n)
+-        old = pts[i].copy()
+-        pts[i] = old + rng.normal(0, step, size=2)
+-        s = _score(pts, idx)
+-        if s >= cur:
+-            cur = s
+-        else:
+-            pts[i] = old
+-        if it % 400 == 399:
+-            step *= 0.6
+-
+-    return pts if _score(pts, idx) >= best_score else best_pts
++    # normalize hull to unit area (scale-invariance)
++    ha = _hull_area(best_pts)
++    if ha > 1e-12:
++        c = best_pts.mean(axis=0)
++        best_pts = (best_pts - c) / np.sqrt(ha) + c
++    return best_pts
+ 
+ 
+ # EVOLVE-BLOCK-END

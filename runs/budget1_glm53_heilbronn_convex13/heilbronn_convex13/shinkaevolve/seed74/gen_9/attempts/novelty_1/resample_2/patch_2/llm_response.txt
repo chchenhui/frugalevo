@@ -1,0 +1,219 @@
+<NAME>
+heilbronn_gradient_refine_solver</NAME>
+<DESCRIPTION>
+Replace the placeholder solver with a deterministic, seed-fixed optimizer for the 13-point Heilbronn problem. The approach combines multiple structured/random initializations (regular 13-gon, concentric rings, seeded uniform random) with smooth-surrogate gradient ascent: the min triangle area is approximated by a LogSumExp soft-min over all 286 triangles, with analytic gradients of the (absolute) signed cross products, an annealed temperature schedule, and adaptive step sizes. A final greedy hill-climbing polish operates on the exact minimum triangle area. The best configuration is rescaled so its convex hull has unit area, maximizing min_area_normalized. All randomness is seeded for full determinism, and error handling falls back to the best configuration found so far.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def solve():
+    """Placeholder for the Heilbronn triangle problem solver."""
+    pass
+=======
+def solve():
+    """Deterministic optimizer for the 13-point Heilbronn triangle problem.
+
+    Strategy:
+      1. Multiple structured initializations (regular polygon, concentric
+         rings, seeded uniform random) for robustness.
+      2. Smooth-surrogate gradient ascent: soft-min (LogSumExp) over all
+         C(13,3)=286 triangle areas with analytic gradients and an annealed
+         temperature schedule.
+      3. Greedy hill-climbing polish on the exact minimum triangle area.
+      4. Rescale so the convex hull has unit area (metric is normalized).
+
+    Returns a list of 13 (x, y) tuples, deterministic across runs.
+    """
+    try:
+        import math
+        import itertools
+        import numpy as np
+    except Exception:
+        # Absolute fallback: regular 13-gon scaled to unit hull area.
+        import math
+        pts = [(math.cos(2 * math.pi * i / 13.0),
+                math.sin(2 * math.pi * i / 13.0)) for i in range(13)]
+        area = 13.0 / 2.0 * math.sin(2 * math.pi / 13.0)
+        s = 1.0 / math.sqrt(area)
+        return [(s * x, s * y) for (x, y) in pts]
+
+    N = 13
+    TRIPLES = list(itertools.combinations(range(N), 3))
+    T = len(TRIPLES)
+
+    # ---------------- exact minimum triangle area ----------------
+    def exact_min_area(pts):
+        best = float("inf")
+        for (i, j, k) in TRIPLES:
+            ax, ay = pts[i]
+            bx, by = pts[j]
+            cx, cy = pts[k]
+            d = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay)
+            a = abs(d) * 0.5
+            if a < best:
+                best = a
+        return best
+
+    # ---------------- convex hull (monotone chain) + area ----------------
+    def hull_area(pts):
+        P = sorted(set(map(tuple, np.round(pts, 12))))
+        if len(P) < 3:
+            return 1e-12
+        P = np.array(P)
+
+        def cross(o, a, b):
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+        lower = []
+        for p in P:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+        upper = []
+        for p in reversed(P):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+        hull = lower[:-1] + upper[:-1]
+        if len(hull) < 3:
+            return 1e-12
+        h = np.asarray(hull)
+        s = 0.0
+        for i in range(len(h)):
+            x1, y1 = h[i]
+            x2, y2 = h[(i + 1) % len(h)]
+            s += x1 * y2 - x2 * y1
+        return abs(s) * 0.5
+
+    # ---------------- smooth surrogate + analytic gradient ----------------
+    def smooth_value_grad(pts, lam):
+        P = pts
+        d = np.empty(T)
+        for t, (i, j, k) in enumerate(TRIPLES):
+            d[t] = ((P[j, 0] - P[i, 0]) * (P[k, 1] - P[i, 1])
+                    - (P[k, 0] - P[i, 0]) * (P[j, 1] - P[i, 1]))
+        sgn = np.where(d >= 0.0, 1.0, -1.0)
+        a = np.abs(d) * 0.5  # triangle areas
+        z = -a / lam
+        zmax = z.max()
+        ez = np.exp(z - zmax)
+        S = -lam * (zmax + np.log(ez.sum()))  # soft-min (lower bound on min)
+        w = ez / ez.sum()  # dS/da_t
+        grad = np.zeros_like(P)
+        dd_da = sgn * 0.5  # da/dd
+        for t, (i, j, k) in enumerate(TRIPLES):
+            wt = w[t] * dd_da[t]
+            if wt == 0.0:
+                continue
+            xi, yi = P[i]
+            xj, yj = P[j]
+            xk, yk = P[k]
+            # d(det)/d(xi) = yj - yk ; d(det)/d(yi) = xk - xj
+            grad[i, 0] += wt * (yj - yk)
+            grad[i, 1] += wt * (xk - xj)
+            grad[j, 0] += wt * (yk - yi)
+            grad[j, 1] += wt * (xi - xk)
+            grad[k, 0] += wt * (yi - yj)
+            grad[k, 1] += wt * (xj - xi)
+        return S, grad
+
+    # ---------------- gradient ascent with annealing ----------------
+    def refine(pts, steps=900):
+        P = pts.copy()
+        lam = 0.02
+        step = 0.02
+        best_ma = exact_min_area(P)
+        best_P = P.copy()
+        for it in range(steps):
+            lam = max(0.0008, lam * 0.997)
+            S, g = smooth_value_grad(P, lam)
+            gn = np.linalg.norm(g)
+            if gn > 1e-12:
+                P = P + (step * 0.5 / max(1.0, gn / 5.0)) * g
+            if it % 50 == 0 or it == steps - 1:
+                ma = exact_min_area(P)
+                if ma > best_ma + 1e-12:
+                    best_ma = ma
+                    best_P = P.copy()
+                    step *= 1.15
+                else:
+                    step *= 0.82
+                    P = best_P.copy() * 0.0 + 0.5 * (best_P + P)  # contract toward best
+                    P = 0.5 * (P + best_P)
+        return best_P, best_ma
+
+    # ---------------- greedy polish on exact objective ----------------
+    def polish(pts, rounds=250):
+        P = pts.copy()
+        best = exact_min_area(P)
+        rng = np.random.default_rng(12345)
+        step = 0.01
+        for r in range(rounds):
+            improved = False
+            order = rng.permutation(N)
+            for idx in order:
+                for dim in range(2):
+                    for direction in (1.0, -1.0):
+                        Q = P.copy()
+                        Q[idx, dim] += direction * step
+                        ma = exact_min_area(Q)
+                        if ma > best + 1e-12:
+                            best = ma
+                            P = Q
+                            improved = True
+            if not improved:
+                step *= 0.6
+                if step < 1e-6:
+                    break
+        return P, best
+
+    # ---------------- initializations (all deterministic) ----------------
+    def initializations():
+        inits = []
+        # regular 13-gon (slightly perturbed deterministically)
+        ang = 2 * math.pi / 13.0
+        poly = np.array([[math.cos(i * ang), math.sin(i * ang)] for i in range(13)])
+        inits.append(poly * 1.0)
+        inits.append(poly * 1.0 + 0.02)
+        # 12-gon + center
+        ang12 = 2 * math.pi / 12.0
+        ring = np.array([[math.cos(i * ang12), math.sin(i * ang12)] for i in range(12)])
+        inits.append(np.vstack([ring, [[0.0, 0.0]]]))
+        # two concentric rings: 8 outer + 5 inner
+        out = np.array([[math.cos(i * math.pi / 4.0), math.sin(i * math.pi / 4.0)] for i in range(8)])
+        inn = 0.5 * np.array([[math.cos(i * 2 * math.pi / 5.0), math.sin(i * 2 * math.pi / 5.0)] for i in range(5)])
+        inits.append(np.vstack([out, inn]))
+        # seeded uniform random
+        for seed in range(4):
+            rng = np.random.default_rng(1000 + seed)
+            inits.append(rng.uniform(-1.0, 1.0, size=(N, 2)))
+        return inits
+
+    best_pts = None
+    best_score = -1.0
+    for init in initializations():
+        try:
+            P, ma = refine(init)
+            P, ma = polish(P)
+            # normalize by hull area -> score = min_area / hull_area
+            ha = hull_area(P)
+            if ha < 1e-9:
+                continue
+            score = ma / ha
+            if score > best_score:
+                best_score = score
+                best_pts = P.copy()
+        except Exception:
+            continue
+
+    if best_pts is None:
+        # fallback: regular 13-gon
+        ang = 2 * math.pi / 13.0
+        best_pts = np.array([[math.cos(i * ang), math.sin(i * ang)] for i in range(13)])
+
+    # scale so convex hull has exactly unit area
+    ha = hull_area(best_pts)
+    if ha > 1e-12:
+        best_pts = best_pts / math.sqrt(ha)
+
+    return [(float(x), float(y)) for (x, y) in best_pts]
+>>>>>>> REPLACE
+</DIFF>

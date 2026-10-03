@@ -1,0 +1,126 @@
+<NAME>
+batched_replica_waterfilling
+</NAME>
+
+<DESCRIPTION>
+Replace the per-extra-replica greedy loop with an exact batched discrete water-filling implementation. The marginal priority of assigning an expert its next replica is `weight / current_copy_count`; therefore selecting the globally largest marginal priorities yields the same minimum maximum-shard-load allocation as repeatedly taking the greatest pressure.
+
+The candidate set starts with only a small useful number of copy ranks per expert and doubles only when the selected top-k boundary could be affected by an omitted rank. This preserves exactness while avoiding the full `[rows, experts, num_extra]` candidate allocation for typical balanced workloads. Once counts are known, physical replica mappings are constructed directly from contiguous replica ranks, also removing repeated scatter updates from the hot loop.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _replicate_by_pressure(
+    weight: torch.Tensor,
+    num_physical: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Allocate replicas by repeatedly reducing the greatest shard pressure.
+
+    At each step an additional copy goes to the expert maximizing
+    load / existing_copies.  This is a discrete water-filling policy for the
+    maximum per-replica load objective and is evaluated for all rows at once.
+    """
+    num_rows, num_logical = weight.shape
+    assert num_physical >= num_logical
+
+    device = weight.device
+    physical_to_logical = torch.empty(
+        (num_rows, num_physical), dtype=torch.int64, device=device
+    )
+    replica_rank = torch.zeros_like(physical_to_logical)
+    logical_count = torch.ones(
+        (num_rows, num_logical), dtype=torch.int64, device=device
+    )
+
+    initial = torch.arange(
+        num_logical, dtype=torch.int64, device=device
+    ).expand(num_rows, -1)
+    physical_to_logical[:, :num_logical] = initial
+
+    row_ids = torch.arange(num_rows, device=device)
+    for physical_id in range(num_logical, num_physical):
+        pressure = weight.float() / logical_count.float()
+        chosen = pressure.argmax(dim=1)
+        current_rank = logical_count[row_ids, chosen]
+
+        physical_to_logical[:, physical_id] = chosen
+        replica_rank[:, physical_id] = current_rank
+        logical_count[row_ids, chosen] += 1
+
+    return physical_to_logical, replica_rank, logical_count
+=======
+def _replicate_by_pressure(
+    weight: torch.Tensor,
+    num_physical: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Allocate replicas with batched discrete water filling.
+
+    Assigning copy number ``c + 1`` to an expert has priority ``weight / c``.
+    Thus, selecting the largest ``num_extra`` priorities is equivalent to the
+    greedy greatest-pressure policy, but does not require one tensor reduction
+    and scatter update per additional physical expert.
+    """
+    num_rows, num_logical = weight.shape
+    assert num_physical >= num_logical
+
+    device = weight.device
+    num_extra = num_physical - num_logical
+    initial = torch.arange(
+        num_logical, dtype=torch.int64, device=device
+    ).expand(num_rows, -1)
+
+    if num_extra == 0:
+        return initial, torch.zeros_like(initial), torch.ones_like(initial)
+
+    # A uniform allocation normally needs only this many candidate copy ranks.
+    # Expand only when an omitted next-copy priority can cross the top-k cutoff.
+    candidate_ranks = max(1, (num_extra + num_logical - 1) // num_logical)
+    weight = weight.float()
+    while True:
+        ranks = torch.arange(
+            1, candidate_ranks + 1, dtype=weight.dtype, device=device
+        )
+        priorities = (weight.unsqueeze(-1) / ranks).flatten(1)
+        selected = priorities.topk(num_extra, dim=1, sorted=False)
+        cutoff = selected.values.min(dim=1).values
+
+        if candidate_ranks == num_extra:
+            break
+
+        omitted_best = (weight / (candidate_ranks + 1)).max(dim=1).values
+        if bool((cutoff >= omitted_best).all()):
+            break
+        candidate_ranks = min(num_extra, candidate_ranks * 2)
+
+    chosen_experts = selected.indices // candidate_ranks
+    logical_count = torch.ones(
+        (num_rows, num_logical), dtype=torch.int64, device=device
+    )
+    logical_count.scatter_add_(
+        1,
+        chosen_experts,
+        torch.ones_like(chosen_experts, dtype=torch.int64),
+    )
+
+    # Emit contiguous ranks for every selected logical expert.  This avoids
+    # relying on arbitrary top-k ordering and keeps logical_to_physical_map
+    # dense even when equal zero-load priorities occur.
+    extra_ranks = torch.arange(
+        1, num_extra + 1, dtype=torch.int64, device=device
+    ).view(1, 1, -1)
+    copy_mask = extra_ranks < logical_count.unsqueeze(-1)
+    extra_logical = initial.unsqueeze(-1).expand(-1, -1, num_extra)
+    extra_logical = extra_logical.masked_select(copy_mask).view(num_rows, -1)
+    extra_replica_ranks = extra_ranks.expand(
+        num_rows, num_logical, -1
+    ).masked_select(copy_mask).view(num_rows, -1)
+
+    physical_to_logical = torch.cat((initial, extra_logical), dim=1)
+    replica_rank = torch.cat(
+        (torch.zeros_like(initial), extra_replica_ranks), dim=1
+    )
+    return physical_to_logical, replica_rank, logical_count
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,251 @@
+<NAME>
+contact_graph_refinement
+</NAME>
+
+<DESCRIPTION>
+This redesign separates the search into a population-based global exploration stage and an elite contact-graph refinement stage. Broad smooth continuation discovers promising basins from geometric and random seeds, while the refinement stage tracks persistent near-minimum and near-diameter pairs and gives those contacts stronger weighted forces. This reduces dilution from transient pair constraints and focuses late optimization on the actual nonsmooth limiting contact graph.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Return 14 points in R^3 maximizing the squared minimum-distance to
+    diameter ratio.  Translation and scale are normalized internally.
+
+    The computation uses:
+      1. a reproducible population of geometrically structured starts,
+      2. smooth min/max continuation for basin discovery,
+      3. persistent-contact refinement around the strongest candidates.
+    """
+    n = 14
+    ii, jj = np.triu_indices(n, 1)
+    rng = np.random.default_rng(7319421)
+
+    def normalize(x: np.ndarray) -> np.ndarray:
+        x = x - x.mean(axis=0, keepdims=True)
+        rms = np.sqrt(np.mean(np.sum(x * x, axis=1)))
+        return x / max(rms, 1.0e-14)
+
+    def distances_sq(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        delta = x[ii] - x[jj]
+        return delta, np.einsum("ij,ij->i", delta, delta)
+
+    def objective(x: np.ndarray) -> float:
+        _, q = distances_sq(x)
+        return float(q.min() / q.max())
+
+    def accumulate_gradient(x: np.ndarray, pair_weight: np.ndarray) -> np.ndarray:
+        delta, _ = distances_sq(x)
+        force = 2.0 * pair_weight[:, None] * delta
+        grad = np.zeros_like(x)
+        np.add.at(grad, ii, force)
+        np.add.at(grad, jj, -force)
+        return grad
+
+    def sphere_seed() -> np.ndarray:
+        x = rng.normal(size=(n, 3))
+        x /= np.linalg.norm(x, axis=1, keepdims=True)
+        return normalize(x)
+
+    def fibonacci_seed(phase: float, twist: float) -> np.ndarray:
+        k = np.arange(n, dtype=float)
+        z = 1.0 - 2.0 * (k + 0.5) / n
+        radial = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+        angle = k * np.pi * (3.0 - np.sqrt(5.0)) + phase + twist * z
+        return normalize(np.column_stack((
+            radial * np.cos(angle),
+            radial * np.sin(angle),
+            z,
+        )))
+
+    def double_ring_seed(height: float, phase: float, cap_shift: float) -> np.ndarray:
+        a = np.arange(6, dtype=float) * (np.pi / 3.0)
+        r = np.sqrt(1.0 - height * height)
+        upper = np.column_stack((
+            r * np.cos(a),
+            r * np.sin(a),
+            np.full(6, height),
+        ))
+        lower = np.column_stack((
+            r * np.cos(a + phase),
+            r * np.sin(a + phase),
+            np.full(6, -height),
+        ))
+        caps = np.array([
+            [cap_shift, -0.55 * cap_shift, 1.0],
+            [-cap_shift, 0.55 * cap_shift, -1.0],
+        ])
+        caps /= np.linalg.norm(caps, axis=1, keepdims=True)
+        return normalize(np.vstack((upper, lower, caps)))
+
+    def cube_axis_seed() -> np.ndarray:
+        cube = np.array([
+            [a, b, c]
+            for a in (-1.0, 1.0)
+            for b in (-1.0, 1.0)
+            for c in (-1.0, 1.0)
+        ])
+        axes = np.vstack((np.eye(3), -np.eye(3))) * np.sqrt(3.0)
+        return normalize(np.vstack((cube, axes)))
+
+    # A mixed seed population intentionally includes both high-symmetry
+    # configurations and asymmetric spherical starts.
+    seeds = [
+        cube_axis_seed(),
+        fibonacci_seed(0.00, 0.00),
+        fibonacci_seed(0.31, 0.13),
+        fibonacci_seed(0.67, -0.17),
+        double_ring_seed(0.38, np.pi / 6.0, 0.10),
+        double_ring_seed(0.43, np.pi / 5.0, 0.18),
+        double_ring_seed(0.48, 0.57, 0.27),
+    ]
+    seeds.extend(sphere_seed() for _ in range(5))
+
+    # EVOLVE-BLOCK-START
+    # Phase 1: population continuation with a smooth log(min/max) force.
+    # Each member is independently evolved, allowing substantially different
+    # contact graphs to survive until elite selection.
+    archive: list[tuple[float, np.ndarray]] = []
+
+    for start_id, start in enumerate(seeds):
+        x = start.copy()
+        velocity = np.zeros_like(x)
+        local_best = x.copy()
+        local_value = objective(x)
+
+        iterations = 2050
+        for it in range(iterations):
+            t = it / (iterations - 1)
+            beta = 6.0 * (105.0 / 6.0) ** (t * t)
+
+            delta, q = distances_sq(x)
+            qlo = q.min()
+            qhi = q.max()
+
+            low_exp = np.exp(-beta * (q - qlo))
+            high_exp = np.exp(beta * (q - qhi))
+            wlow = low_exp / low_exp.sum()
+            whigh = high_exp / high_exp.sum()
+
+            soft_lo = qlo - np.log(np.mean(low_exp)) / beta
+            soft_hi = qhi + np.log(np.mean(high_exp)) / beta
+            pair_weight = wlow / max(soft_lo, 1.0e-12)
+            pair_weight -= whigh / max(soft_hi, 1.0e-12)
+
+            grad = accumulate_gradient(x, pair_weight)
+
+            # Momentum is useful early for escaping nearly symmetric starts;
+            # its influence fades before the nonsmooth limiting regime.
+            step = 0.021 * (1.0 - 0.72 * t) + 0.0018
+            momentum = 0.72 - 0.24 * t
+            velocity = momentum * velocity + step * grad
+            x = normalize(x + velocity)
+
+            # Deterministic small symmetry breaking only in the global phase.
+            if it < 360 and it % 30 == 0:
+                kick = rng.normal(size=x.shape)
+                kick -= kick.mean(axis=0, keepdims=True)
+                x = normalize(x + (0.010 * (1.0 - it / 360.0)) * kick)
+
+            if it % 25 == 0 or it == iterations - 1:
+                value = objective(x)
+                if value > local_value:
+                    local_value = value
+                    local_best = x.copy()
+
+        archive.append((local_value, local_best))
+
+    archive.sort(key=lambda item: item[0], reverse=True)
+    best_value, best = archive[0][0], archive[0][1].copy()
+
+    # Phase 2: refine several elite basins using persistent lower and upper
+    # contact bands.  Contacts that remain active are deliberately emphasized,
+    # rather than averaging every temporary band member equally.
+    elite = archive[:6]
+    refinement_schedule = (
+        (0.055, 0.055, 720),
+        (0.024, 0.024, 820),
+        (0.010, 0.012, 920),
+    )
+
+    for elite_id, (_, elite_point) in enumerate(elite):
+        for replica in range(2):
+            x = elite_point.copy()
+            if replica:
+                perturb = rng.normal(size=x.shape)
+                perturb -= perturb.mean(axis=0, keepdims=True)
+                x = normalize(x + (0.0035 + 0.0015 * elite_id) * perturb)
+
+            persistence_low = np.zeros(len(ii))
+            persistence_high = np.zeros(len(ii))
+            velocity = np.zeros_like(x)
+            local_value = objective(x)
+
+            for low_band, high_band, count in refinement_schedule:
+                for it in range(count):
+                    frac = it / max(count - 1, 1)
+                    delta, q = distances_sq(x)
+                    qlo = q.min()
+                    qhi = q.max()
+
+                    low_relative = q / qlo - 1.0
+                    high_relative = qhi / q - 1.0
+                    active_low = low_relative <= low_band
+                    active_high = high_relative <= high_band
+
+                    persistence_low = 0.945 * persistence_low + active_low
+                    persistence_high = 0.945 * persistence_high + active_high
+
+                    # Exponential proximity supplies a smooth ordering inside
+                    # a band; persistence prevents fleeting contacts from
+                    # overpowering the stable constraint graph.
+                    low_shape = np.exp(-low_relative / max(low_band, 1.0e-5))
+                    high_shape = np.exp(-high_relative / max(high_band, 1.0e-5))
+
+                    low_weight = low_shape * (0.25 + persistence_low)
+                    high_weight = high_shape * (0.25 + persistence_high)
+
+                    # Keep a tiny contribution from all pairs for continuity
+                    # when a contact graph changes.
+                    low_weight += 0.002 * np.exp(-4.0 * low_relative)
+                    high_weight += 0.002 * np.exp(-4.0 * high_relative)
+
+                    low_weight /= low_weight.sum()
+                    high_weight /= high_weight.sum()
+                    pair_weight = low_weight / qlo - high_weight / qhi
+
+                    grad = accumulate_gradient(x, pair_weight)
+                    step0 = 0.010 if low_band > 0.03 else 0.0050
+                    step = step0 * (1.0 - 0.55 * frac)
+
+                    velocity = 0.42 * velocity + step * grad
+                    candidate = normalize(x + velocity)
+
+                    # Short monotonic safeguard: if the persistent force moves
+                    # sharply downhill, retain a damped version instead.
+                    if it % 8 == 0:
+                        candidate_value = objective(candidate)
+                        current_value = objective(x)
+                        if candidate_value + 2.0e-5 < current_value:
+                            velocity *= 0.30
+                            candidate = normalize(x + 0.35 * velocity)
+
+                    x = candidate
+
+                    if it % 10 == 0 or it == count - 1:
+                        value = objective(x)
+                        if value > local_value:
+                            local_value = value
+                        if value > best_value:
+                            best_value = value
+                            best = x.copy()
+
+    return np.asarray(best, dtype=float)
+# EVOLVE-BLOCK-END
+``` 
+</CODE>

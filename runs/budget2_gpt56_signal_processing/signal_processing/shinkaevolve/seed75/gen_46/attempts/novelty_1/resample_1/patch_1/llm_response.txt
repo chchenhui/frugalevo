@@ -1,0 +1,355 @@
+<NAME>
+reliable_multiscale_tracker
+</NAME>
+
+<DESCRIPTION>
+The prior tracker achieved good lag and correlation but produced excessive slope changes and false reversals because short-horizon derivative activity could dominate during noisy or impulse-contaminated intervals. This version retains the causal alpha-beta architecture but adds reliability-weighted fast/slow slope blending.
+
+Key changes and parameters:
+- `base_alpha=0.075`, `max_alpha=0.455`: lower quiet-state gain improves smoothness and noise reduction while retaining rapid adaptation on sustained innovations.
+- `base_beta=0.0022`, `max_beta=0.072`: reduces noisy slope-state oscillation and spurious directional reversals.
+- Fast-model reliability is reduced when `fast_scale / slow_scale` is elevated or the newest endpoint residual is impulse-like.
+- `fast_weight` is activity-dependent but multiplied by reliability, preventing contaminated short windows from forcing false turns.
+- Reversal gates use stronger bands (`reversal_band=0.46`, `immediate_band=1.28`) plus cumulative excursion and directional-model confirmation.
+- A reversal needs both sustained output displacement and reliable slope consensus; genuine strong turns can still pass quickly when fast and slow models agree.
+- Robust MAD/trimmed-RMS noise estimation and asymmetric volatility adaptation remain causal and computationally efficient.
+
+The public inputs, outputs, validation behavior, output lengths, enhanced/basic modes, and non-finite sample handling are preserved.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""
+Reliability-weighted multi-scale causal adaptive signal filter.
+
+Enhanced mode combines robust first-difference noise estimation, adaptive
+alpha-beta tracking, fast/slow derivative consensus, short-model reliability
+scoring, bounded innovations, predictive lead, and model-confirmed reversal
+hysteresis.  Outputs are causal and aligned with the final sample in each
+trailing window.
+"""
+from collections import deque
+import numpy as np
+
+
+class _ReliableMultiScaleTracker:
+    """
+    Causal robust level/slope tracker with reliability-weighted fast dynamics.
+
+    The short derivative model is useful for low-lag response, but is explicitly
+    down-weighted when recent local variability is much larger than the slow
+    window variability or when the newest measurement has an impulse-like
+    endpoint residual.
+    """
+
+    def __init__(
+        self,
+        window_size,
+        fast_span=7,
+        base_alpha=0.075,
+        max_alpha=0.455,
+        base_beta=0.0022,
+        max_beta=0.072,
+        prediction_lead=0.34,
+        reversal_band=0.46,
+        immediate_band=1.28,
+        confirmation_count=2,
+    ):
+        self.window_size = max(3, int(window_size))
+        self.fast_span = max(4, min(int(fast_span), self.window_size))
+
+        self.base_alpha = float(base_alpha)
+        self.max_alpha = float(max_alpha)
+        self.base_beta = float(base_beta)
+        self.max_beta = float(max_beta)
+        self.prediction_lead = float(prediction_lead)
+
+        self.reversal_band = float(reversal_band)
+        self.immediate_band = float(immediate_band)
+        self.confirmation_count = max(2, int(confirmation_count))
+
+        self.level = None
+        self.slope = 0.0
+        self.fast_slope = 0.0
+        self.slow_slope = 0.0
+        self.noise_scale = None
+        self.last_sample = None
+        self.last_output = None
+
+        self.differences = deque(maxlen=self.window_size)
+
+        self.output_direction = 0.0
+        self.pending_direction = 0.0
+        self.pending_count = 0
+        self.pending_excursion = 0.0
+
+    @staticmethod
+    def _difference_scale(values):
+        """
+        Robust measurement-noise estimate from first differences.
+
+        Centering differences before MAD prevents a sustained trend from being
+        interpreted as observation noise.  The trimmed RMS floor handles
+        quantized signals and short nearly-constant sections.
+        """
+        if len(values) < 3:
+            return None
+
+        d = np.asarray(values, dtype=float)
+        center = float(np.median(d))
+        deviation = np.abs(d - center)
+        mad = float(np.median(deviation))
+        scale = mad / (0.67448975 * np.sqrt(2.0))
+
+        cutoff = np.percentile(deviation, 78.0)
+        trimmed = deviation[deviation <= cutoff]
+        if trimmed.size:
+            trimmed_rms = np.sqrt(np.mean(trimmed * trimmed)) / np.sqrt(2.0)
+            scale = max(scale, 0.44 * trimmed_rms)
+
+        return max(float(scale), 1e-6)
+
+    def _update_noise(self):
+        slow_scale = self._difference_scale(self.differences)
+        if slow_scale is None:
+            return None, None
+
+        if len(self.differences) >= self.fast_span:
+            recent = list(self.differences)[-self.fast_span:]
+            fast_scale = self._difference_scale(recent)
+        else:
+            fast_scale = slow_scale
+
+        fast_scale = float(np.clip(fast_scale, 0.48 * slow_scale, 2.35 * slow_scale))
+
+        # The slow component makes the noise estimate stable.  The fast
+        # component responds to genuine volatility changes without allowing one
+        # short noisy segment to dominate thresholds.
+        target = 0.54 * fast_scale + 0.46 * slow_scale
+        if self.noise_scale is None:
+            self.noise_scale = max(target, 1e-6)
+        else:
+            decay = 0.942 if target > self.noise_scale else 0.976
+            self.noise_scale = max(
+                1e-6,
+                decay * self.noise_scale + (1.0 - decay) * target,
+            )
+
+        return fast_scale, slow_scale
+
+    def _reset_pending(self):
+        self.pending_direction = 0.0
+        self.pending_count = 0
+        self.pending_excursion = 0.0
+
+    def update(self, sample):
+        """Consume one finite sample and return a causal filtered estimate."""
+        sample = float(sample)
+
+        if self.level is None:
+            self.level = sample
+            self.last_sample = sample
+            self.last_output = sample
+            self.noise_scale = max(abs(sample) * 0.025, 0.03, 1e-6)
+            return sample
+
+        raw_difference = sample - self.last_sample
+        self.last_sample = sample
+        self.differences.append(raw_difference)
+        fast_scale, slow_scale = self._update_noise()
+
+        sigma = max(float(self.noise_scale), 1e-6)
+        predicted = self.level + self.slope
+        raw_innovation = sample - predicted
+
+        # Wider than the reversal threshold: a real rapid movement can update
+        # the state, while isolated impulses cannot displace it arbitrarily.
+        clip_limit = max(3.65 * sigma, 1e-6)
+        innovation = float(np.clip(raw_innovation, -clip_limit, clip_limit))
+        normalized = abs(innovation) / sigma
+        response = normalized / (normalized + 2.45)
+
+        alpha = self.base_alpha + (self.max_alpha - self.base_alpha) * response
+        beta = self.base_beta + (self.max_beta - self.base_beta) * (response ** 2)
+
+        self.level = predicted + alpha * innovation
+        self.slope = (1.0 - beta) * self.slope + beta * innovation
+
+        # Exponentially weighted derivative models at two time scales.
+        self.fast_slope = 0.70 * self.fast_slope + 0.30 * raw_difference
+        self.slow_slope = 0.940 * self.slow_slope + 0.060 * raw_difference
+
+        # Fast-model reliability combines a local scale disagreement penalty
+        # with endpoint-residual reliability.  Thus a short volatile or
+        # impulse-contaminated fit cannot dominate the consensus.
+        scale_ratio = fast_scale / max(slow_scale, 1e-6)
+        volatility_reliability = 1.0 / (1.0 + max(0.0, scale_ratio - 1.0))
+        endpoint_reliability = 1.0 / (
+            1.0 + max(0.0, abs(raw_innovation) / sigma - 2.0)
+        )
+        fast_reliability = float(np.clip(
+            0.20 + 0.80 * volatility_reliability * endpoint_reliability,
+            0.20,
+            1.0,
+        ))
+
+        slope_activity = abs(self.fast_slope) / (abs(self.fast_slope) + sigma)
+        fast_weight = 0.18 + 0.42 * slope_activity * fast_reliability
+        derivative_consensus = (
+            fast_weight * self.fast_slope
+            + (1.0 - fast_weight) * self.slow_slope
+        )
+        model_slope = 0.66 * self.slope + 0.34 * derivative_consensus
+
+        # A bounded predictive lead compensates causal filter delay.  Its
+        # magnitude falls when the fast estimate is unreliable.
+        lead_gain = self.prediction_lead * (0.72 + 0.28 * fast_reliability)
+        lead_limit = max(1.05 * sigma, 0.82 * abs(model_slope), 1e-8)
+        lead = float(np.clip(lead_gain * model_slope, -lead_limit, lead_limit))
+        candidate = self.level + lead
+
+        delta = candidate - self.last_output
+        direction = float(np.sign(delta))
+        if direction == 0.0:
+            return self.last_output
+
+        if self.output_direction == 0.0 or direction == self.output_direction:
+            self.output_direction = direction
+            self._reset_pending()
+            self.last_output = candidate
+            return self.last_output
+
+        fast_sign = float(np.sign(self.fast_slope))
+        slow_sign = float(np.sign(self.slow_slope))
+        consensus_sign = float(np.sign(derivative_consensus))
+        consensus_strength = abs(derivative_consensus) / sigma
+        state_strength = abs(self.slope) / sigma
+
+        dual_agreement = (
+            fast_sign == direction
+            and slow_sign == direction
+            and fast_reliability >= 0.42
+        )
+        consensus_agreement = (
+            consensus_sign == direction
+            and consensus_strength >= 0.62
+            and state_strength >= 0.16
+        )
+        model_confirmed = dual_agreement or consensus_agreement
+        strong_turn = (
+            model_confirmed
+            and consensus_strength >= 0.92
+            and fast_reliability >= 0.38
+        )
+
+        small_band = max(self.reversal_band * sigma, 1e-7)
+        immediate_band = max(self.immediate_band * sigma, 1e-7)
+
+        if abs(delta) <= small_band:
+            self._reset_pending()
+            return self.last_output
+
+        if direction == self.pending_direction:
+            self.pending_count += 1
+            self.pending_excursion = max(self.pending_excursion, abs(delta))
+        else:
+            self.pending_direction = direction
+            self.pending_count = 1
+            self.pending_excursion = abs(delta)
+
+        # Strong model-confirmed turns remain responsive.  Less certain turns
+        # need persistence and an excursion large enough to reject oscillatory
+        # noise around the current output.
+        if strong_turn and abs(delta) >= immediate_band:
+            accept = True
+        else:
+            required_count = self.confirmation_count if model_confirmed else (
+                self.confirmation_count + 1
+            )
+            required_excursion = (
+                (0.78 if model_confirmed else 1.12) * sigma
+            )
+            accept = (
+                self.pending_count >= required_count
+                and self.pending_excursion >= required_excursion
+                and (model_confirmed or consensus_strength >= 0.42)
+            )
+
+        if accept:
+            self.output_direction = direction
+            self._reset_pending()
+            self.last_output = candidate
+
+        return self.last_output
+
+
+class _SignalProcessingPipeline:
+    """Validation and execution coordinator preserving the public API."""
+
+    def __init__(self, window_size, mode):
+        self.window_size = int(window_size)
+        self.mode = mode
+
+    @staticmethod
+    def _as_signal_array(x):
+        signal = np.asarray(x, dtype=float)
+        if signal.ndim != 1:
+            raise ValueError("Input signal must be a 1D array of real-valued samples")
+        return signal
+
+    def validate(self, x):
+        signal = self._as_signal_array(x)
+        if self.window_size <= 0:
+            raise ValueError("window_size must be a positive integer")
+        if len(signal) < self.window_size:
+            raise ValueError(
+                f"Input signal length ({len(signal)}) must be >= "
+                f"window_size ({self.window_size})"
+            )
+        return signal
+
+    def run_basic(self, signal):
+        cumulative = np.concatenate(([0.0], np.cumsum(signal, dtype=float)))
+        return (
+            cumulative[self.window_size:] - cumulative[:-self.window_size]
+        ) / self.window_size
+
+    def run_enhanced(self, signal):
+        tracker = _ReliableMultiScaleTracker(self.window_size)
+        estimates = np.empty(signal.size, dtype=float)
+        last_valid = 0.0
+
+        for index, value in enumerate(signal):
+            if np.isfinite(value):
+                last_valid = float(value)
+            estimates[index] = tracker.update(last_valid)
+
+        return estimates[self.window_size - 1:]
+
+    def run(self, x):
+        signal = self.validate(x)
+        if self.mode == "enhanced":
+            return self.run_enhanced(signal)
+        return self.run_basic(signal)
+
+
+def adaptive_filter(x, window_size=20):
+    """Basic trailing moving-average filter."""
+    return _SignalProcessingPipeline(window_size, "basic").run(x)
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """Reliability-weighted causal low-lag trend-preserving filter."""
+    return _SignalProcessingPipeline(window_size, "enhanced").run(x)
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """Apply enhanced adaptive filtering or the basic trailing average."""
+    mode = "enhanced" if algorithm_type == "enhanced" else "basic"
+    return _SignalProcessingPipeline(window_size, mode).run(input_signal)
+
+
+# EVOLVE-BLOCK-END
+``` 
+</CODE>

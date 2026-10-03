@@ -1,0 +1,228 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct exactly fourteen points in R^3 maximizing the exact minimum
+    squared pairwise distance divided by the exact maximum squared distance.
+
+    Translation and uniform scaling are immaterial.  States are therefore
+    centered and RMS-normalized throughout the deterministic optimization.
+    """
+    n = 14
+    pair_i, pair_j = np.triu_indices(n, 1)
+    pair_count = len(pair_i)
+
+    def normalize(points: np.ndarray) -> np.ndarray:
+        points = points - points.mean(axis=0, keepdims=True)
+        rms = np.sqrt(np.mean(np.sum(points * points, axis=1)))
+        return points / max(float(rms), 1.0e-14)
+
+    def pair_data(points: np.ndarray):
+        delta = points[pair_i] - points[pair_j]
+        squared = np.einsum("ij,ij->i", delta, delta)
+        return delta, np.maximum(squared, 1.0e-15)
+
+    def exact_ratio(points: np.ndarray) -> float:
+        _, squared = pair_data(points)
+        return float(squared.min() / squared.max())
+
+    def contact_gradient(points: np.ndarray, sharpness: float) -> np.ndarray:
+        """
+        Gradient of softmin(log distance) - softmax(log distance).
+
+        The same field is useful both for continuation and for purposeful
+        restart directions: it expands short-contact bands while contracting
+        long-diameter bands.
+        """
+        delta, squared = pair_data(points)
+        logs = 0.5 * np.log(squared)
+
+        low = logs.min()
+        high = logs.max()
+        near = np.exp(-sharpness * (logs - low))
+        far = np.exp(sharpness * (logs - high))
+        near /= near.sum()
+        far /= far.sum()
+
+        force = ((near - far) / squared)[:, None] * delta
+        gradient = np.zeros((n, 3), dtype=float)
+        np.add.at(gradient, pair_i, force)
+        np.add.at(gradient, pair_j, -force)
+        gradient -= gradient.mean(axis=0, keepdims=True)
+        return gradient
+
+    def refine(seed: np.ndarray, iterations: int, phase: int) -> np.ndarray:
+        """
+        Annealed soft-extrema ascent with exact-objective rollback.
+
+        phase=0 explores broad basins, phase=1 is an asymmetric restart
+        continuation, and phase=2 is a concentrated active-contact polish.
+        """
+        points = normalize(seed.astype(float, copy=True))
+        best = points.copy()
+        best_value = exact_ratio(points)
+        velocity = np.zeros_like(points)
+        step_scale = 1.0
+        regressions = 0
+
+        for iteration in range(iterations):
+            t = iteration / max(iterations - 1, 1)
+
+            if phase == 0:
+                sharpness = 5.0 + 310.0 * t ** 1.72
+                step = 0.044 * (1.0 - 0.66 * t)
+                momentum = 0.835
+                interval = 10
+            elif phase == 1:
+                sharpness = 12.0 + 430.0 * t ** 1.46
+                step = 0.031 * (1.0 - 0.69 * t)
+                momentum = 0.805
+                interval = 8
+            else:
+                sharpness = 70.0 + 950.0 * t * t
+                step = 0.0145 * (1.0 - 0.72 * t)
+                momentum = 0.755
+                interval = 6
+
+            gradient = contact_gradient(points, sharpness)
+            magnitude = np.sqrt(np.mean(np.sum(gradient * gradient, axis=1)))
+            if magnitude > 1.0e-15:
+                gradient /= magnitude
+
+            velocity = momentum * velocity + (1.0 - momentum) * gradient
+            points = normalize(points + step_scale * step * velocity)
+
+            if iteration % interval == interval - 1 or iteration == iterations - 1:
+                value = exact_ratio(points)
+                tolerance = 1.0e-5 if phase < 2 else 3.0e-6
+
+                if value > best_value:
+                    best_value = value
+                    best = points.copy()
+                    regressions = 0
+                    step_scale = min(1.0, step_scale * 1.045)
+                elif value < best_value * (1.0 - tolerance):
+                    regressions += 1
+                else:
+                    regressions = max(0, regressions - 1)
+
+                # At high sharpness, surrogate ascent can leave a favorable
+                # nonsmooth contact graph.  Resume from the exact incumbent.
+                if regressions >= 3:
+                    points = best.copy()
+                    velocity.fill(0.0)
+                    step_scale = max(0.32, step_scale * 0.62)
+                    regressions = 0
+
+        return best
+
+    def layered_seed(radius, height, twist, pole, noise, seed):
+        angles = np.arange(6, dtype=float) * (np.pi / 3.0)
+        lower = np.column_stack((
+            radius * np.cos(angles),
+            radius * np.sin(angles),
+            -height * np.ones(6),
+        ))
+        upper = np.column_stack((
+            radius * np.cos(angles + twist),
+            radius * np.sin(angles + twist),
+            height * np.ones(6),
+        ))
+        result = np.vstack((
+            lower, upper, [[0.0, 0.0, -pole], [0.0, 0.0, pole]]
+        ))
+        if noise:
+            result += noise * np.random.default_rng(seed).standard_normal((n, 3))
+        return result
+
+    def geometry_aware_restarts(points: np.ndarray) -> list:
+        """
+        Form restart seeds in directions suggested by the active pair bands.
+        Each random component is made orthogonal to the contact-gradient
+        direction, so it changes contact assignments without simply undoing
+        the intended shortest/farthest-pair improvement.
+        """
+        rng = np.random.default_rng(581327)
+        base = normalize(points)
+        direction = contact_gradient(base, 185.0)
+        norm = np.sqrt(np.mean(np.sum(direction * direction, axis=1)))
+        if norm > 1.0e-15:
+            direction /= norm
+
+        seeds = []
+        for amplitude in (0.0035, 0.0065, 0.0105, 0.0150):
+            for sign in (-1.0, 1.0):
+                noise = rng.standard_normal((n, 3))
+                noise -= noise.mean(axis=0, keepdims=True)
+                projection = np.sum(noise * direction) / max(
+                    np.sum(direction * direction), 1.0e-15
+                )
+                noise -= projection * direction
+                noise_norm = np.sqrt(np.mean(np.sum(noise * noise, axis=1)))
+                noise /= max(noise_norm, 1.0e-15)
+                seeds.append(normalize(
+                    base + sign * amplitude * direction + 0.55 * amplitude * noise
+                ))
+        return seeds
+
+    # Most broad work is concentrated in the known strong layered basin,
+    # while parameter variations deliberately alter radius, height, twist,
+    # and pole separation independently.
+    layer_parameters = (
+        (1.00, 0.430, np.pi / 6.0, 1.300),
+        (1.00, 0.490, np.pi / 6.0, 1.360),
+        (1.06, 0.460, 0.460,       1.370),
+        (0.95, 0.530, 0.570,       1.340),
+        (1.08, 0.390, 0.500,       1.290),
+        (0.99, 0.580, 0.620,       1.430),
+        (1.03, 0.455, 0.535,       1.350),
+        (0.97, 0.505, 0.505,       1.385),
+    )
+
+    initializers = [
+        layered_seed(*parameters, noise=0.010, seed=2003 + 71 * k)
+        for k, parameters in enumerate(layer_parameters)
+    ]
+
+    cube = np.array(
+        [[x, y, z]
+         for x in (-1.0, 1.0)
+         for y in (-1.0, 1.0)
+         for z in (-1.0, 1.0)],
+        dtype=float,
+    )
+    axes = np.diag((1.53, 1.67, 1.78))
+    initializers.append(np.vstack((cube, axes, -axes)))
+    initializers.append(np.random.default_rng(271828).standard_normal((n, 3)))
+
+    best_points = None
+    best_value = -np.inf
+
+    for index, initial in enumerate(initializers):
+        candidate = refine(initial, iterations=1220, phase=0 if index < 8 else 1)
+        value = exact_ratio(candidate)
+        if value > best_value:
+            best_value = value
+            best_points = candidate
+
+    # Targeted escape attempts around the best exact contact graph.
+    restart_seeds = geometry_aware_restarts(best_points)
+    for index, seed in enumerate(restart_seeds):
+        candidate = refine(seed, iterations=760, phase=1)
+        value = exact_ratio(candidate)
+        if value > best_value:
+            best_value = value
+            best_points = candidate
+
+    # A final continuation emphasizes the active shortest and diameter pairs.
+    polished = refine(best_points, iterations=1850, phase=2)
+    polished_value = exact_ratio(polished)
+    if polished_value > best_value:
+        best_points = polished
+
+    return np.asarray(best_points, dtype=float)
+
+
+# EVOLVE-BLOCK-END

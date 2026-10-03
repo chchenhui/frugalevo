@@ -1,0 +1,186 @@
+<NAME>
+corner_aware_lattice_with_hill_climb
+</NAME>
+<DESCRIPTION>
+The current best program (score 0.93, sum 2.44) used an LP-based radius solver plus a hill-climb over centers, starting from a suboptimal 5/4/5/4/5/3 lattice. The current program has a better initial lattice (6/5/6/5/6 with a growth hole) but no center optimization, capping it at 2.00. I propose combining both strengths: keep the denser lattice as the starting layout, solve radii exactly with the LP at every step, and add a hill-climb over center positions. Crucially, per the corner-aware recommendation, I add directed moves that push circles touching two walls (corner circles) diagonally toward the nearest corner, where three-sided wall slack lets the LP assign them larger radii, and push single-wall circles away from walls. Small interior circles get larger jitter since they have more freedom. This should recover the ~2.44+ regime and improve on it via the denser seed.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Hexagonal-lattice layout: 5 staggered rows with counts 6,5,6,5,6.
+    # Horizontal spacing 0.2, vertical spacing 0.1*sqrt(3) ~ 0.1732.
+    # This lattice supports 28 circles of radius 0.1; we drop 2 adjacent
+    # circles from the middle row (n=26) to leave a growth hole.
+    n = 26
+    centers_list = []
+    y0 = 0.1
+    dy = 0.1 * np.sqrt(3.0)
+    counts = [6, 5, 6, 5, 6]
+    skip = {(2, 2), (2, 3)}  # remove two adjacent circles in the middle row
+    for row, cnt in enumerate(counts):
+        y = y0 + row * dy
+        for k in range(cnt):
+            if (row, k) in skip:
+                continue
+            if cnt == 6:
+                x = 0.2 * k  # touches walls at x=0 and x=1
+            else:
+                x = 0.1 + 0.2 * k  # staggered by half spacing
+            centers_list.append([x, y])
+    centers = np.array(centers_list)
+    assert centers.shape == (n, 2)
+
+    # Compute maximum valid radii for this configuration
+    radii = compute_max_radii(centers)
+
+    # Calculate the sum of radii
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+=======
+    # Hexagonal-lattice layout: 5 staggered rows with counts 6,5,6,5,6.
+    # Horizontal spacing 0.2, vertical spacing 0.1*sqrt(3) ~ 0.1732.
+    # This lattice supports 28 circles of radius 0.1; we drop 2 adjacent
+    # circles from the middle row (n=26) to leave a growth hole.
+    n = 26
+    centers_list = []
+    y0 = 0.1
+    dy = 0.1 * np.sqrt(3.0)
+    counts = [6, 5, 6, 5, 6]
+    skip = {(2, 2), (2, 3)}  # remove two adjacent circles in the middle row
+    for row, cnt in enumerate(counts):
+        y = y0 + row * dy
+        for k in range(cnt):
+            if (row, k) in skip:
+                continue
+            if cnt == 6:
+                x = 0.2 * k  # touches walls at x=0 and x=1
+            else:
+                x = 0.1 + 0.2 * k  # staggered by half spacing
+            centers_list.append([x, y])
+    centers = np.array(centers_list)
+    assert centers.shape == (n, 2)
+
+    # Exact LP radii for the seed layout
+    radii = solve_radii_lp(centers)
+    if radii is None:
+        radii = compute_max_radii(centers)
+
+    best_sum = np.sum(radii)
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+
+    # ---- Hill-climb over center positions, re-solving the LP each step ----
+    rng = np.random.default_rng(12345)
+    n_iters = 600
+    for it in range(n_iters):
+        frac = 1.0 - it / n_iters
+        sigma = 0.008 + 0.04 * frac
+
+        cand = best_centers.copy()
+
+        # Directed corner-aware moves:
+        # - circles touching two walls are pushed diagonally INTO the corner
+        #   (three-sided slack there lets the LP grant them bigger radii)
+        # - circles touching one wall are pushed away from that wall
+        for i in range(n):
+            x, y = cand[i]
+            r = best_radii[i]
+            tol = 1e-7
+            left = r >= x - tol
+            right = r >= 1.0 - x - tol
+            bot = r >= y - tol
+            top = r >= 1.0 - y - tol
+            if left and bot:
+                cand[i] -= [0.5 * sigma, 0.5 * sigma]
+            elif left and top:
+                cand[i, 0] -= 0.5 * sigma
+                cand[i, 1] += 0.5 * sigma
+            elif right and bot:
+                cand[i, 0] += 0.5 * sigma
+                cand[i, 1] -= 0.5 * sigma
+            elif right and top:
+                cand[i] += [0.5 * sigma, 0.5 * sigma]
+            else:
+                if left:
+                    cand[i, 0] += 0.5 * sigma
+                if right:
+                    cand[i, 0] -= 0.5 * sigma
+                if bot:
+                    cand[i, 1] += 0.5 * sigma
+                if top:
+                    cand[i, 1] -= 0.5 * sigma
+
+        # Random jitter, larger for small circles (more freedom of movement)
+        jitter = sigma * (0.3 + 0.7 * (1.0 - best_radii / (best_radii.max() + 1e-12)))
+        cand += rng.normal(0.0, 1.0, cand.shape) * jitter[:, None]
+
+        cand = np.clip(cand, 0.001, 0.999)
+
+        result = solve_radii_lp(cand)
+        if result is None:
+            continue
+        if np.sum(result) > best_sum:
+            best_sum = np.sum(result)
+            best_centers = cand.copy()
+            best_radii = result.copy()
+
+    centers = best_centers
+    radii = best_radii * (1.0 - 1e-6)  # tiny safety shrink
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def compute_max_radii(centers):
+=======
+def solve_radii_lp(centers, eps=1e-9):
+    """
+    Solve the linear program: maximize sum(r_i) subject to
+      r_i + r_j <= dist(i, j)  for all pairs
+      0 <= r_i <= min(x_i, y_i, 1-x_i, 1-y_i)
+    Returns optimal radii array, or None if scipy is unavailable or LP fails.
+    """
+    try:
+        from scipy.optimize import linprog
+    except ImportError:
+        return None
+
+    n = centers.shape[0]
+    c = -np.ones(n)
+
+    rows = []
+    rhs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            rows.append(row)
+            rhs.append(d - 2.0 * eps)
+
+    for i in range(n):
+        x, y = centers[i]
+        for lim in (x - eps, y - eps, 1.0 - x - eps, 1.0 - y - eps):
+            row = np.zeros(n)
+            row[i] = 1.0
+            rows.append(row)
+            rhs.append(max(lim, 0.0))
+
+    A_ub = np.vstack(rows)
+    b_ub = np.array(rhs)
+
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=[(0.0, None)] * n,
+                  method="highs")
+    if not res.success:
+        return None
+    return np.maximum(res.x, 0.0)
+
+
+def compute_max_radii(centers):
+>>>>>>> REPLACE
+</DIFF>

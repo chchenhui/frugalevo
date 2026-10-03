@@ -1,0 +1,341 @@
+# EVOLVE-BLOCK-START
+#include <bits/stdc++.h>
+using namespace std;
+
+struct QueryBroker {
+    int n, q, used = 0;
+    vector<vector<char>> single_cache;
+
+    QueryBroker(int n_, int q_) : n(n_), q(q_), single_cache(n_, vector<char>(n_, 0)) {}
+
+    char ask(const vector<int>& left, const vector<int>& right) {
+        cout << left.size() << ' ' << right.size();
+        for (int x : left) cout << ' ' << x;
+        for (int x : right) cout << ' ' << x;
+        cout << endl;
+
+        char result;
+        cin >> result;
+        ++used;
+        return result;
+    }
+
+    char single(int a, int b) {
+        if (a == b) return '=';
+        if (single_cache[a][b]) return single_cache[a][b];
+
+        char r = ask(vector<int>{a}, vector<int>{b});
+        single_cache[a][b] = r;
+        single_cache[b][a] = (r == '<' ? '>' : r == '>' ? '<' : '=');
+        return r;
+    }
+};
+
+struct RankEstimator {
+    int n, budget;
+    QueryBroker& broker;
+    mt19937& rng;
+
+    vector<int> pivots;
+    vector<int> bucket;
+    vector<double> estimated;
+
+    RankEstimator(int n_, int budget_, QueryBroker& broker_, mt19937& rng_)
+        : n(n_), budget(budget_), broker(broker_), rng(rng_), bucket(n_, 0), estimated(n_, 1.0) {}
+
+    static int ceil_log2_int(int x) {
+        int r = 0;
+        while ((1 << r) < x) ++r;
+        return r;
+    }
+
+    int choose_pivot_count() const {
+        int best = 2;
+        for (int k = 2; k <= n; ++k) {
+            int lg = ceil_log2_int(k);
+            int sort_cost = k * lg;
+            int classify_cost = (n - k) * lg;
+            if (sort_cost + classify_cost <= budget) best = k;
+        }
+        return min(best, n);
+    }
+
+    void merge_sort_rec(vector<int>& a, vector<int>& tmp, int l, int r) {
+        if (r - l <= 1) return;
+        int m = (l + r) / 2;
+        merge_sort_rec(a, tmp, l, m);
+        merge_sort_rec(a, tmp, m, r);
+
+        int i = l, j = m, p = l;
+        while (i < m && j < r) {
+            char c = broker.single(a[i], a[j]);
+            if (c == '<' || c == '=') tmp[p++] = a[i++];
+            else tmp[p++] = a[j++];
+        }
+        while (i < m) tmp[p++] = a[i++];
+        while (j < r) tmp[p++] = a[j++];
+        for (int x = l; x < r; ++x) a[x] = tmp[x];
+    }
+
+    double expected_weight_from_rank(double rank_ascending) const {
+        // Expected exponential order statistic, normalized by its mean.
+        // rank_ascending is in [0, n-1].
+        int r = max(0, min(n - 1, (int)llround(rank_ascending)));
+        double value = 0.0;
+        for (int i = n - r; i <= n; ++i) {
+            if (i > 0) value += 1.0 / i;
+        }
+        return max(0.02, value);
+    }
+
+    vector<double> build() {
+        int k = choose_pivot_count();
+
+        vector<int> all(n);
+        iota(all.begin(), all.end(), 0);
+        shuffle(all.begin(), all.end(), rng);
+
+        pivots.assign(all.begin(), all.begin() + k);
+        vector<int> tmp(k);
+        merge_sort_rec(pivots, tmp, 0, k);
+
+        vector<char> is_pivot(n, false);
+        for (int x : pivots) is_pivot[x] = true;
+
+        for (int j = 0; j < k; ++j) {
+            bucket[pivots[j]] = 2 * j + 1;
+        }
+
+        for (int item = 0; item < n; ++item) {
+            if (is_pivot[item]) continue;
+
+            int lo = 0, hi = k;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                char c = broker.single(item, pivots[mid]);
+                if (c == '<' || c == '=') hi = mid;
+                else lo = mid + 1;
+            }
+
+            // Bucket 0: before first pivot, bucket k: after final pivot.
+            bucket[item] = 2 * lo;
+        }
+
+        for (int item = 0; item < n; ++item) {
+            double sample_position;
+            if (bucket[item] & 1) {
+                int j = bucket[item] / 2;
+                sample_position = j + 0.5;
+            } else {
+                int j = bucket[item] / 2;
+                sample_position = j;
+            }
+
+            double rank = sample_position * (n + 1.0) / (k + 1.0) - 1.0;
+            rank = max(0.0, min((double)n - 1.0, rank));
+            estimated[item] = expected_weight_from_rank(rank);
+        }
+
+        return estimated;
+    }
+};
+
+struct Partition {
+    int n, d;
+    const vector<double>& w;
+
+    vector<int> group_of;
+    vector<vector<int>> members;
+    vector<double> sums;
+
+    Partition(int n_, int d_, const vector<double>& w_)
+        : n(n_), d(d_), w(w_), group_of(n_, 0), members(d_), sums(d_, 0.0) {}
+
+    void initialize_greedy() {
+        vector<int> order(n);
+        iota(order.begin(), order.end(), 0);
+        sort(order.begin(), order.end(), [&](int a, int b) {
+            return w[a] > w[b];
+        });
+
+        for (int item : order) {
+            int g = min_element(sums.begin(), sums.end()) - sums.begin();
+            group_of[item] = g;
+            members[g].push_back(item);
+            sums[g] += w[item];
+        }
+    }
+
+    double objective() const {
+        double total = accumulate(sums.begin(), sums.end(), 0.0);
+        double mean = total / d;
+        double result = 0.0;
+        for (double x : sums) {
+            double z = x - mean;
+            result += z * z;
+        }
+        return result;
+    }
+
+    void rebuild_members() {
+        members.assign(d, {});
+        sums.assign(d, 0.0);
+        for (int i = 0; i < n; ++i) {
+            members[group_of[i]].push_back(i);
+            sums[group_of[i]] += w[i];
+        }
+    }
+
+    void optimize_estimated() {
+        rebuild_members();
+
+        for (int round = 0; round < 160; ++round) {
+            bool changed = false;
+
+            for (int item = 0; item < n; ++item) {
+                int from = group_of[item];
+                if ((int)members[from].size() <= 1) continue;
+
+                int best_to = from;
+                double best_delta = 0.0;
+
+                for (int to = 0; to < d; ++to) {
+                    if (to == from) continue;
+                    double a = sums[from], b = sums[to], x = w[item];
+                    double delta = (a - x) * (a - x) + (b + x) * (b + x)
+                                 - a * a - b * b;
+                    if (delta < best_delta) {
+                        best_delta = delta;
+                        best_to = to;
+                    }
+                }
+
+                if (best_to != from) {
+                    auto& src = members[from];
+                    auto it = find(src.begin(), src.end(), item);
+                    *it = src.back();
+                    src.pop_back();
+                    members[best_to].push_back(item);
+                    sums[from] -= w[item];
+                    sums[best_to] += w[item];
+                    group_of[item] = best_to;
+                    changed = true;
+                }
+            }
+
+            if (!changed) break;
+        }
+    }
+
+    vector<int> make_without(int g, int removed) const {
+        vector<int> result;
+        result.reserve(members[g].size());
+        for (int x : members[g]) {
+            if (x != removed) result.push_back(x);
+        }
+        return result;
+    }
+
+    void move_item(int item, int from, int to) {
+        auto& src = members[from];
+        auto it = find(src.begin(), src.end(), item);
+        *it = src.back();
+        src.pop_back();
+        members[to].push_back(item);
+        group_of[item] = to;
+        sums[from] -= w[item];
+        sums[to] += w[item];
+    }
+
+    void actual_repair(QueryBroker& broker, int repair_limit) {
+        int repair_start = broker.used;
+
+        while (broker.used < repair_start + repair_limit && broker.used < broker.q) {
+            vector<int> valid;
+            for (int g = 0; g < d; ++g) {
+                if (!members[g].empty()) valid.push_back(g);
+            }
+            if ((int)valid.size() < 2) break;
+
+            int a = valid[broker.used % valid.size()];
+            int b = valid[(broker.used * 7 + 3) % valid.size()];
+            if (a == b) b = valid[(b + 1) % valid.size()];
+            if (a == b) break;
+
+            char initial = broker.ask(members[a], members[b]);
+            if (initial == '=') continue;
+
+            int heavy = (initial == '>' ? a : b);
+            int light = (initial == '>' ? b : a);
+
+            if ((int)members[heavy].size() <= 1) continue;
+
+            vector<int> candidates = members[heavy];
+            sort(candidates.begin(), candidates.end(), [&](int x, int y) {
+                return w[x] < w[y];
+            });
+
+            int lo = 0, hi = (int)candidates.size() - 1;
+            int chosen = -1;
+
+            while (lo <= hi && broker.used < repair_start + repair_limit && broker.used < broker.q) {
+                int mid = (lo + hi) / 2;
+                int item = candidates[mid];
+
+                vector<int> left = make_without(heavy, item);
+                vector<int> right = members[light];
+                right.push_back(item);
+
+                char c = broker.ask(left, right);
+
+                if (c == '>') {
+                    lo = mid + 1;
+                } else {
+                    chosen = item;
+                    hi = mid - 1;
+                }
+            }
+
+            if (chosen != -1) {
+                move_item(chosen, heavy, light);
+            }
+        }
+    }
+};
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int N, D, Q;
+    cin >> N >> D >> Q;
+
+    uint64_t seed = chrono::steady_clock::now().time_since_epoch().count();
+    mt19937 rng((uint32_t)(seed ^ (seed >> 32)));
+
+    QueryBroker broker(N, Q);
+
+    int estimation_budget = max(1, (Q * 2) / 3);
+    RankEstimator estimator(N, estimation_budget, broker, rng);
+    vector<double> estimated_weights = estimator.build();
+
+    Partition partition(N, D, estimated_weights);
+    partition.initialize_greedy();
+    partition.optimize_estimated();
+
+    int remaining = Q - broker.used;
+    partition.actual_repair(broker, remaining);
+
+    while (broker.used < Q) {
+        broker.ask(vector<int>{0}, vector<int>{1});
+    }
+
+    for (int i = 0; i < N; ++i) {
+        if (i) cout << ' ';
+        cout << partition.group_of[i];
+    }
+    cout << endl;
+
+    return 0;
+}
+# EVOLVE-BLOCK-END

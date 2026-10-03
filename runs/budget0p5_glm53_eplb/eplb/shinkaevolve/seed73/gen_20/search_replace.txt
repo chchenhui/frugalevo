@@ -1,0 +1,51 @@
+<NAME>
+cap_replica_spread</NAME>
+<DESCRIPTION>
+The current `replicate_experts` uses a pure greedy argmax loop that gives replica after replica to the currently-highest-load expert (by weight/count). This produces extreme replica-count spreads (one hot expert gets most of the redundant budget, most experts stay at 1), which hurts the expert balancedness score (0.25) and leaves the packing step with highly skewed per-replica loads. To improve balance, cap the maximum replica count per logical expert at `num_redundant // 2 + 1` (but never below the feasibility floor `ceil(num_phy / num_log)`, so the full physical budget can always be allocated). Once an expert hits the cap it is excluded from further selection, so excess replicas are spread to the next-highest-load experts instead of piling onto one expert. This keeps all counts within a bounded range, so the downstream `phy2log * maxlogcnt + phyrank` scatter invariant (the full-budget `maxlogcnt = num_redundant + 1` used in `rebalance_experts`) still comfortably holds: with the cap, the maximum observed rank is strictly smaller, so no out-of-bounds scatter can occur. The change adds only a `torch.where` mask per iteration, so runtime is unchanged (same O(num_redundant) vectorized iterations).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+=======
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    # Cap the replica count per logical expert to avoid extreme spreads where
+    # a single hot expert absorbs most of the redundant budget. The cap is
+    # never below the feasibility floor ceil(num_phy / num_log), so the full
+    # physical budget can always be allocated.
+    feasibility_cap = -(-num_phy // num_log)  # ceil division
+    maxlogcnt = max(num_redundant // 2 + 1, feasibility_cap)
+    neg_inf = float("-inf")
+    for i in range(num_log, num_phy):
+        eff = weight / logcnt
+        # exclude experts that reached the replica cap
+        eff = torch.where(logcnt >= maxlogcnt,
+                          torch.full_like(eff, neg_inf), eff)
+        redundant_indices = eff.max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+>>>>>>> REPLACE
+</DIFF>

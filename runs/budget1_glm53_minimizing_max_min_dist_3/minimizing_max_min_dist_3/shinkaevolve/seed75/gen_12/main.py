@@ -1,0 +1,113 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    n, d = 14, 3
+    iu = np.triu_indices(n, 1)
+
+    def pairwise(p):
+        diffs = p[:, None, :] - p[None, :, :]
+        dm = np.sqrt((diffs * diffs).sum(-1))
+        return diffs, dm
+
+    def ratio(p):
+        dd = pairwise(p)[1][iu]
+        return dd.min() / dd.max()
+
+    def run(p0, iters, tau0, tau1, lr0):
+        """Adam ascent on J = softmin(d) / softmax(d), a smooth surrogate of
+        the true objective dmin/dmax, with annealed temperature tau."""
+        p = p0.copy()
+        p -= p.mean(0)
+        p /= np.sqrt((p * p).sum() / n)  # fix overall scale (scale invariance)
+        best_p, best_r = p.copy(), ratio(p)
+        m = np.zeros((n, d))
+        v = np.zeros((n, d))
+        b1, b2, eps = 0.9, 0.999, 1e-8
+        for it in range(iters):
+            frac = it / max(iters - 1, 1)
+            tau = tau0 * (tau1 / tau0) ** frac
+            lr = lr0 * (1.0 - 0.95 * frac)
+
+            diffs, dm = pairwise(p)
+            dd = dm[iu]
+            dmin, dmax = dd.min(), dd.max()
+
+            # numerically-stable softmin (A) and softmax (B) of the distances
+            ew = np.exp(-(dd - dmin) / tau)
+            A = dmin - tau * np.log(ew.sum())
+            eu = np.exp((dd - dmax) / tau)
+            B = dmax + tau * np.log(eu.sum())
+            J = A / max(B, 1e-9)
+
+            w = ew / ew.sum()          # dA/d dd  (weight on short pairs)
+            u = eu / eu.sum()          # dB/d dd  (weight on long pairs)
+            cpair = (w - J * u) / max(B, 1e-9)  # dJ/d dd
+
+            C = np.zeros((n, n))
+            C[iu] = cpair
+            C += C.T
+            inv = 1.0 / np.maximum(dm, 1e-9)
+            grad = np.einsum("ij,ijk->ik", C, diffs * inv[..., None])
+            grad -= grad.mean(0, keepdims=True)  # remove translation drift
+
+            # Adam ascent step (clipped)
+            m = b1 * m + (1 - b1) * grad
+            v = b2 * v + (1 - b2) * grad * grad
+            mh = m / (1 - b1 ** (it + 1))
+            vh = v / (1 - b2 ** (it + 1))
+            step = lr * mh / (np.sqrt(vh) + eps)
+            sn = np.linalg.norm(step, axis=1, keepdims=True)
+            mx = sn.max()
+            if mx > 0.25:
+                step *= 0.25 / mx
+            p = p + step
+            p -= p.mean(0)
+            p /= np.sqrt((p * p).sum() / n)
+
+            # track the true (non-smooth) objective
+            r = ratio(p)
+            if r > best_r:
+                best_r = r
+                best_p = p.copy()
+        return best_p, best_r
+
+    # multi-start: 10 random inits + structured two-ring heptagon start
+    inits = []
+    for s in range(10):
+        inits.append(np.random.default_rng(100 + s).normal(size=(n, d)))
+    ang = 2 * np.pi * np.arange(7) / 7.0
+    ring = np.stack([np.cos(ang), np.sin(ang)], axis=1)
+    ang2 = ang + np.pi / 7.0
+    ring2 = np.stack([np.cos(ang2), np.sin(ang2)], axis=1)
+    h = 0.45
+    two_rings = np.vstack([
+        np.column_stack([ring, np.full(7, h)]),
+        np.column_stack([ring2, np.full(7, -h)]),
+    ])
+    two_rings += 0.05 * np.random.default_rng(7).normal(size=(n, d))
+    inits.append(two_rings)
+
+    best_pts, best_r = None, -1.0
+    for p0 in inits:
+        p, r = run(p0, 2200, 0.15, 0.012, 0.05)
+        if r > best_r:
+            best_r = r
+            best_pts = p
+
+    # deterministic polish of the best candidate with a sharper surrogate
+    for _ in range(2):
+        p, r = run(best_pts, 500, 0.01, 0.004, 0.01)
+        if r > best_r:
+            best_r = r
+            best_pts = p
+
+    # rescale so max pairwise distance is 1
+    dm = pairwise(best_pts)[1]
+    scale = dm[iu].max()
+    best_pts = best_pts / scale
+    return np.asarray(best_pts, dtype=float)
+
+
+# EVOLVE-BLOCK-END

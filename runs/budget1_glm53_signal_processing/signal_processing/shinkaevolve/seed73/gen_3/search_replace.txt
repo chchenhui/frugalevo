@@ -1,0 +1,120 @@
+<NAME>
+zero_phase_adaptive_kalman_filter</NAME>
+<DESCRIPTION>
+Replace the simple exponential weighted moving average with an adaptive two-pass filter combining (1) a fast Savitzky-Golay style local polynomial fit for zero-phase (forward-backward) smoothing that preserves slope/trend, (2) adaptive noise estimation via median absolute deviation to auto-tune smoothing strength, and (3) a robust trend-consistency step that suppresses spurious slope reversals. The key improvements: moving average introduces group delay ~W/2 causing high lag_error (0.38) and false reversals (175.4); a locally-fitted polynomial evaluated at the window center has near-zero phase delay and preserves polynomial trends exactly, dramatically improving lag_error, slope_changes, false_reversals, and correlation simultaneously. Computation is O(N*W) with vectorized numpy convolution for efficiency.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Enhanced version with trend preservation using weighted moving average.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window
+
+    Returns:
+        y: Filtered output signal
+    """
+    if len(x) < window_size:
+        raise ValueError(f"Input signal length ({len(x)}) must be >= window_size ({window_size})")
+
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+    # Create weights that emphasize recent samples
+    weights = np.exp(np.linspace(-2, 0, window_size))
+    weights = weights / np.sum(weights)
+
+    for i in range(output_length):
+        window = x[i : i + window_size]
+
+        # Weighted moving average with exponential weights
+        y[i] = np.sum(window * weights)
+
+    return y
+=======
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Enhanced version with trend preservation using a zero-phase local polynomial
+    (Savitzky-Golay style) filter with adaptive noise estimation.
+
+    A locally fitted polynomial evaluated at the window center has zero group
+    delay, preserves linear trends exactly, and strongly suppresses spurious
+    slope reversals compared to a moving average.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window
+
+    Returns:
+        y: Filtered output signal
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < window_size:
+        raise ValueError(f"Input signal length ({n}) must be >= window_size ({window_size})")
+
+    # Make window odd so there is an exact center sample
+    W = window_size if window_size % 2 == 1 else window_size - 1
+    if W < 5:
+        W = 5
+    half = W // 2
+    poly_order = min(3, W - 1)  # cubic local fit captures dynamics well
+
+    # --- Savitzky-Golay smoothing coefficients (centered, zero phase) ---
+    # Fit polynomial of `poly_order` over offsets [-half, ..., half],
+    # evaluate at offset 0 and at +/-1 to get smoothed slope estimates.
+    offsets = np.arange(-half, half + 1, dtype=float)
+    V = np.vander(offsets, poly_order + 1, increasing=True)  # shape (W, p+1)
+    # Solve for the coefficient extraction rows: c = pinv(V) @ evaluation points
+    Vinv = np.linalg.pinv(V)
+    # Evaluation at offset t: row = [1, t, t^2, ...]
+    eval_center = np.array([0.0 ** k for k in range(poly_order + 1)])
+    eval_plus1 = np.array([1.0 ** k for k in range(poly_order + 1)])
+    eval_minus1 = np.array([(-1.0) ** k for k in range(poly_order + 1)])
+
+    h_center = Vinv @ eval_center   # smoothing kernel (center value)
+    h_plus1 = Vinv @ eval_plus1     # forward extrapolated value at +1
+    h_minus1 = Vinv @ eval_minus1   # backward value at -1
+
+    # --- Pad edges reflectively to keep output length == n (no lag cropping) ---
+    left_pad = x[half : 0 : -1].copy()
+    right_pad = x[-2 : n - half - 2 : -1].copy()
+    xp = np.concatenate((left_pad, x, right_pad))
+
+    # Zero-phase smoothed signal (centered evaluation: no group delay)
+    y_full = np.convolve(xp, h_center[::-1], mode="valid")
+
+    # --- Adaptive noise estimate via MAD of first differences ---
+    # sigma_noise robustly estimates high-frequency noise power
+    d = np.diff(x)
+    sigma_noise = 1.4826 * np.median(np.abs(d - np.median(d))) / np.sqrt(2.0)
+    sigma_noise = max(sigma_noise, 1e-12)
+
+    # --- Trend-consistency pass: suppress spurious slope reversals ---
+    # Estimated local slope from the polynomial fit (centered difference of
+    # the fitted values at +/-1 offsets), compared against noise-driven
+    # slope uncertainty. If slope change is not significant relative to
+    # noise, keep previous direction to avoid false reversals.
+    y_plus = np.convolve(xp, h_plus1[::-1], mode="valid")
+    y_minus = np.convolve(xp, h_minus1[::-1], mode="valid")
+    slope = 0.5 * (y_plus - y_minus)  # smoothed local slope estimate
+
+    # Slope uncertainty scales with noise and shrinks with window size
+    slope_thresh = 1.5 * sigma_noise / np.sqrt(W)
+    y = y_full.copy()
+
+    # Regularize slopes: where slope is below significance threshold,
+    # blend towards local smoothing (avoids noise-induced direction flips)
+    weak = np.abs(slope) < slope_thresh
+    # Blend factor: strong trends keep full dynamics, weak ones get extra smoothing
+    alpha = np.clip(np.abs(slope) / (slope_thresh + 1e-12), 0.0, 1.0)
+    # Extra-smoothed estimate: longer moving average of the zero-phase signal
+    extra = np.convolve(y_full, np.ones(W) / W, mode="same")
+    blend = np.where(weak, 0.5 + 0.5 * alpha, 1.0)
+    y = blend * y_full + (1.0 - blend) * extra
+
+    return y
+>>>>>>> REPLACE
+</DIFF>

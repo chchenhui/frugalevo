@@ -1,0 +1,164 @@
+# EVOLVE-BLOCK-START
+import time
+import math
+import numpy as np
+from itertools import combinations
+
+_TRI_AREA = np.sqrt(3.0) / 4.0
+_TRIPLETS = np.array(list(combinations(range(11), 3)), dtype=int)
+_H = np.sqrt(3.0) / 2.0
+_S3 = np.sqrt(3.0)
+
+
+def _min_area_idx(points: np.ndarray):
+    """Return (min_normalized_area, triplet_index)."""
+    idx = _TRIPLETS
+    p = points[idx]
+    a = (p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) - \
+        (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0])
+    j = np.argmin(np.abs(a))
+    return abs(a[j]) / (2.0 * _TRI_AREA), j
+
+
+def _min_area(points: np.ndarray) -> float:
+    return _min_area_idx(points)[0]
+
+
+def _project(pt):
+    """Project a point into the triangle via barycentric clamping."""
+    x, y = float(pt[0]), float(pt[1])
+    # barycentric w.r.t. (0,0),(1,0),(0.5,h)
+    l3 = y / (2.0 * _H)
+    l2 = x - 0.5 * y / _H
+    l1 = 1.0 - l2 - l3
+    if l1 < 0.0:
+        l1 = 0.0
+    if l2 < 0.0:
+        l2 = 0.0
+    if l3 < 0.0:
+        l3 = 0.0
+    s = l1 + l2 + l3
+    l1, l2, l3 = l1 / s, l2 / s, l3 / s
+    return (l2 + 0.5 * l3, 2.0 * _H * l3)
+
+
+def _seed_vertex_edge():
+    pts = np.zeros((11, 2))
+    pts[0] = (0.0, 0.0)
+    pts[1] = (1.0, 0.0)
+    pts[2] = (0.5, _H)
+    pts[3] = (0.5, 0.0)
+    pts[4] = (0.25, _H / 2)
+    pts[5] = (0.75, _H / 2)
+    # edge midpoints of the three small corner triangles
+    pts[6] = (0.5, 0.0)
+    pts[7] = (0.25, 0.0)
+    pts[8] = (0.125, _H / 4)
+    pts[9] = (0.625, _H / 4)
+    pts[10] = (0.375, 3 * _H / 4)
+    return pts
+
+
+def _seed_ring():
+    """Hexagonal-ring inspired: points on a ring rotated 30 deg + vertices."""
+    pts = np.zeros((11, 2))
+    pts[0] = (0.0, 0.0)
+    pts[1] = (1.0, 0.0)
+    pts[2] = (0.5, _H)
+    cx, cy = 0.5, _H / 3.0
+    for k in range(6):
+        th = math.pi / 6.0 + k * math.pi / 3.0
+        r = 0.42
+        pts[3 + k] = _project((cx + r * math.cos(th) * 0.9,
+                               cy + r * math.sin(th) * 0.9))
+    pts[9] = (0.5, 0.0)
+    pts[10] = (0.5, _H * 0.85)
+    return pts
+
+
+def _seed_boundary_heavy():
+    pts = np.zeros((11, 2))
+    pts[0] = (0.0, 0.0)
+    pts[1] = (1.0, 0.0)
+    pts[2] = (0.5, _H)
+    # 4 more on edges
+    pts[3] = (1 / 3, 0.0)
+    pts[4] = (2 / 3, 0.0)
+    t = 1 / 3
+    pts[5] = (t * 0.5, t * _H)
+    t = 2 / 3
+    pts[6] = (1 - t * 0.5, t * _H)
+    # 4 interior
+    pts[7] = (0.5, _H / 3)
+    pts[8] = (0.30, _H * 0.55)
+    pts[9] = (0.70, _H * 0.55)
+    pts[10] = (0.5, _H * 0.18)
+    return pts
+
+
+def _refine(pts, rng, deadline, step0=0.02):
+    """Targeted local search: perturb a point of the minimal triangle."""
+    cur = pts.copy()
+    cur_val, j = _min_area_idx(cur)
+    best, best_val = cur.copy(), cur_val
+    step = step0
+    fails = 0
+    it = 0
+    while time.time() < deadline:
+        it += 1
+        tri = _TRIPLETS[j]
+        i = tri[rng.integers(3)]
+        # also occasionally move a neighbor point to break ties
+        cand = cur.copy()
+        cand[i] = _project(cand[i] + rng.normal(0.0, step, size=2))
+        v, jj = _min_area_idx(cand)
+        if v >= cur_val - 1e-15:
+            cur, cur_val, j = cand, v, jj
+            if v > best_val:
+                best, best_val = cand.copy(), v
+            fails = 0
+        else:
+            fails += 1
+            if fails > 60:
+                fails = 0
+                step *= 0.65
+                if step < 1e-4:
+                    # restart from best with fresh step
+                    cur = best.copy()
+                    cur_val, j = _min_area_idx(cur)
+                    step = step0 * 0.5
+                # small Metropolis kick
+                elif rng.random() < 0.3:
+                    cur, cur_val, j = cand, v, jj
+    return best, best_val
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """Construct 11 points maximizing the minimum triangle area."""
+    try:
+        rng = np.random.default_rng(20240917)
+        seeds = [_seed_vertex_edge(), _seed_ring(), _seed_boundary_heavy()]
+        # two-stage screening: short refinement per seed
+        t0 = time.time()
+        screen_deadline = t0 + 0.60
+        screened = []
+        for k, s in enumerate(seeds):
+            dl = min(t0 + 0.20 * (k + 1), t0 + 0.60)
+            screened.append(_refine(s, rng, dl, step0=0.02))
+        screened.sort(key=lambda x: -x[1])
+        # full refinement on top 2
+        t1 = time.time()
+        best_pts, best_val = screened[0]
+        for k in range(2):
+            if time.time() > t1 + 1.9:
+                break
+            dl = t1 + 0.95 * (k + 1)
+            p, v = _refine(screened[k][0], rng, dl, step0=0.01)
+            if v > best_val:
+                best_pts, best_val = p, v
+        return best_pts
+    except Exception:
+        return _seed_vertex_edge()
+
+
+# EVOLVE-BLOCK-END

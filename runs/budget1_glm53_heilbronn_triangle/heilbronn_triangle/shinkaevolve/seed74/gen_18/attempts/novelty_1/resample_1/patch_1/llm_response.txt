@@ -1,0 +1,295 @@
+<NAME>
+fast_barycentric_incremental_sa
+</NAME>
+<DESCRIPTION>
+The current version is both slow (10.6s: full O(n^3) area recomputation plus a Python-loop projection every step) and weak (0.38). Key improvements:
+
+1. **Barycentric coordinates**: work in (u,v) simplex coords (u≥0, v≥0, u+v≤1). Projection is a two-line vectorized clamp, and the affine map to the equilateral triangle is exact — no slow per-point edge/vertex closest-point search.
+2. **Incremental scoring**: precompute the 165 triplet index list once. When one point moves, only the C(10,2)=45 triplets containing that point change; update just those areas with a small vectorized op instead of all 165 each of 24k iterations.
+3. **Anisotropic randomized directions**: per the recommendation, use random directional moves (random unit direction, multiple step scales per sweep) plus random jitter, regenerated each iteration — this squeezes through asymmetric gaps better than a fixed fan.
+4. **Multi-restart with greedy polish**: try several deterministic seeds (vertices + spread interior layouts), anneal each briefly, then greedily polish the best with decreasing scales. Keep a static feasible fallback for error safety.
+
+This should raise min_area_normalized well above 0.02 while cutting runtime to ~1–2s.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _in_triangle(pts):
+    """Project points back inside the equilateral triangle (barycentric clamp)."""
+    A = np.array([0.0, 0.0])
+    B = np.array([1.0, 0.0])
+    C = np.array([0.5, np.sqrt(3.0) / 2.0])
+    out = np.empty_like(pts)
+    for i, p in enumerate(pts):
+        best = None
+        best_d = np.inf
+        # vertices
+        for v in (A, B, C):
+            d = np.dot(p - v, p - v)
+            if d < best_d:
+                best_d, best = d, v
+        out[i] = p
+        # clamp to each edge
+        for U, V in ((A, B), (B, C), (C, A)):
+            e = V - U
+            t = np.dot(p - U, e) / np.dot(e, e)
+            t = max(0.0, min(1.0, t))
+            q = U + t * e
+            d = np.dot(p - q, p - q)
+            if d < best_d and d > 0:
+                best_d, best = d, q
+        # if inside triangle, keep as is; else take closest boundary point
+        # check inside via barycentric
+        v0, v1, v2 = B - A, C - A, p - A
+        d00 = np.dot(v0, v0); d01 = np.dot(v0, v1); d11 = np.dot(v1, v1)
+        d20 = np.dot(v2, v0); d21 = np.dot(v2, v1)
+        den = d00 * d11 - d01 * d01
+        u = (d11 * d20 - d01 * d21) / den
+        v = (d00 * d21 - d01 * d20) / den
+        if u >= 0 and v >= 0 and u + v <= 1:
+            out[i] = p
+        else:
+            out[i] = best
+    return out
+=======
+_SQRT3 = np.sqrt(3.0)
+
+
+def _to_xy(b):
+    """Map barycentric simplex coords (u,v) to the equilateral triangle."""
+    b = np.asarray(b, dtype=float)
+    return np.column_stack([b[:, 0] + 0.5 * b[:, 1],
+                            0.5 * _SQRT3 * b[:, 1]])
+
+
+def _project(b):
+    """Vectorized clamp onto simplex u>=0, v>=0, u+v<=1."""
+    b = np.clip(b, 0.0, 1.0)
+    s = b.sum(axis=1, keepdims=True)
+    over = s > 1.0
+    if np.any(over):
+        b = np.where(over, b * (1.0 - 1e-9) / np.maximum(s, 1e-12), b)
+    return b
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def _min_area(pts):
+    """Vectorized minimum absolute triangle area over all triplets."""
+    tri = np.array(list(combinations(range(len(pts)), 3)))
+    a = pts[tri[:, 0]]
+    b = pts[tri[:, 1]]
+    c = pts[tri[:, 2]]
+    areas = 0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+                         (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+    return areas.min()
+=======
+def _min_area(pts):
+    """Vectorized minimum absolute triangle area over all triplets."""
+    tri = np.array(list(combinations(range(len(pts)), 3)))
+    a = pts[tri[:, 0]]
+    b = pts[tri[:, 1]]
+    c = pts[tri[:, 2]]
+    areas = 0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+                         (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+    return areas.min()
+
+
+def _all_areas_xy(xy, tri):
+    a, b, c = xy[tri[:, 0]], xy[tri[:, 1]], xy[tri[:, 2]]
+    return 0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+                       (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+
+
+def _seed_layouts():
+    """Several deterministic barycentric seed configurations."""
+    seeds = []
+    # 1: three vertices + evenly spread interior lattice
+    seeds.append(np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+        [0.5, 0.0], [0.25, 0.25], [0.0, 0.5],
+        [0.5, 0.5], [0.25, 0.0], [0.0, 0.25],
+        [0.5, 0.25], [0.25, 0.5],
+    ]))
+    # 2: vertices + jittered centroidal ring
+    rng = np.random.default_rng(3)
+    s = 0.15 + 0.7 * rng.random((11, 2))
+    s = _project(s)
+    s[:3] = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    seeds.append(s)
+    # 3: hexagonal-ish interior rings (barycentric)
+    s = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    for r, k in ((0.45, 4), (0.25, 4)):
+        for j in range(k):
+            ang = 2.0 * np.pi * j / k + 0.35
+            s = np.vstack([s, [0.33 + r * np.cos(ang) * 0.5,
+                               0.33 + r * np.sin(ang) * 0.5]])
+    seeds.append(_project(s[:11]))
+    return seeds
+
+
+def _anneal(b, tri, rng, iters=6000, t0=0.010, scales=(0.03, 0.01, 0.003)):
+    """Anneal with incremental area updates: only triplets containing the
+    moved point are recomputed. Random directions, multiple step scales."""
+    n = b.shape[0]
+    b = _project(b.copy())
+    xy = _to_xy(b)
+    areas = _all_areas_xy(xy, tri)
+    cur = areas.min()
+    best_b, best = b.copy(), cur
+
+    # precompute, for each point index, the triplets containing it
+    contains = []
+    for i in range(n):
+        mask = (tri[:, 0] == i) | (tri[:, 1] == i) | (tri[:, 2] == i)
+        contains.append((tri[mask], np.nonzero(mask)[0]))
+
+    for it in range(iters):
+        T = t0 * (1.0 - it / iters) + 1e-6
+        i = int(rng.integers(0, n))
+        sub_tri, sub_idx = contains[i]
+        # try a few random directions/scales per sweep
+        accepted = False
+        order = rng.permutation(len(scales))
+        for s_i in order:
+            scale = scales[s_i]
+            d = rng.normal(0.0, 1.0, 2)
+            d /= (np.linalg.norm(d) + 1e-12)
+            if rng.random() < 0.3:
+                d = rng.normal(0.0, 1.0, 2)  # per-coordinate jitter
+            cand = b.copy()
+            cand[i] += scale * d
+            cand = _project(cand)
+            cxy = _to_xy(cand)
+            new_areas = areas.copy()
+            a, bb, c = cxy[sub_tri[:, 0]], cxy[sub_tri[:, 1]], cxy[sub_tri[:, 2]]
+            new_areas[sub_idx] = 0.5 * np.abs(
+                (bb[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+                (bb[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+            val = new_areas.min()
+            if val >= cur or rng.random() < np.exp(min(0.0, (val - cur)) / (T * 1e-3 + 1e-12)):
+                b, areas, cur = cand, new_areas, val
+                accepted = True
+                if val > best:
+                    best, best_b = val, b.copy()
+                break
+        if accepted and cur < best - 1e-15:
+            pass
+    return best_b, best
+
+
+def _polish(b, tri, rng, iters=4000):
+    """Greedy polish with shrinking random-direction steps."""
+    n = b.shape[0]
+    b = _project(b.copy())
+    areas = _all_areas_xy(_to_xy(b), tri)
+    cur = areas.min()
+    contains = []
+    for i in range(n):
+        mask = (tri[:, 0] == i) | (tri[:, 1] == i) | (tri[:, 2] == i)
+        contains.append((tri[mask], np.nonzero(mask)[0]))
+    best, best_b = cur, b.copy()
+    for it in range(iters):
+        scale = 0.004 * (1.0 - it / iters) + 1e-4
+        i = int(rng.integers(0, n))
+        sub_tri, sub_idx = contains[i]
+        done = False
+        for _ in range(3):
+            d = rng.normal(0.0, 1.0, 2)
+            d /= (np.linalg.norm(d) + 1e-12)
+            cand = b.copy()
+            cand[i] += scale * d
+            cand = _project(cand)
+            cxy = _to_xy(cand)
+            new_areas = areas.copy()
+            a, bb, c = cxy[sub_tri[:, 0]], cxy[sub_tri[:, 1]], cxy[sub_tri[:, 2]]
+            new_areas[sub_idx] = 0.5 * np.abs(
+                (bb[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+                (bb[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+            val = new_areas.min()
+            if val > cur + 1e-14:
+                b, areas, cur = cand, new_areas, val
+                if val > best:
+                    best, best_b = val, b.copy()
+                done = True
+                break
+        if not done:
+            continue
+    return best_b, best
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def heilbronn_triangle11() -> np.ndarray:
+    n = 11
+    h = np.sqrt(3.0) / 2.0
+
+    # Structured initial layout: 3 vertices + ring of points inside
+    pts = [np.array([0.0, 0.0]), np.array([1.0, 0.0]), np.array([0.5, h])]
+    # add interior points on two concentric hexagonal-ish rings
+    for r, k in ((0.45, 3), (0.22, 5)):
+        for j in range(k):
+            ang = 2.0 * np.pi * j / k + (0.3 if r < 0.4 else 0.0)
+            x = 0.5 + r * np.cos(ang) * 0.6
+            y = h / 3.0 + r * np.sin(ang) * 0.6
+            pts.append(np.array([x, y]))
+    pts = _in_triangle(np.array(pts))
+
+    rng = np.random.default_rng(20240611)
+    cur = _min_area(pts)
+    T = 0.01
+    best_pts = pts.copy()
+    best = cur
+    for it in range(20000):
+        T = 0.01 * (1.0 - it / 20000.0) + 1e-5
+        i = rng.integers(0, n)
+        step = T * rng.normal(0, 1, 2)
+        cand = pts.copy()
+        cand[i] += step
+        cand = _in_triangle(cand)
+        val = _min_area(cand)
+        if val >= cur or rng.random() < np.exp((val - cur) / (T * 1e-3)):
+            pts, cur = cand, val
+            if val > best:
+                best, best_pts = val, pts.copy()
+    # final greedy polish
+    pts = best_pts.copy()
+    cur = best
+    for it in range(4000):
+        i = rng.integers(0, n)
+        step = rng.normal(0, 0.002, 2)
+        cand = pts.copy()
+        cand[i] += step
+        cand = _in_triangle(cand)
+        val = _min_area(cand)
+        if val > cur:
+            pts, cur = cand, val
+    return pts
+=======
+def heilbronn_triangle11() -> np.ndarray:
+    n = 11
+    tri = np.array(list(combinations(range(n), 3)))
+
+    best_b, best_val = None, -1.0
+    try:
+        for si, seed in enumerate(_seed_layouts()):
+            rng = np.random.default_rng(20240611 + 101 * si)
+            b, val = _anneal(seed, tri, rng)
+            b, val = _polish(b, tri, rng)
+            if val > best_val:
+                best_val, best_b = val, b
+        # extra polish rounds on the winner with fresh randomness
+        rng = np.random.default_rng(777)
+        for _ in range(3):
+            best_b, v = _polish(best_b, tri, rng)
+            best_val = max(best_val, v)
+    except Exception:
+        best_b = None
+
+    if best_b is None or not np.all(np.isfinite(_to_xy(best_b))):
+        # static feasible fallback
+        best_b = _seed_layouts()[0]
+
+    return np.ascontiguousarray(_to_xy(_project(best_b)), dtype=float)
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

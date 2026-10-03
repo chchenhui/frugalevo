@@ -1,0 +1,404 @@
+--- a/original.py
++++ b/original.py
+@@ -1,222 +1,214 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+-def _triangle_indices(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+-    return np.triu_indices(n, 1)[0], np.array(
+-        [k for i in range(n) for j in range(i + 1, n) for k in range(j + 1, n)],
+-        dtype=np.intp,
+-    ), np.array(
+-        [j for i in range(n) for j in range(i + 1, n) for _ in range(j + 1, n)],
+-        dtype=np.intp,
++def _triangle_arrays(n: int = 13) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++    ia, ib, ic = [], [], []
++    for i in range(n - 2):
++        for j in range(i + 1, n - 1):
++            for k in range(j + 1, n):
++                ia.append(i)
++                ib.append(j)
++                ic.append(k)
++    return (
++        np.asarray(ia, dtype=np.intp),
++        np.asarray(ib, dtype=np.intp),
++        np.asarray(ic, dtype=np.intp),
+     )
+ 
+ 
+-def _all_triangle_areas(points: np.ndarray,
+-                        ia: np.ndarray,
+-                        ib: np.ndarray,
+-                        ic: np.ndarray) -> np.ndarray:
+-    """Triangle areas for either (n,2) or (batch,n,2) arrays."""
++def _areas(points: np.ndarray,
++           ia: np.ndarray,
++           ib: np.ndarray,
++           ic: np.ndarray) -> np.ndarray:
+     a = points[..., ia, :]
+     b = points[..., ib, :]
+     c = points[..., ic, :]
+     return 0.5 * np.abs(
+         (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
+         - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
+     )
+ 
+ 
+-def _convex_hull_area(points: np.ndarray) -> float:
+-    """Monotone-chain convex hull area for the small fixed n=13 case."""
+-    pts = sorted((float(x), float(y)) for x, y in points)
+-
+-    def cross(o, a, b):
+-        return ((a[0] - o[0]) * (b[1] - o[1])
+-                - (a[1] - o[1]) * (b[0] - o[0]))
+-
+-    lower = []
+-    for p in pts:
+-        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0.0:
+-            lower.pop()
+-        lower.append(p)
+-
+-    upper = []
+-    for p in reversed(pts):
+-        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0.0:
+-            upper.pop()
+-        upper.append(p)
+-
+-    hull = lower[:-1] + upper[:-1]
+-    if len(hull) < 3:
+-        return 0.0
+-
+-    area2 = 0.0
+-    for i, p in enumerate(hull):
+-        q = hull[(i + 1) % len(hull)]
+-        area2 += p[0] * q[1] - p[1] * q[0]
+-    return abs(area2) * 0.5
+-
+-
+-def _normalized_signature(points: np.ndarray,
+-                          ia: np.ndarray,
+-                          ib: np.ndarray,
+-                          ic: np.ndarray) -> tuple[float, float]:
+-    """
+-    Primary value is the requested affine-invariant minimum triangle area.
+-    The secondary lower-tail average stabilizes local search near ties.
+-    """
+-    hull_area = _convex_hull_area(points)
+-    if hull_area <= 1e-14:
+-        return -np.inf, -np.inf
+-
+-    values = np.sort(_all_triangle_areas(points, ia, ib, ic) / hull_area)
+-    return float(values[0]), float(np.mean(values[:12]))
++def _reflect_unit(x: np.ndarray) -> np.ndarray:
++    """Repeated reflection is robust to the occasional large DE donor."""
++    x = np.mod(x, 2.0)
++    return np.where(x > 1.0, 2.0 - x, x)
+ 
+ 
+ def heilbronn_convex13() -> np.ndarray:
+     """
+-    Deterministically construct 13 points in the unit square.
+-
+-    The unit square is a convex region of unit area.  The returned array has
+-    shape (13, 2), and all coordinates are finite values in [0, 1].
++    Deterministically construct thirteen points in the unit square.
++
++    The four fixed corners ensure that every returned configuration has
++    convex-hull area one.  Consequently raw triangle areas used internally
++    are exactly the requested hull-normalized triangle areas.
+     """
+     n = 13
+-    population_size = 160
+-    generations = 360
+-    rng = np.random.default_rng(20240513)
+-
+-    # Explicit triangle index lists, avoiding repeated combinations creation.
+-    ia = []
+-    ib = []
+-    ic = []
+-    for i in range(n - 2):
+-        for j in range(i + 1, n - 1):
+-            for k in range(j + 1, n):
+-                ia.append(i)
+-                ib.append(j)
+-                ic.append(k)
+-    ia = np.asarray(ia, dtype=np.intp)
+-    ib = np.asarray(ib, dtype=np.intp)
+-    ic = np.asarray(ic, dtype=np.intp)
+-
+-    # Stratified starts give much better initial separation than iid points.
+-    cells = np.array([(x, y) for y in range(4) for x in range(4)], dtype=float)
++    free_count = 9
++    population_size = 192
++    generations = 460
++    rng = np.random.default_rng(13031957)
++
++    ia, ib, ic = _triangle_arrays(n)
++    corners = np.array(
++        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
++        dtype=float,
++    )
++
++    # Nine-cell stratification gives each initial candidate broad coverage
++    # without introducing exact grid collinearities.
++    cells = np.array([(x, y) for y in range(3) for x in range(3)],
++                     dtype=float)
+     population = np.empty((population_size, n, 2), dtype=float)
+-    for m in range(population_size):
+-        chosen = rng.permutation(16)[:n]
+-        jitter = rng.uniform(0.12, 0.88, size=(n, 2))
+-        population[m] = (cells[chosen] + jitter) / 4.0
+-
+-    # A minority of independent starts maintains global diversity.
+-    population[-population_size // 4:] = rng.random(
+-        (population_size // 4, n, 2)
+-    )
+-
+-    def batch_score(configs: np.ndarray) -> np.ndarray:
+-        areas = _all_triangle_areas(configs, ia, ib, ic)
+-        smallest = np.partition(areas, 11, axis=1)[:, :12]
+-        # The minimum dominates, while the lower tail prevents one-triangle
+-        # improvements that create many almost-degenerate triples.
+-        return smallest[:, 0] + 0.16 * np.mean(smallest, axis=1)
+-
+-    scores = batch_score(population)
+-
+-    # Vectorized differential evolution: broad global search with no scipy
+-    # dependency and deterministic pseudo-random choices.
++    population[:, :4] = corners
++    for p in range(population_size):
++        permutation = rng.permutation(9)
++        jitter = rng.uniform(0.11, 0.89, size=(free_count, 2))
++        population[p, 4:] = (cells[permutation] + jitter) / 3.0
++
++    # Independent starts prevent excessive bias toward a perturbed lattice.
++    random_count = population_size // 4
++    population[-random_count:, 4:] = rng.random((random_count, free_count, 2))
++
++    def signature_batch(configs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++        values = _areas(configs, ia, ib, ic)
++        low = np.partition(values, 19, axis=1)[:, :20]
++        return low[:, 0], np.mean(low, axis=1)
++
++    def surrogate(configs: np.ndarray) -> np.ndarray:
++        minimum, tail = signature_batch(configs)
++        # The small tail term supplies useful gradients among tied minima,
++        # but is intentionally much weaker than in the preceding program.
++        return minimum + 0.075 * tail
++
++    scores = surrogate(population)
++
++    # Current-to-elite differential evolution is less disruptive than
++    # rand/1 for this small, highly constrained maximin problem.
+     for generation in range(generations):
+-        order = np.argsort(scores)
+-        elite_count = 10
+-        elites = population[order[-elite_count:]].copy()
+-
+-        r1 = rng.integers(0, population_size, size=population_size)
+-        r2 = rng.integers(0, population_size, size=population_size)
+-        r3 = rng.integers(0, population_size, size=population_size)
+-
+-        # Ensure useful donor diversity even if index draws coincide.
++        rank = np.argsort(scores)
++        elite_count = 12
++        elite_indices = rank[-elite_count:]
++        saved_elites = population[elite_indices].copy()
++        saved_scores = scores[elite_indices].copy()
++
++        pbest = elite_indices[rng.integers(elite_count, size=population_size)]
++        r1 = rng.integers(population_size, size=population_size)
++        r2 = rng.integers(population_size, size=population_size)
+         r2 = (r2 + (r2 == r1)) % population_size
+-        r3 = (r3 + (r3 == r1) + (r3 == r2)) % population_size
+-
+-        scale = 0.56 + 0.20 * (1.0 - generation / generations)
+-        donor = population[r1] + scale * (population[r2] - population[r3])
+-
+-        # Reflection rather than clipping avoids artificial piles on edges.
+-        donor = np.abs(donor)
+-        donor = np.where(donor > 1.0, 2.0 - donor, donor)
+-
+-        crossover = rng.random((population_size, n, 2)) < 0.72
+-        forced_coordinate = rng.integers(0, n * 2, size=population_size)
+-        crossover.reshape(population_size, -1)[
+-            np.arange(population_size), forced_coordinate
+-        ] = True
+-
+-        trial = np.where(crossover, donor, population)
+-        trial_scores = batch_score(trial)
+-        accept = trial_scores > scores
+-        population[accept] = trial[accept]
+-        scores[accept] = trial_scores[accept]
+-
+-        # Elitism protects rare high-quality maximin configurations.
++
++        progress = generation / float(generations - 1)
++        factor = 0.82 - 0.34 * progress
++        donor_free = (
++            population[:, 4:]
++            + factor * (population[pbest, 4:] - population[:, 4:])
++            + factor * (population[r1, 4:] - population[r2, 4:])
++        )
++        donor_free = _reflect_unit(donor_free)
++
++        trial = population.copy()
++        cross = rng.random((population_size, free_count, 2)) < (
++            0.91 - 0.13 * progress
++        )
++        force = rng.integers(free_count * 2, size=population_size)
++        cross.reshape(population_size, -1)[np.arange(population_size), force] = True
++        trial[:, 4:] = np.where(cross, donor_free, population[:, 4:])
++
++        trial_scores = surrogate(trial)
++        accepted = trial_scores >= scores
++        population[accepted] = trial[accepted]
++        scores[accepted] = trial_scores[accepted]
++
++        # Preserve the pre-generation elite exactly.
+         worst = np.argsort(scores)[:elite_count]
+-        population[worst] = elites
+-        scores[worst] = batch_score(elites)
+-
+-    # Select several finalists by the true normalized criterion.
+-    finalists = population[np.argsort(scores)[-12:]]
++        population[worst] = saved_elites
++        scores[worst] = saved_scores
++
++        # A small deterministic immigration event in the early global phase.
++        if generation in (105, 205):
++            worst = np.argsort(scores)[:population_size // 10]
++            for row in worst:
++                perm = rng.permutation(9)
++                jitter = rng.uniform(0.08, 0.92, size=(free_count, 2))
++                population[row, :4] = corners
++                population[row, 4:] = (cells[perm] + jitter) / 3.0
++            scores[worst] = surrogate(population[worst])
++
++    # Choose finalists using the true primary objective, not merely surrogate.
++    mins, tails = signature_batch(population)
++    ordering = np.lexsort((tails, mins))
++    finalists = population[ordering[-10:]].copy()
++
+     best = finalists[0].copy()
+-    best_value, best_tail = _normalized_signature(best, ia, ib, ic)
+-
+-    for candidate in finalists:
+-        value, tail = _normalized_signature(candidate, ia, ib, ic)
+-        if value > best_value or (value == best_value and tail > best_tail):
+-            best = candidate.copy()
+-            best_value, best_tail = value, tail
+-
+-    # Local direct-search polish on the actual normalized objective.
+-    # Several restarts permit movement between distinct active-triangle sets.
+-    for start in finalists[-6:]:
++    best_min, best_tail = signature_batch(best[None, ...])
++    best_min = float(best_min[0])
++    best_tail = float(best_tail[0])
++
++    # Active-constraint batch polish.  Each batch supplies alternatives around
++    # points found in the currently worst triangles, avoiding slow blind moves.
++    for start_id, start in enumerate(finalists):
+         current = start.copy()
+-        current_value, current_tail = _normalized_signature(current, ia, ib, ic)
+-
+-        for step in range(2200):
+-            progress = step / 2199.0
+-            sigma = 0.055 * (1.0 - progress) ** 2 + 0.0012
+-
+-            proposal = current.copy()
+-            point_id = int(rng.integers(n))
+-            proposal[point_id] += rng.normal(0.0, sigma, size=2)
+-
+-            # Reflect at square boundaries.
+-            proposal = np.abs(proposal)
+-            proposal = np.where(proposal > 1.0, 2.0 - proposal, proposal)
+-
+-            value, tail = _normalized_signature(proposal, ia, ib, ic)
+-
+-            # Primarily maximize the requested metric; lower-tail tie-breaking
+-            # avoids unstable configurations with many near-active constraints.
+-            improved = (
+-                value > current_value + 1e-12
++        cur_min_arr, cur_tail_arr = signature_batch(current[None, ...])
++        cur_min = float(cur_min_arr[0])
++        cur_tail = float(cur_tail_arr[0])
++        cur_score = cur_min + 0.035 * cur_tail
++
++        for step in range(1550):
++            fraction = step / 1549.0
++            sigma = 0.038 * (1.0 - fraction) ** 1.65 + 0.00055
++            current_areas = _areas(current, ia, ib, ic)
++            active = np.argpartition(current_areas, 13)[:14]
++            active_points = np.unique(
++                np.concatenate((ia[active], ib[active], ic[active]))
++            )
++            active_free = active_points[active_points >= 4]
++            if active_free.size == 0:
++                active_free = np.arange(4, 13)
++
++            batch_size = 16
++            proposals = np.repeat(current[None, :, :], batch_size, axis=0)
++            for q in range(batch_size):
++                # Most proposals alter one active point; a minority jointly
++                # resolve two competing active constraints.
++                if q < 12:
++                    point_id = int(active_free[rng.integers(active_free.size)])
++                    proposals[q, point_id] += rng.normal(0.0, sigma, size=2)
++                else:
++                    ids = rng.choice(active_free,
++                                     size=min(2, active_free.size),
++                                     replace=False)
++                    proposals[q, ids] += rng.normal(
++                        0.0, sigma * 0.72, size=(len(ids), 2)
++                    )
++
++            proposals[:, 4:] = _reflect_unit(proposals[:, 4:])
++            prop_min, prop_tail = signature_batch(proposals)
++            prop_score = prop_min + 0.035 * prop_tail
++            chosen = int(np.argmax(prop_score))
++
++            # A small early tolerance allows changes of active constraint sets;
++            # final iterations are strict maximin hill climbing.
++            tolerance = 0.00010 * (1.0 - fraction) ** 2
++            if prop_score[chosen] >= cur_score - tolerance:
++                current = proposals[chosen]
++                cur_min = float(prop_min[chosen])
++                cur_tail = float(prop_tail[chosen])
++                cur_score = float(prop_score[chosen])
++
++            if (
++                cur_min > best_min + 1e-13
+                 or (
+-                    abs(value - current_value) <= 1e-12
+-                    and tail > current_tail + 1e-12
+-                )
+-            )
+-
+-            if improved:
+-                current = proposal
+-                current_value, current_tail = value, tail
+-
+-            if (
+-                current_value > best_value + 1e-12
+-                or (
+-                    abs(current_value - best_value) <= 1e-12
+-                    and current_tail > best_tail
++                    abs(cur_min - best_min) <= 1e-13
++                    and cur_tail > best_tail
+                 )
+             ):
+                 best = current.copy()
+-                best_value, best_tail = current_value, current_tail
+-
+-    # Numerical safety and output contract preservation.
+-    return np.clip(np.asarray(best, dtype=float), 0.0, 1.0)
++                best_min = cur_min
++                best_tail = cur_tail
++
++    best[:4] = corners
++    return np.asarray(best, dtype=float)
+ 
+ 
+ # EVOLVE-BLOCK-END

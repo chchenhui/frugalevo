@@ -1,0 +1,107 @@
+<NAME>
+constrained_diameter_polish
+</NAME>
+
+<DESCRIPTION>
+Add a final two-pass SLSQP diameter formulation after the existing smooth and exact-score searches.  The objective can be written with the minimum squared separation fixed to one: minimize the squared diameter `q` subject to every pair satisfying `1 <= d_ij^2 <= q`.  This directly matches the evaluator ratio, unlike the smooth contact surrogate.  Rescaling between passes reinitializes the active set at an exactly normalized minimum distance, and the final candidate is retained only when its measured exact ratio improves the incumbent.  Analytic constraint Jacobians keep the small constrained solve practical.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    if polished_score > best_score:
+        best_points = polished
+
+    return np.asarray(best_points, dtype=np.float64)
+=======
+    if polished_score > best_score:
+        best_points = polished
+        best_score = polished_score
+
+    # Directly minimize the squared diameter with the minimum squared
+    # separation fixed at one.  This is the exact max-min formulation after
+    # scale normalization, and is especially effective once the preceding
+    # continuation has identified a good contact graph.
+    try:
+        from scipy.optimize import minimize
+
+        def constrained_polish(seed: np.ndarray) -> np.ndarray:
+            seed = seed / np.sqrt(
+                np.min(
+                    np.einsum(
+                        "pd,pd->p",
+                        seed[pair_i] - seed[pair_j],
+                        seed[pair_i] - seed[pair_j],
+                    )
+                )
+            )
+            initial_d2 = np.einsum(
+                "pd,pd->p",
+                seed[pair_i] - seed[pair_j],
+                seed[pair_i] - seed[pair_j],
+            )
+            x0 = np.concatenate((seed.ravel(), [initial_d2.max() * (1.0 + 1.0e-10)]))
+
+            def constraints(x: np.ndarray) -> np.ndarray:
+                p = x[:-1].reshape(n, d)
+                delta = p[pair_i] - p[pair_j]
+                d2 = np.einsum("pd,pd->p", delta, delta)
+                return np.concatenate((d2 - 1.0, x[-1] - d2))
+
+            def constraint_jacobian(x: np.ndarray) -> np.ndarray:
+                p = x[:-1].reshape(n, d)
+                delta = p[pair_i] - p[pair_j]
+                jac = np.zeros((2 * pair_count, n * d + 1))
+                rows = np.arange(pair_count)
+                for coordinate in range(d):
+                    derivative = 2.0 * delta[:, coordinate]
+                    jac[rows, d * pair_i + coordinate] = derivative
+                    jac[rows, d * pair_j + coordinate] = -derivative
+                    jac[pair_count + rows, d * pair_i + coordinate] = -derivative
+                    jac[pair_count + rows, d * pair_j + coordinate] = derivative
+                jac[pair_count + rows, -1] = 1.0
+                return jac
+
+            def centered(x: np.ndarray) -> np.ndarray:
+                return x[:-1].reshape(n, d).sum(axis=0)
+
+            center_jacobian = np.zeros((d, n * d + 1))
+            for point in range(n):
+                center_jacobian[:, d * point:d * point + d] = np.eye(d)
+
+            result = minimize(
+                lambda x: x[-1],
+                x0,
+                jac=lambda x: np.r_[np.zeros(n * d), 1.0],
+                method="SLSQP",
+                constraints=(
+                    {"type": "ineq", "fun": constraints, "jac": constraint_jacobian},
+                    {"type": "eq", "fun": centered, "jac": lambda x: center_jacobian},
+                ),
+                options={"maxiter": 700, "ftol": 2.0e-13, "disp": False},
+            )
+            return result.x[:-1].reshape(n, d) if result.success else seed
+
+        # Rescaling after pass one makes the next solve start with an exact
+        # lower-bound contact set rather than accumulated numerical slack.
+        constrained = constrained_polish(best_points)
+        constrained = constrained / np.sqrt(
+            np.min(
+                np.einsum(
+                    "pd,pd->p",
+                    constrained[pair_i] - constrained[pair_j],
+                    constrained[pair_i] - constrained[pair_j],
+                )
+            )
+        )
+        constrained = constrained_polish(constrained)
+        constrained = normalize(constrained)
+        constrained_score = score(constrained)
+        if np.isfinite(constrained_score) and constrained_score > best_score:
+            best_points = constrained
+            best_score = constrained_score
+    except Exception:
+        pass
+
+    return np.asarray(best_points, dtype=np.float64)
+>>>>>>> REPLACE
+</DIFF>

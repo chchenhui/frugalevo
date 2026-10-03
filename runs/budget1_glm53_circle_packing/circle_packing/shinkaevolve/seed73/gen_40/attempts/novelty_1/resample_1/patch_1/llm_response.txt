@@ -1,0 +1,124 @@
+<NAME>
+slsqp_polish_pass</NAME>
+<DESCRIPTION>
+Add an SLSQP-based nonlinear optimization "polish" pass. The current greedy hill-climb moves one center at a time with fixed step sizes, so it cannot make coordinated simultaneous adjustments that grow the total sum (e.g. shifting whole chains of touching circles to open slack). SLSQP can jointly optimize all 52 center coordinates with the sum of radii as the objective — but since radii must also be variables, we instead use a smooth surrogate: maximize sum of "effective radii" computed by a soft-min of the pairwise/wall distance constraints. Concretely, we run SLSQP on z = centers (fixed radii recomputed by grow_radii is non-smooth), so a cleaner formulation: optimize z = [centers, radii] (78 vars) with objective -sum(radii), inequality constraints g(z) >= 0 for each wall distance (r_i - x_i, r_i - (1-x_i), etc.) and each pair (d_ij - r_i - r_j). This directly targets the true objective with exact constraints and is smooth. We repair the SLSQP output (shrink radii to feasibility via grow_radii logic) and keep it only if it strictly improves the valid sum. Applying this only to the best candidate keeps runtime modest relative to the current 7.5s budget.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    best = None
+    for cand, r_init in candidates:
+        centers, radii, s = refine_layout(cand, r_init)
+        if best is None or s > best[2]:
+            best = (centers, radii, s)
+
+    centers, radii, sum_radii = best
+    return centers, radii, sum_radii
+=======
+    best = None
+    for cand, r_init in candidates:
+        centers, radii, s = refine_layout(cand, r_init)
+        if best is None or s > best[2]:
+            best = (centers, radii, s)
+
+    centers, radii, sum_radii = best
+
+    # SLSQP polish: jointly optimize centers and radii with the true
+    # objective (maximize sum of radii) under exact smooth constraints.
+    centers, radii, sum_radii = slsqp_polish(centers, radii, sum_radii)
+
+    return centers, radii, sum_radii
+
+
+def slsqp_polish(centers, radii, cur_sum, rounds=4):
+    """
+    Joint gradient-based refinement of (centers, radii) via SLSQP.
+    Variables z = [x_0, y_0, ..., x_{n-1}, y_{n-1}, r_0, ..., r_{n-1}].
+    Objective: maximize sum(r). Constraints (all >= 0):
+      x_i - r_i >= 0, 1 - x_i - r_i >= 0, same for y;
+      d_ij - r_i - r_j >= 0 for all pairs.
+    Output is repaired to strict feasibility; kept only if it improves.
+    """
+    try:
+        from scipy.optimize import minimize
+    except Exception:
+        return centers, radii, cur_sum
+
+    n = centers.shape[0]
+    best_c, best_r, best_s = centers.copy(), radii.copy(), cur_sum
+
+    ii, jj = np.triu_indices(n, k=1)
+    dxi = centers[ii, 0] - centers[jj, 0]
+    dyi = centers[ii, 1] - centers[jj, 1]
+
+    def unpack(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        return c, r
+
+    def obj(z):
+        return -np.sum(z[2 * n:])
+
+    def obj_grad(z):
+        g = np.zeros_like(z)
+        g[2 * n:] = -1.0
+        return g
+
+    def cons_f(z):
+        c, r = unpack(z)
+        dx = c[ii, 0] - c[jj, 0]
+        dy = c[ii, 1] - c[jj, 1]
+        d = np.sqrt(dx * dx + dy * dy)
+        pair = d - r[ii] - r[jj]
+        walls = np.concatenate([
+            c[:, 0] - r, 1.0 - c[:, 0] - r,
+            c[:, 1] - r, 1.0 - c[:, 1] - r,
+        ])
+        return np.concatenate([pair, walls])
+
+    def cons_j(z):
+        c, r = unpack(z)
+        dx = c[ii, 0] - c[jj, 0]
+        dy = c[ii, 1] - c[jj, 1]
+        d = np.sqrt(dx * dx + dy * dy) + 1e-12
+        m = len(ii)
+        J = np.zeros((m + 4 * n, z.size))
+        for k in range(m):
+            i, j = ii[k], jj[k]
+            J[k, 2 * i] = dx[k] / d[k]
+            J[k, 2 * i + 1] = dy[k] / d[k]
+            J[k, 2 * j] = -dx[k] / d[k]
+            J[k, 2 * j + 1] = -dy[k] / d[k]
+            J[k, 2 * n + i] = -1.0
+            J[k, 2 * n + j] = -1.0
+        for i in range(n):
+            row = m + i
+            J[row, 2 * i] = 1.0
+            J[row, 2 * n + i] = -1.0
+            J[m + n + i, 2 * i] = -1.0
+            J[m + n + i, 2 * n + i] = -1.0
+            J[m + 2 * n + i, 2 * i + 1] = 1.0
+            J[m + 2 * n + i, 2 * n + i] = -1.0
+            J[m + 3 * n + i, 2 * i + 1] = -1.0
+            J[m + 3 * n + i, 2 * n + i] = -1.0
+        return J
+
+    cons = [{'type': 'ineq', 'fun': cons_f, 'jac': cons_j}]
+    bounds = [(0.0, 1.0)] * (2 * n) + [(1e-6, 0.5)] * n
+
+    z0 = np.concatenate([best_c.ravel(), best_r])
+    for _ in range(rounds):
+        res = minimize(obj, z0, jac=obj_grad, bounds=bounds, constraints=cons,
+                       method='SLSQP', options={'maxiter': 500, 'ftol': 1e-14})
+        c, r = unpack(res.x)
+        # Repair: re-grow radii from the proposed centers, guaranteeing
+        # strict feasibility, then compare against the incumbent.
+        r_rep = grow_radii(np.clip(c, 0.005, 0.995), np.max(r) if r.size else 0.1)
+        s_rep = float(np.sum(r_rep))
+        if s_rep > best_s + 1e-12:
+            best_c, best_r, best_s = np.clip(c, 0.005, 0.995), r_rep, s_rep
+            z0 = np.concatenate([best_c.ravel(), best_r])
+        else:
+            break
+    return best_c, best_r, best_s
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,119 @@
+<NAME>
+tensorized_batched_packing
+</NAME>
+
+<DESCRIPTION>
+Replace the per-layer Python heap scheduler and exhaustive Python swap search with a batched tensorized cardinality-constrained LPT assignment. Each sorted item position is assigned simultaneously for all layers to the currently least-loaded non-full pack using a masked argmin. This preserves the greedy descending-weight and exact-capacity policy, including deterministic lowest-pack tie breaking, while eliminating `.tolist()`, `heapq`, Python list allocation, and per-layer scheduling loops. It also keeps the implementation device-agnostic, allowing callers to use accelerator tensors in the future without introducing CPU scalar synchronization.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Keep packing metadata on CPU: the public entry point already performs
+    # balancing on CPU, and Python heap operations require scalar weights.
+    cpu_weight = weight.float().cpu()
+    indices = cpu_weight.sort(-1, descending=True).indices
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        values = cpu_weight[i].tolist()
+        pack_weights = [0.0] * num_packs
+        pack_items = [0] * num_packs
+        members: list[list[tuple[int, int, float]]] = [
+            [] for _ in range(num_packs)
+        ]
+
+        # Entries are removed once a pack reaches its cardinality limit.
+        available = [(0.0, pack) for pack in range(num_packs)]
+        heapq.heapify(available)
+        for group in indices[i].tolist():
+            _, pack = heapq.heappop(available)
+            rank = pack_items[pack]
+            group_weight = values[group]
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = rank
+            members[pack].append((group, rank, group_weight))
+            pack_weights[pack] += group_weight
+            pack_items[pack] += 1
+            if pack_items[pack] < groups_per_pack:
+                heapq.heappush(available, (pack_weights[pack], pack))
+
+        # Refine greedy LPT with the best cardinality-preserving one-item
+        # exchange. Considering every pair catches improvements that do not
+        # involve the globally lightest pack.
+        if num_packs > 1:
+            current_max = max(pack_weights)
+            best_max = current_max
+            best_swap = None
+            for first in range(num_packs - 1):
+                for second in range(first + 1, num_packs):
+                    other_max = max(
+                        (pack_weights[p] for p in range(num_packs)
+                         if p != first and p != second),
+                        default=float("-inf"),
+                    )
+                    for first_group, first_rank, first_weight in members[first]:
+                        for second_group, second_rank, second_weight in members[
+                                second]:
+                            new_first = (pack_weights[first] - first_weight +
+                                         second_weight)
+                            new_second = (pack_weights[second] - second_weight +
+                                          first_weight)
+                            candidate_max = max(other_max, new_first, new_second)
+                            if candidate_max < best_max:
+                                best_max = candidate_max
+                                best_swap = (first, first_group, first_rank,
+                                             second, second_group, second_rank,
+                                             new_first, new_second)
+
+            if best_swap is not None:
+                (first, first_group, first_rank, second, second_group,
+                 second_rank, new_first, new_second) = best_swap
+                # Exchange both slot ranks and pack IDs, retaining a valid
+                # one-item-per-physical-slot permutation.
+                pack_index[i, first_group] = second
+                rank_in_pack[i, first_group] = second_rank
+                pack_index[i, second_group] = first
+                rank_in_pack[i, second_group] = first_rank
+                pack_weights[first] = new_first
+                pack_weights[second] = new_second
+    return pack_index, rank_in_pack
+=======
+    # Batched cardinality-constrained LPT scheduling.  Processing one sorted
+    # position at a time preserves greedy semantics, while each decision is
+    # made for every layer at once and avoids Python scalar/heap overhead.
+    weight = weight.float()
+    indices = weight.sort(-1, descending=True).indices
+    sorted_weight = weight.gather(-1, indices)
+    pack_index = torch.empty(
+        (num_layers, num_groups), dtype=torch.int64, device=weight.device)
+    rank_in_pack = torch.empty_like(pack_index)
+    pack_load = torch.zeros(
+        (num_layers, num_packs), dtype=weight.dtype, device=weight.device)
+    pack_count = torch.zeros(
+        (num_layers, num_packs), dtype=torch.int64, device=weight.device)
+    one = torch.ones((num_layers, 1), dtype=torch.int64, device=weight.device)
+
+    for position in range(num_groups):
+        # masked_fill makes full packs ineligible. argmin selects the lowest
+        # pack id for equal loads, matching the heap's deterministic ordering.
+        eligible_load = pack_load.masked_fill(
+            pack_count == groups_per_pack, float("inf"))
+        selected_pack = eligible_load.argmin(dim=-1)
+        selected_slot = pack_count.gather(
+            -1, selected_pack.unsqueeze(-1)).squeeze(-1)
+        group = indices[:, position]
+
+        pack_index.scatter_(-1, group.unsqueeze(-1),
+                            selected_pack.unsqueeze(-1))
+        rank_in_pack.scatter_(-1, group.unsqueeze(-1),
+                              selected_slot.unsqueeze(-1))
+        pack_load.scatter_add_(
+            -1, selected_pack.unsqueeze(-1), sorted_weight[:, position:position + 1])
+        pack_count.scatter_add_(-1, selected_pack.unsqueeze(-1), one)
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,182 @@
+<NAME>
+perturb_refine_packing
+</NAME>
+
+<DESCRIPTION>
+This version concentrates computation on the strongest known geometric basin: staggered hexagonal layers with poles, plus cube-axis and random alternatives. It uses pair-indexed soft-extrema gradients for lower allocation overhead, preserves the true squared evaluator objective throughout, and adds deterministic perturb-and-refine restarts around the best first-stage candidate. These controlled symmetry-breaking restarts are useful because the best 14-point configurations are slightly nonsymmetric, while a final high-sharpness polish improves the active contact graph.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct fourteen points in R^3 with a large minimum squared
+    pairwise distance relative to the maximum squared pairwise distance.
+
+    Translation and scale are removed after every optimization step.  The
+    search combines structured packing seeds with deterministic perturbed
+    restarts around the strongest discovered configuration.
+    """
+    n = 14
+    pair_i, pair_j = np.triu_indices(n, 1)
+
+    def normalize(points: np.ndarray) -> np.ndarray:
+        points = points - points.mean(axis=0, keepdims=True)
+        rms = np.sqrt(np.mean(np.sum(points * points, axis=1)))
+        return points / max(rms, 1e-14)
+
+    def score(points: np.ndarray) -> float:
+        delta = points[pair_i] - points[pair_j]
+        squared = np.einsum("ij,ij->i", delta, delta)
+        return float(squared.min() / squared.max())
+
+    def gradient(points: np.ndarray, sharpness: float) -> np.ndarray:
+        """
+        Gradient of a stable soft approximation to
+        log(minimum distance / maximum distance).
+        """
+        delta = points[pair_i] - points[pair_j]
+        squared = np.einsum("ij,ij->i", delta, delta)
+        squared = np.maximum(squared, 1e-15)
+        logs = 0.5 * np.log(squared)
+
+        low = logs.min()
+        high = logs.max()
+        near = np.exp(-sharpness * (logs - low))
+        far = np.exp(sharpness * (logs - high))
+        near /= near.sum()
+        far /= far.sum()
+
+        forces = (near - far)[:, None] * delta / squared[:, None]
+        result = np.zeros_like(points)
+        np.add.at(result, pair_i, forces)
+        np.add.at(result, pair_j, -forces)
+        result -= result.mean(axis=0, keepdims=True)
+        return result
+
+    def refine(seed: np.ndarray, iterations: int, mode: int) -> np.ndarray:
+        points = normalize(seed.astype(float, copy=True))
+        best = points.copy()
+        best_score = score(points)
+        velocity = np.zeros_like(points)
+
+        for iteration in range(iterations):
+            progress = iteration / max(iterations - 1, 1)
+
+            if mode == 0:
+                sharpness = 5.0 + 210.0 * progress ** 1.65
+                step_size = 0.044 * (1.0 - 0.63 * progress)
+                momentum = 0.84
+            elif mode == 1:
+                sharpness = 7.0 + 125.0 * progress ** 1.25
+                step_size = 0.047 * (1.0 - 0.60 * progress)
+                momentum = 0.82
+            else:
+                # The final pass is deliberately sharp, but still begins
+                # with several jointly active contacts rather than a single
+                # frozen nearest pair.
+                sharpness = 45.0 + 520.0 * progress * progress
+                step_size = 0.021 * (1.0 - 0.66 * progress)
+                momentum = 0.79
+
+            direction = gradient(points, sharpness)
+            direction_norm = np.sqrt(np.mean(np.sum(direction * direction, axis=1)))
+            if direction_norm > 1e-15:
+                direction /= direction_norm
+
+            velocity = momentum * velocity + (1.0 - momentum) * direction
+            points = normalize(points + step_size * velocity)
+
+            if iteration % 10 == 9 or iteration == iterations - 1:
+                value = score(points)
+                if value > best_score:
+                    best_score = value
+                    best = points.copy()
+
+        return best
+
+    def layered_seed(radius: float, height: float, twist: float,
+                     pole: float, noise: float, seed: int) -> np.ndarray:
+        angles = np.arange(6, dtype=float) * (np.pi / 3.0)
+        lower = np.column_stack((
+            radius * np.cos(angles),
+            radius * np.sin(angles),
+            -height * np.ones(6),
+        ))
+        upper = np.column_stack((
+            radius * np.cos(angles + twist),
+            radius * np.sin(angles + twist),
+            height * np.ones(6),
+        ))
+        result = np.vstack((
+            lower, upper,
+            [[0.0, 0.0, -pole], [0.0, 0.0, pole]],
+        ))
+        if noise:
+            result += noise * np.random.default_rng(seed).standard_normal((n, 3))
+        return result
+
+    initializers = []
+    layer_parameters = (
+        (1.00, 0.43, np.pi / 6.0, 1.30),
+        (1.00, 0.49, np.pi / 6.0, 1.36),
+        (1.06, 0.46, 0.46,       1.37),
+        (0.95, 0.53, 0.57,       1.34),
+        (1.08, 0.39, 0.50,       1.29),
+        (0.99, 0.58, 0.62,       1.43),
+    )
+    for k, parameters in enumerate(layer_parameters):
+        initializers.append(layered_seed(
+            *parameters, noise=0.014, seed=1009 + 97 * k
+        ))
+
+    cube = np.array(
+        [[x, y, z]
+         for x in (-1.0, 1.0)
+         for y in (-1.0, 1.0)
+         for z in (-1.0, 1.0)],
+        dtype=float,
+    )
+    axes = np.diag((1.53, 1.67, 1.78))
+    initializers.append(np.vstack((cube, axes, -axes)))
+
+    rng = np.random.default_rng(271828)
+    initializers.append(rng.standard_normal((n, 3)))
+
+    best_points = None
+    best_value = -np.inf
+
+    # Broad continuation over complementary basins.
+    for index, initial in enumerate(initializers):
+        candidate = refine(initial, iterations=1150, mode=index % 2)
+        value = score(candidate)
+        if value > best_value:
+            best_value = value
+            best_points = candidate
+
+    # Controlled symmetry breaking around the strongest layout.  The
+    # amplitudes span the useful 0.02--0.08 RMS-scale perturbation range.
+    restart_rng = np.random.default_rng(148731)
+    for amplitude in (0.018, 0.027, 0.038, 0.052, 0.067, 0.080):
+        perturbed = best_points + amplitude * restart_rng.standard_normal((n, 3))
+        candidate = refine(perturbed, iterations=820, mode=1)
+        value = score(candidate)
+        if value > best_value:
+            best_value = value
+            best_points = candidate
+
+    polished = refine(best_points, iterations=1450, mode=2)
+    polished_value = score(polished)
+    if polished_value > best_value:
+        best_points = polished
+
+    return np.asarray(best_points, dtype=float)
+
+
+# EVOLVE-BLOCK-END
+``` 
+</CODE>

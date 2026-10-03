@@ -1,0 +1,150 @@
+<NAME>
+antipodal_linepacking
+</NAME>
+
+<DESCRIPTION>
+This uses a geometric reduction rather than directly optimizing 14 unconstrained points. The 14 points are constructed as seven antipodal pairs, so the diameter is exactly fixed by construction and the problem becomes a 7-line Grassmannian packing problem in 3D: minimize the largest absolute inner product between seven unit directions.
+
+A batched Riemannian soft-max optimization searches many line-packings simultaneously on the product of spheres. It is followed by an exact hard-coherence coordinate search that only accepts improvements to the true minimum-distance/diameter ratio. This removes translation, scale, diameter handling, and half of the point variables from the numerical search.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct 14 points as seven antipodal pairs.
+
+    For unit directions u_i, the returned set is {u_i, -u_i}.  Its diameter
+    is exactly 2, while its minimum squared distance is
+        2 - 2 max_{i<j} |u_i . u_j|.
+    Thus maximizing the requested ratio is equivalent to the classical
+    minimax coherence problem for seven unoriented lines in R^3.
+    """
+    rng = np.random.default_rng(716293)
+    m, dim = 7, 3
+    ii, jj = np.triu_indices(m, 1)
+    npairs = len(ii)
+
+    def normalize_rows(x: np.ndarray) -> np.ndarray:
+        return x / np.sqrt(np.sum(x * x, axis=-1, keepdims=True))
+
+    def coherence(x: np.ndarray) -> float:
+        gram = x @ x.T
+        return float(np.max(np.abs(gram[ii, jj])))
+
+    # A batch of independent line packings is evolved together.  The objective
+    # is a log-sum-exp approximation to maximum absolute inner product, with
+    # all gradients projected onto the tangent spaces of the unit spheres.
+    batch = 80
+    x = normalize_rows(rng.normal(size=(batch, m, dim)))
+    mom = np.zeros_like(x)
+    var = np.zeros_like(x)
+
+    for step in range(3600):
+        t = step / 3599.0
+        # Early broad smoothing discovers the global arrangement; the final
+        # temperature resolves the contact graph of the line packing.
+        beta = 5.0 * (1.0 - t) + 520.0 * t
+
+        gram = np.einsum("bik,bjk->bij", x, x)
+        dots = gram[:, ii, jj]
+        # A differentiable absolute value avoids arbitrary sign flips at zero.
+        absolute = np.sqrt(dots * dots + 1.0e-14)
+
+        z = beta * absolute
+        z -= z.max(axis=1, keepdims=True)
+        weights = np.exp(z)
+        weights /= weights.sum(axis=1, keepdims=True)
+
+        signed = weights * dots / absolute
+        wmat = np.zeros((batch, m, m), dtype=float)
+        bidx = np.arange(batch)[:, None]
+        wmat[bidx, ii[None, :], jj[None, :]] = signed
+        wmat[bidx, jj[None, :], ii[None, :]] = signed
+
+        # Gradient of the smooth maximum coherence.
+        grad = np.einsum("bij,bjk->bik", wmat, x)
+        grad -= np.sum(grad * x, axis=2, keepdims=True) * x
+
+        # Adam descent on the sphere product.
+        mom = 0.88 * mom + 0.12 * grad
+        var = 0.992 * var + 0.008 * grad * grad
+        mh = mom / (1.0 - 0.88 ** (step + 1))
+        vh = var / (1.0 - 0.992 ** (step + 1))
+        rate = 0.040 * (1.0 - 0.82 * t) + 0.0015
+        x = normalize_rows(x - rate * mh / (np.sqrt(vh) + 1.0e-9))
+
+        # Very small occasional tangent perturbations prevent all starts from
+        # settling into the same soft-objective basin.
+        if step in (900, 1750):
+            noise = rng.normal(size=x.shape)
+            noise -= np.sum(noise * x, axis=2, keepdims=True) * x
+            x = normalize_rows(x + 0.012 * noise)
+
+    values = np.empty(batch)
+    for k in range(batch):
+        values[k] = coherence(x[k])
+
+    # Keep several distinct good basins.  Hard polishing below uses the exact
+    # objective, rather than a temperature approximation.
+    finalists = np.argsort(values)[:10]
+    best_x = x[finalists[0]].copy()
+    best_c = coherence(best_x)
+
+    for chosen in finalists:
+        y = x[chosen].copy()
+        current = coherence(y)
+        scale = 0.070
+        failures = 0
+
+        for iteration in range(5200):
+            gram = y @ y.T
+            ad = np.abs(gram)
+            np.fill_diagonal(ad, -1.0)
+            worst = float(ad.max())
+
+            # Select a direction involved in a current limiting contact.
+            contacts = np.argwhere(ad >= worst - 2.0e-5)
+            a, b = contacts[rng.integers(len(contacts))]
+            axis = int(a if rng.random() < 0.5 else b)
+
+            # Evaluate a small population of tangent moves for this one line.
+            trials = 18
+            perturb = rng.normal(size=(trials, dim))
+            perturb -= (perturb @ y[axis])[:, None] * y[axis]
+            proposal_axis = y[axis][None, :] + scale * perturb
+            proposal_axis = normalize_rows(proposal_axis)
+
+            candidates = np.repeat(y[None, :, :], trials, axis=0)
+            candidates[:, axis, :] = proposal_axis
+            grams = np.einsum("tik,tjk->tij", candidates, candidates)
+            trial_c = np.max(np.abs(grams[:, ii, jj]), axis=1)
+
+            win = int(np.argmin(trial_c))
+            if trial_c[win] < current - 1.0e-13:
+                y = candidates[win]
+                current = float(trial_c[win])
+                scale = min(0.11, scale * 1.025)
+                failures = 0
+            else:
+                failures += 1
+                if failures % 30 == 0:
+                    scale *= 0.68
+                    if scale < 2.0e-7:
+                        break
+
+        if current < best_c:
+            best_c = current
+            best_x = y.copy()
+
+    # Antipodal construction is centered and has positive diameter 2.
+    points = np.vstack((best_x, -best_x))
+    return np.asarray(points, dtype=float)
+
+
+# EVOLVE-BLOCK-END
+```

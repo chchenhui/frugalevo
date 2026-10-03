@@ -1,0 +1,133 @@
+<NAME>
+fix_incremental_scoring_add_basin_kicks</NAME>
+
+<DESCRIPTION>
+All prior programs plateau at min_area_normalized = 0.02. Two problems in the current code: (1) `_point_outside_hull` always returns True ("conservative"), and it's actually called incorrectly (indexes `cand` with an interior index but never receives the moved vertex index), so accepted moves get exact recomputes via a wrong path while rejected moves use approximate hull areas that may never update — the cached `hull_a` can go stale and corrupt the score silently. (2) The annealer only ever moves a single vertex at a time with adaptive sigma, which collapses to tiny local steps and cannot escape the incumbent basin — this is exactly why every program is stuck at 0.02.
+
+Fix: (a) replace the acceptance block with an exact score recomputation on every accepted move (full 286-triangle numpy evaluation + monotone-chain hull is only microseconds, so correctness costs nothing while the incremental min-over-rest still screens candidates cheaply); (b) replace `_point_outside_hull` with a proper point-in-convex-polygon test; (c) add a basin-hopping mechanism: when no improvement for several rounds, kick 3-4 randomly chosen vertices simultaneously at sigma ~0.14 from the best-known configuration, then resume local annealing — coordinated multi-vertex kicks are far more likely to jump between basins than isotropic single-vertex noise, and the strict best-seen bookkeeping guarantees the returned result never regresses.</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _point_outside_hull(cand, old_pts, hmask):
+    """True if the moved point likely lies outside the old hull (cheap test)."""
+    hull_pts = old_pts[hmask]
+    if len(hull_pts) < 3:
+        return True
+    H = hull_pts[np.argsort(np.arctan2(hull_pts[:, 1] - hull_pts[:, 1].mean(),
+                                       hull_pts[:, 0] - hull_pts[:, 0].mean()))]
+    x, y = H[:, 0], H[:, 1]
+    px, py = cand[np.where(~hmask)[0][0]] if (~hmask).sum() == 1 else (None, None)
+    return True  # conservative: force exact recompute via caller's logic
+=======
+def _point_outside_hull(pt, hull_pts):
+    """True if 2D point pt lies strictly outside convex polygon hull_pts.
+
+    hull_pts must be ordered (we sort by angle around the centroid first).
+    Uses the sign of the cross product against each hull edge.
+    """
+    if len(hull_pts) < 3:
+        return True
+    c = hull_pts.mean(axis=0)
+    ang = np.arctan2(hull_pts[:, 1] - c[1], hull_pts[:, 0] - c[0])
+    H = hull_pts[np.argsort(ang)]
+    x, y = H[:, 0], H[:, 1]
+    x2, y2 = np.roll(x, -1), np.roll(y, -1)
+    cr = (x2 - x) * (pt[1] - y) - (y2 - y) * (pt[0] - x)
+    # outside if the point is on the "wrong" side of ANY edge
+    return bool(np.any(cr > 1e-12) and np.any(cr < -1e-12))
+=======
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            if new_hull <= 1e-12:
+                continue
+            csc = new_min / new_hull
+            d = csc - sc
+            if d > 0 or (T > 0 and rng.random() < np.exp(d / max(T, 1e-12))):
+                if not was_hull:
+                    # check the moved point didn't escape the hull; if it did,
+                    # recompute hull and score exactly
+                    if _point_outside_hull(cand, pts, hmask):
+                        new_hull = _hull_area(cand)
+                        csc = _tri_areas(cand).min() / new_hull
+                pts, sc = cand, csc
+                hull_a = new_hull
+                # update cached areas: only triangles containing i changed
+                all_areas = all_areas.copy()
+                all_areas[TRI_HAS[i]] = aff
+                hmask = _hull_mask(pts)
+                if sc > best_sc + 1e-14:
+                    best, best_sc = pts.copy(), sc
+                    since_best = 0
+=======
+            if new_hull <= 1e-12:
+                continue
+            csc = new_min / new_hull
+            d = csc - sc
+            if d > 0 or (T > 0 and rng.random() < np.exp(d / max(T, 1e-12))):
+                # exact recomputation on acceptance (cheap: 286 triangles +
+                # monotone-chain hull) to keep the cached state consistent
+                new_hull = _hull_area(cand)
+                if new_hull <= 1e-12:
+                    continue
+                exact_areas = _tri_areas(cand)
+                csc = exact_areas.min() / new_hull
+                # re-evaluate acceptance against the exact score
+                d_exact = csc - sc
+                if not (d_exact > 0 or (T > 0 and
+                        rng.random() < np.exp(d_exact / max(T, 1e-12)))):
+                    continue
+                pts, sc = cand, csc
+                hull_a = new_hull
+                all_areas = exact_areas
+                hmask = _hull_mask(pts)
+                if sc > best_sc + 1e-14:
+                    best, best_sc = pts.copy(), sc
+                    since_best = 0
+                    sigma = min(sigma * 1.25, 0.3)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        since_best += 1
+        T = max(T * 0.92, T_min)
+        if since_best > 4:
+            sigma = max(sigma * 0.7, 1e-4)
+            since_best = 0
+        elif since_best == 0:
+            sigma = min(sigma * 1.25, 0.3)
+    return best, best_sc
+=======
+        since_best += 1
+        T = max(T * 0.92, T_min)
+        if since_best > 4:
+            # basin-hopping kick: perturb 3-4 vertices together at moderate
+            # sigma from the best-known configuration, then resume local search
+            pts = best.copy()
+            hull_a = _hull_area(pts)
+            all_areas = _tri_areas(pts)
+            sc = all_areas.min() / hull_a if hull_a > 1e-12 else 0.0
+            hmask = _hull_mask(pts)
+            kick_n = int(rng.integers(3, 5))
+            idxs = rng.choice(13, size=kick_n, replace=False)
+            kick_pts = pts.copy()
+            kick_pts[idxs] += rng.normal(0, 0.14, (kick_n, 2))
+            kh = _hull_area(kick_pts)
+            if kh > 1e-12:
+                ka = _tri_areas(kick_pts)
+                ksc = ka.min() / kh
+                # accept the kick with mild annealing probability
+                if ksc > sc or rng.random() < np.exp((ksc - sc) / max(T, 1e-12)):
+                    pts, sc = kick_pts, ksc
+                    hull_a = kh
+                    all_areas = ka
+                    hmask = _hull_mask(pts)
+            sigma = 0.08
+            since_best = 0
+    return best, best_sc
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

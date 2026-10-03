@@ -1,0 +1,110 @@
+<NAME>
+warm_started_shift_search</NAME>
+<DESCRIPTION>
+The current layout (4,5,4,5,4,4 rows) is already strong (2.47 vs target 2.635), but the fixed hex lattice is not the exact optimum: the solver only computes maximal radii *given* the centers, and the seed positions leave slack (e.g., the top row of 4 at x=0.1..0.7 leaves the top-right corner region underused, and tiny perturbations of centers change how radii can be redistributed). The known remaining gap (~0.16) comes from center positions, not the radius solve. I add a coordinate-shift local search: for each circle, try shifting it by ±delta in x and y at several delta scales, re-solve radii, and keep improvements. The key efficiency insight (per the recommendation) is warm-starting the Gauss-Seidel solver from the previous radius vector — after a 0.001-scale shift, radii converge in a handful of passes, so each candidate evaluation is cheap and we can afford 3 delta scales and multiple sweeps well within the time budget (the fast solver currently converges in <0.15s, and warm-started re-solves take only a few passes). I also fix the top row to be pulled toward the right wall (x = 0.2,0.4,0.6,0.8-style but staggered 0.3,0.5,0.7,0.9) so corner slack is shared more evenly — actually I keep the seed and let the shift search discover improvements, only nudging the top row to span the full width (0.1..0.9 spacing would be 4 circles at 0.15,0.45,... no — I shift the last row to [0.1,0.3,0.5,0.9]... safer: let shift search handle it; only change row to [0.1,0.3,0.5,0.7,0.9][:4]→ keep). To stay safe, I only add: (1) an `init` warm-start parameter to solve_radii, (2) a `_local_shift_search` function, and (3) call it in construct_packing. This is a strictly-improving hill climb: it only accepts center moves that raise the sum of radii, so validity and the current 2.47 are guaranteed as a floor.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def solve_radii(centers, iterations=200):
+=======
+def solve_radii(centers, iterations=200, init=None):
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    radii = walls.copy()
+
+    # Precompute pairwise distances
+    dist = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=-1)
+
+    # Gauss-Seidel: each radius takes the maximum value allowed by
+    # the current neighbor radii and the walls. Feasible by
+    # construction and much less lossy than proportional shrinking.
+    big = np.full((n, n), 1e9)
+    np.fill_diagonal(dist, np.inf)
+    for _ in range(iterations):
+=======
+    radii = walls.copy() if init is None else np.minimum(init, walls).copy()
+
+    # Precompute pairwise distances
+    dist = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=-1)
+
+    # Gauss-Seidel: each radius takes the maximum value allowed by
+    # the current neighbor radii and the walls. Feasible by
+    # construction and much less lossy than proportional shrinking.
+    # Warm-starting from `init` makes post-shift re-solves converge
+    # in only a few passes.
+    np.fill_diagonal(dist, np.inf)
+    for _ in range(iterations):
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def construct_packing():
+    """
+    Construct a specific arrangement of 26 circles in a unit square
+    that attempts to maximize the sum of their radii.
+
+    Returns:
+        Tuple of (centers, radii, sum_of_radii)
+        centers: np.array of shape (26, 2) with (x, y) coordinates
+        radii: np.array of shape (26) with radius of each circle
+        sum_of_radii: Sum of all radii
+    """
+    centers = build_hex_rows()
+    radii = solve_radii(centers)
+    sum_radii = float(np.sum(radii))
+    return centers, radii, sum_radii
+=======
+def _local_shift_search(centers, radii, deltas=(0.01, 0.003, 0.001, 0.0005),
+                        sweeps_per_delta=2):
+    """
+    Greedy coordinate-shift hill climb on the sum of radii.
+
+    For each circle, try shifting it by +/-delta along each axis,
+    warm-start the radius solver from the current solution (cheap:
+    radii move very little for tiny shifts), and keep any shift
+    that strictly improves the total. Only accepts improving moves,
+    so the input packing is a guaranteed lower bound.
+    """
+    centers = centers.copy()
+    n = centers.shape[0]
+    best_r = radii.copy()
+    best_s = float(np.sum(best_r))
+
+    for delta in deltas:
+        for _ in range(sweeps_per_delta):
+            improved = False
+            for i in range(n):
+                for axis in (0, 1):
+                    for sign in (+1.0, -1.0):
+                        cand = centers.copy()
+                        cand[i, axis] = np.clip(
+                            cand[i, axis] + sign * delta, 1e-6, 1.0 - 1e-6)
+                        new_r = solve_radii(cand, iterations=60, init=best_r)
+                        new_s = float(np.sum(new_r))
+                        if new_s > best_s + 1e-9:
+                            centers = cand
+                            best_r = new_r
+                            best_s = new_s
+                            improved = True
+            if not improved:
+                break
+    return centers, best_r
+
+
+def construct_packing():
+    """
+    Construct a specific arrangement of 26 circles in a unit square
+    that attempts to maximize the sum of their radii.
+
+    Returns:
+        Tuple of (centers, radii, sum_of_radii)
+        centers: np.array of shape (26, 2) with (x, y) coordinates
+        radii: np.array of shape (26) with radius of each circle
+        sum_of_radii: Sum of all radii
+    """
+    centers = build_hex_rows()
+    radii = solve_radii(centers)
+    centers, radii = _local_shift_search(centers, radii)
+    # Final exact solve from scratch to guarantee maximality/validity
+    radii = solve_radii(centers)
+    sum_radii = float(np.sum(radii))
+    return centers, radii, sum_radii
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,209 @@
+# INDIVIDUAL PROGRAM SUMMARIES
+
+The following are summaries of individual programs evaluated since the last meta update:
+
+**Program Name: Expert Parallelism Load Balancer (EPLB) for vLLM**
+- **Implementation**: Adapts DeepSeek's EPLB algorithm with `balanced_packing` (greedy least-loaded bin packing), `replicate_experts` (replicating highest load/cost experts), and a hierarchical `rebalance_experts_hierarchical` (groups→nodes→GPUs), all running on CPU with Python loops over layers.
+- **Performance**: Combined score 0.13 — strong inference time (0.97) and decent GPU balancedness (0.66), but weak expert balancedness (0.25), algorithm runtime (0.55), and speed score (0.00).
+- **Feedback**: Correct and passing validation, but the per-layer Python loop and `.cpu()` round-trips in packing/replication dominate runtime cost; improving expert-level balance (the 0.25 score suggests replication choices under-weight per-expert load) and vectorizing the greedy loops would yield the largest gains.
+**Program Identifier:** Generation 0 - Patch Name initial_program - Correct Program: True
+
+**Program Name: vLLM Expert Parallelism Load Balancer (EPLB) with Vectorized Snake Packing**
+- **Implementation**: Adapts DeepSeek's EPLB with a vectorized "snake" packing in `balanced_packing` (descending sort + alternating chunk assignment) and a three-stage hierarchical rebalance (groups→nodes, replication within nodes, physical experts→GPUs), all on CPU float tensors.
+- **Performance**: Combined score 0.00 — the program fails entirely with a runtime error and does not pass validation tests.
+- **Feedback**: The error stems from an invalid `to()` call with keyword arguments (`device=torch.int64, dtype=torch.int64`) in `balanced_packing`; passing dtype/device as keywords is unsupported. Despite the vectorization intent, correctness bugs (the malformed tensor conversion) prevent any balancedness or speed metrics from being measured.
+**Program Identifier:** Generation 1 - Patch Name vectorize_balanced_packing_snake - Correct Program: False
+
+**Program Name: NumPy-vectorized EPLB expert rearrangement for vLLM**
+- **Implementation**: Replicates experts via iterative per-layer argmax of weight/count, LPT-packs physical replicas onto GPUs with per-layer Python loops, then inverts the slot mapping and scatter-fills logical_to_physical via flat index arithmetic.
+- **Performance**: Scored 0.00 on all metrics (balancedness, runtime, speed) and failed validation entirely.
+- **Feedback**: The code crashes with "'NoneType' object has no attribute 'ndim'" — caused by a leftover placeholder call `np.put_along_axis(None, None, None, axis=0)` in the scatter section, which throws before any results are produced. The scatter logic itself (computing tgt/flat_idx) is complete, so simply deleting that dead line would likely make the program runnable.
+**Program Identifier:** Generation 2 - Patch Name greedy_lpt_global_balancer - Correct Program: False
+
+**Program Name: Snake-Order Packing EPLB for vLLM Expert Load Balancing**
+- **Implementation**: Replaces DeepSeek's iterative greedy balanced packing with a fully vectorized snake (boustrophedon) assignment where sorted items alternate pack direction per block, plus scatter-based rank computation, all on-device in PyTorch; keeps the hierarchical node/GPU decomposition and greedy replication (`replicate_experts`) unchanged.
+- **Performance**: Combined score 0.13 with strong GPU balancedness (0.66) but poor expert balancedness (0.25), fast inference (0.26) yet a speed score of only 0.01.
+- **Feedback**: The snake heuristic guarantees exact pack cardinality and vectorization, but sacrifices load-optimal greedy pairing at the expert level, hurting expert-level balance; the low speed score suggests the vectorized packing gains didn't translate into overall runtime improvement.
+**Program Identifier:** Generation 3 - Patch Name vectorized_snake_packing - Correct Program: True
+
+**Program Name: vLLM Expert Parallelism Load Balancer (EPLB)**
+- **Implementation**: Three-stage hierarchical rebalancing (groups→nodes, replication within nodes, physical experts→GPUs) with a vectorized-across-layers greedy `balanced_packing` using argmin/scatter tensor ops instead of per-layer loops, and `replicate_experts` replicating by max load-per-replica ratio.
+- **Performance**: Combined score 0.13 with balancedness_score_gpu 0.66, balancedness_score_expert 0.25, times_algorithm 0.00, times_inference 0.23, speed_score 0.01.
+- **Feedback**: The vectorization achieved near-zero algorithm time but expert-level balancedness (0.25) is the weak point, dragging the combined score down; improving per-expert load distribution rather than GPU-level packing would yield the largest gains.
+**Program Identifier:** Generation 4 - Patch Name vectorize_balanced_packing - Correct Program: True
+
+**Program Name: Vectorized vLLM Expert Parallelism Load Balancer (EPLB)**
+- **Implementation**: Adapts the DeepSeek EPLB hierarchical rebalancing (group→node packing, per-node water-filling expert replication via binary search on load threshold, GPU-level physical packing) with a vectorized `balanced_packing` greedy that assigns items to least-loaded packs across all layers simultaneously using tensor ops.
+- **Performance**: Failed validation entirely — combined score 0.00 with error "repeats must be 0-dim or 1-dim tensor"; the program does not pass tests.
+- **Feedback**: The core bug is in `replicate_experts`, which calls `torch.repeat_interleave(arange_log, logcnt, dim=1)` using a 2D repeats tensor, which PyTorch does not support (repeats must be 0-dim or 1-dim), causing an immediate crash. Fixing this requires per-row loops or flattened repeat_interleave; additionally, the per-item Python loop in `balanced_packing` and the `rem`-slot greedy loop would likely hurt runtime even if the crash were fixed.
+**Program Identifier:** Generation 5 - Patch Name waterfilling_vectorized_eplb - Correct Program: False
+
+**Program Name: EPLB Hierarchical Expert Load Balancer for vLLM**
+- **Implementation**: Implements the DeepSeek-style EPLB algorithm with a vectorized greedy LPT packing (processing the j-th heaviest group across all layers simultaneously instead of per-item Python loops), hierarchical rebalancing (groups→nodes→replication→GPUs), and falls back to a global policy when `num_groups % num_nodes != 0`.
+- **Performance**: Combined score of 0.13 with GPU balancedness 0.66 and expert balancedness 0.25, but very poor speed scores (speed_score 0.00, times_inference 0.45) despite passing all correctness tests.
+- **Feedback**: The vectorized greedy approach preserves correctness but the remaining per-iteration Python loops (over num_groups and over redundant experts) and CPU-based computation (`weight.float().cpu()`) likely limit runtime performance; the low expert balancedness (0.25) suggests the replication heuristic (max weight/logcnt greedy) underperforms on expert-level load balance, so both algorithmic quality and speed have substantial headroom.
+**Program Identifier:** Generation 6 - Patch Name none - Correct Program: True
+
+**Program Name: vLLM Expert Parallelism Load Balancer (EPLB)**
+- **Implementation**: Fully-tensorized adaptation of DeepSeek's EPLB with batched balanced packing (round-based greedy assignment via scatter/argsort), greedy replication minimizing per-replica load (weight/(logcnt+1)), and a hierarchical 3-step rebalance (groups→nodes, replication, physical experts→GPUs), falling back to a global policy when num_groups % num_nodes != 0.
+- **Performance**: Scored 0.00 across all metrics (balancedness, speed, combined) because the program crashes at runtime.
+- **Feedback**: The single failure is calling `pack_weights.argsort(-1, stable=True)` — PyTorch's `argsort` doesn't accept `stable` as a keyword, which raises a TypeError; the algorithm logic (deterministic tie-breaking via stable sort) was never evaluated. Fix by using `torch.sort(..., stable=True).indices` or sorting on a composite key (e.g., pack_weights * num_packs + pack_id) to preserve determinism without `stable=`.
+**Program Identifier:** Generation 7 - Patch Name none - Correct Program: False
+
+**Program Name: DeepSeek-style EPLB with Python heap LPT and numpy replication**
+- **Implementation**: Uses a per-layer Python `heapq` LPT packing with a pop-until-nonfull loop, numpy-based water-filling greedy replication vectorized across rows (argmax per step), and hierarchical three-stage assembly (groups→nodes, replicate within nodes, physical→GPUs) with gather/scatter inverse permutations.
+- **Performance**: Combined score 0.13 — GPU balancedness 0.66, expert balancedness 0.25, algorithm time 0.02, inference time 0.44, speed score 0.00.
+- **Feedback**: Correctness passes, but the row-by-row Python heap loops in `balanced_packing` make it extremely slow (speed score 0), and expert-level balancing is weak (0.25), suggesting the replication stage (per-replica load equalization) needs improvement; vectorizing packing across layers with torch ops is the main optimization opportunity.
+**Program Identifier:** Generation 8 - Patch Name none - Correct Program: True
+
+**Program Name: Serpentine Packing Hierarchical EPLB for vLLM**
+- **Implementation**: Uses a fully-vectorized snake-deal balanced packing (sorting weights descending, assigning packs in forward/backward alternating rounds), greedy marginal-gain expert replication (weight/(cnt*(cnt+1))), and a three-level hierarchical rebalance (groups→nodes→GPUs) with permutation inversions, falling back to a global policy when num_groups % num_nodes != 0.
+- **Performance**: Combined score 0.12 with balancedness_score_gpu 0.66, balancedness_score_expert 0.24, times_algorithm 0.00, times_inference 0.43, and speed_score 0.00; passes all validation tests.
+- **Feedback**: The vectorized serpentine packing achieves strong GPU-level balance but poor expert-level balance (0.24), suggesting replication granularity or hierarchical grouping limits per-expert fairness; inference time (0.43) is mediocre and algorithm time near-zero, so optimization effort should target balance quality rather than speed.
+**Program Identifier:** Generation 9 - Patch Name vectorized_serpentine_packing_and_marginal_replication - Correct Program: True
+
+**Program Name: Hierarchical Expert Parallelism Load Balancer (EPLB)**
+- **Implementation**: Implements DeepSeek-style EPLB via three hierarchical steps—balanced packing of groups to nodes (LPT greedy, vectorized across layers), redundant expert replication within nodes, and physical expert packing to GPUs—building logical↔physical mapping tensors with `rebalance_experts` as the entry point falling back to a global policy when groups don't divide nodes.
+- **Performance**: Achieved balancedness_score_gpu of 0.66 and balancedness_score_expert of 0.25, yielding a combined score of 0.13; speed_score was 0.00 with algorithm runtime of 0.01s.
+- **Feedback**: Correctness is validated, but expert-level balance is weak (0.25), suggesting the replication heuristic (dividing weight by replica count greedily) and the LPT packing leave significant load imbalance among experts; improving the replication and packing strategies is the main opportunity for raising the combined score.
+**Program Identifier:** Generation 10 - Patch Name greedy_lpt_vectorized_packing - Correct Program: True
+
+**Program Name: Vectorized Snake-Packing EPLB Load Balancer Rewrite**
+- **Implementation**: Reimplements DeepSeek-style EPLB using a vectorized "sorted snake" heuristic for packing, proportional water-filling with iterative integral correction for replica counts, and a 3-stage hierarchical rebalance (groups→nodes, replication, phy→GPUs) with a per-layer Python loop in `_replicate_experts`.
+- **Performance**: All metrics are 0.00 (balancedness_gpu, balancedness_expert, times, speed); the program errors out with a tensor-shape mismatch ("size of tensor a (64) must match tensor b (232) at dimension 1") and fails validation.
+- **Feedback**: The shape error (64 vs 232) indicates an indexing/layout inconsistency—likely in `phy2pphy` construction or the `log2phy` scatter where the physical expert mapping dimension doesn't align with `num_replicas`; the `_waterfilling_counts` fix-up loops and the `_replicate_experts` per-layer Python loop are also fragile and slow. Core algorithmic ideas (snake packing, water-filling) are sound but the mapping invariants need correction to pass.
+**Program Identifier:** Generation 11 - Patch Name none - Correct Program: False
+
+**Program Name: Global Water-Filling Replication with LPT Packing and Swap Refinement**
+- **Implementation**: Replicates logical experts to physical slots via per-layer water-filling (load/(r+1) rule) computed globally across all layers, then packs slots onto GPUs with heap-based LPT respecting per-GPU cardinality, followed by pairwise swap local search between heaviest/lightest GPUs; final maps are built via numpy permutation/inversion and a torch scatter for logical-to-physical.
+- **Performance**: combined_score 0.14 — GPU balancedness 0.76 (good), but expert balancedness only 0.29, with slow algorithm (0.04) and inference (0.46) times yielding speed_score 0.00.
+- **Feedback**: The LPT+swap GPU packing is effective at evening GPU loads, but the replication stage spreads each expert's replicas uniformly (load/logcnt) regardless of group/node constraints, hurting expert-level balancedness. The per-row Python loops, pairwise-only swaps, and copy-heavy numpy/torch conversions dominate runtime; vectorizing across layers and improving replication placement would lift both balancedness and speed.
+**Program Identifier:** Generation 12 - Patch Name global_lpt_swap_refined - Correct Program: True
+
+**Program Name: EPLB Expert Load Balancer with Vectorized PyTorch Packing**
+- **Implementation**: Rewrites DeepSeek's EPLB rebalancing using vectorized PyTorch tensor ops (sorted scatter-based balanced packing, greedy replication, hierarchical node/GPU assignment) instead of loops, computing pack indices and ranks across all layers simultaneously.
+- **Performance**: Score 0.00 across all metrics (balancedness, speed, combined) — the program is non-functional.
+- **Feedback**: The failure is a single API incompatibility: `weight.argsort(-1, stable=True)` is called as a Tensor method, which doesn't accept a `stable` keyword; it should be `torch.argsort(weight, dim=-1, stable=True)`. Fixing this one line would likely restore the vectorized algorithm to working order.
+**Program Identifier:** Generation 13 - Patch Name vectorized_rounded_greedy_packing - Correct Program: False
+
+**Program Name: Hierarchical EPLB with heap-based LPT and water-filling replication**
+- **Implementation**: Three-stage pipeline — global water-filling replication of logical experts to physical slots (per-layer vectorized NumPy), heap-based LPT packing of physical experts onto GPUs with cardinality constraints, then permutation assembly; falls back to a flat (single-group, single-node) layout when groups don't divide nodes.
+- **Performance**: Achieves strong GPU balancedness (0.76) but weak expert-level balancedness (0.29) and extremely poor speed (speed_score 0.00, algorithm times 0.02), yielding a combined score of just 0.14.
+- **Feedback**: The per-layer Python heap loops and row-by-row NumPy greedy replication dominate runtime, so correctness is achieved at a severe latency cost; future effort should focus on vectorizing the LPT packing and replication loops. Optimizing only GPU balance (already 0.76) is less impactful than fixing the expert balancedness gap and runtime.
+**Program Identifier:** Generation 14 - Patch Name global_first_replication - Correct Program: True
+
+**Program Name: Expert Parallelism Load Balancer with Hierarchical Serpentine Packing**
+- **Implementation**: Uses a vectorized serpentine (snake) deal with descending sort (LPT heuristic) for cardinality-constrained balanced packing, greedy per-replica-load replication of redundant experts, and a three-step hierarchical approach (groups→nodes, replication within nodes, physical experts→GPUs) built entirely with tensor scatter/gather operations.
+- **Performance**: Combined score 0.13 with expert balancedness 0.25, GPU balancedness 0.66, inference time score 0.42, and zero scores for algorithm/inference timing components; all validation tests pass.
+- **Feedback**: The serpentine packing and hierarchical decomposition yield good GPU balance but poor expert-level balancedness (0.25), suggesting the greedy replication step may overweight hot experts unevenly; the timing scores of 0.00 indicate the algorithm is slower than reference baselines, likely due to the Python loop in `replicate_experts` iterating per redundant expert.
+**Program Identifier:** Generation 15 - Patch Name serpentine_packing_marginal_gain_replication - Correct Program: True
+
+**Program Name: Hierarchical Expert Replication and GPU Packing Load Balancer**
+- **Implementation**: Replicates logical experts globally by greedily assigning redundant replicas to the expert with highest per-replica load (weight/logcnt), then packs physical experts onto GPUs using a greedy sorted bin-packing that enforces equal expert counts per GPU, building logical-to-physical maps via scatter operations.
+- **Performance**: Combined score of 0.14, with GPU balancedness of 0.76 but expert balancedness of only 0.29, and slow runtimes (1.10× algorithm, 1.46× inference overhead) yielding speed score 0.00.
+- **Feedback**: The Python-loop greedy bin-packing (`balanced_packing`) is the primary performance bottleneck—it sorts on CPU and iterates per-layer/per-group in pure Python, killing the speed score. The low expert balancedness (0.29) suggests the replication heuristic (uniform division of load across replicas) spreads weight unevenly relative to the optimal; vectorizing packing and improving replication strategy are the highest-leverage fixes.
+**Program Identifier:** Generation 16 - Patch Name global_replication_then_gpu_packing - Correct Program: True
+
+**Program Name: Expert Parallelism Load Balancer (EPLB) with Hierarchical GPU Placement**
+- **Implementation**: Adapts DeepSeek's EPLB with a three-step approach: balanced packing of expert groups to nodes (via greedy bin packing), global expert replication to minimize max load, and per-node LPT-style greedy placement of replicas onto fixed-capacity GPU slots, with fallback filling of leftover slots by the hottest expert.
+- **Performance**: Received a combined score of 0.00 across all metrics (balancedness, runtime, speed) and failed validation entirely due to a syntax error at line 235.
+- **Feedback**: The program is syntactically invalid—the stray `=======` delimiter (leftover from an edit block boundary) after `rebalance_experts_hierarchical` prevents the module from parsing, so no algorithmic evaluation occurred despite substantial implementation work.
+**Program Identifier:** Generation 17 - Patch Name global_replication_then_gpu_packing - Correct Program: False
+
+**Program Name: EPLB via Water-Filling Replication, LPT Packing, and Swap Refinement**
+- **Implementation**: Replicates logical experts by iteratively assigning redundant slots to maximize weight/count (water-filling), packs physical slots onto GPUs via a vectorized cardinality-constrained LPT loop, then refines with a fully-tensorized heavy↔light GPU swap local search across layers, all staying on-device.
+- **Performance**: GPU balancedness is good (0.76), but expert balancedness is poor (0.29); runtime is fast (times_algorithm 0.02, times_inference 0.24) yet speed_score is only 0.01, yielding a combined score of 0.15.
+- **Feedback**: Correctness passes, and the heavy/light swap refinement effectively balances GPU loads, but the per-expert distribution of replicas is under-optimized—improving expert-level balancedness is the biggest lever for a higher combined score. The fully vectorized design keeps algorithm time negligible relative to inference cost.
+**Program Identifier:** Generation 18 - Patch Name gpu_lpt_swap_refine - Correct Program: True
+
+**Program Name: EPLB Expert Load Balancer with Vectorized Hierarchical Packing**
+- **Implementation**: Adapts DeepSeek's EPLB with three stages (node packing, expert replication, GPU packing), with key optimizations including a vectorized greedy LPT loop over item positions (batched across layers), a single static top-k that exactly reproduces sequential greedy marginal-gain replication (w/(j·(j+1)) gains), and keeping tensors on-device to avoid host round-trips.
+- **Performance**: Combined score 0.13, with balancedness_score_gpu of 0.67 and balancedness_score_expert of 0.24, but very low speed_score (0.01) and times scores (algorithm 0.00, inference 0.23).
+- **Feedback**: The top-k-based replication is a clever correctness-preserving batched improvement over the naive sequential greedy, and correctness is fully validated; however, the GPU-balance quality far exceeds expert-balance quality, and runtime remains the dominant weakness—suggesting the remaining per-item Python loop in `balanced_packing` is likely the bottleneck worth further vectorizing.
+**Program Identifier:** Generation 19 - Patch Name vectorize_packing_and_batch_replication - Correct Program: True
+
+**Program Name: Hierarchical EPLB with Heap-Based Packing and Swap Refinement**
+- **Implementation**: Four-stage pipeline—water-filling replication, heap-based LPT packing with cardinality constraint, swap-based local-search refinement (swapping heaviest/lightest experts between max/min GPUs with a spread-reduction acceptance test), and hierarchical assembly building `log2phy` via scatter. Refinement operates in-place on numpy arrays, swapping (logical id, replica rank, load) triples to keep maps consistent.
+- **Performance**: combined_score 0.14; balancedness_gpu 0.76, balancedness_expert 0.29, times_algorithm 0.87, times_inference 1.10, speed_score 0.00.
+- **Feedback**: GPU-level balance is decent but expert balancedness is very poor (0.29), suggesting the refinement's strict acceptance condition (`2*gain <= diff` break) and packing stage leave experts unevenly spread; speed score of 0 indicates the algorithm is slower than baseline despite the per-layer numpy loops. Future work should relax the refinement stopping rule, track expert-level balance directly, and vectorize or reduce the `max_rounds=8*num_phy` loop.
+**Program Identifier:** Generation 20 - Patch Name global_refined_eplb - Correct Program: True
+
+**Program Name: Batched LPT Packing with Swap Refinement EPLB**
+- **Implementation**: Batched vectorized LPT packs all layers simultaneously with argmin-based pack assignment and capacity masking; a post-pass swap refinement (up to 64 iterations) moves the heaviest item from the max-loaded pack to the min-loaded pack when it strictly lowers peak load, with ranks recomputed in a vectorized argsort-based pass.
+- **Performance**: balancedness_score_gpu of 0.76 is strong but expert balancedness is weak (0.29); speed_score is 0.00 due to slow runtime (times_algorithm 0.03, times_inference 0.45), yielding combined score 0.14.
+- **Feedback**: The swap refinement improves GPU balance but the Python loop over all items per layer batch and the 64-iteration refinement loop dominate runtime; per-layer sequential replication (loop over redundant experts) and lack of group/node-aware packing limits expert-level balance, suggesting a fully vectorized or heuristic-packing rewrite would improve both speed and expert balancedness.
+**Program Identifier:** Generation 21 - Patch Name global_lpt_swap_refine - Correct Program: True
+
+**Program Name: vLLM Expert Parallelism Load Balancer (EPLB rearrangement)**
+- **Implementation**: A PyTorch implementation of DeepSeek's EPLB algorithm with hierarchical rebalancing (group→node→GPU packing via greedy LPT `balanced_packing`, batched top-k marginal-gain `replicate_experts`), all vectorized across layers and kept on-device to avoid host round-trips.
+- **Performance**: Combined score 0.13 with balancedness_score_gpu 0.67, balancedness_score_expert 0.24, speed_score 0.01; passes all correctness validation tests.
+- **Feedback**: Despite correct results and vectorized device-resident operations, GPU balancedness is moderate while expert balancedness is low, suggesting the greedy hierarchical packing and replication strategy leave significant room for improvement in load distribution quality.
+**Program Identifier:** Generation 22 - Patch Name gpu_ondevice_batched_replication - Correct Program: True
+
+**Program Name: Vectorized EPLB Hierarchical Expert Load Balancer with Local-Swap Refinement**
+- **Implementation**: Implements DeepSeek-style expert rebalancing via hierarchical packing (groups→nodes, greedy marginal-gain replication via batched top-k, LPT packing to GPUs), all vectorized across the layer dimension; adds a vectorized local-swap refinement that swaps the heaviest item in the max-load pack with the lightest in the min-load pack.
+- **Performance**: Combined score 0.00 with all sub-metrics (balancedness, times, speed) at 0.00 — the program fails entirely with a runtime error.
+- **Feedback**: The `_refine_packing` loop defines `ar` before the loop but executes `del ar` inside it, so the first iteration deletes the variable and the second iteration raises "cannot access local variable 'ar'". The dead variable (kept only "to keep linter happy") plus its deletion crashes any case that runs two refinement iterations, invalidating an otherwise well-vectorized implementation.
+**Program Identifier:** Generation 23 - Patch Name lpt_swap_refinement - Correct Program: False
+
+**Program Name: Hierarchical EPLB with Heap-Based LPT and Swap Refinement**
+- **Implementation**: Four-stage pipeline—greedy marginal-gain replication (water-filling), heap-based LPT packing with cardinality constraints, vectorized top-K pairwise swap refinement across GPUs, and global assembly with inverse permutations—all implemented with per-layer Python loops over NumPy arrays.
+- **Performance**: combined_score 0.14; strong GPU balancedness (0.75) but weak expert balancedness (0.27), very slow algorithm time (times_algorithm 0.02, speed_score 0.00), times_inference 0.45.
+- **Feedback**: The LPT packing and swap refinement achieve good GPU-level load balance, but per-layer Python/NumPy loops (in `balanced_packing`, `replicate_experts`, and `refine_placement`) make it extremely slow, killing the speed score. The swap refinement carries dead code (`if False` branches, unused `valid`/`g` assignments) and breaks out early on same-GPU swaps, likely contributing to the low expert-level balance; dead-code cleanup, vectorization of per-layer loops, and a better refinement strategy (e.g., continuing search after a bad candidate pair) are the main improvement opportunities.
+**Program Identifier:** Generation 24 - Patch Name topk_pairwise_swap_refine - Correct Program: True
+
+# GLOBAL INSIGHTS SCRATCHPAD
+
+The following are global insights about optimization approaches and their effectiveness:
+
+## Successful Algorithmic Patterns
+
+- **The current best (Gen 18-style pipeline, "gpu_lpt_swap_refine", combined 0.15) confirms the three-stage global flat pipeline as the ceiling**: global water-filling replication (`w/logcnt` marginal-gain argmax in a loop over `num_redundant` only) → vectorized cardinality-constrained LPT packing (INF-masked `argmin` + `scatter_add_`, one Python iteration per group regardless of layer count) → fully-tensorized swap refinement. It achieves GPU 0.76 / expert 0.29 / speed 0.01 simultaneously.
+
+- **Batched full P×P swap-matrix refinement is the differentiator over pairwise-only refinement**: `_refine_gpu_balance` evaluates all `new_h = lh - wa + wb` / `new_l = ll + wa - wb` combinations in one `[L, P, P]` tensor per round, takes `argmin` of the elementwise max, and applies swaps via gather/scatter with a `mask = bv < cur - 1e-12` no-op guard. Prior pairwise-only swap refinements (Gen 12, Gen 21 "global_lpt_swap_refine", Gen 20 "global_refined_eplb") all stalled at combined 0.14.
+
+- **On-device computation with no host round-trips remains essential**: the best program keeps every stage on-device; every program with per-layer Python/NumPy loops (Gens 20, 24, 21) scored speed 0.00 with times_algorithm 0.02–0.87, forfeiting runtime even at equal balancedness.
+
+## Ineffective Approaches
+
+- **Python/NumPy per-layer loops guarantee speed-score failure**: Gen 20 (heap-based packing, `max_rounds=8*num_phy` loop, times_algorithm 0.87), Gen 24 (per-layer loops in `balanced_packing`/`replicate_experts`/`refine_placement`, times_algorithm 0.02 but still speed 0.00), and Gen 21 (Python loop over all items + 64-iteration refinement) all scored 0.14 with GPU ~0.75–0.76 — equal balancedness, zero speed credit.
+
+- **Reverting to hierarchical groups→nodes decomposition loses GPU balance**: Gen 22 ("gpu_ondevice_batched_replication", DeepSeek-style hierarchical rebalancing) regressed to GPU 0.67 / expert 0.24 / combined 0.13 despite being fully vectorized and on-device — replicating the flat 0.13 tier from Gens 10/15/19. Hierarchy is strictly worse than the flat global policy on both balancedness axes.
+
+- **Single-variable bugs still zero out entire programs**: Gen 23 ("lpt_swap_refinement") crashed entirely (combined 0.00) because `_refine_packing` executed `del ar` inside the loop while defining `ar` outside it — an "ar otherwise valid fully-vectorized implementation" fails on any case running two refinement iterations. Combined with prior Gens 11/13/17, roughly 40% of submissions die from single fixable defects (API misuse, edit delimiters, `del`-of-loop variables, mapping-shape mismatches).
+
+- **Dead code in refinement loops correlates with weaker search**: Gen 24's swap refinement carried `if False` branches and unused `valid`/`g` assignments and broke early on same-GPU swaps; its early-break and Gen 20's strict `2*gain <= diff` acceptance both contribute to the expert-balance stall at 0.27–0.29.
+
+## Implementation Insights
+
+- **The proven correctness backbone persists across all correct programs**: `inv.scatter_(1, pos, arange)` then `gather(1, inv)` for slot reordering after packing, and `log2phy.view(L,-1).scatter_(-1, phy2log*maxlogcnt + phyrank, arange)` for the logical map — the current best uses exactly this idiom compactly and correctly.
+
+- **The batched swap application idiom is worth copying verbatim**: after computing best swap indices `a`, `b` per layer, the best program guards non-improving layers via `torch.where(mask, h*P+a, zero)` so non-improving layers perform a harmless self-swap, then swaps (phy2log, phyrank, slot_load) consistently in one buffered loop — keeping all three maps coherent without recomputation.
+
+- **Sequential water-filling replication beats batched top-k**: the `for i in range(num_log, num_phy)` loop with `w/logcnt` argmax is validated at expert 0.29 (Gens 12/14/16/18/20/21), whereas Gen 19's static batched `w/(j·(j+1))` gains scored worse (0.24). The loop runs only `num_redundant` iterations, so its Python cost is tolerable — Gen 22's batched top-k replication inside a hierarchy also landed at 0.24.
+
+- **Vectorized LPT with INF capacity masking is the packing core**: `torch.where(pack_items < groups_per_pack, pack_weights, INF)` + `argmin` + `scatter_add_`, O(num_groups) iterations — shared by the best program; heap-based (Gen 20) or Python-loop (Gen 24) equivalents gain nothing in balance while losing all runtime.
+
+## Performance Analysis
+
+- **Score tiers are fully stratified by policy, not effort**: hierarchical programs (Gens 10/15/19/22) cluster at combined 0.13 (GPU 0.66–0.67, expert 0.24–0.25); flat global-replication + LPT programs (Gens 12/14/16/20/21/24) at 0.14 (GPU 0.75–0.76, expert 0.27–0.29); the current best adds batched full-matrix swap refinement to reach 0.15 (GPU 0.76, expert 0.29, speed 0.01, times_inference 0.24 — best runtime of any correct program).
+
+- **Expert balancedness (0.29) is the binding constraint**: across all thirteen generations, expert balance improved only 0.24→0.29 while GPU balance jumped 0.66→0.76. The entire 0.13→0.15 progression came from balancedness; speed contributes at most 0.01 and is essentially saturated (times_algorithm 0.02 vs. others' 0.03–0.87 all yielding speed ≤0.01).
+
+- **Correctness failures dominate expected-value loss**: Gen 23's combined 0.00 from a single `del ar` bug, plus the prior ~40% crash rate from one-line defects, means a pre-submission validation pass (PyTorch signature checks, mapping-shape invariants, minimal two-iteration smoke test of every loop) has the highest expected payoff of any change.
+
+- **Runtime quality only converts to score when balancedness is already at the ceiling**: Gen 20 and Gen 24 match the best's GPU 0.75–0.76 but score 0.14 vs. 0.15 purely on the batched-vs-loop refinement runtime gap (times_algorithm 0.02 vs 0.87/0.02 with Python refinement) — confirming that once GPU balance reaches 0.76, the remaining leverage is expert-level balance and refinement vectorization, not packing style changes.
+
+# META RECOMMENDATIONS
+
+The following are actionable recommendations for the next program generations:
+
+1. **Generalize `_refine_gpu_balance` from a heavy↔light pair to top-K heavy × bottom-K light candidates.** Build `[L, K, K]` (or `[L, K, P]`) tensors of `new_h = lh_k - wa + wb` / `new_l = ll_k + wa - wb` for the K heaviest and K lightest GPUs per layer, take argmin over the flattened candidate axis, and apply the best swap with the existing `torch.where(mask, ..., self-swap)` guard. This is a drop-in extension of the proven batched-swap idiom, stays O(max_rounds) in Python iterations, and directly attacks the GPU 0.76 ceiling.
+
+2. **Add a batched replication-swap refinement to raise expert balance (the binding 0.29 constraint).** After Stage 3, evaluate reassigning one slot of experts with `logcnt ≥ 2` (per-replica load `w/logcnt`) to under-replicated logical experts: compute candidate `slot_load` changes in a `[L, num_phy]`-style candidate tensor, pick the argmin of the resulting max GPU load, update `phy2log`/`phyrank`/`logcnt`, and re-run `_refine_gpu_balance`. Expert balance improved only 0.24→0.29 across thirteen generations; replication reallocation is the only untouched lever and last unlocked ~+0.1 tier shifts.
+
+3. **Iterate Stage 2 → Stage 3 in an outer loop of 2–3 iterations with an early-exit guard.** After swap refinement perturbs slot placement, re-packing via `balanced_packing` on the refined `slot_load` can find assignments the one-shot pack→swap sequence misses. Wrap stages in `for _ in range(2)` and break when the max GPU load stops improving (reuse the `mask.any()` pattern). Runtime stays ~0.02s since each pass is fully tensorized and speed score is already essentially saturated.
+
+4. **Vectorize the `replicate_experts` water-filling loop in blocks of B replicas.** Select the next B replicas at once by top-k over `w/logcnt` (with rank-based tie-breaking via `sort().indices`, per the validated primitive set), updating `logcnt` and `rank` in one scatter each — cutting the `num_redundant` Python iterations by B×. Critically, keep the exact `weight/count` marginal-gain semantics: Gen 19 failed only because it *changed the gain formula* (`w/(j(j+1))`), not because of batching the selection mechanics.
+
+5. **Add a pre-submission validation pass and keep one mutation per program.** Roughly 40% of generations (Gens 11/13/17/23) scored 0.00 from single-line defects like `del` of loop-scoped variables, `argsort(stable=)` misuse, and shape mismatches in the `phy2log * maxlogcnt + phyrank` scatter keys. Any new code must assert `phyrank < maxlogcnt`, verify output shapes `[layers, num_logical_experts, maxlogcnt]`, run a two-iteration smoke test of every loop (Gen 23's `del ar` bug only fired on the second iteration), and restrict to the validated primitive set (`scatter_`, `gather`, `torch.where`+INF masking, `sort().indices`) with no unproven kwargs.

@@ -1,0 +1,502 @@
+<NAME>
+rts_pipeline_autoselect_curvature
+</NAME>
+<DESCRIPTION>
+Structural redesign around a modular pipeline with multi-candidate generation and internal proxy scoring. Instead of one fixed cascade, the pipeline builds several zero-phase candidates (different process-noise scales, one-pole alphas, and curvature-clamp strengths — including a guarded second-difference clamp that directly attacks the never-improving slope-change count), then selects the candidate that minimizes an internal objective combining (a) sign-flip/slope-change count of the first difference, (b) curvature violation mass, and (c) fidelity to the smoothed reference (correlation-guarded). This auto-calibrates per signal toward the scoring metrics without needing the clean reference, while all stages remain zero-phase so lag is preserved.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""
+Real-Time Adaptive Signal Processing Algorithm for Non-Stationary Time Series
+
+Architecture (modular pipeline + candidate selection):
+  1. NoiseStats: robust sigma_r / sigma_acc estimation from raw input.
+  2. RTSSmoother: constant-velocity Kalman forward + RTS backward pass
+     (zero-phase by construction), reusable at multiple Q scales.
+  3. Zero-phase post-ops: bilateral one-pole damper, velocity clamp,
+     curvature (second-difference) clamp, sub-noise reversal damp.
+  4. CandidateBuilder: assembles a small set of full-pipeline variants
+     (different Q scales, alphas, clamp strengths).
+  5. ProxySelector: scores every candidate with an internal objective
+     (slope-flip count + curvature-violation mass - fidelity weight) and
+     emits the winner. This directly targets the slope-change / false-
+     reversal metrics without needing the clean reference.
+
+Output contract: y[i] corresponds to input time i + window_size - 1,
+len(y) = len(x) - window_size + 1.
+"""
+import numpy as np
+
+
+# ----------------------------------------------------------------------------
+# Stage 1: robust noise / dynamics statistics
+# ----------------------------------------------------------------------------
+class NoiseStats:
+    """Robust measurement-noise and local-acceleration statistics."""
+
+    def __init__(self, x, window_size):
+        n = x.size
+        sig_range = float(np.std(x)) if n > 1 else 0.0
+        scale = max(sig_range, 1e-9)
+        d1 = np.diff(x)
+        sigma_r = np.median(np.abs(d1 - np.median(d1))) / (0.6745 * np.sqrt(2.0))
+        if not np.isfinite(sigma_r) or sigma_r <= 0.0:
+            sigma_r = scale
+        self.sigma_r = float(np.clip(sigma_r, 1e-4 * scale, scale))
+
+        w_r = int(max(3, min(window_size, n // 3)))
+        if w_r % 2 == 0:
+            w_r += 1
+        rough = np.convolve(x, np.ones(w_r) / w_r, mode="valid")
+        var_acc = 0.0
+        if rough.size > 2:
+            d2 = rough[2:] - 2.0 * rough[1:-1] + rough[:-2]
+            mad2 = np.median(np.abs(d2 - np.median(d2))) / 0.6745
+            noise_d2 = (self.sigma_r / np.sqrt(w_r)) * np.sqrt(6.0)
+            var_acc = mad2 * mad2 - noise_d2 * noise_d2
+        floor_acc = 0.05 * self.sigma_r
+        if var_acc < floor_acc * floor_acc:
+            var_acc = floor_acc * floor_acc
+        self.sigma_acc = float(min(np.sqrt(var_acc), 0.6 * self.sigma_r))
+
+
+# ----------------------------------------------------------------------------
+# Stage 2: reusable Kalman + RTS smoother
+# ----------------------------------------------------------------------------
+class RTSSmoother:
+    """Constant-velocity Kalman forward + RTS backward smoother."""
+
+    F = np.array([[1.0, 1.0], [0.0, 1.0]])
+    H = np.array([1.0, 0.0])
+    I2 = np.eye(2)
+
+    def __init__(self, R, qa):
+        self.R = R
+        self.qa = qa
+
+    def run(self, signal, q_scale):
+        n = len(signal)
+        R = self.R
+        Q = (self.qa * q_scale) * np.array([[0.25, 0.5], [0.5, 1.0]])
+        F, H, I2 = self.F, self.H, self.I2
+
+        xp = np.zeros((n, 2))
+        xf = np.zeros((n, 2))
+        Pp = np.zeros((n, 2, 2))
+        Pf = np.zeros((n, 2, 2))
+
+        x_est = np.array([signal[0], 0.0])
+        P = I2 * max(R, 1e-15)
+        for k in range(n):
+            if k == 0:
+                xp[k] = x_est
+                Pp[k] = P
+            else:
+                xp[k] = F @ x_est
+                Pp[k] = F @ P @ F.T + Q
+            S = Pp[k][0, 0] + R
+            K = Pp[k][:, 0] / S
+            x_est = xp[k] + K * (signal[k] - xp[k, 0])
+            P = (I2 - np.outer(K, H)) @ Pp[k]
+            P = 0.5 * (P + P.T)
+            xf[k] = x_est
+            Pf[k] = P
+
+        xs = xf.copy()
+        for k in range(n - 2, -1, -1):
+            Ppred = Pp[k + 1]
+            try:
+                Ppred_inv = np.linalg.inv(Ppred)
+            except np.linalg.LinAlgError:
+                Ppred_inv = np.linalg.pinv(Ppred)
+            G = Pf[k] @ F.T @ Ppred_inv
+            xs[k] = xf[k] + G @ (xs[k + 1] - xp[k + 1])
+        return xs
+
+
+# ----------------------------------------------------------------------------
+# Stage 3: zero-phase post-processing operators
+# ----------------------------------------------------------------------------
+def bilateral_one_pole(x, alpha):
+    """Forward then reversed one-pole smoothing — net zero phase delay."""
+    y = np.empty_like(x)
+    acc = x[0]
+    y[0] = acc
+    for i in range(1, len(x)):
+        acc = alpha * x[i] + (1.0 - alpha) * acc
+        y[i] = acc
+    acc = y[-1]
+    out = y.copy()
+    for i in range(len(x) - 2, -1, -1):
+        acc = alpha * y[i] + (1.0 - alpha) * acc
+        out[i] = acc
+    return out
+
+
+def velocity_clamp(y, vel, slack, sigma_r):
+    """Zero-phase displacement clamp driven by the smoothed velocity state."""
+    n = len(y)
+    if n < 2:
+        return y.copy()
+    out = y.copy()
+    for k in range(1, n):
+        d = out[k] - out[k - 1]
+        limit = 2.0 * abs(vel[k]) + slack * sigma_r
+        if abs(d) > limit:
+            out[k] = out[k - 1] + np.sign(d) * limit
+    for k in range(n - 2, -1, -1):
+        d = out[k] - out[k + 1]
+        limit = 2.0 * abs(vel[k]) + slack * sigma_r
+        if abs(d) > limit:
+            out[k] = out[k + 1] + np.sign(d) * limit
+    return out
+
+
+def curvature_clamp(y, limit):
+    """
+    Zero-phase second-difference clamp: |y[k+1]-2y[k]+y[k-1]| <= limit.
+    Directly removes alternating +/- residual steps — the oscillation mode
+    that displacement clamps cannot see. Applied in mirrored forward/back
+    sweeps so the operator is zero-phase.
+    """
+    n = len(y)
+    if n < 3 or limit <= 0:
+        return y.copy()
+    out = y.copy()
+    for k in range(1, n - 1):
+        d2 = out[k + 1] - 2.0 * out[k] + out[k - 1]
+        if abs(d2) > limit:
+            half = np.sign(d2) * (limit - d2) / 2.0
+            out[k - 1] -= half
+            out[k + 1] += half
+    for k in range(n - 2, 0, -1):
+        d2 = out[k + 1] - 2.0 * out[k] + out[k - 1]
+        if abs(d2) > limit:
+            half = np.sign(d2) * (limit - d2) / 2.0
+            out[k - 1] -= half
+            out[k + 1] += half
+    return out
+
+
+def reversal_damp(y, thresh, keep=0.0):
+    """
+    Suppress sub-noise sign flips in the first difference. On a detected
+    flip below `thresh`, hold the line (keep=0) or retain a partial step
+    (keep>0). Mirrored forward/back sweeps => zero phase.
+    """
+    n = len(y)
+    if n < 3:
+        return y
+    out = y.copy()
+    prev_d = y[1] - y[0]
+    for k in range(2, n):
+        d = out[k] - out[k - 1]
+        if prev_d * d < 0 and abs(d) < thresh:
+            out[k] = out[k - 1] + keep * d
+        prev_d = out[k] - out[k - 1] if keep > 0 else d
+    prev_d = y[-2] - y[-1]
+    for k in range(n - 3, -1, -1):
+        d = out[k] - out[k + 1]
+        if prev_d * d < 0 and abs(d) < thresh:
+            out[k] = out[k + 1] + keep * d
+        prev_d = out[k] - out[k + 1] if keep > 0 else d
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Stages 4+5: candidate pipeline + proxy-based selection
+# ----------------------------------------------------------------------------
+def _count_flips(v):
+    dv = np.diff(v)
+    dv = dv[dv != 0]
+    return int(np.sum(dv[1:] * dv[:-1] < 0)) if dv.size > 1 else 0
+
+
+def _robust_mad(v):
+    if v.size < 3:
+        return 0.0
+    return float(np.median(np.abs(v - np.median(v))) / 0.6745)
+
+
+def _guarded(fn, y, guard_ref, min_corr=0.97, max_tries=4, **kwargs):
+    """Apply `fn` with escalating slack-type params until the correlation
+    guard passes; return the guarded result or None."""
+    cur = y.copy()
+    for _ in range(max_tries):
+        cand = fn(cur, **kwargs)
+        c = np.corrcoef(cand, guard_ref)[0, 1]
+        if np.isfinite(c) and c >= min_corr:
+            return cand
+        # relax: scale any multiplicative parameter up 2x if present
+        if "limit" in kwargs:
+            kwargs["limit"] *= 2.0
+        if "thresh" in kwargs:
+            kwargs["thresh"] *= 2.0
+        if "slack" in kwargs:
+            kwargs["slack"] *= 2.0
+    return None
+
+
+def _build_candidate(x, stats, smoother, q_scale2, alpha_base, curv_c):
+    """Build one full pipeline variant. Returns the filtered trajectory."""
+    n = x.size
+    R = stats.sigma_r ** 2
+    qa = stats.sigma_acc ** 2
+
+    # Pass 1: full-noise RTS on raw input
+    xs1 = smoother.run(x, 1.0)
+    y = xs1[:, 0].copy()
+
+    # Pass 2: refinement at q_scale2 on smoothed output + dynamics blend
+    xs2 = smoother.run(y, q_scale2)
+    y_ref = xs2[:, 0].copy()
+    if stats.sigma_acc > 1e-12 and stats.sigma_r > 1e-12:
+        dyn = stats.sigma_acc / stats.sigma_r
+        w = float(np.clip(1.25 - 1.25 * dyn, 0.25, 1.0))
+    else:
+        w = 1.0
+    y = w * y_ref + (1.0 - w) * y
+
+    # Bilateral one-pole ripple damper (alpha from residual noise)
+    dy = np.diff(y)
+    r_std = np.median(np.abs(dy - np.median(dy))) / (0.6745 * np.sqrt(2.0)) if dy.size > 2 else 0.0
+    if r_std > 0:
+        alpha = float(np.clip(
+            alpha_base + 0.4 * np.tanh(2.0 * stats.sigma_r / max(r_std, 1e-12) - 2.0),
+            0.55, 0.95))
+    else:
+        alpha = 1.0
+    if alpha < 0.999:
+        y = bilateral_one_pole(y, alpha)
+
+    # Guarded velocity clamp
+    vel = xs2[:, 1].copy() if n >= 2 else xs1[:, 1].copy()
+    cand = _guarded(velocity_clamp, y, y, slack=0.6, vel=vel, sigma_r=stats.sigma_r)
+    if cand is not None:
+        y = cand
+
+    # Guarded curvature clamp (direct slope-change attack)
+    d2o = y[2:] - 2.0 * y[1:-1] + y[:-2]
+    d2_scale = _robust_mad(d2o)
+    if d2_scale > 0:
+        cand = _guarded(curvature_clamp, y, y, limit=curv_c * d2_scale)
+        if cand is not None:
+            y = cand
+
+    # Guarded sub-noise reversal damping
+    dy_o = np.diff(y)
+    step_std = _robust_mad(dy_o)
+    if step_std > 0:
+        cand = _guarded(reversal_damp, y, y, thresh=1.5 * step_std, keep=0.0)
+        if cand is not None:
+            y = cand
+    return y
+
+
+def _proxy_score(y, ref, sigma_r):
+    """
+    Internal objective approximating the external metric mix (lower=better):
+      - slope-change / flip count of the first difference (dominant),
+      - curvature-violation mass (smoothness proxy),
+      - fidelity penalty: deviation from a trust-region reference.
+    """
+    flips = _count_flips(y)
+    d2 = y[2:] - 2.0 * y[1:-1] + y[:-2] if y.size >= 3 else np.zeros(1)
+    d2_scale = _robust_mad(d2)
+    viol = float(np.sum(np.maximum(np.abs(d2) - 3.0 * max(d2_scale, 1e-12), 0.0)))
+    err = float(np.sqrt(np.mean((y - ref) ** 2)))
+    return flips + 20.0 * viol / max(sigma_r, 1e-12) + 40.0 * err / max(sigma_r, 1e-12)
+
+
+def kalman_rts_filter(x, window_size=20):
+    """
+    Pipeline entry: statistics -> multi-candidate zero-phase filtering ->
+    internal proxy selection -> output slice.
+    Output index i corresponds to input time i + window_size - 1.
+    """
+    x = np.asarray(x, dtype=float, copy=True).ravel()
+    bad = ~np.isfinite(x)
+    if bad.any():
+        idx = np.arange(x.size)
+        if bad.all():
+            return np.zeros(max(0, x.size - window_size + 1))
+        x[bad] = np.interp(idx[bad], idx[~bad], x[~bad])
+    n = x.size
+    if n < window_size:
+        return x[: max(1, n - window_size + 1)].copy()
+    if n == 1:
+        return x.copy()
+
+    stats = NoiseStats(x, window_size)
+    smoother = RTSSmoother(stats.sigma_r ** 2, stats.sigma_acc ** 2)
+
+    # Reference for fidelity: single-pass RTS output (trust region anchor)
+    ref = smoother.run(x, 1.0)[:, 0].copy()
+
+    # Candidate grid: (refinement Q scale, one-pole alpha base, curvature c)
+    grid = [
+        (0.25, 0.55, 1.5),   # baseline configuration (known ~0.72 behavior)
+        (0.25, 0.55, 1.0),   # stronger curvature clamp
+        (0.12, 0.60, 0.8),   # deeper smoothing + strongest curvature
+        (0.50, 0.60, 1.2),   # more responsive, moderate curvature
+    ]
+
+    best_y, best_score = None, np.inf
+    for (qs, ab, cc) in grid:
+        cand = _build_candidate(x, stats, smoother, qs, ab, cc)
+        # sanity: must stay close to the trust region
+        corr = np.corrcoef(cand, ref)[0, 1]
+        if not np.isfinite(corr) or corr < 0.95:
+            continue
+        s = _proxy_score(cand, ref, stats.sigma_r)
+        if s < best_score:
+            best_score = s
+            best_y = cand
+
+    if best_y is None:
+        best_y = ref
+
+    # --- Slice to output contract ---
+    y = best_y[window_size - 1:].copy()
+    expected = n - window_size + 1
+    if y.shape[0] != expected:
+        y = y[:expected]
+    return y
+
+
+# ----------------------------------------------------------------------------
+# Public API (same contract as before)
+# ----------------------------------------------------------------------------
+def adaptive_filter(x, window_size=20):
+    """Baseline entry — routes to the candidate-selecting pipeline."""
+    return enhanced_filter_with_trend_preservation(x, window_size)
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """Enhanced entry — modular pipeline with proxy-based selection."""
+    return kalman_rts_filter(x, window_size)
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """
+    Main signal processing function that applies the selected algorithm.
+
+    Args:
+        input_signal: Input time series data
+        window_size: Window size for processing
+        algorithm_type: Type of algorithm to use ("basic", "enhanced", or "rts")
+
+    Returns:
+        Filtered signal
+    """
+    return kalman_rts_filter(input_signal, window_size)
+
+# EVOLVE-BLOCK-END
+
+
+def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+    """
+    Generate synthetic test signal with known characteristics.
+
+    Args:
+        length: Length of the signal
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (noisy_signal, clean_signal)
+    """
+    np.random.seed(seed)
+    t = np.linspace(0, 10, length)
+
+    clean_signal = (
+        2 * np.sin(2 * np.pi * 0.5 * t)
+        + 1.5 * np.sin(2 * np.pi * 2 * t)
+        + 0.5 * np.sin(2 * np.pi * 5 * t)
+        + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)
+    )
+
+    trend = 0.1 * t * np.sin(0.2 * t)
+    clean_signal += trend
+
+    random_walk = np.cumsum(np.random.randn(length) * 0.05)
+    clean_signal += random_walk
+
+    noise = np.random.normal(0, noise_level, length)
+    noisy_signal = clean_signal + noise
+
+    return noisy_signal, clean_signal
+
+
+def run_signal_processing(noisy_signal=None, signal_length=1000, noise_level=0.3, window_size=20):
+    """
+    Run the signal processing algorithm on a test signal.
+
+    Args:
+        noisy_signal: Input signal to filter (if provided, use this; otherwise generate)
+        signal_length: Length if generating signal (for backward compatibility)
+        noise_level: Noise level if generating signal (for backward compatibility)
+        window_size: Window size for processing
+
+    Returns:
+        Dictionary containing results and metrics
+    """
+    if noisy_signal is not None:
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+        clean_signal = None
+    else:
+        noisy_signal, clean_signal = generate_test_signal(signal_length, noise_level)
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+
+    if len(filtered_signal) > 0 and clean_signal is not None:
+        delay = window_size - 1
+        aligned_clean = clean_signal[delay:]
+        aligned_noisy = noisy_signal[delay:]
+
+        min_length = min(len(filtered_signal), len(aligned_clean))
+        filtered_signal = filtered_signal[:min_length]
+        aligned_clean = aligned_clean[:min_length]
+        aligned_noisy = aligned_noisy[:min_length]
+
+        correlation = np.corrcoef(filtered_signal, aligned_clean)[0, 1] if min_length > 1 else 0
+
+        noise_before = np.var(aligned_noisy - aligned_clean)
+        noise_after = np.var(filtered_signal - aligned_clean)
+        noise_reduction = (noise_before - noise_after) / noise_before if noise_before > 0 else 0
+
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": aligned_clean,
+            "noisy_signal": aligned_noisy,
+            "correlation": correlation,
+            "noise_reduction": noise_reduction,
+            "signal_length": min_length,
+        }
+    elif len(filtered_signal) > 0:
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": None,
+            "noisy_signal": None,
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": len(filtered_signal),
+        }
+    else:
+        return {
+            "filtered_signal": [],
+            "clean_signal": [],
+            "noisy_signal": [],
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": 0,
+        }
+
+
+if __name__ == "__main__":
+    results = run_signal_processing()
+    print("Signal processing completed!")
+    print(f"Correlation with clean signal: {results['correlation']:.3f}")
+    print(f"Noise reduction: {results['noise_reduction']:.3f}")
+    print(f"Processed signal length: {results['signal_length']}")
+```
+</CODE>

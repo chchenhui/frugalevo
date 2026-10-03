@@ -1,0 +1,232 @@
+<NAME>
+multistart_lattice_optimizer
+</NAME>
+
+<DESCRIPTION>
+This constructor retains the strong 5×5 lattice plus interstice seed from the current program, but improves it with deterministic multistart optimization. It combines square-grid, jittered-grid, and staggered hexagonal/layered initial arrangements, then uses SLSQP to optimize all center coordinates and radii simultaneously. The best certified feasible result is retained, followed by a small continuation perturbation around the best basin. A final common scaling step guarantees circles remain inside the unit square and non-overlapping despite numerical optimizer tolerances.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles"""
+import numpy as np
+
+
+def construct_packing():
+    """
+    Construct and optimize a 26-circle packing in the unit square.
+
+    Several deterministic structured seeds are used: a square contact
+    lattice with an interstitial circle, perturbed lattice variants, and
+    a staggered hexagonal-style layout.  Each seed is optimized directly
+    over centers and radii, and the best certified feasible packing is
+    returned.
+    """
+    n = 26
+    ii, jj = np.triu_indices(n, 1)
+
+    grid = np.linspace(0.1, 0.9, 5)
+    lattice_centers = np.array([(x, y) for y in grid for x in grid],
+                               dtype=float)
+    lattice_centers = np.vstack((lattice_centers, [0.2, 0.2]))
+    lattice_radii = np.full(n, 0.1, dtype=float)
+    lattice_radii[-1] = np.sqrt(0.02) - 0.1
+
+    def clearance(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        delta = c[ii] - c[jj]
+        pair_distance = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+        return np.concatenate((
+            c[:, 0] - r,
+            1.0 - c[:, 0] - r,
+            c[:, 1] - r,
+            1.0 - c[:, 1] - r,
+            pair_distance - r[ii] - r[jj],
+        ))
+
+    def safe_scale(c, r):
+        """Apply one common conservative scale to certify feasibility."""
+        border = np.minimum.reduce((
+            c[:, 0], c[:, 1], 1.0 - c[:, 0], 1.0 - c[:, 1],
+        ))
+        delta = c[ii] - c[jj]
+        dist = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+        denom = r[ii] + r[jj]
+        scale = min(
+            1.0,
+            float(np.min(border / np.maximum(r, 1.e-15))),
+            float(np.min(dist / np.maximum(denom, 1.e-15))),
+        )
+        return r * max(0.0, 0.9999995 * scale)
+
+    def uniform_feasible_radii(c, cap=0.075):
+        delta = c[ii] - c[jj]
+        dist = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+        border = np.minimum.reduce((
+            c[:, 0], c[:, 1], 1.0 - c[:, 0], 1.0 - c[:, 1],
+        ))
+        value = min(cap, float(np.min(border)), 0.5 * float(np.min(dist)))
+        return np.full(n, max(1.e-4, 0.995 * value), dtype=float)
+
+    rng = np.random.default_rng(26031991)
+    seeds = [(lattice_centers, lattice_radii)]
+
+    # Two asymmetric openings of the square lattice.  Starting smaller
+    # permits the nonlinear optimizer to change its contact graph.
+    for amplitude in (0.018, 0.036):
+        c = lattice_centers.copy()
+        c += rng.uniform(-amplitude, amplitude, size=c.shape)
+        c = np.clip(c, 0.055, 0.945)
+        seeds.append((c, uniform_feasible_radii(c, 0.072)))
+
+    # A staggered five-row layout has a different, near-hexagonal contact
+    # graph and is useful when the square-lattice basin is restrictive.
+    rows = []
+    row_specs = [
+        (5, 0.10, 0.90),
+        (5, 0.10, 0.90),
+        (6, 0.075, 0.925),
+        (5, 0.10, 0.90),
+        (5, 0.10, 0.90),
+    ]
+    ys = np.linspace(0.09, 0.91, 5)
+    for y, (count, left, right) in zip(ys, row_specs):
+        for x in np.linspace(left, right, count):
+            rows.append((x, y))
+    hex_centers = np.asarray(rows, dtype=float)
+    seeds.append((hex_centers, uniform_feasible_radii(hex_centers, 0.070)))
+
+    best_centers = lattice_centers.copy()
+    best_radii = lattice_radii.copy()
+    best_value = float(np.sum(best_radii))
+
+    try:
+        from scipy.optimize import minimize
+
+        bounds = [(0.0, 1.0)] * (2 * n) + [(1.e-7, 0.5)] * n
+
+        def optimize(c0, r0):
+            z0 = np.concatenate((c0.ravel(), r0))
+            result = minimize(
+                lambda z: -float(np.sum(z[2 * n:])),
+                z0,
+                method="SLSQP",
+                bounds=bounds,
+                constraints={"type": "ineq", "fun": clearance},
+                options={"maxiter": 600, "ftol": 2.e-12, "disp": False},
+            )
+            if result.x is None:
+                return None
+            c = result.x[:2 * n].reshape(n, 2)
+            r = result.x[2 * n:]
+            if not (np.all(np.isfinite(c)) and np.all(np.isfinite(r))):
+                return None
+            if np.min(clearance(np.concatenate((c.ravel(), r)))) < -2.e-6:
+                return None
+            return c, safe_scale(c, r)
+
+        for c0, r0 in seeds:
+            candidate = optimize(c0, r0)
+            if candidate is not None:
+                c, r = candidate
+                value = float(np.sum(r))
+                if value > best_value:
+                    best_centers, best_radii, best_value = c, r, value
+
+        # A final small continuation restart around the strongest result
+        # often releases contacts that were fixed by the original seed.
+        c0 = best_centers + rng.uniform(-0.009, 0.009, size=best_centers.shape)
+        c0 = np.clip(c0, 0.02, 0.98)
+        r0 = safe_scale(c0, best_radii * 0.72)
+        candidate = optimize(c0, r0)
+        if candidate is not None:
+            c, r = candidate
+            value = float(np.sum(r))
+            if value > best_value:
+                best_centers, best_radii, best_value = c, r, value
+
+    except ImportError:
+        pass
+
+    return best_centers, best_radii, float(np.sum(best_radii))
+
+
+def compute_max_radii(centers):
+    """
+    Compute the maximum possible radii for each circle position
+    such that they don't overlap and stay within the unit square.
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+
+    Returns:
+        np.array of shape (n) with radius of each circle
+    """
+    n = centers.shape[0]
+    radii = np.ones(n)
+
+    for i in range(n):
+        x, y = centers[i]
+        radii[i] = min(x, y, 1 - x, 1 - y)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if radii[i] + radii[j] > dist:
+                scale = dist / (radii[i] + radii[j])
+                radii[i] *= scale
+                radii[j] *= scale
+
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)
+``` 
+</CODE>

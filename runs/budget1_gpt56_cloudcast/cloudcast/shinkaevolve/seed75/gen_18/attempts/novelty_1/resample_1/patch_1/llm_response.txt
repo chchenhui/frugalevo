@@ -1,0 +1,206 @@
+<NAME>
+multistart_shared_greedy
+</NAME>
+
+<DESCRIPTION>
+Replace the single nearest-destination large-fanout fallback with deterministic multi-start shared-tree construction. Different attachment orders expose different relay trunks and shared-prefix opportunities across cloud networks. Each candidate is reverse-pruned by testing whether every destination remains source-reachable after removing an edge, then the lowest unique-link-cost union is retained. This preserves correctness while reducing redundant inter-cloud transfers for destination sets above the exact Steiner threshold.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+import heapq
+import math
+import os
+from typing import Dict, List
+=======
+import heapq
+import math
+import os
+import random
+from typing import Dict, List
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def _greedy_shared_edges(src, terminals, h):
+    """Scalable fallback for large fanout: shared-prefix greedy arborescence."""
+    tree_nodes = {src}
+    remaining = set(terminals)
+    selected_edges = set()
+
+    while remaining:
+        distances, paths = nx.multi_source_dijkstra(h, tree_nodes, weight="cost")
+        reachable = [dst for dst in remaining if dst in distances]
+        if not reachable:
+            missing = ", ".join(str(dst) for dst in remaining)
+            raise nx.NetworkXNoPath(f"No priced broadcast route from {src} to: {missing}")
+
+        dst = min(reachable, key=lambda node: (distances[node], str(node)))
+        branch = paths[dst]
+
+        for u, v in zip(branch, branch[1:]):
+            selected_edges.add((u, v))
+            tree_nodes.add(u)
+            tree_nodes.add(v)
+
+        remaining.remove(dst)
+
+    # Remove non-terminal leaves left behind by overlapping greedy branches.
+    pruned = nx.DiGraph()
+    pruned.add_edges_from(selected_edges)
+    protected = set(terminals) | {src}
+
+    changed = True
+    while changed:
+        changed = False
+        for node in list(pruned.nodes()):
+            if node not in protected and pruned.out_degree(node) == 0:
+                pruned.remove_node(node)
+                changed = True
+
+    return set(pruned.edges())
+=======
+def _prune_shared_edges(src, terminals, edges):
+    """Remove every selected link that is unnecessary for delivery."""
+    topology = nx.DiGraph()
+    topology.add_edges_from(edges)
+
+    # First discard dead relay branches cheaply.
+    protected = set(terminals) | {src}
+    changed = True
+    while changed:
+        changed = False
+        for node in list(topology.nodes()):
+            if node not in protected and topology.out_degree(node) == 0:
+                topology.remove_node(node)
+                changed = True
+
+    # A greedy union can contain alternate paths or cycles.  Reverse-delete
+    # links while preserving source reachability for every requested terminal.
+    ordered_edges = sorted(
+        topology.edges(),
+        key=lambda edge: (
+            -float(topology[edge[0]][edge[1]].get("cost", 0.0)),
+            str(edge[0]),
+            str(edge[1]),
+        ),
+    )
+    for u, v in ordered_edges:
+        topology.remove_edge(u, v)
+        if not all(
+            dst in topology and nx.has_path(topology, src, dst)
+            for dst in terminals
+        ):
+            topology.add_edge(u, v)
+
+    return set(topology.edges())
+
+
+def _greedy_candidate(src, terminals, h, policy, seed, source_distances):
+    """Build one order-sensitive shared-prefix candidate."""
+    rng = random.Random(seed)
+    tree_nodes = {src}
+    remaining = set(terminals)
+    selected_edges = set()
+
+    while remaining:
+        distances, paths = nx.multi_source_dijkstra(h, tree_nodes, weight="cost")
+        reachable = [dst for dst in remaining if dst in distances]
+        if not reachable:
+            missing = ", ".join(str(dst) for dst in remaining)
+            raise nx.NetworkXNoPath(
+                f"No priced broadcast route from {src} to: {missing}"
+            )
+
+        if policy == "nearest":
+            dst = min(reachable, key=lambda node: (distances[node], str(node)))
+        elif policy == "farthest":
+            dst = max(
+                reachable,
+                key=lambda node: (
+                    distances[node],
+                    source_distances.get(node, math.inf),
+                    str(node),
+                ),
+            )
+        elif policy == "source_farthest":
+            dst = max(
+                reachable,
+                key=lambda node: (
+                    source_distances.get(node, -math.inf),
+                    -distances[node],
+                    str(node),
+                ),
+            )
+        else:
+            # Deterministic randomized orders can discover trunks that fixed
+            # nearest-first ordering never installs early enough to reuse.
+            dst = min(
+                reachable,
+                key=lambda node: (rng.random(), distances[node], str(node)),
+            )
+
+        branch = paths[dst]
+        for u, v in zip(branch, branch[1:]):
+            selected_edges.add((u, v))
+            tree_nodes.add(u)
+            tree_nodes.add(v)
+        remaining.remove(dst)
+
+    return _prune_shared_edges(src, terminals, selected_edges)
+
+
+def _greedy_shared_edges(src, terminals, h):
+    """Compare complementary shared-prefix construction orders."""
+    source_distances = nx.single_source_dijkstra_path_length(
+        h, src, weight="cost"
+    )
+    missing = [dst for dst in terminals if dst not in source_distances]
+    if missing:
+        raise nx.NetworkXNoPath(
+            "No priced broadcast route from {} to: {}".format(
+                src, ", ".join(str(dst) for dst in missing)
+            )
+        )
+
+    best_edges = None
+    best_score = None
+    for policy, seed in (
+        ("nearest", 0),
+        ("farthest", 0),
+        ("source_farthest", 0),
+        ("random", 17),
+        ("random", 113),
+        ("random", 911),
+    ):
+        candidate = _greedy_candidate(
+            src, terminals, h, policy, seed, source_distances
+        )
+        score = (
+            sum(float(h[u][v]["cost"]) for u, v in candidate),
+            len(candidate),
+            tuple(sorted((str(u), str(v)) for u, v in candidate)),
+        )
+        if best_score is None or score < best_score:
+            best_edges = candidate
+            best_score = score
+
+    return best_edges
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if len(terminals) <= EXACT_TERMINAL_LIMIT:
+            selected_edges = _exact_shared_edges(src, terminals, h)
+        else:
+            selected_edges = _greedy_shared_edges(src, terminals, h)
+=======
+        if len(terminals) <= EXACT_TERMINAL_LIMIT:
+            selected_edges = _exact_shared_edges(src, terminals, h)
+            selected_edges = _prune_shared_edges(src, terminals, selected_edges)
+        else:
+            selected_edges = _greedy_shared_edges(src, terminals, h)
+>>>>>>> REPLACE
+</DIFF>

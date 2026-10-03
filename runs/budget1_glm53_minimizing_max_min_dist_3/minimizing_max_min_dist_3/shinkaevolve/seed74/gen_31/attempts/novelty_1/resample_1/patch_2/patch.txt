@@ -1,0 +1,393 @@
+--- a/original.py
++++ b/original.py
+@@ -1,160 +1,262 @@
+ # EVOLVE-BLOCK-START
++import time
+ import numpy as np
++
++try:
++    from scipy.optimize import minimize
++    HAVE_SCIPY = True
++except Exception:
++    HAVE_SCIPY = False
+ 
+ 
+ def min_max_dist_dim3_14() -> np.ndarray:
+     """
+-    Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
+-
+-    Returns
+-        points: np.ndarray of shape (14,3) containing the (x,y) coordinates of the 14 points.
+-
++    Constructs 14 points in 3D maximizing min pairwise distance / max pairwise
++    distance. Returns np.ndarray of shape (14, 3).
+     """
+-
+-    n = 14
+-    d = 3
+-
+-    from scipy.optimize import minimize
+-
+-    rng = np.random.default_rng(42)
+-    I, J = np.triu_indices(n, k=1)
+-
+-    def true_ratio(P):
+-        dd = np.linalg.norm(P[I] - P[J], axis=1)
++    n, d = 14, 3
++    rng = np.random.default_rng(20240)
++    I, J = np.triu_indices(n, 1)
++    m = len(I)
++    NV = 3 * n
++    T0 = time.time()
++    BUDGET = 5.5
++
++    def pdist(P):
++        return np.linalg.norm(P[I] - P[J], axis=1)
++
++    def ratio(P):
++        dd = pdist(P)
+         mx = dd.max()
+-        if mx <= 0:
+-            return 0.0
+-        return dd.min() / mx
++        return 0.0 if mx <= 1e-12 else dd.min() / mx
+ 
+     def normalize(P):
+-        P = P - P.mean(axis=0)
+-        mx = np.linalg.norm(P[I] - P[J], axis=1).max()
+-        if mx <= 1e-12:
++        P = np.asarray(P, dtype=float).copy()
++        P -= P.mean(axis=0)
++        mx = pdist(P).max()
++        return P / mx if mx > 1e-12 else P
++
++    # ---------- smoothed-ratio annealing (log-sum-exp softmin/softmax) ----------
++    def soft_fg(x, T):
++        P = x.reshape(n, 3)
++        diff = P[I] - P[J]
++        dd = np.sqrt(np.sum(diff * diff, axis=1) + 1e-16)
++        a = -dd / T
++        am = a.max()
++        softmin = -T * (am + np.log(np.sum(np.exp(a - am))))
++        b = dd / T
++        bm = b.max()
++        softmax = T * (bm + np.log(np.sum(np.exp(b - bm))))
++        w = np.exp(-dd / T)
++        w /= w.sum()
++        v = np.exp(dd / T)
++        v /= v.sum()
++        gdd = (w * softmax - softmin * v) / (softmax * softmax)
++        u = diff / dd[:, None]
++        G = np.zeros((n, 3))
++        np.add.at(G, I, gdd[:, None] * u)
++        np.add.at(G, J, -gdd[:, None] * u)
++        return -softmin / softmax, -G.ravel()
++
++    def anneal(P0, temps=(0.15, 0.06, 0.02)):
++        x = normalize(P0).ravel()
++        if not HAVE_SCIPY:
++            return normalize(x.reshape(n, 3))
++        for T in temps:
++            try:
++                res = minimize(lambda z: soft_fg(z, T), x, jac=True,
++                               method="L-BFGS-B",
++                               options={"maxiter": 100, "ftol": 1e-12})
++                if np.all(np.isfinite(res.x)):
++                    x = res.x
++            except Exception:
++                pass
++        return normalize(x.reshape(n, 3))
++
++    # ---------- exact constrained solve: max t s.t. t^2 <= d^2 <= 1 ----------
++    def slsqp(P0, maxiter=300):
++        P = normalize(P0)
++        if pdist(P).max() <= 1e-12 or not HAVE_SCIPY:
+             return P
+-        return P / mx
+-
+-    # Fast annealed analytic-gradient ascent on a soft-minimum of the
+-    # pairwise distances. Points are re-centered and re-scaled to dmax=1
+-    # after every step, so the ratio equals the minimum distance.
+-    def grad_ascend(P0, ks=(3.0, 6.0, 12.0, 25.0, 50.0), iters=200,
+-                    lr=0.02):
+-        P = normalize(np.asarray(P0, dtype=float).copy())
+-        for k in ks:
+-            for _ in range(iters):
+-                diff = P[I] - P[J]
+-                dd = np.linalg.norm(diff, axis=1)
+-                dd = np.maximum(dd, 1e-9)
+-                w = np.exp(-k * (dd - dd.min()))
+-                W = w.sum()
+-                u = diff / dd[:, None]
+-                coef = (w / W)[:, None]
+-                G = np.zeros_like(P)
+-                np.add.at(G, I, coef * u)
+-                np.add.at(G, J, -coef * u)
+-                P = normalize(P + lr * G)
+-        return P
+-
+-    # Structured starts: icosahedron + poles, Fibonacci sphere, jittered,
+-    # random-sphere and Gaussian starts.
++        x0 = np.concatenate([P.ravel(), [pdist(P).min()]])
++
++        def fobj(x):
++            return -x[-1]
++
++        def fjac(x):
++            g = np.zeros(NV + 1)
++            g[-1] = -1.0
++            return g
++
++        def cons(x):
++            P2 = x[:NV].reshape(n, d)
++            dv = np.sum((P2[I] - P2[J]) ** 2, axis=1)
++            return np.concatenate([1.0 - dv, dv - x[-1] ** 2])
++
++        def cjac(x):
++            P2 = x[:NV].reshape(n, d)
++            diff = P2[I] - P2[J]
++            Jc = np.zeros((2 * m, NV + 1))
++            ci = 3 * I[:, None] + np.arange(3)
++            cj = 3 * J[:, None] + np.arange(3)
++            Jc[:m, ci] = -2 * diff
++            Jc[:m, cj] = 2 * diff
++            Jc[m:, ci] = 2 * diff
++            Jc[m:, cj] = -2 * diff
++            Jc[m:, -1] = -2 * x[-1]
++            return Jc
++
++        try:
++            res = minimize(fobj, x0, jac=fjac, method="SLSQP",
++                           constraints=[{"type": "ineq", "fun": cons, "jac": cjac}],
++                           options={"maxiter": maxiter, "ftol": 1e-12})
++            P2 = res.x[:NV].reshape(n, d)
++            if np.all(np.isfinite(P2)):
++                P = P2
++        except Exception:
++            pass
++        return normalize(P)
++
++    # ---------- exact nonsmooth ratio polish ----------
++    def exact_fg(x):
++        P = x.reshape(n, 3)
++        diff = P[I] - P[J]
++        dd = np.sqrt(np.sum(diff * diff, axis=1) + 1e-16)
++        im = int(dd.argmin())
++        iM = int(dd.argmax())
++        dmin = dd[im]
++        dmax = max(dd[iM], 1e-12)
++        r = dmin / dmax
++        G = np.zeros((n, 3))
++
++        def add(k, c):
++            a, b = I[k], J[k]
++            u = (P[a] - P[b]) / dd[k]
++            G[a] += c * u
++            G[b] -= c * u
++
++        add(im, 2.0 * r / dmax)
++        add(iM, -2.0 * r * dmin / (dmax * dmax))
++        return -r * r, -G.ravel()
++
++    def exact_polish(P0):
++        P = normalize(P0)
++        if not HAVE_SCIPY:
++            return P
++        try:
++            res = minimize(exact_fg, P.ravel(), jac=True, method="L-BFGS-B",
++                           options={"maxiter": 300, "ftol": 1e-16, "gtol": 1e-12})
++            P2 = res.x.reshape(n, 3)
++            if np.all(np.isfinite(P2)) and ratio(P2) > ratio(P):
++                P = P2
++        except Exception:
++            pass
++        return normalize(P)
++
++    # ---------- diversified structured starts ----------
+     phi = (1 + np.sqrt(5)) / 2
+-    ico = []
+-    for a in (-1, 1):
+-        for b in (-phi, phi):
+-            ico.append([a, b, 0])
+-            ico.append([0, a, b])
+-            ico.append([b, 0, a])
+-    ico = np.array(ico, dtype=float)
+-    ico_poles = np.vstack([ico, [[0, 0, 2.0], [0, 0, -2.0]]])
++    ico = np.array(
++        [[s1, s2 * phi, 0] for s1 in (-1, 1) for s2 in (-1, 1)]
++        + [[0, s1, s2 * phi] for s1 in (-1, 1) for s2 in (-1, 1)]
++        + [[s2 * phi, 0, s1] for s1 in (-1, 1) for s2 in (-1, 1)],
++        dtype=float)
++    ico /= np.linalg.norm(ico, axis=1, keepdims=True)
+ 
+     kk = np.arange(n) + 0.5
+     ga = np.pi * (3 - np.sqrt(5))
+-    fib = np.zeros((n, 3))
++    fib = np.empty((n, 3))
+     fib[:, 2] = 1 - 2 * kk / n
+-    r_ = np.sqrt(np.maximum(0.0, 1 - fib[:, 2] ** 2))
+-    fib[:, 0] = r_ * np.cos(ga * kk)
+-    fib[:, 1] = r_ * np.sin(ga * kk)
+-
+-    starts = [ico_poles.copy(), fib.copy()]
+-    for scale in (0.05, 0.2):
+-        starts.append(ico_poles + scale * rng.standard_normal((n, d)))
+-        starts.append(fib + scale * rng.standard_normal((n, d)))
+-    for _ in range(10):
++    rr = np.sqrt(np.maximum(0.0, 1 - fib[:, 2] ** 2))
++    fib[:, 0] = rr * np.cos(ga * kk)
++    fib[:, 1] = rr * np.sin(ga * kk)
++
++    cube = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)],
++                    dtype=float)
++    octa = np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0],
++                     [0, 0, 1], [0, 0, -1]], dtype=float)
++    cuboct = []
++    for sx in (-1, 1):
++        for sy in (-1, 1):
++            cuboct += [[sx, sy, 0], [sx, 0, sy], [0, sx, sy]]
++    cuboct = np.array(cuboct, dtype=float)
++
++    starts = []
++    # icosahedron + poles: radius sweep on z axis and x axis
++    for h in (0.6, 0.9, 1.2, 1.6, 2.2, 3.0):
++        starts.append(np.vstack([ico, [[0, 0, h], [0, 0, -h]]]))
++    for h in (1.0, 1.8):
++        starts.append(np.vstack([ico, [[h, 0, 0], [-h, 0, 0]]]))
++    # other structured families
++    starts.append(fib)
++    starts.append(np.vstack([cube, 1.2 * octa]))
++    starts.append(np.vstack([cuboct, [[0, 0, 1.4], [0, 0, -1.4]]]))
++    # jittered variants of the two best-known structures
++    base1 = np.vstack([ico, [[0, 0, 1.2], [0, 0, -1.2]]])
++    for s in (0.05, 0.2):
++        starts.append(base1 + s * rng.standard_normal((n, d)))
++        starts.append(fib + s * rng.standard_normal((n, d)))
++    # random starts: spherical shells and full Gaussian
++    for _ in range(6):
+         p = rng.standard_normal((n, d))
+-        p = p / np.linalg.norm(p, axis=1, keepdims=True)
++        p /= np.linalg.norm(p, axis=1, keepdims=True)
+         starts.append(p * (0.5 + rng.random()))
+     for _ in range(4):
+         starts.append(rng.standard_normal((n, d)))
+ 
+-    best_pts = None
++    # ---------- stage 1: cheap soft annealing on all starts ----------
++    cands = []
++    for idx, P0 in enumerate(starts):
++        if time.time() - T0 > BUDGET * 0.55:
++            break
++        P = anneal(P0)
++        cands.append((ratio(P), idx, P))
++    if not cands:  # safety
++        P = anneal(starts[0])
++        cands.append((ratio(P), 0, P))
++    cands.sort(key=lambda z: -z[0])
++
++    # ---------- stage 2: exact constrained solve on the best candidates ----------
+     best_r = -1.0
+-    for pts0 in starts:
+-        P = grad_ascend(pts0)
+-        r = true_ratio(P)
+-        if r > best_r:
+-            best_r = r
+-            best_pts = P.copy()
+-
+-    # Exact SLSQP polish: maximize t s.t. t^2 <= ||pi-pj||^2 <= 1
+-    m = len(I)
+-
+-    def polish(P):
+-        P = normalize(P)
+-        if np.linalg.norm(P[I] - P[J], axis=1).max() <= 1e-12:
+-            return P, true_ratio(P)
+-        t0 = np.linalg.norm(P[I] - P[J], axis=1).min()
+-        x0 = np.concatenate([P.flatten(), [t0]])
+-
+-        def fobj(x):
+-            return -x[-1]
+-
+-        def fjac(x):
+-            Jc = np.zeros(43)
+-            Jc[-1] = -1.0
+-            return Jc
+-
+-        def cons(x):
+-            P2 = x[:42].reshape(n, d)
+-            dv = np.sum((P2[I] - P2[J]) ** 2, axis=1)
+-            return np.concatenate([1.0 - dv, dv - x[-1] ** 2])
+-
+-        def cjac(x):
+-            P2 = x[:42].reshape(n, d)
+-            diff = P2[I] - P2[J]
+-            Jc = np.zeros((2 * m, 43))
+-            Jc[:m, 3 * I[:, None] + np.arange(3)] = -2 * diff
+-            Jc[:m, 3 * J[:, None] + np.arange(3)] = 2 * diff
+-            Jc[m:, 3 * I[:, None] + np.arange(3)] = 2 * diff
+-            Jc[m:, 3 * J[:, None] + np.arange(3)] = -2 * diff
+-            Jc[m:, -1] = -2 * x[-1]
+-            return Jc
+-
+-        res = minimize(fobj, x0, method="SLSQP",
+-                       constraints=[{"type": "ineq", "fun": cons,
+-                                     "jac": cjac}],
+-                       options={"maxiter": 500, "ftol": 1e-12})
+-        P2 = res.x[:42].reshape(n, d)
+-        P2 = P2 - P2.mean(axis=0)
+-        return P2, true_ratio(P2)
+-
+-    P2, r2 = polish(best_pts)
+-    if r2 > best_r:
+-        best_r = r2
+-        best_pts = P2
+-    for _ in range(5):
+-        Pp = best_pts + 0.02 * rng.standard_normal((n, d))
+-        P2, r2 = polish(Pp)
++    best_pts = normalize(starts[0])
++    for k, (r0, idx, P) in enumerate(cands[:6]):
++        if time.time() - T0 > BUDGET * 0.85 and k >= 1:
++            break
++        P2 = slsqp(P)
++        r2 = ratio(P2)
+         if r2 > best_r:
+             best_r = r2
+             best_pts = P2
+ 
+-    # Normalize: center and scale so max pairwise distance = 1 (convenience)
++    # ---------- stage 3: basin hopping around the incumbent ----------
++    scales = (0.08, 0.04, 0.02, 0.01, 0.005)
++    rounds = 0
++    while time.time() - T0 < BUDGET and rounds < 12:
++        for s in scales:
++            if time.time() - T0 > BUDGET:
++                break
++            rounds += 1
++            Pj = best_pts + s * rng.standard_normal((n, d))
++            P2 = slsqp(Pj, maxiter=200)
++            r2 = ratio(P2)
++            if r2 > best_r:
++                best_r = r2
++                best_pts = P2
++
++    # ---------- stage 4: final exact nonsmooth polish ----------
++    Pf = exact_polish(best_pts)
++    if ratio(Pf) > best_r:
++        best_r = ratio(Pf)
++        best_pts = Pf
++
++    # normalize output: centered, max pairwise distance = 1
+     best_pts = best_pts - best_pts.mean(axis=0)
+-    dists = np.linalg.norm(best_pts[:, None, :] - best_pts[None, :, :], axis=-1)
+-    dmax = dists.max()
++    dmax = np.linalg.norm(best_pts[:, None, :] - best_pts[None, :, :], axis=-1).max()
+     if dmax > 0:
+         best_pts = best_pts / dmax
+-
+-    return best_pts
++    if not np.all(np.isfinite(best_pts)):
++        best_pts = np.zeros((n, d))
++        best_pts[:, 0] = np.arange(n)
++    return np.asarray(best_pts, dtype=float)
+ 
+ 
+ # EVOLVE-BLOCK-END

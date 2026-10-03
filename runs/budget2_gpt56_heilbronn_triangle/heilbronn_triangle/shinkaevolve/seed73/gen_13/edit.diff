@@ -1,0 +1,223 @@
+--- a/original.py
++++ b/original.py
+@@ -1,108 +1,154 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+-    Deterministically search for a high-minimum-area 11 point configuration.
++    Deterministically construct a high-minimum-area 11-point configuration in
++    the equilateral triangle with vertices (0,0), (1,0), and (1/2,sqrt(3)/2).
+ 
+-    The first three points are the vertices of the equilateral container.  The
+-    remaining points are represented by two barycentric parameters, which makes
+-    infeasible candidates impossible during the evolutionary search.
++    Three container vertices and three side support points are explicit.  The
++    remaining five points use barycentric coordinates, guaranteeing feasibility.
+     """
+-    sqrt3_over_2 = np.sqrt(3.0) * 0.5
+-    vertices = np.array(
+-        [[0.0, 0.0], [1.0, 0.0], [0.5, sqrt3_over_2]], dtype=float
+-    )
++    h = np.sqrt(3.0) * 0.5
++    vertices = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, h]], dtype=float)
+     triples = np.array(
+         [(i, j, k) for i in range(11) for j in range(i + 1, 11)
+          for k in range(j + 1, 11)],
+-        dtype=int,
++        dtype=np.intp,
+     )
+     rng = np.random.default_rng(11031987)
+ 
++    # Parameters:
++    #   0,1,2: one point on base, left side, and right side respectively.
++    #   3:13 : five interior points, each represented by (q,v), with
++    #          u=q*(1-v), so u,v >= 0 and u+v <= 1.
++    dimensions = 13
++
++    def reflect_unit(x: np.ndarray) -> np.ndarray:
++        """Reflect arbitrary real values into [0,1] without clipping bias."""
++        x = np.mod(x, 2.0)
++        return np.where(x > 1.0, 2.0 - x, x)
++
+     def decode(population: np.ndarray) -> np.ndarray:
+-        """Map [0,1]^16 parameters to eight points in the triangle."""
+-        p = population.reshape(-1, 8, 2)
+-        # u, v, 1-u-v are barycentric coordinates.  u=(1-v)*q
+-        # ensures u >= 0 and u+v <= 1 without constraints or penalties.
+-        v = p[:, :, 1]
+-        u = p[:, :, 0] * (1.0 - v)
+-        free = np.empty((len(population), 8, 2), dtype=float)
+-        free[:, :, 0] = u + 0.5 * v
+-        free[:, :, 1] = sqrt3_over_2 * v
+-        return np.concatenate(
+-            (np.broadcast_to(vertices, (len(population), 3, 2)), free), axis=1
+-        )
++        m = len(population)
++        p = np.empty((m, 11, 2), dtype=float)
++        p[:, :3] = vertices
+ 
+-    def quality(population: np.ndarray) -> np.ndarray:
+-        """Minimum doubled triangle area for every member of a population."""
++        # One non-vertex point on each container side.
++        t0, t1, t2 = population[:, 0], population[:, 1], population[:, 2]
++        p[:, 3, 0], p[:, 3, 1] = t0, 0.0
++        p[:, 4, 0], p[:, 4, 1] = 0.5 * t1, h * t1
++        p[:, 5, 0], p[:, 5, 1] = 1.0 - 0.5 * t2, h * t2
++
++        z = population[:, 3:].reshape(m, 5, 2)
++        v = z[:, :, 1]
++        u = z[:, :, 0] * (1.0 - v)
++        p[:, 6:, 0] = u + 0.5 * v
++        p[:, 6:, 1] = h * v
++        return p
++
++    def areas(population: np.ndarray) -> np.ndarray:
+         p = decode(population)
+         a = p[:, triples[:, 0]]
+         b = p[:, triples[:, 1]]
+         c = p[:, triples[:, 2]]
+-        double_areas = np.abs(
++        return np.abs(
+             (b[:, :, 0] - a[:, :, 0]) * (c[:, :, 1] - a[:, :, 1])
+             - (b[:, :, 1] - a[:, :, 1]) * (c[:, :, 0] - a[:, :, 0])
+         )
+-        return double_areas.min(axis=1)
+ 
+-    # A moderately large, entirely vectorized population gives substantially
+-    # better designs than a hand-picked lattice while remaining reproducible.
+-    population_size = 224
+-    dimensions = 16
++    def true_quality(population: np.ndarray) -> np.ndarray:
++        return areas(population).min(axis=1)
++
++    def smooth_quality(population: np.ndarray, temperature: float) -> np.ndarray:
++        """
++        Stable soft-minimum of doubled triangle areas.  Unlike a bare minimum,
++        this also improves triangles that are close to becoming active.
++        """
++        x = areas(population)
++        lo = x.min(axis=1)
++        return lo - temperature * np.log(
++            np.exp(-(x - lo[:, None]) / temperature).sum(axis=1)
++        )
++
++    population_size = 288
+     population = rng.random((population_size, dimensions))
+-    scores = quality(population)
+ 
+-    for generation in range(1400):
++    # Seed several well-spread configurations, avoiding a wholly random start.
++    for r in range(48):
++        population[r, :3] = np.array([0.22, 0.49, 0.76]) + rng.normal(0.0, 0.07, 3)
++        population[r, 3:] = rng.random(10)
++        population[r, 3::2] = np.mod(
++            np.linspace(0.10, 0.90, 5) + rng.normal(0.0, 0.10, 5), 1.0
++        )
++        population[r, 4::2] = np.mod(
++            np.linspace(0.78, 0.18, 5) + rng.normal(0.0, 0.10, 5), 1.0
++        )
++    population = reflect_unit(population)
++
++    actual = true_quality(population)
++    best_index = int(np.argmax(actual))
++    best = population[best_index].copy()
++    best_score = float(actual[best_index])
++
++    for generation in range(1500):
++        temp = 0.006 if generation < 850 else 0.0022
++        scores = smooth_quality(population, temp)
++
+         order = np.argsort(scores)
+         elite = population[order[-1]]
+-        indices = np.arange(population_size)
+-        a = rng.permutation(indices)
+-        b = rng.permutation(indices)
+-        c = rng.permutation(indices)
+-        # Ensure the three donor indices differ from the target index.
+-        a = np.where(a == indices, (a + 1) % population_size, a)
+-        b = np.where((b == indices) | (b == a), (b + 2) % population_size, b)
++        idx = np.arange(population_size)
++
++        a = rng.permutation(idx)
++        b = rng.permutation(idx)
++        c = rng.permutation(idx)
++        a = np.where(a == idx, (a + 1) % population_size, a)
++        b = np.where((b == idx) | (b == a), (b + 7) % population_size, b)
+         c = np.where(
+-            (c == indices) | (c == a) | (c == b), (c + 3) % population_size, c
++            (c == idx) | (c == a) | (c == b),
++            (c + 19) % population_size,
++            c,
+         )
+ 
+-        # Blend conventional DE/rand/1 with a weak pull toward the best member.
+-        scale = 0.72 if generation < 900 else 0.48
++        scale = 0.76 if generation < 950 else 0.49
+         mutant = population[a] + scale * (population[b] - population[c])
+-        mutant += 0.10 * (elite - population[a])
+-        mutant = np.mod(mutant, 2.0)
+-        mutant = np.where(mutant > 1.0, 2.0 - mutant, mutant)
++        mutant += 0.13 * (elite - population[a])
++        mutant = reflect_unit(mutant)
+ 
+-        crossover = rng.random((population_size, dimensions)) < 0.82
+-        crossover[np.arange(population_size), rng.integers(dimensions,
+-                                                           size=population_size)] = True
+-        trial = np.where(crossover, mutant, population)
+-        trial_scores = quality(trial)
+-        accept = trial_scores >= scores
+-        population[accept] = trial[accept]
+-        scores[accept] = trial_scores[accept]
++        cross_rate = 0.87 if generation < 1000 else 0.76
++        cross = rng.random((population_size, dimensions)) < cross_rate
++        cross[idx, rng.integers(0, dimensions, population_size)] = True
++        trial = np.where(cross, mutant, population)
+ 
+-    # Nonsmooth max-min objectives benefit from a final direct batch refinement.
+-    best = population[np.argmax(scores)].copy()
+-    best_score = quality(best[None, :])[0]
+-    step = 0.055
+-    for _ in range(420):
+-        candidates = best + rng.normal(0.0, step, size=(96, dimensions))
+-        candidates = np.mod(candidates, 2.0)
+-        candidates = np.where(candidates > 1.0, 2.0 - candidates, candidates)
+-        candidate_scores = quality(candidates)
+-        winner = np.argmax(candidate_scores)
++        trial_scores = smooth_quality(trial, temp)
++        accepted = trial_scores >= scores
++        population[accepted] = trial[accepted]
++
++        # Preserve the best true max-min design even while the population uses
++        # the smoother exploratory objective.
++        trial_actual = true_quality(trial)
++        candidate = int(np.argmax(trial_actual))
++        if trial_actual[candidate] > best_score:
++            best_score = float(trial_actual[candidate])
++            best = trial[candidate].copy()
++
++    # Deterministic batch hill refinement on the exact objective.
++    step = 0.040
++    for _ in range(520):
++        candidates = reflect_unit(
++            best + rng.normal(0.0, step, size=(112, dimensions))
++        )
++        candidate_scores = true_quality(candidates)
++        winner = int(np.argmax(candidate_scores))
+         if candidate_scores[winner] > best_score:
++            best_score = float(candidate_scores[winner])
+             best = candidates[winner]
+-            best_score = candidate_scores[winner]
+-            step *= 1.015
++            step = min(0.075, step * 1.018)
+         else:
+-            step *= 0.985
+-        step = max(step, 0.0015)
++            step = max(0.0010, step * 0.987)
+ 
+     return decode(best[None, :])[0]
+ 
+ 
+ # EVOLVE-BLOCK-END

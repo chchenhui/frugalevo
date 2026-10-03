@@ -1,0 +1,111 @@
+<NAME>
+best_swap_local_search_refinement
+</NAME>
+<DESCRIPTION>
+GPU balancedness (0.66) is the dominant weakness. The existing `_refine_packing` only tries one swap per round (heaviest pack's smallest item ↔ lightest pack's largest item) and stops as soon as that single extreme pair fails, which gets stuck in poor local optima. I replace it with a stronger local search that, for the most-loaded pack's smallest item, evaluates the best partner pack among *all* other packs (each contributing its largest item) and picks the swap that minimizes the resulting maximum pack load. Cardinality and rank-slot constraints are preserved exactly (swapped items inherit each other's pack and rank slots), so all downstream map construction (`inverse`, `gather`) still works verbatim. To keep it fast, the inner search runs on plain Python lists per layer with early termination when no improving swap exists, and per-pack item lists are maintained incrementally so each round costs O(n) instead of O(P·n) tensor ops. Since `balanced_packing` is used both for node packing (Step 1) and GPU packing (Step 3), the improved swap heuristic directly raises GPU-level balance without touching the risky hierarchical plumbing. More refinement rounds (64) are affordable because the loop breaks as soon as convergence is reached.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _refine_packing(pack_index: torch.Tensor, rank_in_pack: torch.Tensor,
+                    weight: torch.Tensor, num_packs: int,
+                    groups_per_pack: int, rounds: int = 8):
+    """Local-search refinement of a cardinality-constrained packing.
+
+    Repeatedly swap the smallest item in the most-loaded pack with the
+    largest item in the least-loaded pack when this reduces the spread.
+    Swaps preserve pack cardinalities and rank uniqueness (the swapped items
+    inherit each other's rank slots).
+    """
+    num_layers = weight.size(0)
+    for l in range(num_layers):
+        w = weight[l]
+        pi = pack_index[l]
+        ri = rank_in_pack[l]
+        for _ in range(rounds):
+            loads = torch.zeros(num_packs, dtype=w.dtype)
+            loads.scatter_add_(0, pi, w)
+            hi = int(torch.argmin(-loads))
+            lo = int(torch.argmin(loads))
+            spread = float(loads[hi] - loads[lo])
+            if spread <= 1e-12:
+                break
+            # smallest item in heaviest pack
+            cand_hi = w.masked_fill(pi != hi, float("inf"))
+            a = int(torch.argmin(cand_hi))
+            # largest item in lightest pack
+            cand_lo = w.masked_fill(pi != lo, float("-inf"))
+            b = int(torch.argmax(cand_lo))
+            if a == b or not (w[a] > w[b]):
+                break  # no beneficial single swap remains
+            # swap packs and rank slots
+            pi[a], pi[b] = int(pi[b]), int(pi[a])
+            ri[a], ri[b] = int(ri[b]), int(ri[a])
+    return pack_index, rank_in_pack
+=======
+def _refine_packing(pack_index: torch.Tensor, rank_in_pack: torch.Tensor,
+                    weight: torch.Tensor, num_packs: int,
+                    groups_per_pack: int, rounds: int = 64):
+    """Local-search refinement of a cardinality-constrained packing.
+
+    Each round takes the smallest item of the most-loaded pack and scans
+    every other pack, pairing it with that pack's largest item. Among all
+    beneficial swaps we pick the one minimizing the resulting maximum pack
+    load. Swaps preserve pack cardinalities and rank uniqueness (the
+    swapped items inherit each other's rank slots). The search runs on
+    plain Python lists per layer with early termination, so it is cheap
+    while exploring a much richer neighborhood than single extreme-pair
+    swaps.
+    """
+    num_layers = weight.size(0)
+    for l in range(num_layers):
+        w = weight[l].tolist()
+        pi = pack_index[l].tolist()
+        ri = rank_in_pack[l].tolist()
+        packs = [[] for _ in range(num_packs)]
+        for j, p in enumerate(pi):
+            packs[p].append(j)
+        for _ in range(rounds):
+            loads = [0.0] * num_packs
+            for p in range(num_packs):
+                s = 0.0
+                for j in packs[p]:
+                    s += w[j]
+                loads[p] = s
+            hi = max(range(num_packs), key=loads.__getitem__)
+            lo = min(range(num_packs), key=loads.__getitem__)
+            if loads[hi] - loads[lo] <= 1e-12:
+                break
+            # smallest item in the heaviest pack
+            a = min(packs[hi], key=lambda j: w[j])
+            # best partner: swap with the largest item of the pack that
+            # minimizes the resulting maximum load
+            best = None
+            for p in range(num_packs):
+                if p == hi:
+                    continue
+                b = max(packs[p], key=lambda j: w[j])
+                gain = w[a] - w[b]
+                if gain <= 1e-12:
+                    continue
+                l_hi = loads[hi] - gain
+                l_p = loads[p] + gain
+                other = max((loads[q] for q in range(num_packs)
+                             if q != hi and q != p), default=-1.0)
+                cand = max(l_hi, l_p, other)
+                if best is None or cand < best[0] - 1e-15:
+                    best = (cand, p, b)
+            if best is None:
+                break  # no beneficial single swap remains
+            _, p, b = best
+            # swap packs and rank slots
+            packs[hi].remove(a)
+            packs[p].remove(b)
+            packs[hi].append(b)
+            packs[p].append(a)
+            pi[a], pi[b] = pi[b], pi[a]
+            ri[a], ri[b] = ri[b], ri[a]
+        pack_index[l] = torch.tensor(pi, dtype=torch.int64)
+        rank_in_pack[l] = torch.tensor(ri, dtype=torch.int64)
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

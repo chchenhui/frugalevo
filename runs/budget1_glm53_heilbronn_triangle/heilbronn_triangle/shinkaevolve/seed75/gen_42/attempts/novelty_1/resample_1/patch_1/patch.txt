@@ -1,0 +1,217 @@
+--- a/original.py
++++ b/original.py
+@@ -1,204 +1,206 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ import time
+ from itertools import combinations
+ 
+ 
+ def _all_triples(n):
+     return np.array(list(combinations(range(n), 3)), dtype=int)
+ 
+ 
+ def _areas(points, triples):
+     p = points[triples]  # (T,3,2)
+     a = p[:, 1] - p[:, 0]
+     b = p[:, 2] - p[:, 0]
+     return 0.5 * np.abs(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0])
+ 
+ 
+ def _project(pts):
+     orig_shape = pts.shape
+     flat = pts.reshape(-1, 2)
+     s3 = np.sqrt(3.0)
+     verts = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, s3 / 2.0]])
+     v1 = verts[1] - verts[0]
+     v2 = verts[2] - verts[0]
+     det = v1[0] * v2[1] - v1[1] * v2[0]
+     rel = flat - verts[0]
+     b1 = (rel[:, 0] * v2[1] - rel[:, 1] * v2[0]) / det
+     b2 = (v1[0] * rel[:, 1] - v1[1] * rel[:, 0]) / det
+     b3 = 1.0 - b1 - b2
+     b = np.stack([b3, b1, b2], axis=1)
+     b = np.clip(b, 0.0, 1.0)
+     b /= b.sum(axis=1, keepdims=True)
+     return (b @ verts).reshape(orig_shape)
+ 
+ 
+ def _init_points(rng, n):
+     u = rng.random((n, 2))
+     su = np.sqrt(u[:, 0])
+     b = np.stack([1 - su, su * (1 - u[:, 1]), su * u[:, 1]], axis=1)
+     verts = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, np.sqrt(3.0) / 2.0]])
+     return b @ verts
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     n = 11
+     rng = np.random.default_rng(987654321)
+     s3 = np.sqrt(3.0)
+     verts = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, s3 / 2.0]])
+     triples = _all_triples(n)
+     T = len(triples)
+     norm = 1.0 / (s3 / 4.0)
+ 
+     # Precompute, for each point index, the triples that contain it.
+     contains = []
+     for i in range(n):
+         mask = (triples == i).any(axis=1)
+         contains.append(np.where(mask)[0])  # triple row-indices involving point i
+ 
+     # Precompute local pair lists so incremental update only needs the two other points.
+     # For point i and each containing triple t: (j, k) other two indices.
+     inc_pairs = []
+     for i in range(n):
+         rows = contains[i]
+         others = []
+         for t in rows:
+             tri = triples[t]
+             others.append([p for p in tri if p != i])
+         inc_pairs.append((rows, np.array(others, dtype=int)))
+ 
+     t0 = time.time()
+-    time_budget = 9.0
++    time_budget = 17.0
+ 
+     def eval_full(pts):
+         return _areas(pts, triples) * norm
+ 
+     def best_of_k_move(pts, area_vec, pi, step, K):
+         """Batched best-of-K perturbation of point pi; incremental area update."""
+         K = int(K)
+         disp = rng.normal(0.0, step, size=(K, 2))
+         base = np.repeat(pts[None], K, axis=0)
+         base[:, pi, :] += disp
+         base = _project(base)
+         rows, pairs = inc_pairs[pi]
+         # K x R areas for affected triples
+         pj = base[:, pairs[:, 0], :]  # (K, R, 2)
+         pk = base[:, pairs[:, 1], :]
+         pvi = base[:, pi, :][:, None, :]
+         cross = ((pj - pvi)[:, :, 0] * (pk - pvi)[:, :, 1]
+                  - (pj - pvi)[:, :, 1] * (pk - pvi)[:, :, 0])
+         new_areas = 0.5 * np.abs(cross) * norm  # (K, R)
+         # full min per candidate = min(min over unaffected, min over affected)
+         unaffected_min = np.min(np.delete(area_vec, rows)) if T - len(rows) > 0 else np.inf
+         aff_min = new_areas.min(axis=1)
+         vals = np.minimum(unaffected_min, aff_min)
+         # also cap by duplicated-point guard: min pairwise distance involving pi
+         others = np.delete(base, pi, axis=1)
+         d = np.linalg.norm(base[:, pi, :][:, None, :] - others, axis=2)
+         bad = d.min(axis=1) < 1e-7
+         vals = np.where(bad, -1.0, vals)
+         j = int(np.argmax(vals))
+         if vals[j] > area_vec.min() + 1e-13:
+             cand_pts = base[j]
+             cand_vec = area_vec.copy()
+             cand_vec[rows] = new_areas[j]
+             return cand_pts, cand_vec, True
+         return pts, area_vec, False
+ 
+     def local_search(pts, budget_deadline):
+         area_vec = eval_full(pts)
+         step = 0.05
+         stall = 0
+         while step > 1e-6 and time.time() - t0 < budget_deadline:
+             improved = False
+-            w = int(np.argmin(area_vec))
+-            worst_pts = triples[w]
+-            order = rng.permutation(3)
+-            for oi in order:
+-                pi = worst_pts[oi]
+-                pts, area_vec, imp = best_of_k_move(pts, area_vec, pi, step, 24)
++            # k-worst softmin focus: perturb all points involved in the k
++            # smallest-area triples (binding constraints), not just the worst.
++            k = 5
++            worst_rows = np.argpartition(area_vec, k)[:k]
++            focus = np.unique(triples[worst_rows].reshape(-1))
++            order = rng.permutation(focus)
++            for pi in order:
++                pts, area_vec, imp = best_of_k_move(pts, area_vec, pi, step, 48)
+                 if imp:
+                     improved = True
+             if not improved:
+                 # occasional random-point move to escape worst-triple cycling
+                 pi = int(rng.integers(n))
+-                pts, area_vec, imp = best_of_k_move(pts, area_vec, pi, step, 24)
++                pts, area_vec, imp = best_of_k_move(pts, area_vec, pi, step, 48)
+                 improved = imp
+                 if not improved:
+                     step *= 0.65
+             else:
+                 stall = 0
+         return pts, area_vec.min()
+ 
+     # ---------- warm starts (boundary-heavy) ----------
+     starts = []
+     # 3 vertices + random interior
+     starts.append(_project(np.vstack([verts, _init_points(rng, n - 3)])))
+     # jittered triangular lattices
+     for m in (3, 4, 5):
+         lat = []
+         for i in range(m + 1):
+             for j in range(m + 1 - i):
+                 k = m - i - j
+                 lat.append([(j + 0.5 * k) / m, (k * s3 / 2.0) / m])
+         lat = np.array(lat)
+         if len(lat) >= n:
+             p = lat[:n]
+         else:
+             p = np.vstack([lat, _init_points(rng, n - len(lat))])
+         starts.append(_project(p + rng.normal(0.0, 0.01, size=p.shape)))
+     # vertices + dense edge coverage + interior
+     edge_pts = []
+     for (P, Q, cnt) in [(verts[0], verts[1], 3), (verts[1], verts[2], 2), (verts[2], verts[0], 2)]:
+         for tt in range(1, cnt + 1):
+             edge_pts.append(P + (Q - P) * (tt / (cnt + 1)))
+     edge_pts = np.array(edge_pts)
+     starts.append(_project(np.vstack([verts, edge_pts, _init_points(rng, n - 3 - len(edge_pts))])))
+ 
+     results = []  # (score, pts)
+ 
+     def run_and_record(pts):
+         pts, val = local_search(pts, time_budget * 0.55)
+         results.append((val, pts.copy()))
+ 
+     # Phase 1: warm starts then random restarts until 55% of budget
+     si = 0
+     while time.time() - t0 < time_budget * 0.55:
+         if si < len(starts):
+             p = starts[si].copy()
+         else:
+             p = _init_points(rng, n)
+         si += 1
+         run_and_record(p)
+         if not results:
+             break
+ 
+     if not results:  # extreme safety
+         return _project(_init_points(np.random.default_rng(0), n))
+ 
+     results.sort(key=lambda r: -r[0])
+     best_val, best_pts = results[0]
+ 
+     # Phase 2: crossover/merge polish on top-3 configurations
+     top = results[:3]
+     rng.shuffle(top)  # deterministic but varied pairing
+     ci = 0
+     while time.time() - t0 < time_budget and ci < 6:
+         ci += 1
+         (v1, p1), (v2, p2) = top[ci % len(top)], top[(ci + 1) % len(top)]
+         # merge: 5 points from p1, 6 from p2 (random subsets)
+         perm = rng.permutation(n)
+         take1 = perm[:5]
+         take2 = perm[5:]
+         merged = p1.copy()
+         merged[take2] = p2[take2]
+         merged = _project(merged + rng.normal(0.0, 0.005, size=merged.shape))
+         pts, val = local_search(merged, time_budget)
+         if val > best_val:
+             best_val = val
+             best_pts = pts.copy()
+ 
+     return np.asarray(best_pts, dtype=float)
+ 
+ 
+ # EVOLVE-BLOCK-END

@@ -1,0 +1,167 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _pair_sq(pts):
+    d2 = np.sum((pts[:, None, :] - pts[None, :, :]) ** 2, axis=-1)
+    iu = np.triu_indices(pts.shape[0], 1)
+    return d2, d2[iu]
+
+
+def _hard_ratio(pts):
+    _, a = _pair_sq(pts)
+    return np.sqrt(a.min() / a.max())
+
+
+def _project_sphere(pts):
+    nrm = np.linalg.norm(pts, axis=1, keepdims=True)
+    nrm[nrm < 1e-12] = 1e-12
+    return pts / nrm
+
+
+def _soft_grad(pts, tau):
+    """Gradient of log(softmin(a)) - log(softmax(a)) wrt points, a = squared pair dists."""
+    n = pts.shape[0]
+    d2, a = _pair_sq(pts)
+    # softmin over a
+    w = np.exp(-(a - a.min()) / tau)
+    p = w / w.sum()
+    # softmax over a
+    v = np.exp((a - a.max()) / tau)
+    q = v / v.sum()
+    coef = p / (a.min() - tau * np.log(w.sum()) + 1e-12) - q / (a.max() + tau * np.log(v.sum()) + 1e-12)
+    C = np.zeros((n, n))
+    i, j = np.triu_indices(n, 1)
+    C[i, j] = coef
+    C[j, i] = coef
+    s = C.sum(axis=1, keepdims=True)
+    grad = 2.0 * (s * pts - C @ pts)
+    return grad
+
+
+def _soft_optimize(pts, steps=1800, lr=0.02, tau0=0.05, tau1=0.004, seed=0):
+    rng = np.random.default_rng(seed)
+    pts = _project_sphere(pts.astype(float).copy())
+    m = np.zeros_like(pts)
+    v = np.zeros_like(pts)
+    b1, b2, eps = 0.9, 0.999, 1e-8
+    best = pts.copy()
+    best_r = _hard_ratio(pts)
+    for t in range(1, steps + 1):
+        tau = tau0 * (tau1 / tau0) ** (t / steps)
+        g = _soft_grad(pts, tau)
+        m = b1 * m + (1 - b1) * g
+        v = b2 * v + (1 - b2) * g * g
+        mh = m / (1 - b1 ** t)
+        vh = v / (1 - b2 ** t)
+        pts = pts + lr * mh / (np.sqrt(vh) + eps)
+        pts = _project_sphere(pts)
+        # mild random jitter early on to escape poor symmetry
+        if t < steps // 4 and rng.random() < 0.05:
+            pts += rng.normal(0, 0.02, pts.shape)
+            pts = _project_sphere(pts)
+        if t % 50 == 0:
+            r = _hard_ratio(pts)
+            if r > best_r:
+                best_r = r
+                best = pts.copy()
+    return best, best_r
+
+
+def _local_polish(pts, iters=2500, seed=0):
+    rng = np.random.default_rng(seed)
+    pts = _project_sphere(pts.copy())
+    best = pts.copy()
+    best_r = _hard_ratio(pts)
+    _, a = _pair_sq(pts)
+    n = pts.shape[0]
+    iu = np.triu_indices(n, 1)
+    T0 = 0.02
+    for it in range(iters):
+        T = T0 * (1 - it / iters) + 1e-5
+        cand = pts.copy()
+        dd = _pair_sq(cand)[1]
+        k = int(np.argmin(dd))
+        i, j = iu[0][k], iu[1][k]
+        idx = i if rng.random() < 0.5 else j
+        cand[idx] += rng.normal(0, T, 3)
+        cand = _project_sphere(cand)
+        r = _hard_ratio(cand)
+        if r > best_r or rng.random() < 0.02 * np.exp((r - best_r) / max(T, 1e-9)):
+            if r > best_r:
+                best_r = r
+                best = cand.copy()
+            pts = cand
+    return best, best_r
+
+
+def _seed_pool(n=14, dim=3):
+    seeds = []
+    rng = np.random.default_rng(2024)
+    # structured seeds
+    phi = (1 + 5 ** 0.5) / 2
+    ico = []
+    for a in (-1, 1):
+        for b in (-phi, phi):
+            ico.append((0, a, b)); ico.append((a, b, 0)); ico.append((b, 0, a))
+    seeds.append(np.array(ico[:n], dtype=float))
+    # staggered heptagons
+    z1, z2 = 0.75, -0.75
+    pts = []
+    for k in range(7):
+        a1 = 2 * np.pi * k / 7
+        a2 = a1 + np.pi / 7
+        pts.append([np.cos(a1), np.sin(a1), z1])
+        pts.append([np.cos(a2), np.sin(a2), z2])
+    seeds.append(np.array(pts, dtype=float))
+    # prism + caps
+    pts = [[0, 0, 1.0], [0, 0, -1.0]]
+    for k in range(6):
+        a = np.pi * k / 3
+        pts.append([np.cos(a), np.sin(a), 0.5])
+        pts.append([np.cos(a), np.sin(a), -0.5])
+    seeds.append(np.array(pts[:n], dtype=float))
+    # random
+    for _ in range(14):
+        seeds.append(rng.normal(0, 1, (n, dim)))
+    return seeds
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    n, dim = 14, 3
+    best_pts, best_val = None, -1.0
+
+    for s, seed_pts in enumerate(_seed_pool(n, dim)):
+        p, r = _soft_optimize(seed_pts, steps=1500, seed=s)
+        if r > best_val:
+            best_val, best_pts = r, p
+
+    # polish best candidates
+    cands = []
+    rng = np.random.default_rng(7)
+    for s in range(8):
+        base = best_pts + rng.normal(0, 0.05, best_pts.shape)
+        cands.append(base)
+    cands.append(best_pts)
+    for s, c in enumerate(cands):
+        p, r = _local_polish(c, iters=1500, seed=100 + s)
+        if r > best_val:
+            best_val, best_pts = r, p
+
+    # final small-radius refinement cycles
+    for s in range(3):
+        p, r = _soft_optimize(best_pts, steps=600, lr=0.005,
+                              tau0=0.004, tau1=0.001, seed=500 + s)
+        if r > best_val:
+            best_val, best_pts = r, p
+        p, r = _local_polish(p, iters=1200, seed=600 + s)
+        if r > best_val:
+            best_val, best_pts = r, p
+
+    # normalize so max pairwise distance is 1
+    d = np.linalg.norm(best_pts[:, None, :] - best_pts[None, :, :], axis=-1)
+    best_pts = best_pts / d.max()
+    return best_pts
+
+
+# EVOLVE-BLOCK-END

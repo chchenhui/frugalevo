@@ -1,0 +1,163 @@
+# EVOLVE-BLOCK-START
+import itertools
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Deterministically construct an 11-point configuration in the unit
+    equilateral triangle.  Optimization is performed in barycentric (u, v)
+    coordinates, where an absolute 2D determinant is exactly the triangle
+    area normalized by the enclosing triangle area.
+    """
+    n = 11
+    rng = np.random.default_rng(38110429)
+    triples = np.asarray(list(itertools.combinations(range(n), 3)), dtype=np.intp)
+
+    # A batch of independent local optimizations is substantially more useful
+    # here than genetic recombination: every configuration receives an exact
+    # gradient from all its nearly-active triangle constraints.
+    batch = 56
+    weights = rng.dirichlet((0.82, 0.82, 0.82), size=(batch, n))
+    population = weights[..., 1:].copy()
+
+    # The enclosing corners use the full available domain and remove three
+    # redundant degrees of freedom.
+    population[:, 0] = (0.0, 0.0)
+    population[:, 1] = (1.0, 0.0)
+    population[:, 2] = (0.0, 1.0)
+
+    # Seed several candidates with perturbed triangular-grid arrangements.
+    grid = np.array(
+        [
+            (0.0, 0.0), (1.0, 0.0), (0.0, 1.0),
+            (0.20, 0.12), (0.51, 0.10), (0.77, 0.08),
+            (0.10, 0.42), (0.38, 0.34), (0.64, 0.25),
+            (0.12, 0.70), (0.35, 0.53),
+        ],
+        dtype=float,
+    )
+    for k in range(min(12, batch)):
+        trial = grid.copy()
+        trial[3:] += rng.normal(0.0, 0.075 + 0.006 * k, size=(n - 3, 2))
+        population[k] = trial
+
+    def project_triangle(a: np.ndarray) -> None:
+        """In-place projection of free barycentric pairs onto u,v>=0,u+v<=1."""
+        np.maximum(a, 0.0, out=a)
+        s = a.sum(axis=-1, keepdims=True)
+        mask = s > 1.0
+        a[...] = np.where(mask, a / np.maximum(s, 1.0), a)
+
+    project_triangle(population[:, 3:])
+
+    ia, ib, ic = triples[:, 0], triples[:, 1], triples[:, 2]
+    rows = np.arange(batch)[:, None]
+
+    def determinants(configs: np.ndarray) -> np.ndarray:
+        q = configs[:, triples]
+        p = q[:, :, 1] - q[:, :, 0]
+        r = q[:, :, 2] - q[:, :, 0]
+        return np.abs(p[..., 0] * r[..., 1] - p[..., 1] * r[..., 0])
+
+    def minima(configs: np.ndarray) -> np.ndarray:
+        return determinants(configs).min(axis=1)
+
+    best_index = int(np.argmax(minima(population)))
+    best = population[best_index].copy()
+    best_value = float(minima(population)[best_index])
+
+    # Temperature continuation: initially many constraints guide each point;
+    # the final stages increasingly approximate the actual minimum operator.
+    stages = (
+        (0.0100, 430, 0.020),
+        (0.0040, 520, 0.010),
+        (0.00135, 650, 0.0048),
+        (0.00042, 520, 0.0018),
+    )
+
+    try:
+        for temperature, iterations, learning_rate in stages:
+            moment1 = np.zeros_like(population)
+            moment2 = np.zeros_like(population)
+
+            for step in range(1, iterations + 1):
+                q = population[:, triples]
+                a = q[:, :, 0]
+                b = q[:, :, 1]
+                c = q[:, :, 2]
+
+                signed = ((b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
+                          - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0]))
+                areas = np.abs(signed)
+
+                # Stable soft-min weights.  Their weighted determinant
+                # gradients are the gradient of -tau*log(sum(exp(-A/tau))).
+                amin = areas.min(axis=1, keepdims=True)
+                active = np.exp(-(areas - amin) / temperature)
+                active /= active.sum(axis=1, keepdims=True)
+                coeff = active * np.where(signed >= 0.0, 1.0, -1.0)
+
+                ga = np.empty_like(a)
+                gb = np.empty_like(a)
+                gc = np.empty_like(a)
+
+                ga[..., 0] = b[..., 1] - c[..., 1]
+                ga[..., 1] = c[..., 0] - b[..., 0]
+                gb[..., 0] = c[..., 1] - a[..., 1]
+                gb[..., 1] = a[..., 0] - c[..., 0]
+                gc[..., 0] = a[..., 1] - b[..., 1]
+                gc[..., 1] = b[..., 0] - a[..., 0]
+
+                ga *= coeff[..., None]
+                gb *= coeff[..., None]
+                gc *= coeff[..., None]
+
+                gradient = np.zeros_like(population)
+                np.add.at(gradient, (rows, ia[None, :]), ga)
+                np.add.at(gradient, (rows, ib[None, :]), gb)
+                np.add.at(gradient, (rows, ic[None, :]), gc)
+                gradient[:, :3] = 0.0
+
+                # Adam-style normalized ascent makes the method insensitive
+                # to how many triangle constraints are currently active.
+                moment1 = 0.86 * moment1 + 0.14 * gradient
+                moment2 = 0.985 * moment2 + 0.015 * gradient * gradient
+                correction1 = 1.0 - 0.86 ** step
+                correction2 = 1.0 - 0.985 ** step
+                update = (moment1 / correction1) / (
+                    np.sqrt(moment2 / correction2) + 1.0e-9
+                )
+
+                # A gentle deterministic decay prevents late oscillation at
+                # intersections of active area constraints.
+                scale = learning_rate * (1.0 - 0.35 * step / iterations)
+                population[:, 3:] += scale * update[:, 3:]
+                project_triangle(population[:, 3:])
+
+                if step % 25 == 0 or step == iterations:
+                    values = minima(population)
+                    winner = int(np.argmax(values))
+                    if values[winner] > best_value:
+                        best_value = float(values[winner])
+                        best = population[winner].copy()
+
+            # Reinsert the globally best solution into a few slots before the
+            # next sharper continuation stage.
+            population[:4] = best
+            if batch > 8:
+                population[4:8] = best
+                population[4:8, 3:] += rng.normal(
+                    0.0, temperature * 2.5, size=(4, n - 3, 2)
+                )
+                project_triangle(population[4:8, 3:])
+
+    except (FloatingPointError, ValueError):
+        # The best feasible configuration accumulated so far remains valid.
+        pass
+
+    height = np.sqrt(3.0) / 2.0
+    return np.column_stack((best[:, 0] + 0.5 * best[:, 1], height * best[:, 1]))
+
+
+# EVOLVE-BLOCK-END

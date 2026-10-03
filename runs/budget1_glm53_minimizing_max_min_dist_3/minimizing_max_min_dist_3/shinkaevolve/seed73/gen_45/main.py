@@ -1,0 +1,192 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.optimize import minimize
+
+N, D = 14, 3
+PAIRS_I, PAIRS_J = np.triu_indices(N, k=1)
+
+# Early-exit threshold: the reference optimum has dmin/dmax ~ 0.4899
+# (squared ratio 1/4.165849767). Exit as soon as we essentially match it.
+TARGET_RATIO = 0.4895
+
+
+def _pair_dists(flat_or_pts):
+    P = flat_or_pts.reshape(N, D) if flat_or_pts.ndim == 1 else flat_or_pts
+    return np.linalg.norm(P[PAIRS_I] - P[PAIRS_J], axis=1)
+
+
+def _ratio(pts):
+    ds = _pair_dists(pts)
+    dmax = ds.max()
+    if dmax <= 0:
+        return -1.0
+    return ds.min() / dmax
+
+
+def _repulsion_stage(pts, iters=500, step=0.03):
+    """Cheap pre-optimizer: normalize diameter to 1, repel close pairs."""
+    pts = pts.copy()
+    for _ in range(iters):
+        ds = _pair_dists(pts)
+        dmax = ds.max()
+        if dmax <= 0:
+            break
+        pts /= dmax
+        diff = pts[PAIRS_I] - pts[PAIRS_J]
+        dist = np.linalg.norm(diff, axis=1)
+        w = 1.0 / np.maximum(dist, 1e-6) ** 12
+        forces = (w[:, None] * diff) / np.maximum(dist, 1e-6)[:, None]
+        grad = np.zeros_like(pts)
+        np.add.at(grad, PAIRS_I, forces)
+        np.add.at(grad, PAIRS_J, -forces)
+        norm = np.linalg.norm(grad, axis=1, keepdims=True)
+        norm[norm == 0] = 1.0
+        pts += step * grad / norm
+        step *= 0.997
+    return pts
+
+
+def _slsqp_stage(pts, maxiter=400, ftol=1e-12):
+    """Polish: maximize dmin subject to dmax <= 1."""
+    def objective(flat):
+        return -_pair_dists(flat).min()
+
+    def constraint(flat):
+        return 1.0 - _pair_dists(flat).max()
+
+    ds = _pair_dists(pts)
+    dmax = ds.max()
+    if dmax > 0:
+        pts = pts / dmax
+    res = minimize(
+        objective,
+        pts.ravel(),
+        method='SLSQP',
+        constraints={'type': 'ineq', 'fun': constraint},
+        options={'maxiter': maxiter, 'ftol': ftol},
+    )
+    out = res.x.reshape(N, D)
+    if not np.all(np.isfinite(out)):
+        return pts
+    return out
+
+
+def _icosahedron():
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    ico = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    ], dtype=float)
+    return ico / np.linalg.norm(ico, axis=1, keepdims=True)
+
+
+def _fibonacci_sphere(offset=0.0):
+    k = np.arange(N) + 0.5
+    ph = np.arccos(1.0 - 2.0 * k / N)
+    th = np.pi * (1.0 + 5.0 ** 0.5) * k + offset
+    return np.stack([np.cos(th) * np.sin(ph),
+                     np.sin(th) * np.sin(ph),
+                     np.cos(ph)], axis=1)
+
+
+def _unit(v):
+    return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+
+
+def _seeds(rng):
+    seeds = []
+    ico = _icosahedron()
+    # icosahedron + 2 perturbed poles
+    for _ in range(3):
+        extra = np.array([[0, 0, 1], [0, 0, -1]]) + 0.05 * rng.standard_normal((2, 3))
+        seeds.append(np.vstack([ico, _unit(extra)]))
+    # Fibonacci variants
+    for off in (0.0, 0.7, 1.9, 3.3):
+        seeds.append(_fibonacci_sphere(off))
+    # random on sphere and in ball
+    for _ in range(6):
+        seeds.append(_unit(rng.standard_normal((N, D))))
+        seeds.append(rng.uniform(-1.0, 1.0, (N, D)))
+    return seeds
+
+
+def _bottleneck_micropolish(pts):
+    """Target the exact non-smooth bottleneck: displace each point of the
+    min-distance pair 1e-4 outward along their separation direction, then a
+    single tight SLSQP pass. Keep only strict improvements."""
+    best, best_r = pts.copy(), _ratio(pts)
+    ds = _pair_dists(best)
+    k = int(np.argmin(ds))
+    i, j = int(PAIRS_I[k]), int(PAIRS_J[k])
+    direction = best[i] - best[j]
+    nrm = np.linalg.norm(direction)
+    if nrm <= 0:
+        return best
+    direction = direction / nrm
+    cand = best.copy()
+    cand[i] = cand[i] + 1e-4 * direction
+    cand[j] = cand[j] - 1e-4 * direction
+    cand = _slsqp_stage(cand, maxiter=200, ftol=1e-14)
+    r = _ratio(cand)
+    if r > best_r + 1e-14 and np.all(np.isfinite(cand)):
+        best, best_r = cand, r
+    return best
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3 dimensions in order to maximize the ratio of
+    minimum to maximum pairwise distance.
+
+    Returns
+        points: np.ndarray of shape (14, 3)
+    """
+    rng = np.random.default_rng(42)
+    best_pts, best_ratio = None, -1.0
+
+    results = []
+    for init in _seeds(rng):
+        pre = _repulsion_stage(init)
+        for cand in (pre, init):
+            polished = _slsqp_stage(cand)
+            r = _ratio(polished)
+            results.append((r, polished))
+            if r > best_ratio:
+                best_ratio, best_pts = r, polished.copy()
+        if best_ratio >= TARGET_RATIO:
+            break
+
+    results.sort(key=lambda t: t[0], reverse=True)
+
+    # Multi-pass polish on the best candidates
+    top = results[:4]
+    for r, pts in top:
+        cur, cur_r = pts, r
+        for _ in range(3):
+            nxt = _slsqp_stage(cur, maxiter=400, ftol=1e-14)
+            rn = _ratio(nxt)
+            if rn > cur_r + 1e-14:
+                cur, cur_r = nxt, rn
+            else:
+                break
+        if cur_r > best_ratio:
+            best_ratio, best_pts = cur_r, cur.copy()
+        if best_ratio >= TARGET_RATIO:
+            break
+
+    # Bottleneck micro-polish on the top-2 candidates
+    for r, pts in results[:2]:
+        polished = _bottleneck_micropolish(pts)
+        rp = _ratio(polished)
+        if rp > best_ratio:
+            best_ratio, best_pts = rp, polished
+
+    if best_pts is None:
+        np.random.seed(42)
+        best_pts = np.random.randn(N, D)
+
+    return np.asarray(best_pts, dtype=float)
+
+
+# EVOLVE-BLOCK-END

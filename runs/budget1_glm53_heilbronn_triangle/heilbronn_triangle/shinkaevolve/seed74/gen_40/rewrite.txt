@@ -1,0 +1,257 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+_SQRT3 = float(np.sqrt(3.0))
+_AREA_SCALE = 0.5 * _SQRT3  # det of barycentric->xy jacobian products
+
+
+# ---------- Stage 1: Geometry kernel ----------
+
+class Geometry:
+    """Barycentric (u,v) in 2-simplex  <->  xy in the equilateral triangle."""
+
+    __slots__ = ("n", "tri", "I", "J", "K")
+
+    def __init__(self, n):
+        self.n = n
+        self.tri = self._triples(n)
+        self.I, self.J, self.K = (self.tri[:, c] for c in range(3))
+
+    @staticmethod
+    def _triples(n):
+        return np.array([(i, j, k) for i in range(n)
+                         for j in range(i + 1, n)
+                         for k in range(j + 1, n)])
+
+    @staticmethod
+    def to_xy(b):
+        b = np.asarray(b, dtype=float)
+        return np.column_stack([b[:, 0] + 0.5 * b[:, 1],
+                                0.5 * _SQRT3 * b[:, 1]])
+
+    @staticmethod
+    def project(b):
+        b = np.clip(b, 0.0, 1.0)
+        s = b.sum(axis=1)
+        over = s > 1.0
+        if np.any(over):
+            b[over] *= (1.0 - 1e-9) / s[over, None]
+        return b
+
+    def areas(self, xy):
+        p, q, r = xy[self.I], xy[self.J], xy[self.K]
+        return 0.5 * np.abs((q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1])
+                            - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0]))
+
+    def score(self, b):
+        return float(self.areas(self.to_xy(b)).min())
+
+
+# ---------- Stage 2: Vectorized softmin (log-sum-exp) Adam optimizer ----------
+
+class SoftminAdam:
+    """Smooth surrogate  S(b) = -tau * log(sum(exp(-a_t/tau)))
+    anneals from soft-min to hard-min as tau -> 0. Gradients are fully
+    vectorized over all triples via np.add.at (no Python loops)."""
+
+    def __init__(self, geom, seed, steps=900, tau0=0.02, tau1=5e-4,
+                 lr=0.010):
+        self.g = geom
+        self.rng = np.random.default_rng(seed)
+        self.steps = steps
+        self.tau0, self.tau1 = tau0, tau1
+        self.lr = lr
+
+    def _surrogate_grad(self, b, tau):
+        xy = Geometry.to_xy(b)
+        p, q, r = xy[self.g.I], xy[self.g.J], xy[self.g.K]
+        cross = ((q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1])
+                 - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0]))
+        s = np.where(np.abs(cross) > 1e-18, np.sign(cross), 1.0)
+        a = 0.5 * np.abs(cross)
+        # softmin weights over triangle areas
+        z = -(a - a.min()) / tau
+        w = np.exp(z)
+        w = w / w.sum()
+        # per-triangle gradients wrt the three xy vertices (x 0.5*s*w)
+        cw = 0.5 * s * w
+        gpx = (-(r[:, 1] - p[:, 1]) + (q[:, 1] - p[:, 1])) * cw
+        gpy = ((r[:, 0] - p[:, 0]) - (q[:, 0] - p[:, 0])) * cw
+        gqx = (r[:, 1] - p[:, 1]) * cw
+        gqy = -(r[:, 0] - p[:, 0]) * cw
+        grx = -(q[:, 1] - p[:, 1]) * cw
+        gry = (q[:, 0] - p[:, 0]) * cw
+        gxy = np.zeros((self.g.n, 2))
+        np.add.at(gxy, self.g.I, np.column_stack([gpx, gpy]))
+        np.add.at(gxy, self.g.J, np.column_stack([gqx, gqy]))
+        np.add.at(gxy, self.g.K, np.column_stack([grx, gry]))
+        # xy -> (u,v):  x = u + 0.5 v,  y = 0.5*sqrt3 * v
+        guv = np.column_stack([gxy[:, 0],
+                               0.5 * gxy[:, 0] + gxy[:, 1] * (2.0 / _SQRT3)])
+        return a, guv
+
+    def run(self, b):
+        g = self.g
+        b = Geometry.project(b.copy())
+        best_b, best = b.copy(), g.score(b)
+        m = np.zeros_like(b)
+        v = np.zeros_like(b)
+        b1, b2, eps = 0.9, 0.999, 1e-8
+        for t in range(self.steps):
+            tau = self.tau0 * (self.tau1 / self.tau0) ** (t / self.steps)
+            a, grad = self._surrogate_grad(b, tau)
+            # Adam update (ascent)
+            m = b1 * m + (1 - b1) * grad
+            v = b2 * v + (1 - b2) * grad * grad
+            mh = m / (1 - b1 ** (t + 1))
+            vh = v / (1 - b2 ** (t + 1))
+            step = self.lr * (1 - 0.5 * t / self.steps)
+            cand = Geometry.project(b + step * mh / (np.sqrt(vh) + eps))
+            sc = g.score(cand)
+            if sc > best:
+                best, best_b = sc, cand.copy()
+            b = cand
+        return best_b, best
+
+
+# ---------- Stage 3: Bottleneck-targeted annealer + adaptive polish ----------
+
+class EscapeAnnealer:
+    """Short simulated-annealing burst that perturbs points involved in
+    (near-)minimal triangles; used to escape local optima between Adam runs."""
+
+    def __init__(self, geom, seed):
+        self.g = geom
+        self.rng = np.random.default_rng(seed)
+        self.member = np.zeros((geom.n, len(geom.tri)), dtype=bool)
+        for c in range(3):
+            self.member[geom.tri[:, c], np.arange(len(geom.tri))] = True
+
+    def run(self, b, iters=700, T0=0.008, T1=5e-5):
+        g = self.g
+        b = Geometry.project(b.copy())
+        cur = g.score(b)
+        best, best_b = cur, b.copy()
+        for it in range(iters):
+            T = T0 * (T1 / T0) ** (it / iters)
+            a = g.areas(Geometry.to_xy(b))
+            tight = a <= a.min() * 1.8
+            cnt = self.member[:, tight].sum(axis=1).astype(float) + 1e-9
+            cand = b.copy()
+            k = int(self.rng.integers(1, 4))
+            pick = self.rng.choice(g.n, size=k, replace=False, p=cnt / cnt.sum())
+            for pt in pick:
+                cand[pt] += self.rng.normal(0.0, T * 3.0, 2)
+            cand = Geometry.project(cand)
+            v = g.score(cand)
+            if v >= cur or self.rng.random() < np.exp((v - cur) / max(T * 1e-3, 1e-15)):
+                b, cur = cand, v
+                if v > best:
+                    best, best_b = v, b.copy()
+        return best_b, best
+
+
+def adaptive_polish(geom, b, rng, step_schedule=(0.01, 0.003, 0.001, 0.0003)):
+    """Directional polish on bottleneck points. The tight-triangle threshold
+    adapts per step size: coarse steps move points in near-minimal triangles
+    broadly; fine steps target only exactly-binding constraints."""
+    best = geom.score(b)
+    b = Geometry.project(b.copy())
+    for si, sc in enumerate(step_schedule):
+        mult = 3.0 - 2.4 * (si / max(1, len(step_schedule) - 1))
+        improved = True
+        while improved:
+            improved = False
+            a = geom.areas(Geometry.to_xy(b))
+            tight = np.where(a <= a.min() * mult + 1e-14)[0]
+            pts = np.unique(geom.tri[tight].ravel())
+            for pt in pts:
+                found = False
+                for du, dv in ((sc, 0), (-sc, 0), (0, sc), (0, -sc),
+                               (sc, sc), (-sc, -sc), (sc, -sc), (-sc, sc)):
+                    cand = b.copy()
+                    cand[pt] += np.array([du, dv])
+                    cand = Geometry.project(cand)
+                    v = geom.score(cand)
+                    if v > best + 1e-15:
+                        b, best = cand, v
+                        improved = found = True
+                        break
+                if found:
+                    break
+    return b, best
+
+
+# ---------- Stage 4: Deterministic seed bank ----------
+
+def seed_bank():
+    s = []
+    s.append(np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+        [1/3, 0.0], [2/3, 0.0], [0.0, 1/3], [0.0, 2/3],
+        [1/3, 1/3], [2/3, 1/3], [1/3, 2/3], [0.5, 1/6],
+    ]))
+    s.append(np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+        [0.5, 0.0], [0.25, 0.25], [0.0, 0.5],
+        [0.5, 0.5], [0.25, 0.0], [0.0, 0.25],
+        [0.5, 0.25], [0.25, 0.5],
+    ]))
+    rng = np.random.default_rng(2024)
+    for base in list(s):
+        j = base + rng.normal(0.0, 0.05, base.shape)
+        j[:3] = base[:3]
+        s.append(Geometry.project(j))
+    # golden-ratio low-discrepancy seed
+    g = (np.sqrt(5.0) - 1.0) / 2.0
+    pts = [[((k * g) % 1.0) * 0.8 + 0.05,
+            ((k * g * g) % 1.0) * 0.7 + 0.05] for k in range(3, 11)]
+    s.append(Geometry.project(np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]] + pts)))
+    # free-form random seeds
+    for rs in (5, 7):
+        r = np.random.default_rng(rs).random((11, 2)) * 0.8 + 0.05
+        r[:3] = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+        s.append(Geometry.project(r))
+    return s
+
+
+# ---------- Orchestrator: Adam -> escape -> Adam -> adaptive polish ----------
+
+def heilbronn_triangle11() -> np.ndarray:
+    n = 11
+    fallback_b = np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+        [1/3, 0.0], [2/3, 0.0], [0.0, 1/3], [0.0, 2/3],
+        [1/3, 1/3], [2/3, 1/3], [1/3, 2/3], [0.5, 1/6],
+    ])
+    try:
+        geom = Geometry(n)
+        fb_val = geom.score(fallback_b)
+        best_xy, best_val = None, -1.0
+        for si, seed in enumerate(seed_bank()):
+            # Phase 1: softmin Adam (coarse-to-fine temperature anneal)
+            opt = SoftminAdam(geom, seed=101 + 17 * si, steps=700)
+            b, val = opt.run(seed)
+            # Phase 2: annealed escape burst
+            esc = EscapeAnnealer(geom, seed=301 + 17 * si)
+            b2, val2 = esc.run(b)
+            if val2 > val:
+                b, val = b2, val2
+            # Phase 3: fine-grained softmin Adam at low temperature
+            opt2 = SoftminAdam(geom, seed=501 + 17 * si, steps=350,
+                               tau0=2e-3, tau1=2e-4, lr=0.003)
+            b, val = opt2.run(b)
+            # Phase 4: adaptive bottleneck polish
+            b, val = adaptive_polish(geom, b, opt.rng)
+            if val > best_val:
+                best_val, best_xy = val, Geometry.to_xy(b)
+        if best_xy is None or not np.all(np.isfinite(best_xy)):
+            raise RuntimeError("optimization failed")
+        if best_val < fb_val:
+            best_xy = Geometry.to_xy(fallback_b)
+        return np.ascontiguousarray(best_xy, dtype=float)
+    except Exception:
+        return np.ascontiguousarray(Geometry.to_xy(fallback_b), dtype=float)
+
+
+# EVOLVE-BLOCK-END

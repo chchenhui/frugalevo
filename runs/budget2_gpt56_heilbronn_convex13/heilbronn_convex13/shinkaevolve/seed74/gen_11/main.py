@@ -1,0 +1,181 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct a deterministic thirteen-point maximin configuration.
+
+    The layout has 3-fold rotational structure:
+      - one central point,
+      - two optimized interior triangular orbits,
+      - two outer triangular orbits interlaced into a regular hexagon.
+
+    The regular hexagonal hull is scaled to area one, so the minimum triangle
+    area equals the normalized objective used by the evaluator.
+    """
+    rng = np.random.default_rng(130013)
+
+    triples = np.array(
+        [(i, j, k) for i in range(13)
+         for j in range(i + 1, 13)
+         for k in range(j + 1, 13)],
+        dtype=np.intp,
+    )
+
+    period = 2.0 * np.pi / 3.0
+    root_angles = np.array([0.0, period, 2.0 * period], dtype=float)
+
+    # The unscaled outer hull is a regular hexagon of circumradius 1.
+    hex_area = 3.0 * np.sqrt(3.0) / 2.0
+
+    def layouts_from_parameters(params: np.ndarray) -> np.ndarray:
+        """
+        Parameters are [r1, r2, phase1, phase2].
+        The six outer points are two interlaced 3-fold orbits.
+        """
+        m = params.shape[0]
+        result = np.empty((m, 13, 2), dtype=float)
+        result[:, 0, :] = 0.0
+
+        for offset, radius_column, phase_column in (
+            (1, 0, 2),
+            (4, 1, 3),
+        ):
+            angles = params[:, phase_column, None] + root_angles[None, :]
+            radius = params[:, radius_column, None]
+            result[:, offset:offset + 3, 0] = radius * np.cos(angles)
+            result[:, offset:offset + 3, 1] = radius * np.sin(angles)
+
+        # Interlaced outer orbits: angles 0, 60, 120, ..., 300 degrees.
+        outer_a = root_angles
+        outer_b = root_angles + np.pi / 3.0
+        result[:, 7:10, 0] = np.cos(outer_a)
+        result[:, 7:10, 1] = np.sin(outer_a)
+        result[:, 10:13, 0] = np.cos(outer_b)
+        result[:, 10:13, 1] = np.sin(outer_b)
+        return result
+
+    def scores(params: np.ndarray) -> np.ndarray:
+        layouts = layouts_from_parameters(params)
+        u = layouts[:, triples[:, 1]] - layouts[:, triples[:, 0]]
+        v = layouts[:, triples[:, 2]] - layouts[:, triples[:, 0]]
+        areas = 0.5 * np.abs(u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0])
+        return areas.min(axis=1) / hex_area
+
+    def repair(params: np.ndarray) -> np.ndarray:
+        """Keep all optimized orbits strictly inside the hexagonal hull."""
+        repaired = params.copy()
+        repaired[:, :2] = np.clip(repaired[:, :2], 0.405, 0.835)
+        repaired[:, 2:] = np.mod(repaired[:, 2:], period)
+
+        # Label the two interior rings consistently, preserving their phases.
+        swap = repaired[:, 0] > repaired[:, 1]
+        if np.any(swap):
+            repaired[swap] = repaired[swap][:, [1, 0, 3, 2]]
+        return repaired
+
+    population_size = 160
+    generations = 850
+
+    population = np.empty((population_size, 4), dtype=float)
+    population[:, 0] = rng.uniform(0.42, 0.60, population_size)
+    population[:, 1] = rng.uniform(0.61, 0.82, population_size)
+    population[:, 2:] = rng.uniform(0.0, period, size=(population_size, 2))
+
+    # Include several deliberately staggered, geometrically useful seeds.
+    population[:8] = np.array([
+        [0.46, 0.69, 0.10, 0.44],
+        [0.48, 0.72, 0.28, 0.80],
+        [0.50, 0.75, 0.52, 0.17],
+        [0.44, 0.67, 0.72, 0.35],
+        [0.53, 0.78, 0.18, 0.61],
+        [0.47, 0.73, 0.91, 0.49],
+        [0.51, 0.70, 0.39, 0.96],
+        [0.43, 0.64, 0.63, 0.08],
+    ])
+    population = repair(population)
+    values = scores(population)
+
+    best_index = int(np.argmax(values))
+    best = population[best_index].copy()
+    best_value = float(values[best_index])
+
+    for generation in range(generations):
+        fraction = generation / (generations - 1.0)
+        order = np.argsort(values)
+        elite = population[order[-12:]]
+        leader = elite[-1]
+
+        a = population[rng.integers(0, population_size, population_size)]
+        b = population[rng.integers(0, population_size, population_size)]
+        c = population[rng.integers(0, population_size, population_size)]
+
+        differential_weight = 0.82 - 0.27 * fraction
+        attraction = 0.18 + 0.22 * fraction
+        candidates = population + differential_weight * (a - b)
+        candidates += attraction * (leader - population)
+
+        # A shrinking isotropic component permits basin escapes early and
+        # precise active-constraint adjustments late in the run.
+        noise_scale = 0.055 * (1.0 - fraction) ** 1.7 + 0.0010
+        candidates += rng.normal(0.0, noise_scale, size=candidates.shape)
+
+        # Periodic phase parameters should use circular differences rather
+        # than ordinary linear subtraction near the period boundary.
+        phase_delta = candidates[:, 2:] - population[:, 2:]
+        phase_delta = (phase_delta + period / 2.0) % period - period / 2.0
+        candidates[:, 2:] = population[:, 2:] + phase_delta
+
+        candidates = repair(candidates)
+        candidate_values = scores(candidates)
+
+        accepted = candidate_values >= values
+        population[accepted] = candidates[accepted]
+        values[accepted] = candidate_values[accepted]
+
+        current_index = int(np.argmax(values))
+        if values[current_index] > best_value:
+            best_value = float(values[current_index])
+            best = population[current_index].copy()
+
+        # Deterministic partial refresh prevents all population members from
+        # collapsing prematurely onto the same nonsmooth local maximum.
+        if generation in (280, 560):
+            worst = np.argsort(values)[:44]
+            population[worst, 0] = rng.uniform(0.41, 0.58, len(worst))
+            population[worst, 1] = rng.uniform(0.60, 0.83, len(worst))
+            population[worst, 2:] = rng.uniform(
+                0.0, period, size=(len(worst), 2)
+            )
+            population[worst] = repair(population[worst])
+            values[worst] = scores(population[worst])
+
+    # Deterministic pattern search directly on the nonsmooth min-area value.
+    directions = np.eye(4)
+    directions = np.vstack((directions, -directions))
+    step = np.array([0.018, 0.018, 0.040, 0.040], dtype=float)
+
+    for _ in range(11):
+        improved = True
+        while improved:
+            improved = False
+            trials = np.repeat(best[None, :], len(directions), axis=0)
+            trials += directions * step
+            trials = repair(trials)
+            trial_values = scores(trials)
+            index = int(np.argmax(trial_values))
+            if trial_values[index] > best_value:
+                best = trials[index]
+                best_value = float(trial_values[index])
+                improved = True
+        step *= 0.56
+
+    result = layouts_from_parameters(best[None, :])[0]
+
+    # Scale the regular hexagonal hull from area 3*sqrt(3)/2 to unit area.
+    result /= np.sqrt(hex_area)
+    return result
+
+
+# EVOLVE-BLOCK-END

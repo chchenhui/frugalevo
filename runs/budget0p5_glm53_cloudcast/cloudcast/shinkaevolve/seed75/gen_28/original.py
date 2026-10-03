@@ -1,0 +1,236 @@
+# EVOLVE-BLOCK-START
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+from collections import defaultdict
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: candidate path generation (per destination, with relay reuse)
+# ---------------------------------------------------------------------------
+class PathOracle:
+    """Precomputes shortest-path data and provides cheap candidate paths."""
+
+    def __init__(self, G: nx.DiGraph, src: str, k: int = 3):
+        # remove useless edges: into src and self loops
+        h = G.copy()
+        h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+        self.h = h
+        self.src = src
+        self.k = k
+        # length & path caches keyed by dst
+        self._astar_cache: Dict[str, List] = {}
+        self._shortest_cost: Dict[str, float] = defaultdict(lambda: float("inf"))
+
+    def candidate_paths(self, dst: str) -> List[List[str]]:
+        """Return up to k simple paths, ordered by total cost."""
+        if dst in self._astar_cache:
+            return self._astar_cache[dst]
+        try:
+            gen = nx.shortest_simple_paths(self.h, self.src, dst, weight="cost")
+            paths = []
+            for i, p in enumerate(gen):
+                if i >= self.k:
+                    break
+                paths.append(p)
+                self._shortest_cost[dst] = min(
+                    self._shortest_cost[dst], self._path_cost(p))
+            if not paths:
+                paths = [nx.dijkstra_path(self.h, self.src, dst, weight="cost")]
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            paths = []
+        self._astar_cache[dst] = paths
+        return paths
+
+    def _path_cost(self, path: List[str]) -> float:
+        c = 0.0
+        for i in range(len(path) - 1):
+            c += self.h[path[i]][path[i + 1]].get("cost") or 0.0
+        return c
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: partition assignment with shared-prefix (tree) accounting
+# ---------------------------------------------------------------------------
+class TreeCostModel:
+    """Tracks which (edge) segments are already 'paid for' by earlier
+    destinations, so shared prefixes of the multicast tree are only
+    transferred once. Also balances load across parallel candidate paths."""
+
+    def __init__(self, num_partitions: int):
+        self.used_edges = set()
+        self.edge_load = defaultdict(int)  # edge -> partitions routed over it
+        self.num_partitions = num_partitions
+
+    def partition_cost(self, path: List[str]) -> float:
+        """Marginal cost: edges not yet used cost full price; used edges
+        are free (data already in flight / relayed)."""
+        c = 0.0
+        for i in range(len(path) - 1):
+            e = (path[i], path[i + 1])
+            if e not in self.used_edges:
+                data = self.h_edge_cost(path[i], path[i + 1])
+                c += data
+        return c
+
+    def h_edge_cost(self, s, t) -> float:
+        return 0.0  # set by caller via bind
+
+    def commit(self, path: List[str], edge_cost_fn):
+        for i in range(len(path) - 1):
+            e = (path[i], path[i + 1])
+            self.used_edges.add(e)
+            self.edge_load[e] += 1
+
+
+def assign_partitions(oracle: PathOracle, dsts: List[str],
+                       num_partitions: int) -> Dict[str, Dict[str, List[List]]]:
+    """
+    For each dst, greedily distribute the num_partitions over the candidate
+    paths minimizing marginal cost (shared edges are free), balancing load.
+    """
+    tree = TreeCostModel(num_partitions)
+    edge_cost_fn = lambda s, t: oracle.h[s][t].get("cost") or 0.0
+    tree.h_edge_cost = staticmethod_dict(edge_cost_fn)
+    tree_edge_cost = edge_cost_fn
+
+    result: Dict[str, Dict[str, List[List]]] = {}
+    # order destinations by cheapest path first to maximize sharing
+    ordered = sorted(dsts, key=lambda d: min(
+        (sum(tree_edge_cost(p[i], p[i + 1]) for i in range(len(p) - 1))
+         for p in oracle.candidate_paths(d)), default=float("inf")))
+
+    for dst in ordered:
+        cands = oracle.candidate_paths(dst)
+        if not cands:
+            result[dst] = {str(j): None for j in range(num_partitions)}
+            continue
+        # marginal cost function accounting for committed tree edges
+        def marginal(p):
+            return sum(
+                0.0 if (p[i], p[i + 1]) in tree.used_edges else tree_edge_cost(p[i], p[i + 1])
+                for i in range(len(p) - 1)
+            )
+        # sort candidates by marginal cost
+        scored = sorted(cands, key=marginal)
+        # distribute partitions: fill cheapest path first, then overflow to
+        # next-cheapest to balance load (avoids overloading single network)
+        per_path = len(scored)
+        paths_assignment: Dict[str, List[List]] = {str(j): None for j in range(num_partitions)}
+        for j in range(num_partitions):
+            p = scored[j % per_path]
+            # record edge list [s, t, data] like original format
+            edge_list = []
+            for i in range(len(p) - 1):
+                edge_list.append([p[i], p[i + 1], oracle.h[p[i]][p[i + 1]]])
+            paths_assignment[str(j)] = edge_list
+        # commit chosen path(s) to tree so later dsts can share
+        for p in set(map(tuple, scored)):
+            tree.commit(list(p), tree_edge_cost)
+        result[dst] = paths_assignment
+    return result
+
+
+def staticmethod_dict(fn):
+    # simple shim so TreeCostModel can use an external cost function
+    class Shim:
+        def __call__(self, s, t):
+            return fn(s, t)
+    return Shim()
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]  # [[src, dst, edge data]]
+
+
+class BroadCastTopology:
+    """Public API preserved: src, dsts, num_partitions, paths."""
+
+    def __init__(self, src: str, dsts: List[str], num_partitions: int = 4,
+                 paths: Dict[str, SingleDstPath] = None):
+        self.src = src
+        self.dsts = dsts
+        self.num_partitions = num_partitions
+        if paths is not None:
+            self.paths = paths
+        else:
+            self.paths = {dst: {str(i): None for i in range(num_partitions)}
+                          for dst in dsts}
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        self.paths[dst][str(partition)] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    """Two-phase pipeline: PathOracle (candidate paths) + tree-aware
+    partition assignment with load balancing."""
+    oracle = PathOracle(G, src, k=3)
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    assignments = assign_partitions(oracle, dsts, num_partitions)
+    for dst, partitions in assignments.items():
+        for part, edge_list in partitions.items():
+            if edge_list is None:
+                continue
+            for edge in edge_list:
+                bc_topology.append_dst_partition_path(dst, int(part), edge)
+    return bc_topology
+
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    """
+    Default graph with capacity constraints and cost info
+    nodes: regions, edges: links
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if cost_path is None:
+        cost = pd.read_csv(os.path.join(current_dir, "profiles/cost.csv"))
+    else:
+        cost = pd.read_csv(cost_path)
+
+    if throughput_path is None:
+        throughput = pd.read_csv(os.path.join(current_dir, "profiles/throughput.csv"))
+    else:
+        throughput = pd.read_csv(throughput_path)
+
+    G = nx.DiGraph()
+    for _, row in throughput.iterrows():
+        if row["src_region"] == row["dst_region"]:
+            continue
+        G.add_edge(row["src_region"], row["dst_region"], cost=None,
+                   throughput=num_vms * row["throughput_sent"] / 1e9)
+
+    for _, row in cost.iterrows():
+        if row["src"] in G and row["dest"] in G[row["src"]]:
+            G[row["src"]][row["dest"]]["cost"] = row["cost"]
+
+    no_cost_pairs = [(s, d) for s, d, data in G.edges.data() if data["cost"] is None]
+    print("Unable to get costs for: ", no_cost_pairs)
+    return G
+
+# EVOLVE-BLOCK-END
+
+# Helper functions that won't be evolved
+def create_broadcast_topology(src: str, dsts: List[str], num_partitions: int = 4):
+    """Create a broadcast topology instance"""
+    return BroadCastTopology(src, dsts, num_partitions)
+
+def run_search_algorithm(src: str, dsts: List[str], G, num_partitions: int):
+    """Run the search algorithm and return the topology"""
+    return search_algorithm(src, dsts, G, num_partitions)

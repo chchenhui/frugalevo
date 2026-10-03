@@ -1,0 +1,248 @@
+<NAME>
+multistart_greedy_local_search_hybrid
+</NAME>
+<DESCRIPTION>
+Crossover of the best-performing program (multi-start greedy with diverse orderings and two greedy modes + local search, scoring 26.18) with the current program's best-fit greedy tie-breaking and 3-cycle rotation refinement. The new version builds a pool of candidate placements from multiple sort orders (by weight, by size, by weight-density, etc.) and two greedy modes (post-placement KVPR best-fit with memory tie-break, and lowest-current-KVPR), then applies an efficient incremental local search with single-model moves, pairwise swaps, and 3-cycle rotations across the hottest GPUs, keeping the best result across all candidates.
+</DESCRIPTION>
+<CODE>
+```python
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+    Multi-start greedy (diverse orders x greedy modes) + local search
+    (single-model moves, pairwise swaps, 3-cycle rotations).
+    """
+
+    def w_of(m):
+        return m.req_rate / m.slo
+
+    def build_greedy(order, mode):
+        placement = {g: [] for g in range(gpu_num)}
+        shared_kv = [GPU_MEM_SIZE] * gpu_num
+        wr = [0.0] * gpu_num
+        for model in order:
+            best_idx, best_ratio, best_mem = None, float('inf'), -1.0
+            w = w_of(model)
+            for g in range(gpu_num):
+                rem = shared_kv[g] - model.model_size
+                if rem <= 0:
+                    continue
+                if mode == 0:
+                    # best-fit: lowest post-placement KVPR, tie-break on more remaining mem
+                    r = (wr[g] + w) / rem
+                    if r < best_ratio - 1e-12 or (abs(r - best_ratio) <= 1e-9 and rem > best_mem):
+                        best_ratio, best_mem, best_idx = r, rem, g
+                else:
+                    # lowest current KVPR
+                    r = wr[g] / shared_kv[g]
+                    if r < best_ratio - 1e-12 or (abs(r - best_ratio) <= 1e-9 and rem > best_mem):
+                        best_ratio, best_mem, best_idx = r, rem, g
+            if best_idx is None:
+                return None
+            placement[best_idx].append(model)
+            wr[best_idx] += w
+            shared_kv[best_idx] -= model.model_size
+        return placement
+
+    def kvprs(placement):
+        out = []
+        for g in range(gpu_num):
+            mem_left = GPU_MEM_SIZE - sum(m.model_size for m in placement[g])
+            wr = sum(w_of(m) for m in placement[g])
+            out.append(float('inf') if mem_left <= 0 else wr / mem_left)
+        return out
+
+    def local_search(placement):
+        # maintain incremental state
+        shared_kv = [GPU_MEM_SIZE - sum(m.model_size for m in placement[g])
+                     for g in range(gpu_num)]
+        wr = [sum(w_of(m) for m in placement[g]) for g in range(gpu_num)]
+
+        def kvs():
+            return [float('inf') if shared_kv[g] <= 0 else wr[g] / shared_kv[g]
+                    for g in range(gpu_num)]
+
+        cur_kvs = kvs()
+        for _round in range(25):
+            best_max = max(cur_kvs)
+            improved = False
+            # Move 1: single-model relocation from hottest GPUs
+            hot = [g for g in range(gpu_num) if cur_kvs[g] >= best_max - 1e-12]
+            for src in hot:
+                if improved:
+                    break
+                for pos in range(len(placement[src])):
+                    if improved:
+                        break
+                    model = placement[src][pos]
+                    w = w_of(model)
+                    for dst in range(gpu_num):
+                        if dst == src or shared_kv[dst] < model.model_size:
+                            continue
+                        # apply move
+                        placement[src].pop(pos)
+                        placement[dst].append(model)
+                        wr[src] -= w
+                        wr[dst] += w
+                        shared_kv[src] += model.model_size
+                        shared_kv[dst] -= model.model_size
+                        new_max = max(kvs())
+                        if new_max < best_max - 1e-12:
+                            cur_kvs = kvs()
+                            improved = True
+                            break
+                        # revert
+                        placement[dst].pop()
+                        placement[src].insert(pos, model)
+                        wr[dst] -= w
+                        wr[src] += w
+                        shared_kv[dst] += model.model_size
+                        shared_kv[src] -= model.model_size
+                if improved:
+                    break
+            if improved:
+                continue
+            # Move 2: pairwise swap between GPUs
+            for src in range(gpu_num):
+                for dst in range(src + 1, gpu_num):
+                    if improved:
+                        break
+                    for p1 in range(len(placement[src])):
+                        for p2 in range(len(placement[dst])):
+                            m1, m2 = placement[src][p1], placement[dst][p2]
+                            delta_mem = m2.model_size - m1.model_size
+                            if shared_kv[dst] + delta_mem < 0 or shared_kv[src] - delta_mem < 0:
+                                continue
+                            w1, w2 = w_of(m1), w_of(m2)
+                            w_delta = w2 - w1
+                            placement[src][p1], placement[dst][p2] = m2, m1
+                            wr[src] += w_delta
+                            wr[dst] -= w_delta
+                            shared_kv[src] += delta_mem
+                            shared_kv[dst] -= delta_mem
+                            if max(kvs()) < best_max - 1e-12:
+                                cur_kvs = kvs()
+                                improved = True
+                                break
+                            placement[src][p1], placement[dst][p2] = m1, m2
+                            wr[src] -= w_delta
+                            wr[dst] += w_delta
+                            shared_kv[src] -= delta_mem
+                            shared_kv[dst] += delta_mem
+                        if improved:
+                            break
+                    if improved:
+                        break
+            if improved:
+                continue
+            # Move 3: 3-cycle rotation across three hottest GPUs
+            hot_order = sorted(range(gpu_num), key=lambda g: -cur_kvs[g])
+            cand_gpus = hot_order[:3]
+            found = False
+            for g1 in cand_gpus:
+                for g2 in cand_gpus:
+                    for g3 in cand_gpus:
+                        if len({g1, g2, g3}) < 3:
+                            continue
+                        for p1 in range(len(placement[g1])):
+                            for p2 in range(len(placement[g2])):
+                                for p3 in range(len(placement[g3])):
+                                    m1 = placement[g1][p1]
+                                    m2 = placement[g2][p2]
+                                    m3 = placement[g3][p3]
+                                    d12 = m1.model_size - m2.model_size
+                                    d23 = m2.model_size - m3.model_size
+                                    d31 = m3.model_size - m1.model_size
+                                    if (shared_kv[g1] + d12 < 0 or
+                                            shared_kv[g2] + d23 < 0 or
+                                            shared_kv[g3] + d31 < 0):
+                                        continue
+                                    w1, w2, w3 = w_of(m1), w_of(m2), w_of(m3)
+                                    placement[g1][p1], placement[g2][p2], placement[g3][p3] = m2, m3, m1
+                                    wr[g1] += w2 - w1
+                                    wr[g2] += w3 - w2
+                                    wr[g3] += w1 - w3
+                                    shared_kv[g1] += d12
+                                    shared_kv[g2] += d23
+                                    shared_kv[g3] += d31
+                                    if max(kvs()) < best_max - 1e-12:
+                                        cur_kvs = kvs()
+                                        improved = True
+                                        found = True
+                                        break
+                                    placement[g1][p1], placement[g2][p2], placement[g3][p3] = m1, m2, m3
+                                    wr[g1] += w1 - w2
+                                    wr[g2] += w2 - w3
+                                    wr[g3] += w3 - w1
+                                    shared_kv[g1] -= d12
+                                    shared_kv[g2] -= d23
+                                    shared_kv[g3] -= d31
+                                if found:
+                                    break
+                            if found:
+                                break
+                        if found:
+                            break
+            if not improved:
+                break
+        return placement
+
+    # candidate pool: diverse orders and greedy modes
+    orders = [
+        sorted(models, key=lambda m: -w_of(m)),
+        sorted(models, key=lambda m: -m.model_size),
+        sorted(models, key=lambda m: m.model_size),
+        sorted(models, key=lambda m: -(w_of(m) / m.model_size)),
+        sorted(models, key=lambda m: w_of(m)),
+    ]
+    candidates = []
+    for order in orders:
+        for mode in (0, 1):
+            p = build_greedy(order, mode)
+            if p is not None:
+                candidates.append(p)
+
+    best_placement, best_score = None, float('inf')
+    for cand in candidates:
+        p = {g: list(cand[g]) for g in range(gpu_num)}
+        p = local_search(p)
+        score = max(kvprs(p))
+        if score < best_score:
+            best_score, best_placement = score, p
+
+    if best_placement is None:
+        raise ValueError("Unable to place models on any GPU.")
+
+    return best_placement
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")
+```
+</CODE>

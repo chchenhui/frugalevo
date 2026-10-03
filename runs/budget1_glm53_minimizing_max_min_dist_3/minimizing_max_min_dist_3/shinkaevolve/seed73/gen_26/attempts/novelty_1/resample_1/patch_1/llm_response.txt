@@ -1,0 +1,97 @@
+<NAME>
+smooth_softmin_and_bottleneck_polish</NAME>
+
+<DESCRIPTION>
+The current SLSQP maximizes a non-smooth min-distance objective, which stalls easily because the gradient only "sees" a single bottleneck pair. Two targeted changes:
+
+1. Replace the non-smooth objective with a smooth softmin surrogate, `-(1/β)·log(Σ exp(-β·d_k))`, which approximates the true minimum (for β ~ 50–100 the error is negligible) but gives informative gradients on all near-minimal pairs. SLSQP handles this far better and can escape flat/stalled configurations.
+
+2. Add the recommended bottleneck-escape micro-search: after SLSQP converges, identify the point participating in the smallest pairwise distance and push it directly away from its nearest neighbor (a finite-difference direction of dmin) with a few decreasing step sizes, renormalizing diameter each time. Any improvement is fed back into one more SLSQP pass. This directly attacks the exact pair limiting the ratio at near-zero extra cost.
+
+Both changes are applied to every polished candidate so the global best can only improve.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    def slsqp(pts):
+        pts = normalize(pts)
+        def obj(flat):
+            return -pair_dists(flat.reshape(n, d)).min()
+        def con(flat):
+            return 1.0 - pair_dists(flat.reshape(n, d)).max()
+        res = minimize(obj, pts.ravel(), method='SLSQP',
+                       constraints={'type': 'ineq', 'fun': con},
+                       options={'maxiter': 300, 'ftol': 1e-12})
+        return res.x.reshape(n, d)
+=======
+    def slsqp(pts, beta=80.0):
+        pts = normalize(pts)
+        def obj(flat):
+            ds = pair_dists(flat.reshape(n, d))
+            # smooth softmin surrogate for -min(ds)
+            m = ds.min()
+            return -(m + np.log(np.sum(np.exp(-beta * (ds - m)))) / beta)
+        def con(flat):
+            return 1.0 - pair_dists(flat.reshape(n, d)).max()
+        res = minimize(obj, pts.ravel(), method='SLSQP',
+                       constraints={'type': 'ineq', 'fun': con},
+                       options={'maxiter': 300, 'ftol': 1e-12})
+        return res.x.reshape(n, d)
+>>>>>>> REPLACE
+<DIFF>
+<<<<<<< SEARCH
+    def polish(pts, rounds=4):
+        best = pts
+        best_r = ratio(pts)
+        cur = pts
+        for _ in range(rounds):
+            cur = slsqp(cur)
+            r = ratio(cur)
+            if r > best_r + 1e-12:
+                best_r, best = r, cur
+            else:
+                break
+        return best, best_r
+=======
+    def bottleneck_escape(pts):
+        # Push the point in the min-distance pair away from its nearest
+        # neighbor, then renormalize; keep any strict improvement.
+        best = normalize(pts)
+        best_r = ratio(best)
+        ds = pair_dists(best)
+        k = int(np.argmin(ds))
+        i, j = PI[k], PJ[k]
+        for step in (0.02, 0.01, 0.005, 0.002, 0.001):
+            for pt, other in ((i, j), (j, i)):
+                cand = best.copy()
+                dirv = cand[pt] - cand[other]
+                nrm = np.linalg.norm(dirv)
+                if nrm <= 0:
+                    continue
+                cand[pt] = cand[pt] + step * dirv / nrm
+                cand = normalize(cand)
+                r = ratio(cand)
+                if r > best_r + 1e-14:
+                    best_r, best = r, cand
+        return best, best_r
+
+    def polish(pts, rounds=4):
+        best = pts
+        best_r = ratio(pts)
+        cur = pts
+        for _ in range(rounds):
+            cur = slsqp(cur)
+            r = ratio(cur)
+            if r > best_r + 1e-12:
+                best_r, best = r, cur
+            else:
+                break
+        # Targeted micro-search on the bottleneck pair + one more SLSQP pass
+        cur, r = bottleneck_escape(best)
+        if r > best_r + 1e-14:
+            cur = slsqp(cur)
+            r = ratio(cur)
+            if r > best_r:
+                best_r, best = r, cur
+        return best, best_r
+>>>>>>> REPLACE
+</DIFF>

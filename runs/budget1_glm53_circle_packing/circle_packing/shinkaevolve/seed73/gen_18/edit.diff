@@ -1,0 +1,277 @@
+--- a/original.py
++++ b/original.py
+@@ -1,157 +1,228 @@
+ # EVOLVE-BLOCK-START
+ """Constructor-based circle packing for n=26 circles"""
+ import numpy as np
+ 
+ 
+ def construct_packing():
+     """
+     Construct a specific arrangement of 26 circles in a unit square
+     that attempts to maximize the sum of their radii.
+ 
+     Returns:
+         Tuple of (centers, radii, sum_of_radii)
+         centers: np.array of shape (26, 2) with (x, y) coordinates
+         radii: np.array of shape (26) with radius of each circle
+         sum_of_radii: Sum of all radii
+     """
+     # Initialize arrays for 26 circles
+     n = 26
+     centers = np.zeros((n, 2))
+ 
+-    # Hexagonal lattice layout: 6 staggered rows with counts 4,5,4,5,4,4
+-    # Lattice spacing s chosen so rows of 5 fit horizontally (5s <= 1)
+-    # and rows fit vertically with row spacing h = sqrt(3)/2 * s.
++    # Enumerate multiple lattice topologies and spacings; relax each with
++    # uniform-radius repulsion and keep the best total radius.
+     sqrt3_2 = np.sqrt(3.0) / 2.0
+-    s = 1.0 / (5.0 + sqrt3_2)  # solve (1 - s)/5 = sqrt(3)/2 * s
+-    h = sqrt3_2 * s
+-    row_counts = [4, 5, 4, 5, 4, 4]
+-
+-    idx = 0
+-    for r_i, cnt in enumerate(row_counts):
+-        y = s / 2.0 + r_i * h
+-        # Stagger odd rows by half a spacing
+-        x0 = 0.5 - (cnt - 1) * s / 2.0
+-        if r_i % 2 == 1:
+-            x0 += s / 2.0
+-        for c in range(cnt):
+-            centers[idx] = [x0 + c * s, y]
+-            idx += 1
+-
+-    # Repulsion-based positional relaxation:
+-    # treat every circle as having the target uniform radius r0 = s/2 and
+-    # push apart centers that are too close, while keeping them off walls.
+-    r0 = s / 2.0
+-    n_iters = 300
+-    for _ in range(n_iters):
+-        max_move = 0.0
+-        for i in range(n):
+-            for j in range(i + 1, n):
+-                diff = centers[i] - centers[j]
+-                d = np.sqrt(np.sum(diff ** 2))
+-                if d < 2 * r0 and d > 1e-12:
+-                    push = (2 * r0 - d) / 2.0
+-                    u = diff / d
+-                    step = 0.05 * push
+-                    centers[i] += step * u
+-                    centers[j] -= step * u
+-                    max_move = max(max_move, step)
+-        # Keep circles away from the walls by at least r0
+-        m = r0
+-        centers[:, 0] = np.clip(centers[:, 0], m, 1 - m)
+-        centers[:, 1] = np.clip(centers[:, 1], m, 1 - m)
+-        if max_move < 1e-8:
+-            break
+-
+-    # Compute maximum valid radii for this configuration
++    iu = np.triu_indices(n, k=1)
++
++    def make_layout(row_counts, s, stagger):
++        pts = np.zeros((n, 2))
++        h = sqrt3_2 * s if stagger else s
++        idx = 0
++        for r_i, cnt in enumerate(row_counts):
++            y = s / 2.0 + r_i * h
++            x0 = 0.5 - (cnt - 1) * s / 2.0
++            if stagger and r_i % 2 == 1:
++                x0 += s / 2.0
++            for c in range(cnt):
++                pts[idx] = [x0 + c * s, y]
++                idx += 1
++        return pts
++
++    def uniform_relax(pts, r0, n_iters=300):
++        pts = pts.copy()
++        for _ in range(n_iters):
++            diff = pts[:, None, :] - pts[None, :, :]
++            dist = np.sqrt((diff ** 2).sum(-1))
++            d = dist[iu]
++            ov = 2.0 * r0 - d
++            mask = ov > 1e-12
++            if not mask.any():
++                break
++            ii, jj = iu[0][mask], iu[1][mask]
++            u = diff[ii, jj] / d[mask][:, None]
++            push = 0.05 * ov[mask][:, None] * u
++            move = np.zeros_like(pts)
++            np.add.at(move, ii, push)
++            np.add.at(move, jj, -push)
++            pts += move
++            pts[:, 0] = np.clip(pts[:, 0], r0, 1 - r0)
++            pts[:, 1] = np.clip(pts[:, 1], r0, 1 - r0)
++        return pts
++
++    candidates = []
++    for s in [0.155, 0.17, 0.185, 0.19, 1.0 / (5.0 + sqrt3_2)]:
++        candidates.append(make_layout([4, 5, 4, 5, 4, 4], s, True))
++        candidates.append(make_layout([5, 4, 5, 4, 5, 3], s, True))
++        candidates.append(make_layout([5, 4, 5, 4, 4, 4], s, False))
++        candidates.append(make_layout([4, 5, 4, 5, 4, 4], s, False))
++
++    best = None
++    for pts0 in candidates:
++        dmin = np.min((np.sqrt(((pts0[:, None, :] - pts0[None, :, :]) ** 2).sum(-1)
++                                + np.eye(n) * 1e9)).min(axis=1))
++        pts = uniform_relax(pts0, dmin / 2.0)
++        radii_c = compute_max_radii(pts)
++        total = radii_c.sum()
++        if best is None or total > best[2]:
++            best = (pts, radii_c, total)
++
++    centers = best[0]
++
++    # Contact relaxation: move each center to equalize its gap to the two
++    # nearest constraints (nearest neighbor or wall), maximizing its own
++    # grown radius. Repeat a few sweeps; keep the best feasible result.
++    def contact_relax(pts, n_iters=60):
++        pts = pts.copy()
++        for _ in range(n_iters):
++            moved = 0.0
++            for i in range(n):
++                diff = pts - pts[i]
++                dist = np.sqrt((diff ** 2).sum(-1))
++                dist[i] = 1e9
++                # candidate gaps if circle i grows: to neighbors r_i = d/2
++                # (shared), to walls
++                j = int(np.argmin(dist))
++                d_n = dist[j]
++                # wall-limited radius
++                r_w = min(pts[i, 0], 1 - pts[i, 0],
++                          pts[i, 1], 1 - pts[i, 1])
++                # gradient step: grow towards more room
++                r_n = d_n / 2.0
++                g = r_n - r_w
++                if abs(g) < 1e-9:
++                    continue
++                if r_n > r_w:
++                    # move away from nearest neighbor, towards wall room
++                    u = diff[j] / d_n
++                    # also consider the tighter wall
++                    walls = np.array([-pts[i, 0], 1 - pts[i, 0]])
++                    wall_dir = np.argmax(walls)
++                    step = 0.1 * g
++                    if wall_dir == 0:
++                        pts[i, 0] -= step
++                    else:
++                        pts[i, 0] += step
++                    pts[i, 0] = np.clip(pts[i, 0], 0.01, 0.99)
++                    pts[i] -= 0.5 * step * u * 0.0  # neighbor handled below
++                    pts[i] = np.clip(pts[i], 0.01, 0.99)
++                else:
++                    # wall-limited: move toward center of square side gaps
++                    if pts[i, 0] < 0.5:
++                        pts[i, 0] += 0.1 * g
++                    else:
++                        pts[i, 0] -= 0.1 * g
++                    if pts[i, 1] < 0.5:
++                        pts[i, 1] += 0.1 * g
++                    else:
++                        pts[i, 1] -= 0.1 * g
++                    moved = max(moved, abs(0.1 * g))
++                moved = max(moved, abs(0.1 * g))
++            if moved < 1e-9:
++                break
++        return pts
++
++    pts2 = contact_relax(centers)
++    radii2 = compute_max_radii(pts2)
++    if radii2.sum() > best[2]:
++        centers = pts2
++
++    # Compute maximum valid radii for the final configuration
+     radii = compute_max_radii(centers)
+-
+-    # Calculate the sum of radii
+     sum_radii = np.sum(radii)
+ 
+     return centers, radii, sum_radii
+ 
+ 
+ def compute_max_radii(centers):
+     """
+     Compute the maximum possible radii for each circle position
+     such that they don't overlap and stay within the unit square.
+ 
+     Args:
+         centers: np.array of shape (n, 2) with (x, y) coordinates
+ 
+     Returns:
+         np.array of shape (n) with radius of each circle
+     """
+     n = centers.shape[0]
+ 
+     # Start from the distance to the square borders
+     radii = np.minimum(
+         np.minimum(centers[:, 0], 1 - centers[:, 0]),
+         np.minimum(centers[:, 1], 1 - centers[:, 1]),
+     )
+ 
+     # Iteratively enforce pairwise non-overlap by proportional scaling.
+     # Radii only shrink, so this loop converges to a feasible configuration.
+     for _ in range(200):
+         changed = False
+         for i in range(n):
+             for j in range(i + 1, n):
+                 dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                 total = radii[i] + radii[j]
+                 if total > dist and total > 1e-15:
+                     scale = dist / total
+                     radii[i] *= scale
+                     radii[j] *= scale
+                     changed = True
+         if not changed:
+             break
+ 
+     return radii
+ 
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ # This part remains fixed (not evolved)
+ def run_packing():
+     """Run the circle packing constructor for n=26"""
+     centers, radii, sum_radii = construct_packing()
+     return centers, radii, sum_radii
+ 
+ 
+ def visualize(centers, radii):
+     """
+     Visualize the circle packing
+ 
+     Args:
+         centers: np.array of shape (n, 2) with (x, y) coordinates
+         radii: np.array of shape (n) with radius of each circle
+     """
+     import matplotlib.pyplot as plt
+     from matplotlib.patches import Circle
+ 
+     fig, ax = plt.subplots(figsize=(8, 8))
+ 
+     # Draw unit square
+     ax.set_xlim(0, 1)
+     ax.set_ylim(0, 1)
+     ax.set_aspect("equal")
+     ax.grid(True)
+ 
+     # Draw circles
+     for i, (center, radius) in enumerate(zip(centers, radii)):
+         circle = Circle(center, radius, alpha=0.5)
+         ax.add_patch(circle)
+         ax.text(center[0], center[1], str(i), ha="center", va="center")
+ 
+     plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+     plt.show()
+ 
+ 
+ if __name__ == "__main__":
+     centers, radii, sum_radii = run_packing()
+     print(f"Sum of radii: {sum_radii}")
+     # AlphaEvolve improved this to 2.635
+ 
+     # Uncomment to visualize:
+     visualize(centers, radii)

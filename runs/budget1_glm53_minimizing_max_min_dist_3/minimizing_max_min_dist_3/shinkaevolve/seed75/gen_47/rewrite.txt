@@ -1,0 +1,218 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3D maximizing min pairwise distance / max pairwise distance.
+
+    Returns:
+        points: np.ndarray of shape (14, 3)
+    """
+    from scipy.optimize import minimize
+
+    n = 14
+    d = 3
+    iu = np.triu_indices(n, 1)
+    ii, jj = iu
+
+    def dists(p):
+        diff = p[ii] - p[jj]
+        return np.sqrt(np.maximum(np.sum(diff * diff, axis=1), 1e-18))
+
+    def ratio(p):
+        D = dists(p)
+        return D.min() / D.max()
+
+    def norm_cfg(pts):
+        pts = pts - pts.mean(axis=0)
+        return pts / max(np.linalg.norm(pts, axis=1).max(), 1e-12)
+
+    rng = np.random.default_rng(12345)
+    best_pts = None
+    best_r = -1.0
+
+    # ---- Clipped soft-min / soft-max surrogate (fast, no logsumexp) ----
+    def make_loss(T):
+        def loss(x):
+            p = x.reshape(n, d)
+            p = p - p.mean(axis=0)
+            D = dists(p)
+            Dmax = max(D.max(), 1e-9)
+            Dn = D / Dmax
+            emin = np.exp(np.clip((Dn.min() - Dn) / T, -50.0, 50.0))
+            smin = Dn.min() - T * np.log(emin.sum())
+            emax = np.exp(np.clip((Dn - Dn.max()) / T, -50.0, 50.0))
+            smax = Dn.max() + T * np.log(emax.sum())
+            return -(smin / smax)
+        return loss
+
+    def anneal(pts, taus, maxiter=400, maxfun=1500, ftol=1e-12, gtol=1e-10):
+        for T in taus:
+            try:
+                res = minimize(make_loss(T), pts.ravel(), method="L-BFGS-B",
+                               options={"maxiter": maxiter, "maxfun": maxfun,
+                                        "ftol": ftol, "gtol": gtol})
+                q = res.x.reshape(n, d)
+                if np.isfinite(q).all():
+                    pts = norm_cfg(q)
+            except Exception:
+                pass
+        return pts
+
+    # ---- Hard polish on all near-binding pairs (min & max) ----
+    def hard_polish(P, iters=600, step0=0.01, tol=0.05):
+        P = norm_cfg(P.copy())
+        r_best = ratio(P)
+        step = step0
+        for _ in range(iters):
+            D = dists(P)
+            dmin, dmax = D.min(), D.max()
+            near_min = np.where(D <= dmin * (1 + tol))[0]
+            near_max = np.where(D >= dmax * (1 - tol))[0]
+            improved = False
+            # single-pair moves on every binding (or near-binding) pair
+            for idx in near_min:
+                i, j = ii[idx], jj[idx]
+                u = P[j] - P[i]
+                nu = np.linalg.norm(u)
+                if nu <= 1e-12:
+                    continue
+                u = u / nu
+                Q = P.copy()
+                Q[i] -= step * u
+                Q[j] += step * u
+                Q = norm_cfg(Q)
+                r = ratio(Q)
+                if r > r_best + 1e-15:
+                    P, r_best, improved = Q, r, True
+                    break
+            if improved:
+                continue
+            for idx in near_max:
+                k, l = ii[idx], jj[idx]
+                v = P[l] - P[k]
+                nv = np.linalg.norm(v)
+                if nv <= 1e-12:
+                    continue
+                v = v / nv
+                Q = P.copy()
+                Q[k] += step * v
+                Q[l] -= step * v
+                Q = norm_cfg(Q)
+                r = ratio(Q)
+                if r > r_best + 1e-15:
+                    P, r_best, improved = Q, r, True
+                    break
+            if improved:
+                continue
+            # combined moves: separate a min pair AND pull a max pair
+            done = False
+            for a in near_min[:3]:
+                i, j = ii[a], jj[a]
+                u = P[j] - P[i]
+                nu = np.linalg.norm(u)
+                if nu <= 1e-12:
+                    continue
+                u = u / nu
+                for b in near_max[:3]:
+                    k, l = ii[b], jj[b]
+                    v = P[l] - P[k]
+                    nv = np.linalg.norm(v)
+                    if nv <= 1e-12:
+                        continue
+                    v = v / nv
+                    Q = P.copy()
+                    Q[i] -= step * u
+                    Q[j] += step * u
+                    Q[k] += step * v
+                    Q[l] -= step * v
+                    Q = norm_cfg(Q)
+                    r = ratio(Q)
+                    if r > r_best + 1e-15:
+                        P, r_best, improved, done = Q, r, True, True
+                        break
+                if done:
+                    break
+            if not improved:
+                step *= 0.6
+                if step < 1e-8:
+                    break
+        return P, r_best
+
+    # ---- Seed library ----
+    def d6_seed(p, h, r):
+        t = 2 * np.pi * np.arange(6) / 6.0
+        ring1 = np.stack([r * np.cos(t), r * np.sin(t), np.full(6, h)], axis=1)
+        ring2 = np.stack([r * np.cos(t + np.pi / 6), r * np.sin(t + np.pi / 6),
+                          np.full(6, -h)], axis=1)
+        poles = np.array([[0.0, 0.0, p], [0.0, 0.0, -p]])
+        return np.vstack([ring1, ring2, poles])
+
+    seeds = [d6_seed(1.0, 0.35, 1.0), d6_seed(1.1, 0.4, 1.05),
+             d6_seed(0.9, 0.3, 0.9), d6_seed(1.2, 0.45, 1.0)]
+    phi = (1 + np.sqrt(5)) / 2
+    ico = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    ], dtype=float)
+    ico /= np.linalg.norm(ico, axis=1, keepdims=True)
+    for pz in (1.0, 1.1):
+        seeds.append(np.vstack([ico, [[0.0, 0.0, pz], [0.0, 0.0, -pz]]]))
+    for twist in (0.0, np.pi / 7):
+        t = 2 * np.pi * np.arange(7) / 7
+        r1 = np.stack([np.cos(t), np.sin(t), np.full(7, -0.5)], axis=1)
+        r2 = np.stack([np.cos(t + twist), np.sin(t + twist), np.full(7, 0.5)], axis=1)
+        seeds.append(np.vstack([r1, r2]))
+    for _ in range(4):
+        p = rng.normal(size=(n, d))
+        seeds.append(p / np.linalg.norm(p, axis=1, keepdims=True))
+
+    # ---- Phase 1: seed sweep with clipped anneal ladder ----
+    for P0 in seeds:
+        pts = norm_cfg(np.asarray(P0, dtype=float).copy())
+        pts = anneal(pts, (0.05, 0.02, 0.008, 0.003, 0.001))
+        pts, r = hard_polish(pts, iters=250, step0=0.01)
+        if r > best_r:
+            best_r, best_pts = r, pts.copy()
+
+    # ---- Phase 2: perturb + reanneal + hard polish around incumbent ----
+    for trial in range(6):
+        scale = 0.02 + 0.02 * trial
+        P0 = best_pts + scale * rng.normal(size=(n, d)) / np.sqrt(3)
+        pts = norm_cfg(P0)
+        pts = anneal(pts, (0.02, 0.005, 0.002, 0.001))
+        pts, r = hard_polish(pts, iters=400, step0=0.01)
+        if r > best_r:
+            best_r, best_pts = r, pts.copy()
+
+    # ---- Phase 3: alternate tiny-kick reanneal and deep hard polish ----
+    for trial in range(3):
+        scale = 0.003 + 0.002 * trial
+        P0 = best_pts + scale * rng.normal(size=(n, d)) / np.sqrt(3)
+        pts = norm_cfg(P0)
+        pts = anneal(pts, (0.002, 0.001, 0.0005), maxiter=600, maxfun=2500,
+                     ftol=1e-14, gtol=1e-12)
+        pts, r = hard_polish(pts, iters=500, step0=0.005)
+        if r > best_r:
+            best_r, best_pts = r, pts.copy()
+        # re-anneal the polished config at low temperature; pair moves
+        # alone are not a local optimum of the smooth objective.
+        re = anneal(norm_cfg(best_pts.copy()), (0.003, 0.001, 0.0003),
+                    maxiter=500, maxfun=2000, ftol=1e-14, gtol=1e-12)
+        re, r = hard_polish(re, iters=300, step0=0.003)
+        if r > best_r:
+            best_r, best_pts = r, re.copy()
+
+    # ---- Normalize and guard ----
+    points = np.asarray(best_pts, dtype=float)
+    points = points - points.mean(axis=0)
+    Dm = dists(points).max()
+    if (not np.isfinite(points).all()) or points.shape != (n, d) or Dm <= 0:
+        points = rng.normal(size=(n, d))
+    else:
+        points = points / Dm
+
+    return points
+# EVOLVE-BLOCK-END

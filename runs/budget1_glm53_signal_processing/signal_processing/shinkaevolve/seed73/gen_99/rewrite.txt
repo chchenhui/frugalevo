@@ -1,0 +1,479 @@
+# EVOLVE-BLOCK-START
+"""
+Real-Time Adaptive Signal Processing Algorithm for Non-Stationary Time Series
+
+Two-pass wavelet hard-kill cascade with strengthened directional hysteresis.
+
+  Pipeline (PredictFusePipeline):
+    Stage A  NoiseProfiler          - robust MAD noise scale from raw signal
+    Stage B  ForwardBackwardKalman  - capped-NIS CV Kalman fwd + bwd fused
+    Stage C  AtrousDenoiseStage x2  - stationary wavelet, per-scale decision;
+                                      noise-dominated scales HARD-KILLED in
+                                      BOTH passes (attacks noise_reduction,
+                                      the weakest metric); signal scales pass
+    Stage D  TrendFusionStage       - robust local median+slope projection blend
+    Stage E  PredictivePolyStage    - noise-adaptive blend of center/edge
+                                      quadratic evaluations (no net phase lag)
+    Stage F  DirectionalHysteresis  - stronger slope sign-vote + local-sigma
+                                      snap + 5-tap median: cuts slope_changes
+                                      and false_reversals
+
+Output contract preserved: len(y) == len(x) - window_size + 1.
+"""
+import numpy as np
+
+
+# ----------------------------------------------------------------------------
+# Shared context
+# ----------------------------------------------------------------------------
+class SignalContext:
+    def __init__(self, x_raw, sigma, window_size):
+        self.x_raw = np.asarray(x_raw, dtype=float)
+        self.sigma = sigma
+        self.window_size = window_size
+        self.n = len(self.x_raw)
+        self.signal = self.x_raw.copy()
+
+
+# ----------------------------------------------------------------------------
+# Stage A: robust noise profiling
+# ----------------------------------------------------------------------------
+class NoiseProfiler:
+    def run(self, ctx):
+        x = ctx.x_raw
+        if len(x) < 3:
+            sigma = max(float(np.std(x)) if len(x) > 1 else 1.0, 1e-8)
+        else:
+            d = np.diff(x)
+            med = np.median(d)
+            mad = np.median(np.abs(d - med)) / 0.6745
+            sigma = max(mad / np.sqrt(2.0), 1e-8)
+        ctx.sigma = sigma
+        return ctx
+
+
+# ----------------------------------------------------------------------------
+# Stage B: forward/backward capped-NIS Kalman, information-fused
+# ----------------------------------------------------------------------------
+class ForwardBackwardKalman:
+    def __init__(self, q_base=0.01):
+        self.q_base = q_base
+
+    def _sweep(self, sig, r):
+        n = len(sig)
+        if n < 2:
+            return sig.copy()
+        q_base = self.q_base * r
+        lvl, slope = sig[0], 0.0
+        p00 = p11 = max(r, 1.0)
+        p01 = 0.0
+        out = np.empty(n)
+        out[0] = lvl
+        for k in range(1, n):
+            lvl += slope
+            p00 = p00 + 2.0 * p01 + p11
+            p01 = p01 + p11
+            innov = sig[k] - lvl
+            S = p00 + r
+            nis = innov * innov / max(S, 1e-12)
+            mult = 1.0 + 3.0 * min(nis, 6.0) / 6.0  # cap: [1, 4]
+            q = q_base * mult
+            p00 += 0.25 * q
+            p01 += 0.5 * q
+            p11 += q
+            S = p00 + r
+            k0 = p00 / S
+            k1 = p01 / S
+            lvl += k0 * innov
+            slope += k1 * innov
+            p00 = max((1.0 - k0) * p00, 1e-12)
+            p11 = max(p11 - k1 * p01, 1e-12)
+            p01 = (1.0 - k0) * p01
+            out[k] = lvl
+        return out
+
+    def run(self, ctx):
+        if ctx.n < 4:
+            return ctx
+        r = max(ctx.sigma ** 2, 1e-8)
+        fwd = self._sweep(ctx.signal, r)
+        bwd = self._sweep(ctx.signal[::-1], r)[::-1]
+        n = ctx.n
+        w = np.linspace(0.60, 0.40, n)  # favors fwd early, bwd late
+        ctx.signal = w * fwd + (1.0 - w) * bwd
+        return ctx
+
+
+# ----------------------------------------------------------------------------
+# Stage C: a trous wavelet with per-scale hard decisions (run twice)
+# ----------------------------------------------------------------------------
+class AtrousDenoiseStage:
+    def __init__(self, uni_mult=0.85, hard_zone=0.65, trans_zone=1.5,
+                 recompute_sigma=False):
+        self.uni_mult = uni_mult
+        self.hard_zone = hard_zone
+        self.trans_zone = trans_zone
+        self.recompute_sigma = recompute_sigma
+
+    @staticmethod
+    def _decompose(x, n_levels):
+        kernel = np.array([1.0, 4.0, 6.0, 4.0, 1.0]) / 16.0
+        n = len(x)
+        details, approx = [], np.asarray(x, dtype=float).copy()
+        for level in range(n_levels):
+            step = 2 ** level
+            pad = 2 * step
+            padded = np.concatenate((
+                np.full(pad, approx[0]), approx, np.full(pad, approx[-1])))
+            offsets = pad - 2 * step + np.arange(5) * step
+            new_approx = np.zeros(n)
+            for k in range(5):
+                new_approx += kernel[k] * padded[offsets[k]:offsets[k] + n]
+            details.append(approx - new_approx)
+            approx = new_approx
+        return details, approx
+
+    def run(self, ctx):
+        n_levels = int(np.clip(np.floor(np.log2(max(ctx.window_size, 4))), 1, 6))
+        details, approx = self._decompose(ctx.signal, n_levels)
+
+        sigma = max(ctx.sigma, 1e-12)
+        if self.recompute_sigma:
+            # second pass: recalibrate on the already-denoised signal so
+            # transitional scales that survived pass 1 now look noise-
+            # dominated relative to the cleaner signal and get killed too
+            d = np.diff(ctx.signal)
+            if len(d) >= 3:
+                med = np.median(d)
+                mad = np.median(np.abs(d - med)) / 0.6745
+                s2 = max(mad / np.sqrt(2.0), 1e-12)
+                # keep RAW sigma as floor: never under-threshold
+                sigma = max(s2, 0.5 * ctx.sigma, 1e-12)
+
+        thr = sigma * np.sqrt(2.0 * np.log(max(ctx.n, 3))) * self.uni_mult
+
+        recon = approx.copy()
+        for c in details:
+            mag = np.median(np.abs(c)) / sigma
+            if mag < self.hard_zone:
+                # noise-dominated scale: FULL hard kill — no residual pass
+                continue
+            elif mag < self.trans_zone:
+                ct = np.sign(c) * np.maximum(np.abs(c) - thr, 0.0)
+            else:
+                ct = np.clip(c, -6.0 * sigma, 6.0 * sigma)
+            recon = recon + ct
+        ctx.signal = recon
+        return ctx
+
+
+# ----------------------------------------------------------------------------
+# Stage D: robust local-linear trend fusion
+# ----------------------------------------------------------------------------
+class TrendFusionStage:
+    def __init__(self, alpha=0.45, fusion=0.45):
+        self.alpha = alpha
+        self.fusion = fusion
+
+    def run(self, ctx):
+        x = ctx.signal
+        n = len(x)
+        if n < 5:
+            return ctx
+        half = max(ctx.window_size // 4, 2)
+        padded = np.concatenate((np.full(half, x[0]), x, np.full(half, x[-1])))
+        win = 2 * half + 1
+        sw = np.lib.stride_tricks.sliding_window_view(padded, win)
+        med = np.median(sw, axis=1)
+        slope = np.median(np.diff(sw, axis=1), axis=1)
+        idx_center = win // 2
+        proj = med + slope * (win - 1 - idx_center)
+        trend = self.alpha * x + (1.0 - self.alpha) * proj
+        ctx.signal = (1.0 - self.fusion) * x + self.fusion * trend
+        return ctx
+
+
+# ----------------------------------------------------------------------------
+# Stage E: predictive local-polynomial smoothing (noise-adaptive lead)
+# ----------------------------------------------------------------------------
+class PredictivePolyStage:
+    def run(self, ctx):
+        y = ctx.signal
+        n = len(y)
+        half = max(ctx.window_size // 3, 3)
+        if n < 2 * half + 1:
+            return ctx
+        win = 2 * half + 1
+        padded = np.concatenate((np.full(half, y[0]), y, np.full(half, y[-1])))
+        sw = np.lib.stride_tricks.sliding_window_view(padded, win)
+        t = np.arange(win, dtype=float) - half
+        A = np.vstack([np.ones(win), t, t * t]).T
+
+        # zero-phase quadratic center evaluation (pure smoothing)
+        w_center = np.linalg.pinv(A)[0]
+        out_c = sw @ w_center
+
+        # edge-lead evaluation (cancels symmetric-fit group delay)
+        t_eval = 0.5 * half
+        e = np.array([1.0, t_eval, t_eval * t_eval])
+        w_edge = e @ np.linalg.pinv(A)
+        out_e = sw @ w_edge
+
+        # noise-adaptive lead: trust extrapolation more when SNR is high
+        rng = max(np.std(y), 1e-12)
+        snr = np.clip(ctx.sigma / rng, 0.0, 1.0)
+        lead = 0.5 * (1.0 - 0.5 * snr)  # in [0.25, 0.5]
+        ctx.signal = (1.0 - lead) * out_c + lead * out_e
+        return ctx
+
+
+# ----------------------------------------------------------------------------
+# Stage F: directional hysteresis — slope sign vote + local-sigma snap
+# ----------------------------------------------------------------------------
+class DirectionalHysteresis:
+    def __init__(self, block=51, k=0.8, blend=0.7):
+        self.block = block
+        self.k = k
+        self.blend = blend
+
+    def run(self, ctx):
+        y = ctx.signal
+        m = len(y)
+        if m <= 5:
+            return ctx
+        d = np.diff(y)
+        dm = len(d)
+
+        # 5-tap slope sign vote: zero out sub-noise slope samples whose
+        # neighborhood sign vote disagrees — removes churn-driven reversals
+        signs = np.sign(d)
+        pad_s = np.concatenate(([signs[0]] * 2, signs, [signs[-1]] * 2))
+        votes = (pad_s[:-4] + pad_s[1:-3] + pad_s[2:-2] +
+                 pad_s[3:-1] + pad_s[4:])
+        votes = votes[:dm]
+
+        # local robust sigma over diffs
+        B = min(self.block, dm if dm % 2 == 1 else dm - 1)
+        B = max(B, 3)
+        pad_n = B // 2
+        dpad = np.concatenate((np.full(pad_n, d[0]), d, np.full(pad_n, d[-1])))
+        wins = np.lib.stride_tricks.sliding_window_view(dpad, B)
+        local_sigma = (1.4826 * np.median(
+            np.abs(wins - np.median(wins, axis=1, keepdims=True)),
+            axis=1) + 1e-12)[:dm]
+
+        thresh = self.k * local_sigma
+        churn = (np.abs(d) < thresh) & (np.abs(votes) >= 3) & (signs * votes < 0)
+
+        # 5-tap median of y for snapping churned positions
+        pad = np.concatenate((y[:2][::-1], y, y[-2:][::-1]))
+        stacked = np.stack([pad[0:m], pad[1:m + 1], pad[2:m + 2],
+                            pad[3:m + 3], pad[4:m + 4]])
+        med5 = np.median(stacked, axis=0)
+
+        out = y.copy()
+        idx = np.where(churn)[0] + 1
+        out[idx] = (1.0 - self.blend) * out[idx] + self.blend * med5[idx]
+
+        # final zero-phase 5-tap median snap on all samples: removes
+        # residual isolated spikes without phase delay
+        ctx.signal = 0.5 * out + 0.5 * med5
+        return ctx
+
+
+# ----------------------------------------------------------------------------
+# Pipeline orchestrator
+# ----------------------------------------------------------------------------
+class PredictFusePipeline:
+    def __init__(self, window_size=20):
+        self.window_size = window_size
+        self.stages = [
+            NoiseProfiler(),
+            ForwardBackwardKalman(q_base=0.01),
+            # pass 1: hard-kill noise scales with wide hard zone
+            AtrousDenoiseStage(uni_mult=0.85, hard_zone=0.65,
+                               trans_zone=1.5, recompute_sigma=False),
+            # pass 2: recalibrate sigma, kill surviving transitional detail
+            AtrousDenoiseStage(uni_mult=0.85, hard_zone=0.65,
+                               trans_zone=1.5, recompute_sigma=True),
+            TrendFusionStage(alpha=0.45, fusion=0.45),
+            PredictivePolyStage(),
+            DirectionalHysteresis(block=51, k=0.8, blend=0.7),
+        ]
+
+    def run(self, x):
+        xf = np.asarray(x, dtype=float)
+        n = len(xf)
+        if n < self.window_size:
+            raise ValueError(
+                f"Input signal length ({n}) must be >= window_size "
+                f"({self.window_size})"
+            )
+        ctx = SignalContext(xf, sigma=1.0, window_size=self.window_size)
+        ctx = NoiseProfiler().run(ctx)  # sets ctx.sigma from raw input
+        for stage in self.stages:
+            ctx = stage.run(ctx)
+
+        out_len = n - self.window_size + 1
+        y = ctx.signal[n - out_len:] if out_len <= n else ctx.signal
+        return np.asarray(y, dtype=float)
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """Predict-fuse multiscale filter.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Sliding window size W
+
+    Returns:
+        y: Filtered signal, length = len(x) - W + 1
+    """
+    return PredictFusePipeline(window_size).run(x)
+
+
+def adaptive_filter(x, window_size=20):
+    """Basic sliding-window moving average (kept for API compatibility)."""
+    xf = np.asarray(x, dtype=float)
+    if len(xf) < window_size:
+        raise ValueError(
+            f"Input signal length ({len(xf)}) must be >= window_size ({window_size})"
+        )
+    c = np.cumsum(np.insert(xf, 0, 0.0))
+    return (c[window_size:] - c[:-window_size]) / window_size
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """
+    Main signal processing function that applies the selected algorithm.
+
+    Args:
+        input_signal: Input time series data
+        window_size: Window size for processing
+        algorithm_type: Type of algorithm to use ("basic" or "enhanced")
+
+    Returns:
+        Filtered signal
+    """
+    if algorithm_type == "enhanced":
+        return enhanced_filter_with_trend_preservation(input_signal, window_size)
+    return adaptive_filter(input_signal, window_size)
+
+
+# EVOLVE-BLOCK-END
+
+
+def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+    """
+    Generate synthetic test signal with known characteristics.
+
+    Args:
+        length: Length of the signal
+        noise_level: Standard deviation of noise to add
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (noisy_signal, clean_signal)
+    """
+    np.random.seed(seed)
+    t = np.linspace(0, 10, length)
+
+    # Create a complex signal with multiple components
+    clean_signal = (
+        2 * np.sin(2 * np.pi * 0.5 * t)  # Low frequency component
+        + 1.5 * np.sin(2 * np.pi * 2 * t)  # Medium frequency component
+        + 0.5 * np.sin(2 * np.pi * 5 * t)  # Higher frequency component
+        + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)  # Decaying oscillation
+    )
+
+    # Add non-stationary behavior
+    trend = 0.1 * t * np.sin(0.2 * t)  # Slowly varying trend
+    clean_signal += trend
+
+    # Add random walk component for non-stationarity
+    random_walk = np.cumsum(np.random.randn(length) * 0.05)
+    clean_signal += random_walk
+
+    # Add noise
+    noise = np.random.normal(0, noise_level, length)
+    noisy_signal = clean_signal + noise
+
+    return noisy_signal, clean_signal
+
+
+def run_signal_processing(noisy_signal=None, signal_length=1000, noise_level=0.3, window_size=20):
+    """
+    Run the signal processing algorithm on a test signal (if provided, use this; otherwise generate)
+    signal_length: Length if generating signal (for backward compatibility)
+    noise_level: Noise level if generating signal (for backward compatibility)
+    window_size: Window size for processing
+
+    Returns:
+        Dictionary containing results and metrics
+    """
+    if noisy_signal is not None:
+        # Filter the provided signal
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+        clean_signal = None  # Not available when using provided signal
+    else:
+        # Generate test signal (for __main__ and backward compatibility)
+        noisy_signal, clean_signal = generate_test_signal(signal_length, noise_level)
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+
+    # Calculate basic metrics (only if we have clean_signal from generation)
+    if len(filtered_signal) > 0 and clean_signal is not None:
+        # Align signals for comparison (account for processing delay)
+        delay = window_size - 1
+        aligned_clean = clean_signal[delay:]
+        aligned_noisy = noisy_signal[delay:]
+
+        # Ensure same length
+        min_length = min(len(filtered_signal), len(aligned_clean))
+        filtered_signal = filtered_signal[:min_length]
+        aligned_clean = aligned_clean[:min_length]
+        aligned_noisy = aligned_noisy[:min_length]
+
+        # Calculate correlation with clean signal
+        correlation = np.corrcoef(filtered_signal, aligned_clean)[0, 1] if min_length > 1 else 0
+
+        # Calculate noise reduction
+        noise_before = np.var(aligned_noisy - aligned_clean)
+        noise_after = np.var(filtered_signal - aligned_clean)
+        noise_reduction = (noise_before - noise_after) / noise_before if noise_before > 0 else 0
+
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": aligned_clean,
+            "noisy_signal": aligned_noisy,
+            "correlation": correlation,
+            "noise_reduction": noise_reduction,
+            "signal_length": min_length,
+        }
+    elif len(filtered_signal) > 0:
+        # When using provided signal (no clean_signal available), just return filtered signal
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": None,
+            "noisy_signal": None,
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": len(filtered_signal),
+        }
+    else:
+        return {
+            "filtered_signal": [],
+            "clean_signal": [],
+            "noisy_signal": [],
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": 0,
+        }
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    results = run_signal_processing()
+    print("Signal processing completed!")
+    print(f"Correlation with clean signal: {results['correlation']:.3f}")
+    print(f"Noise reduction: {results['noise_reduction']:.3f}")
+    print(f"Processed signal length: {results['signal_length']}")

@@ -1,0 +1,137 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of n=11 points inside/on an equilateral triangle
+    (0,0), (1,0), (0.5, sqrt(3)/2) maximizing the minimum triangle area.
+
+    Approach: projected gradient ascent on a softmax-weighted area objective.
+    Areas are affine in point coordinates, so gradients are exact and cheap.
+    """
+    n = 11
+    sqrt3 = np.sqrt(3.0)
+
+    def bary_to_xy(b):
+        u, v = b[:, 0], b[:, 1]
+        return np.column_stack([u + 0.5 * v, 0.5 * sqrt3 * v])
+
+    triples = np.array(list(combinations(range(n), 3)), dtype=np.int32)
+    T = len(triples)
+    i0, i1, i2 = triples[:, 0], triples[:, 1], triples[:, 2]
+
+    def all_areas(xy):
+        p, q, r = xy[i0], xy[i1], xy[i2]
+        cr = (q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1]) - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0])
+        return 0.5 * np.abs(cr), np.sign(cr)
+
+    def project(b):
+        """Per-row projection onto simplex u>=0, v>=0, u+v<=1 (approx, clip-based)."""
+        b = np.clip(b, 0.0, 1.0)
+        s = b.sum(axis=1)
+        over = s > 1.0
+        if np.any(over):
+            b[over] *= (1.0 / s[over])[:, None]
+        return b
+
+    def make_start(seed):
+        rng = np.random.default_rng(seed)
+        b = rng.random((n, 2))
+        s = b.sum(axis=1)
+        over = s > 1.0
+        b[over] *= (0.95 / s[over])[:, None]
+        # anchor vertices to guarantee spread
+        b[0] = [0.0, 0.0]
+        b[1] = [1.0, 0.0]
+        b[2] = [0.0, 1.0]
+        return b
+
+    def optimize(b0, iters=400):
+        b = b0.copy()
+        best_b = b.copy()
+        best_min = -1.0
+        lr = 0.02
+        for it in range(iters):
+            xy = bary_to_xy(b)
+            a, sgn = all_areas(xy)
+            m = a.min()
+            if m > best_min:
+                best_min = m
+                best_b = b.copy()
+            # softmax weights on smallest areas (temperature annealed)
+            beta = 200.0 + 800.0 * it / iters
+            w = np.exp(-beta * (a - m))
+            w /= w.sum()
+            # gradient of weighted signed area wrt each point
+            # signed_area = 0.5*cr ; d cr/d p = -(r_y - q_y, r_x - q_x) etc.
+            p, q, r = xy[i0], xy[i1], xy[i2]
+            g = np.zeros_like(xy)
+            # wrt p: d(0.5*cr)/dp = 0.5* ( -(r_y - q_y), (r_x - q_x) )
+            cw = 0.5 * w * sgn
+            dp = np.column_stack([-(r[:, 1] - q[:, 1]), (r[:, 0] - q[:, 0])])
+            dq = np.column_stack([(r[:, 1] - p[:, 1]), -(r[:, 0] - p[:, 0])])
+            dr = np.column_stack([(q[:, 1] - p[:, 1]), -(q[:, 0] - p[:, 0])])
+            np.add.at(g, i0, cw[:, None] * dp)
+            np.add.at(g, i1, cw[:, None] * dq)
+            np.add.at(g, i2, cw[:, None] * dr)
+            # ascent step in xy -> convert to barycentric delta (affine inverse)
+            # x = u + 0.5v, y = (sqrt3/2) v  =>  v = 2y/sqrt3, u = x - y/sqrt3
+            gx, gy = g[:, 0], g[:, 1]
+            du = gx - gy / sqrt3
+            dv = 2.0 * gy / sqrt3
+            # normalize step
+            step = np.column_stack([du, dv])
+            norm = np.linalg.norm(step, axis=1, keepdims=True)
+            norm = np.maximum(norm, 1e-12)
+            step = lr * step / norm
+            b = project(b + step)
+            lr *= 0.999
+        xy = bary_to_xy(best_b)
+        return best_b, all_areas(xy)[0].min()
+
+    def local_refine(b, rounds=300):
+        """Random pair/triple perturbations accepting improvements on true min."""
+        rng = np.random.default_rng(7)
+        xy = bary_to_xy(b)
+        cur = all_areas(xy)[0].min()
+        scale = 0.01
+        for _ in range(rounds):
+            k = rng.integers(1, 3)
+            idx = rng.integers(3, n, size=k)  # keep vertices pinned
+            trial = b.copy()
+            trial[idx] += rng.normal(0, scale, (k, 2))
+            trial = project(trial)
+            tmin = all_areas(bary_to_xy(trial))[0].min()
+            if tmin > cur:
+                b, cur = trial, tmin
+                scale = max(scale * 0.995, 1e-4)
+            else:
+                scale *= 0.999
+        return b, cur
+
+    try:
+        best_b, best_val = None, -1.0
+        for seed in (3, 11, 42, 97, 2024):
+            b0 = make_start(seed)
+            b1, v1 = optimize(b0)
+            b2, v2 = local_refine(b1)
+            if v2 > best_val:
+                best_val, best_b = v2, b2
+        if best_b is not None and best_val > 0:
+            return bary_to_xy(best_b)
+    except Exception:
+        pass
+
+    # Deterministic fallback (always feasible)
+    b = np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+        [0.5, 0.0], [0.5, 0.5], [0.0, 0.5],
+        [0.25, 0.0], [0.25, 0.25], [0.75, 0.0],
+        [0.0, 0.25], [0.375, 0.25],
+    ])
+    return bary_to_xy(b)
+
+
+# EVOLVE-BLOCK-END

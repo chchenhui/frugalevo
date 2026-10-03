@@ -1,0 +1,186 @@
+<NAME>
+diverse_multistart_local_search
+</NAME>
+
+<DESCRIPTION>
+The existing beam search keeps only prefixes with the smallest immediate makespan. This can prematurely discard schedules whose early conflict cost is slightly higher but which avoid a much longer read/write dependency chain later. The edit improves this in three stages:
+
+1. It increases the beam width while retaining an elite set plus diverse prefixes ending in different transactions. The last scheduled transaction strongly affects which data conflicts are exposed next, so this avoids beam collapse into near-identical orders.
+2. It applies simulator-scored local optimization to several final beam schedules rather than only the single best beam result. Each seed is improved with both insertion moves and non-adjacent swaps. Insertions are effective for moving a transaction around a conflict chain, while swaps can cross local minima requiring two opposing moves.
+3. It uses deterministic segment-reversal perturbations followed by the same exact local search. These temporary uphill moves let the search leave local minima without introducing random performance variation.
+
+Every decision continues to use `workload.get_opt_seq_cost`, so optimization is based directly on actual transactional conflict makespan rather than metadata-based heuristics.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Keep several alternative low-cost prefixes.  Unlike random sampling,
+    # every possible next transaction is considered for every beam member.
+    beam_width = max(1, min(num_seqs, num_txns))
+    beam = [([], tuple(range(num_txns)), 0)]
+
+    for _ in range(num_txns):
+        expanded = []
+        for prefix, remaining, _ in beam:
+            for txn in remaining:
+                candidate = prefix + [txn]
+                next_remaining = tuple(x for x in remaining if x != txn)
+                expanded.append(
+                    (candidate, next_remaining, schedule_cost(candidate))
+                )
+
+        expanded.sort(key=lambda state: (state[2], tuple(state[0])))
+        beam = expanded[:beam_width]
+
+    best_sequence, _, best_cost = min(
+        beam, key=lambda state: (state[2], tuple(state[0]))
+    )
+
+    # Relocation search repairs early beam decisions.  Testing every insertion
+    # position is substantially stronger than swapping only adjacent entries.
+    # Two improving passes capture interacting conflict chains without making
+    # the search unbounded.
+    for _ in range(2):
+        improved_sequence = best_sequence
+        improved_cost = best_cost
+
+        for source_index in range(num_txns):
+            moved_txn = best_sequence[source_index]
+            reduced = (
+                best_sequence[:source_index] + best_sequence[source_index + 1:]
+            )
+            for destination_index in range(num_txns):
+                candidate = (
+                    reduced[:destination_index]
+                    + [moved_txn]
+                    + reduced[destination_index:]
+                )
+                candidate_cost = schedule_cost(candidate)
+                if candidate_cost < improved_cost:
+                    improved_sequence = candidate
+                    improved_cost = candidate_cost
+
+        if improved_cost >= best_cost:
+            break
+        best_sequence, best_cost = improved_sequence, improved_cost
+
+    return best_cost, best_sequence
+=======
+    # A wider beam prevents an attractive short prefix from eliminating orders
+    # that defer a conflict now but remove a longer dependency chain later.
+    # Preserve some elite prefixes and use the remaining capacity to retain
+    # different most-recent transactions, which gives genuinely different
+    # conflict frontiers in subsequent expansions.
+    beam_width = min(48, max(12, num_seqs * 4))
+    beam = [([], tuple(range(num_txns)), 0)]
+
+    for _ in range(num_txns):
+        expanded = []
+        for prefix, remaining, _ in beam:
+            for txn in remaining:
+                candidate = prefix + [txn]
+                next_remaining = tuple(x for x in remaining if x != txn)
+                expanded.append(
+                    (candidate, next_remaining, schedule_cost(candidate))
+                )
+
+        expanded.sort(key=lambda state: (state[2], tuple(state[0])))
+        if len(expanded) <= beam_width:
+            beam = expanded
+            continue
+
+        elite_count = beam_width // 2
+        beam = expanded[:elite_count]
+        represented_last_txns = {state[0][-1] for state in beam}
+
+        for state in expanded[elite_count:]:
+            last_txn = state[0][-1]
+            if last_txn not in represented_last_txns:
+                beam.append(state)
+                represented_last_txns.add(last_txn)
+                if len(beam) == beam_width:
+                    break
+
+        if len(beam) < beam_width:
+            selected = {tuple(state[0]) for state in beam}
+            for state in expanded[elite_count:]:
+                if tuple(state[0]) not in selected:
+                    beam.append(state)
+                    selected.add(tuple(state[0]))
+                    if len(beam) == beam_width:
+                        break
+
+    def improve_locally(sequence, cost):
+        """Steepest descent over insertion and exchange neighborhoods."""
+        while True:
+            improved_sequence = sequence
+            improved_cost = cost
+
+            # Relocation can move a transaction before or after an entire
+            # conflict chain in one simulator-scored operation.
+            for source_index in range(num_txns):
+                moved_txn = sequence[source_index]
+                reduced = sequence[:source_index] + sequence[source_index + 1:]
+                for destination_index in range(num_txns):
+                    candidate = (
+                        reduced[:destination_index]
+                        + [moved_txn]
+                        + reduced[destination_index:]
+                    )
+                    candidate_cost = schedule_cost(candidate)
+                    if candidate_cost < improved_cost:
+                        improved_sequence = candidate
+                        improved_cost = candidate_cost
+
+            # A distant exchange is not generally reachable by a single
+            # improving relocation, so it is evaluated explicitly.
+            for left in range(num_txns - 1):
+                for right in range(left + 1, num_txns):
+                    candidate = sequence.copy()
+                    candidate[left], candidate[right] = (
+                        candidate[right],
+                        candidate[left],
+                    )
+                    candidate_cost = schedule_cost(candidate)
+                    if candidate_cost < improved_cost:
+                        improved_sequence = candidate
+                        improved_cost = candidate_cost
+
+            if improved_cost >= cost:
+                return cost, sequence
+            cost, sequence = improved_cost, improved_sequence
+
+    # Several beam leaves can belong to different basins of attraction.
+    # Optimize each promising leaf rather than assuming the lowest raw beam
+    # leaf is the one from which local search can reach the global best order.
+    beam.sort(key=lambda state: (state[2], tuple(state[0])))
+    seed_count = min(len(beam), max(6, num_seqs))
+    best_cost = float("inf")
+    best_sequence = None
+
+    for sequence, _, cost in beam[:seed_count]:
+        cost, sequence = improve_locally(sequence, cost)
+        if cost < best_cost:
+            best_cost, best_sequence = cost, sequence
+
+        # Reversing a short interval is a deterministic uphill kick.  The
+        # subsequent descent can reach schedules unavailable from this local
+        # optimum through only improving single moves.
+        for span in (2, 3, 4):
+            if span >= num_txns:
+                continue
+            for start in (0, (num_txns - span) // 2, num_txns - span):
+                kicked = (
+                    sequence[:start]
+                    + list(reversed(sequence[start:start + span]))
+                    + sequence[start + span:]
+                )
+                kicked_cost, kicked = improve_locally(
+                    kicked, schedule_cost(kicked)
+                )
+                if kicked_cost < best_cost:
+                    best_cost, best_sequence = kicked_cost, kicked
+
+    return best_cost, best_sequence
+>>>>>>> REPLACE
+</DIFF>

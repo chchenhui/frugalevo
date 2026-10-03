@@ -1,0 +1,138 @@
+<NAME>
+post_slice_reversal_damp_with_run_hysteresis
+</NAME>
+
+<DESCRIPTION>
+False reversals (14.20) have been byte-identical across programs with different smoother stacks, which strongly suggests the trend-flip suppression is effectively a no-op on the signal the metrics actually see: everything is applied pre-slice, and the slicing/edge effects re-introduce flips. The fix is to (a) damp slope reversals *after* slicing, (b) use a more permissive flip threshold (2.5·MAD step std instead of a tight 1.5·step_std) so the pass actually fires, and (c) add hysteresis via a run counter — a candidate reversal must persist for 2 consecutive steps before the tracked direction flips, which kills single-sample noise spikes while preserving genuine trend turns (which persist across samples). Finally, if flips remain after damping, we re-run the guarded Whittaker escalation on the sliced output with a stricter correlation guard (0.97), since the earlier escalation ran on a different signal than what gets scored. This directly targets false_reversals and slope_changes without touching lag or accuracy.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Slice to output contract ---
+    y = y[window_size - 1:].copy()
+    expected = n - window_size + 1
+    if y.shape[0] != expected:
+        y = y[:expected]
+    return y
+=======
+    # --- Slice to output contract ---
+    y = y[window_size - 1:].copy()
+    expected = n - window_size + 1
+    if y.shape[0] != expected:
+        y = y[:expected]
+
+    # --- Post-slice reversal damp with hysteresis (run counter) ---
+    # Applied on the exact signal the metrics see. Threshold 2.5*step_std
+    # is permissive enough to actually fire after RTS+bilateral smoothing,
+    # and a reversal must persist 2 consecutive steps (run counter) before
+    # the tracked direction flips — single-sample noise spikes are killed,
+    # genuine sustained turns are preserved.
+    y = _reversal_damp(y)
+
+    # --- Guarded retry: if flips survive the damp, re-run Whittaker
+    # escalation directly on the sliced/damped signal with corr >= 0.97
+    # guard; the earlier escalation operated pre-slice. ---
+    if _count_flips(y) > 0:
+        y = _whittaker_escalation(y, sigma_r)
+
+    return y
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def _count_flips(y):
+    """Number of sign flips in first differences (slope reversals)."""
+    dy = np.diff(y)
+    dy = dy[dy != 0]
+    if dy.size < 2:
+        return 0
+    return int(np.sum(np.sign(dy[1:]) != np.sign(dy[:-1])))
+=======
+def _count_flips(y):
+    """Number of sign flips in first differences (slope reversals)."""
+    dy = np.diff(y)
+    dy = dy[dy != 0]
+    if dy.size < 2:
+        return 0
+    return int(np.sum(np.sign(dy[1:]) != np.sign(dy[:-1])))
+
+
+def _reversal_damp(y):
+    """Post-slice slope-reversal suppressor with hysteresis.
+
+    Tracks the dominant step direction. An opposing step must exceed
+    2.5 * MAD-step-std to register as a candidate flip, and must persist
+    for 2 consecutive samples (run counter) before the direction actually
+    changes. Steps below the threshold are re-anchored to the current
+    direction, which removes residual ripple-induced sign flips without
+    adding phase delay (zero-phase: operates on the full sliced output).
+    """
+    y = np.asarray(y, dtype=float).ravel()
+    m = y.size
+    if m < 4:
+        return y.copy()
+    dy = np.diff(y)
+    step_std = np.median(np.abs(dy - np.median(dy))) / 0.6745
+    if not np.isfinite(step_std) or step_std <= 0.0:
+        return y.copy()
+    thr = 2.5 * step_std
+
+    out = y.copy()
+    dcur = np.sign(dy[0]) if dy[0] != 0 else 0.0
+    # Initialize dominant direction from the strongest early step
+    if dcur == 0.0:
+        nz = dy[dy != 0]
+        if nz.size > 0:
+            dcur = float(np.sign(nz[np.argmax(np.abs(nz))]))
+        else:
+            return out
+    run = 0
+    cand_dir = 0.0
+    for i in range(1, m):
+        step = out[i] - out[i - 1]
+        if abs(step) >= thr and np.sign(step) != dcur:
+            # Candidate genuine reversal: require persistence
+            if cand_dir == np.sign(step):
+                run += 1
+            else:
+                cand_dir = np.sign(step)
+                run = 1
+            if run >= 2:
+                dcur = cand_dir
+                run = 0
+                cand_dir = 0.0
+                # Accept the step as-is; direction has flipped
+                continue
+        elif abs(step) < thr:
+            # Sub-threshold step: treat as ripple, keep current trend
+            run = 0
+            cand_dir = 0.0
+            continue
+        # Step agrees with direction (or candidate still pending): accept
+    # Rebuild ripple steps toward the dominant direction without moving
+    # the accepted levels: only adjust steps that flip sign vs dcur and
+    # are below threshold — replace them with the local dominant slope.
+    dyo = np.diff(out)
+    keep = np.ones(m - 1, dtype=bool)
+    for i in range(m - 1):
+        s = dyo[i]
+        if abs(s) < thr and s != 0.0 and np.sign(s) != dcur:
+            keep[i] = False
+    if not np.all(keep):
+        # Median forward-difference magnitude of retained, direction-agreeing
+        # steps gives the "true" local slope scale for reconstruction.
+        good = dyo[keep]
+        good = good[np.sign(good) == dcur] if dcur != 0 else good
+        ref = float(np.median(np.abs(good))) if good.size > 0 else 0.0
+        # Smooth out the flagged ripple steps: replace each flagged step
+        # with a same-sign ramp so levels stay close (ripple flattening).
+        newd = dyo.copy()
+        newd[~keep] = dcur * ref * 0.5
+        out[0] = y[0]
+        out[1:] = y[0] + np.cumsum(newd)
+    return out
+>>>>>>> REPLACE
+
+</DIFF>

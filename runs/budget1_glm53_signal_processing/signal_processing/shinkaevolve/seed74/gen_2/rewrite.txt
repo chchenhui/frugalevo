@@ -1,0 +1,192 @@
+import numpy as np
+from collections import deque
+
+# EVOLVE-BLOCK-START
+
+class AdaptiveKalmanWaveletHybridFilter:
+    """
+    Volatility-adaptive Kalman filter + wavelet denoising + slope-stability latch.
+    Causal, single-pass, O(1) per sample (fixed-size sliding buffers).
+
+    Inputs:
+        data: 1D array of volatile, non-stationary time series values.
+    Outputs:
+        filtered: 1D array of smoothed values preserving genuine trends,
+        same length as input (first samples use warm-up fallback smoothing).
+    """
+
+    # --- Key parameters (evolved values) ---
+    VOLATILITY_CLIP_LOW = 0.5      # min volatility ratio
+    VOLATILITY_CLIP_HIGH = 4.0     # max volatility ratio
+    Q_MODULATION_EXP = 1.5         # process noise scaling exponent
+    BASE_PROCESS_NOISE = 1e-4      # baseline Q for calm regimes
+    MAD_K = 2.5                    # robust wavelet noise threshold multiplier
+    WAVELET_LEVEL = 2              # coarse/fine scale split
+    SLOPE_PERSISTENCE = 3          # min consecutive samples to confirm reversal
+    SLOPE_NOISE_FRACTION = 0.4     # slope threshold as fraction of noise floor
+    HYSTERESIS_FACTOR = 1.2        # reversal confirmation hysteresis band
+    SHORT_WINDOW = 8               # short-horizon volatility estimator
+    LONG_WINDOW = 64               # baseline volatility estimator
+    RESIDUAL_BUFFER = 16           # fixed buffer for wavelet residual gating
+    WARMUP_QUARTIC = 12            # warm-up window for polynomial fallback
+
+    def __init__(self, **overrides):
+        for k, v in overrides.items():
+            setattr(self, k, v)
+        # Kalman state: [level, slope]
+        self.x = np.zeros(2)          # state vector
+        self.P = np.eye(2) * 10.0     # covariance
+        self.short_buf = deque(maxlen=self.SHORT_WINDOW)
+        self.long_buf = deque(maxlen=self.LONG_WINDOW)
+        self.residual_buf = deque(maxlen=self.RESIDUAL_BUFFER)
+        self.slope_sign = 0
+        self.slope_run = 0
+        self.pending_sign = 0
+        self.pending_run = 0
+        self.initialized = False
+
+    @staticmethod
+    def _db2_filter_pair():
+        # Daubechies-2 (db4 tap) high/low pass kernels
+        h = np.array([0.4829629, 0.8365163, 0.2241439, -0.1294095])
+        g = np.array([-0.1294095, -0.2241439, 0.8365163, -0.4829629])
+        return h, g
+
+    def _estimate_R(self, buf):
+        """Robust measurement noise via MAD (immune to outliers)."""
+        arr = np.asarray(buf)
+        med = np.median(arr)
+        mad = np.median(np.abs(arr - med)) + 1e-12
+        return float(1.4826 * mad) ** 2
+
+    def _modulate_Q(self):
+        """Volatility-ratio-driven process noise."""
+        if len(self.long_buf) < self.LONG_WINDOW:
+            return self.BASE_PROCESS_NOISE * 8.0  # conservative during warm-up
+        s = np.asarray(self.short_buf)
+        l = np.asarray(self.long_buf)
+        v_short = np.var(np.diff(s)) + 1e-12
+        v_long = np.var(np.diff(l)) + 1e-12
+        ratio = np.clip(v_short / v_long,
+                        self.VOLATILITY_CLIP_LOW,
+                        self.VOLATILITY_CLIP_HIGH)
+        return self.BASE_PROCESS_NOISE * (ratio ** self.Q_MODULATION_EXP)
+
+    def _kalman_step(self, z, dt=1.0):
+        """Constant-velocity Kalman update with adaptive Q, robust R."""
+        F = np.array([[1.0, dt], [0.0, 1.0]])
+        H = np.array([[1.0, 0.0]])
+
+        Q_base = self._modulate_Q()
+        Q = np.array([[Q_base * dt ** 3 / 3.0, Q_base * dt ** 2 / 2.0],
+                      [Q_base * dt ** 2 / 2.0, Q_base * dt]])
+        R = max(self._estimate_R(self.short_buf), 1e-6)
+
+        # Predict
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + Q
+        # Update
+        S = (H @ self.P @ H.T + R).item()
+        K = (self.P @ H.T) / S
+        innov = z - (H @ self.x).item()
+        self.x = self.x + (K * innov).ravel()
+        self.P = self.P - np.outer(K.ravel(), (H @ self.P).ravel())
+        return self.x[0], innov
+
+    def _wavelet_residual_gate(self, residual):
+        """
+        Soft-threshold fine-scale residual content against adaptive MAD noise
+        floor; only genuine (coarse-scale) transients pass through correction.
+        """
+        self.residual_buf.append(residual)
+        if len(self.residual_buf) < 4:
+            return 0.0
+        arr = np.asarray(self.residual_buf)
+        h, g = self._db2_filter_pair()
+        # detail coefficients (fine scale) from last few residuals
+        detail = np.convolve(arr[-4:], g[::-1], mode='valid')
+        detail = detail if detail.size else np.array([0.0])
+        thr = self.MAD_K * (1.4826 * np.median(np.abs(detail)) + 1e-12)
+        # soft-threshold: suppress noise, keep large transients
+        gated = np.sign(detail[-1]) * max(abs(detail[-1]) - thr, 0.0)
+        # coarse-scale persistence check: only correct if transient repeats
+        coarse = np.convolve(arr[-4:], h[::-1], mode='valid')
+        coarse = coarse if coarse.size else np.array([0.0])
+        coarse_mag = abs(coarse[-1]) / (2.0 ** 0.5)
+        return gated * 0.5 + coarse_mag * 0.25
+
+    def _slope_latch(self, level, slope, sigma_hat):
+        """
+        Trend-direction latch with persistence + hysteresis.
+        Only confirmed persistent reversals change the tracked direction.
+        """
+        thr = self.SLOPE_NOISE_FRACTION * sigma_hat * self.HYSTERESIS_FACTOR
+        sign = np.sign(slope) if abs(slope) > self.SLOPE_NOISE_FRACTION * sigma_hat else 0
+
+        if sign != 0 and sign == self.pending_sign:
+            self.pending_run += 1
+        else:
+            self.pending_sign = sign
+            self.pending_run = 1 if sign != 0 else 0
+
+        if self.pending_run >= self.SLOPE_PERSISTENCE and \
+           abs(slope) > thr and self.pending_sign != self.slope_sign:
+            self.slope_sign = self.pending_sign
+            self.slope_run = 0
+
+        self.slope_run += 1
+        # micro-adjustment: lean output toward confirmed trend direction
+        return self.slope_sign
+
+    def filter(self, data):
+        data = np.asarray(data, dtype=float)
+        n = data.shape[0]
+        filtered = np.empty(n)
+        warmup = min(self.WARMUP_QUARTIC, n)
+
+        # Warm-up: quartic polynomial fit (predictive, low-lag fit)
+        if warmup > 0:
+            w = data[:warmup]
+            t = np.arange(warmup, dtype=float)
+            coeffs = np.polyfit(t, w, deg=min(4, warmup - 1))
+            filtered[:warmup] = np.polyval(coeffs, t)
+
+        for i in range(n):
+            z = data[i]
+            self.short_buf.append(z)
+            self.long_buf.append(z)
+            if i < warmup:
+                continue  # already filled by warm-up fit
+
+            level, innov = self._kalman_step(z)
+            sigma_hat = np.sqrt(max(self._estimate_R(self.short_buf), 1e-12))
+            correction = self._wavelet_residual_gate(innov)
+            trend_sign = self._slope_latch(level, self.x[1], sigma_hat)
+            # Blend: Kalman level + gated residual correction + trend lean
+            out = level + correction + trend_sign * sigma_hat * 0.05
+            filtered[i] = out
+
+        return filtered
+
+
+def adaptive_filter(data, **params):
+    """
+    Main entry point. Maintains the same interface as the original program:
+    input = 1D array of time series, output = filtered 1D array.
+    """
+    return AdaptiveKalmanWaveletHybridFilter(**params).filter(data)
+
+# EVOLVE-BLOCK-END
+
+if __name__ == "__main__":
+    np.random.seed(42)
+    t = np.linspace(0, 100, 1000)
+    true = 5 * np.sin(0.15 * t) + 0.02 * t ** 1.5
+    noisy = true + np.random.normal(0, 1.0, t.size)
+    out = adaptive_filter(noisy)
+    lag = np.mean(np.abs(np.diff(out)))  # stability proxy
+    err = np.mean(np.abs(out - true))
+    print(f"MAE vs truth: {err:.4f}")
+    print(f"Output roughness: {lag:.4f}")
+    reversals = np.sum(np.diff(np.sign(np.diff(out))) != 0)
+    print(f"Direction reversals: {reversals}")

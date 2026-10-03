@@ -1,0 +1,154 @@
+--- a/original.py
++++ b/original.py
+@@ -1,18 +1,144 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
++
++_TRI = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, np.sqrt(3.0) / 2.0]])
++
++
++def _to_bary(pts):
++    # pts: (m,2) -> barycentric coords (m,3)
++    A, B, C = _TRI
++    v0 = B - A
++    v1 = C - A
++    v2 = pts - A
++    d00 = v0 @ v0
++    d01 = v0 @ v1
++    d11 = v1 @ v1
++    d20 = v2 @ v0
++    d21 = v2 @ v1
++    den = d00 * d11 - d01 * d01
++    b = np.empty((pts.shape[0], 3))
++    b[:, 1] = (d11 * d20 - d01 * d21) / den
++    b[:, 2] = (d00 * d21 - d01 * d20) / den
++    b[:, 0] = 1.0 - b[:, 1] - b[:, 2]
++    return b
++
++
++def _from_bary(b):
++    return b[:, 0:1] * _TRI[0] + b[:, 1:2] * _TRI[1] + b[:, 2:3] * _TRI[2]
++
++
++def _min_area_and_idx(pts):
++    n = pts.shape[0]
++    i, j, k = np.triu_indices(n, 3)
++    a = pts[i]
++    b = pts[j]
++    c = pts[k]
++    areas = 0.5 * np.abs(
++        (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
++        - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
++    )
++    m = np.argmin(areas)
++    return areas[m], (i[m], j[m], k[m]), areas
++
++
++def _grad_min_area(pts, triplet, h=1e-7):
++    """Numerical gradient of the area of the given triplet w.r.t. all points."""
++    n = pts.shape[0]
++    grad = np.zeros_like(pts)
++    a, b, c = (pts[t] for t in triplet)
++    base = 0.5 * abs(
++        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
++    )
++    for pi in triplet:
++        for d in range(2):
++            pp = pts.copy()
++            pp[pi, d] += h
++            a2, b2, c2 = (pp[t] for t in triplet)
++            ar = 0.5 * abs(
++                (b2[0] - a2[0]) * (c2[1] - a2[1])
++                - (b2[1] - a2[1]) * (c2[0] - a2[0])
++            )
++            grad[pi, d] = (ar - base) / h
++    return grad, base
++
++
++def _init_config(seed, n=11):
++    rng = np.random.default_rng(seed)
++    # stratified: golden-ratio sampling in barycentric simplex
++    u = rng.random((n, 2))
++    b = np.empty((n, 3))
++    s = np.sqrt(u[:, 0])
++    b[:, 0] = 1 - s
++    b[:, 1] = u[:, 1] * s
++    b[:, 2] = s * (1 - u[:, 1])
++    # push slightly inside boundary
++    b = 0.02 + 0.96 * b
++    b /= b.sum(axis=1, keepdims=True)
++    return _from_bary(b)
++
++
++def _optimize(pts, iters=600):
++    best_pts = pts.copy()
++    try:
++        cur, trip, _ = _min_area_and_idx(pts)
++        best_val = cur
++        step = 0.02
++        for it in range(iters):
++            g, _ = _grad_min_area(pts, trip)
++            gn = np.linalg.norm(g[trip, :])
++            if gn < 1e-12:
++                break
++            new = pts + step * g / gn
++            # project into triangle via barycentric clipping
++            b = _to_bary(new)
++            b = np.clip(b, 0.0, 1.0)
++            b /= b.sum(axis=1, keepdims=True)
++            new = _from_bary(b)
++            v, t, _ = _min_area_and_idx(new)
++            if v > cur:
++                pts, cur, trip = new, v, t
++                if v > best_val:
++                    best_val, best_pts = v, pts.copy()
++            else:
++                step *= 0.7
++                if step < 1e-6:
++                    break
++    except Exception:
++        return best_pts
++    return best_pts
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+-    Construct an arrangement of n points on or inside a convex region in order to maximize the area of the
+-    smallest triangle formed by these points. Here n = 11.
+-
+-    Returns:
+-        points: np.ndarray of shape (11,2) with the x,y coordinates of the points.
++    Construct an arrangement of 11 points inside the unit equilateral triangle to
++    maximize the smallest triangle area (Heilbronn problem). Deterministic
++    projected maximin ascent with multiple fixed-seed restarts.
+     """
+     n = 11
+-    points = np.zeros((n, 2))
+-    return points
++    best_pts = None
++    best_val = -1.0
++    for seed in range(12):
++        pts = _init_config(seed, n)
++        pts = _optimize(pts)
++        try:
++            v, _, _ = _min_area_and_idx(pts)
++        except Exception:
++            continue
++        if v > best_val:
++            best_val, best_pts = v, pts.copy()
++    if best_pts is None:
++        # fallback: deterministic golden-ratio spiral config
++        t = (np.arange(n) + 0.5) / n
++        b = np.stack([1 - np.sqrt(t), t * np.sqrt(t) * 0.5, t * np.sqrt(t) * 0.5], axis=1)
++        b /= b.sum(axis=1, keepdims=True)
++        best_pts = _from_bary(b)
++    # hard validity check
++    bb = _to_bary(best_pts)
++    if (bb < -1e-9).any():
++        bb = np.clip(bb, 0, 1)
++        bb /= bb.sum(axis=1, keepdims=True)
++        best_pts = _from_bary(bb)
++    return best_pts
+ 
+ 
+ # EVOLVE-BLOCK-END

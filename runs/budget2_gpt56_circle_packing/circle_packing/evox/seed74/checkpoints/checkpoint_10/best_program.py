@@ -1,0 +1,162 @@
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles"""
+import numpy as np
+
+
+def construct_packing():
+    """Select the best SLSQP packing from asymmetric layered hexagonal starts."""
+    from scipy.optimize import minimize
+
+    n = 26
+    ii, jj = np.triu_indices(n, 1)
+    bounds = [(1e-5, 0.99999)] * (2 * n) + [(1e-5, 0.5)] * n
+    # All patterns have five layers and total 26 circles.  They expose
+    # different boundary contact graphs, especially for the two dense rows.
+    patterns = (
+        (5, 6, 5, 6, 4), (4, 6, 6, 6, 4), (5, 5, 6, 5, 5),
+        (5, 6, 6, 5, 4), (4, 5, 6, 6, 5), (5, 5, 5, 6, 5),
+        (6, 5, 5, 5, 5), (5, 5, 5, 5, 6), (4, 6, 5, 6, 5),
+        (5, 4, 6, 6, 5), (6, 5, 4, 6, 5), (5, 6, 4, 5, 6),
+    )
+
+    def unpack(z):
+        return z[:2 * n].reshape(n, 2), z[2 * n:]
+
+    def feasibility(z):
+        c, r = unpack(z)
+        boundary = np.concatenate((
+            c[:, 0] - r, 1.0 - c[:, 0] - r,
+            c[:, 1] - r, 1.0 - c[:, 1] - r,
+        ))
+        d = c[ii] - c[jj]
+        separation = np.sum(d * d, axis=1) - (r[ii] + r[jj]) ** 2
+        return np.concatenate((boundary, separation))
+
+    def make_safe(z):
+        c, r = unpack(z.copy())
+        r = np.maximum(r, 1e-8)
+        border = np.minimum.reduce(c, axis=1) / r
+        border = np.minimum(border, np.minimum.reduce(1.0 - c, axis=1) / r)
+        distance = np.sqrt(np.sum((c[ii] - c[jj]) ** 2, axis=1))
+        scale = 0.999999 * min(1.0, float(np.min(border)),
+                               float(np.min(distance / (r[ii] + r[jj]))))
+        return c, r * max(scale, 1e-10)
+
+    best_sum = -np.inf
+    best_centers = best_radii = None
+    # The phase cycles deliberately vary the initial lattice aspect ratio.
+    # This is useful because the best unequal-radius packing need not inherit
+    # the nominal hexagonal spacing of an equal-circle arrangement.
+    for trial in range(120):
+        rng = np.random.default_rng(2609 + trial)
+        phase = trial // len(patterns)
+        row_gap = 0.184 + 0.0025 * (phase % 9)
+        horizontal_shift = 0.05 + 0.075 * (phase % 8)
+        seed = []
+        for row, count in enumerate(patterns[trial % len(patterns)]):
+            y = 0.5 + (row - 2) * row_gap
+            stagger = 0.5 if row % 2 else 0.0
+            for col in range(count):
+                seed.append(((col + 0.5 + horizontal_shift * stagger) / count, y))
+        seed = np.asarray(seed, dtype=float)
+        seed += rng.normal(0.0, 0.006 + 0.0012 * (trial % 10), seed.shape)
+        if trial & 1:
+            seed[:, 0] = 1.0 - seed[:, 0]
+        seed = np.clip(seed, 0.025, 0.975)
+        z0 = np.concatenate((seed.ravel(), np.full(n, 0.052)))
+        result = minimize(
+            lambda z: -np.sum(z[2 * n:]), z0, method="SLSQP",
+            bounds=bounds, constraints={"type": "ineq", "fun": feasibility},
+            options={"maxiter": 2200, "ftol": 1e-11, "disp": False},
+        )
+        centers, radii = make_safe(result.x if result.x is not None else z0)
+        total = float(np.sum(radii))
+        if total > best_sum:
+            best_centers, best_radii, best_sum = centers, radii, total
+
+    return best_centers, best_radii, best_sum
+
+
+def compute_max_radii(centers):
+    """
+    Compute the maximum possible radii for each circle position
+    such that they don't overlap and stay within the unit square.
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+
+    Returns:
+        np.array of shape (n) with radius of each circle
+    """
+    n = centers.shape[0]
+    radii = np.ones(n)
+
+    # First, limit by distance to square borders
+    for i in range(n):
+        x, y = centers[i]
+        # Distance to borders
+        radii[i] = min(x, y, 1 - x, 1 - y)
+
+    # Then, limit by distance to other circles
+    # Each pair of circles with centers at distance d can have
+    # sum of radii at most d to avoid overlap
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+
+            # If current radii would cause overlap
+            if radii[i] + radii[j] > dist:
+                # Scale both radii proportionally
+                scale = dist / (radii[i] + radii[j])
+                radii[i] *= scale
+                radii[j] *= scale
+
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

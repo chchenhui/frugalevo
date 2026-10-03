@@ -1,0 +1,185 @@
+<NAME>
+add_reverse_pair_exchange
+</NAME>
+
+<DESCRIPTION>
+Extend local refinement with reverse two-for-one exchanges. A single relocation cannot improve placements where a bottleneck GPU must give up two smaller models in exchange for one larger model from another GPU to rebalance both memory and request pressure. The new neighborhood examines pairs only on current bottleneck GPUs, verifies both resulting memory capacities, and accepts only a strict lexicographic improvement of the sorted KVPR profile. This guarantees that the maximum KVPR never increases while allowing improvements that are unreachable through single-model moves.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Greedy placement can leave an avoidable hotspot.  Apply improving moves
+    # until no single memory-feasible relocation lowers the global maximum.
+    while True:
+        current_score = maximum_kvpr()
+        best_move = None
+        best_score = current_score
+
+        for source_gpu in range(gpu_num):
+            for model in placement[source_gpu]:
+                model_pressure = model.req_rate / model.slo
+                for target_gpu in range(gpu_num):
+                    if target_gpu == source_gpu:
+                        continue
+                    if model.model_size > remaining[target_gpu]:
+                        continue
+
+                    candidate_score = 0.0
+                    for gpu_id in range(gpu_num):
+                        if gpu_id == source_gpu:
+                            score = kvpr(
+                                pressure[gpu_id] - model_pressure,
+                                remaining[gpu_id] + model.model_size,
+                            )
+                        elif gpu_id == target_gpu:
+                            score = kvpr(
+                                pressure[gpu_id] + model_pressure,
+                                remaining[gpu_id] - model.model_size,
+                            )
+                        else:
+                            score = kvpr(pressure[gpu_id], remaining[gpu_id])
+                        candidate_score = max(candidate_score, score)
+
+                    if candidate_score < best_score - 1e-12:
+                        best_score = candidate_score
+                        best_move = (model, source_gpu, target_gpu, model_pressure)
+
+        if best_move is None:
+            break
+
+        model, source_gpu, target_gpu, model_pressure = best_move
+        placement[source_gpu].remove(model)
+        placement[target_gpu].append(model)
+        remaining[source_gpu] += model.model_size
+        remaining[target_gpu] -= model.model_size
+        pressure[source_gpu] -= model_pressure
+        pressure[target_gpu] += model_pressure
+=======
+    # Use the complete pressure profile as the objective.  This preserves the
+    # minimum maximum KVPR and also removes ties that otherwise block useful
+    # exchanges.
+    def pressure_profile(candidate_remaining, candidate_pressure):
+        return tuple(sorted(
+            (kvpr(candidate_pressure[g], candidate_remaining[g])
+             for g in range(gpu_num)),
+            reverse=True,
+        ))
+
+    # Greedy placement can leave a hotspot requiring either a relocation or a
+    # simultaneous reverse two-for-one exchange.
+    while True:
+        current_profile = pressure_profile(remaining, pressure)
+        best_move = None
+        best_profile = current_profile
+
+        for source_gpu in range(gpu_num):
+            for model in placement[source_gpu]:
+                model_pressure = model.req_rate / model.slo
+                for target_gpu in range(gpu_num):
+                    if target_gpu == source_gpu or model.model_size > remaining[target_gpu]:
+                        continue
+
+                    trial_remaining = remaining[:]
+                    trial_pressure = pressure[:]
+                    trial_remaining[source_gpu] += model.model_size
+                    trial_remaining[target_gpu] -= model.model_size
+                    trial_pressure[source_gpu] -= model_pressure
+                    trial_pressure[target_gpu] += model_pressure
+                    candidate_profile = pressure_profile(
+                        trial_remaining, trial_pressure
+                    )
+
+                    if candidate_profile < best_profile:
+                        best_profile = candidate_profile
+                        best_move = (model, source_gpu, target_gpu, model_pressure)
+
+        if best_move is not None:
+            model, source_gpu, target_gpu, model_pressure = best_move
+            placement[source_gpu].remove(model)
+            placement[target_gpu].append(model)
+            remaining[source_gpu] += model.model_size
+            remaining[target_gpu] -= model.model_size
+            pressure[source_gpu] -= model_pressure
+            pressure[target_gpu] += model_pressure
+            continue
+
+        # A bottleneck may need to release two models before it can accept a
+        # larger model held by another GPU.  This is the reverse of a
+        # one-for-two exchange and is restricted to bottlenecks for speed.
+        bottleneck = current_profile[0]
+        bottleneck_gpus = [
+            g for g in range(gpu_num)
+            if abs(kvpr(pressure[g], remaining[g]) - bottleneck) <= 1e-12
+        ]
+        best_exchange = None
+        best_profile = current_profile
+
+        for source_gpu in bottleneck_gpus:
+            source_models = placement[source_gpu]
+            for left in range(len(source_models)):
+                first = source_models[left]
+                first_pressure = first.req_rate / first.slo
+                for right in range(left + 1, len(source_models)):
+                    second = source_models[right]
+                    second_pressure = second.req_rate / second.slo
+                    released_size = first.model_size + second.model_size
+                    released_pressure = first_pressure + second_pressure
+
+                    for target_gpu in range(gpu_num):
+                        if target_gpu == source_gpu:
+                            continue
+                        for incoming in placement[target_gpu]:
+                            if (incoming.model_size >
+                                    remaining[source_gpu] + released_size):
+                                continue
+                            if (released_size >
+                                    remaining[target_gpu] + incoming.model_size):
+                                continue
+
+                            incoming_pressure = (
+                                incoming.req_rate / incoming.slo
+                            )
+                            trial_remaining = remaining[:]
+                            trial_pressure = pressure[:]
+                            trial_remaining[source_gpu] += (
+                                released_size - incoming.model_size
+                            )
+                            trial_remaining[target_gpu] += (
+                                incoming.model_size - released_size
+                            )
+                            trial_pressure[source_gpu] += (
+                                incoming_pressure - released_pressure
+                            )
+                            trial_pressure[target_gpu] += (
+                                released_pressure - incoming_pressure
+                            )
+                            candidate_profile = pressure_profile(
+                                trial_remaining, trial_pressure
+                            )
+
+                            if candidate_profile < best_profile:
+                                best_profile = candidate_profile
+                                best_exchange = (
+                                    source_gpu, target_gpu, first, second,
+                                    incoming, first_pressure, second_pressure,
+                                    incoming_pressure,
+                                )
+
+        if best_exchange is None:
+            break
+
+        (source_gpu, target_gpu, first, second, incoming, first_pressure,
+         second_pressure, incoming_pressure) = best_exchange
+        placement[source_gpu].remove(first)
+        placement[source_gpu].remove(second)
+        placement[target_gpu].remove(incoming)
+        placement[source_gpu].append(incoming)
+        placement[target_gpu].extend((first, second))
+        released_size = first.model_size + second.model_size
+        remaining[source_gpu] += released_size - incoming.model_size
+        remaining[target_gpu] += incoming.model_size - released_size
+        released_pressure = first_pressure + second_pressure
+        pressure[source_gpu] += incoming_pressure - released_pressure
+        pressure[target_gpu] += released_pressure - incoming_pressure
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,268 @@
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles"""
+import numpy as np
+
+
+def construct_packing():
+    """
+    Construct 26 unequal circles by directly optimizing centers and radii.
+
+    A staggered lattice is a useful feasible starting point, but the square
+    boundary strongly favors unequal boundary circles.  Consequently the
+    radii are optimization variables rather than being computed greedily
+    after the centers have been fixed.
+    """
+    from scipy.optimize import minimize
+
+    n = 26
+
+    def layered_seed(rows):
+        """A square-adapted, approximately triangular seed for one row topology."""
+        seed = []
+        for row, count in enumerate(rows):
+            # Different row populations naturally give the required horizontal
+            # stagger.  The common vertical spacing leaves a feasible initial
+            # radius while allowing SLSQP to form unequal boundary contacts.
+            xs = np.linspace(1.0 / (count + 1), count / (count + 1), count)
+            y = 0.10 + 0.20 * row
+            seed.extend((x, y) for x in xs)
+        return np.asarray(seed, dtype=float)
+
+    # Row populations determine which circles can become wall-supported.
+    # In particular, moving a six-circle row away from the center changes the
+    # contact graph much more substantially than merely jittering a seed.
+    row_topologies = (
+        (5, 5, 6, 5, 5),
+        (4, 6, 6, 5, 5),
+        (5, 5, 6, 6, 4),
+        (6, 4, 6, 5, 5),
+        (5, 6, 6, 4, 5),
+        (5, 5, 6, 4, 6),
+        (5, 4, 6, 6, 5),
+    )
+    base_centers = layered_seed(row_topologies[0])
+
+    pi, pj = np.triu_indices(n, 1)
+
+    def constraints(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        dx = c[pi, 0] - c[pj, 0]
+        dy = c[pi, 1] - c[pj, 1]
+        pair_clearance = dx * dx + dy * dy - (r[pi] + r[pj]) ** 2
+        wall_clearance = np.concatenate((
+            c[:, 0] - r, c[:, 1] - r,
+            1.0 - c[:, 0] - r, 1.0 - c[:, 1] - r
+        ))
+        return np.concatenate((wall_clearance, pair_clearance))
+
+    def constraint_jacobian(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        jac = np.zeros((4 * n + len(pi), 3 * n))
+        for k in range(n):
+            jac[k, 2 * k] = 1.0
+            jac[k, 2 * n + k] = -1.0
+            jac[n + k, 2 * k + 1] = 1.0
+            jac[n + k, 2 * n + k] = -1.0
+            jac[2 * n + k, 2 * k] = -1.0
+            jac[2 * n + k, 2 * n + k] = -1.0
+            jac[3 * n + k, 2 * k + 1] = -1.0
+            jac[3 * n + k, 2 * n + k] = -1.0
+
+        start = 4 * n
+        dx = c[pi, 0] - c[pj, 0]
+        dy = c[pi, 1] - c[pj, 1]
+        rs = r[pi] + r[pj]
+        q = np.arange(len(pi)) + start
+        jac[q, 2 * pi] = 2.0 * dx
+        jac[q, 2 * pi + 1] = 2.0 * dy
+        jac[q, 2 * pj] = -2.0 * dx
+        jac[q, 2 * pj + 1] = -2.0 * dy
+        jac[q, 2 * n + pi] = -2.0 * rs
+        jac[q, 2 * n + pj] = -2.0 * rs
+        return jac
+
+    bounds = [(0.0, 1.0)] * (2 * n) + [(1e-7, 0.5)] * n
+    con = {"type": "ineq", "fun": constraints, "jac": constraint_jacobian}
+    rng = np.random.default_rng(271828)
+
+    # Start every topology once, but give the best known central-six topology
+    # two symmetry-breaking variants.  These radii are deliberately below the
+    # lattice clearance, so all starts remain feasible despite the jitters.
+    starts = []
+    for rows in row_topologies:
+        starts.append((layered_seed(rows), np.full(n, 0.050)))
+    for amplitude in (0.009, 0.018):
+        seed_centers = base_centers + rng.normal(0.0, amplitude,
+                                                 base_centers.shape)
+        seed_centers = np.clip(seed_centers, 0.055, 0.945)
+        seed_radii = 0.040 + rng.uniform(-0.008, 0.008, n)
+        starts.append((seed_centers, seed_radii))
+
+    objective = lambda z: -np.sum(z[2 * n:])
+    objective_jac = lambda z: np.r_[np.zeros(2 * n), -np.ones(n)]
+
+    def feasible_score(z):
+        """Objective after the same common scaling used for final validation."""
+        c = z[:2 * n].reshape(n, 2)
+        r = np.maximum(z[2 * n:], 0.0)
+        wall = np.minimum.reduce((c[:, 0], c[:, 1],
+                                  1.0 - c[:, 0], 1.0 - c[:, 1]))
+        scale = float(np.min(wall / np.maximum(r, 1e-15)))
+        distances = np.hypot(c[pi, 0] - c[pj, 0], c[pi, 1] - c[pj, 1])
+        scale = min(scale, float(np.min(
+            distances / np.maximum(r[pi] + r[pj], 1e-15))))
+        return max(0.0, min(1.0, scale)) * float(np.sum(r))
+
+    best = None
+    best_score = -np.inf
+    for seed_centers, seed_radii in starts:
+        z0 = np.concatenate((seed_centers.ravel(), seed_radii))
+        result = minimize(
+            objective, z0, jac=objective_jac, method="SLSQP",
+            bounds=bounds, constraints=con,
+            options={"maxiter": 1400, "ftol": 1e-11, "disp": False}
+        )
+        score = feasible_score(result.x)
+        if score > best_score:
+            best = result.x
+            best_score = score
+
+    # A good local optimum is normally held in place by a large collection
+    # of tangencies.  Release just the interior part of that contact graph:
+    # wall circles retain the useful square-adapted boundary arrangement,
+    # while small independent displacements can lead to a better unequal
+    # radius contact pattern in the bulk.
+    continuation_rng = np.random.default_rng(918273)
+    for attempt in range(10):
+        trial = best.copy()
+        trial_centers = trial[:2 * n].reshape(n, 2)
+        wall_distance = np.min(np.column_stack((
+            trial_centers[:, 0], trial_centers[:, 1],
+            1.0 - trial_centers[:, 0], 1.0 - trial_centers[:, 1]
+        )), axis=1)
+        interior = wall_distance > 0.135
+        displacement = continuation_rng.normal(0.0, 0.0025, (n, 2))
+        # Alternate a few slightly stronger disruptions to cross particularly
+        # rigid local contact graphs.
+        if attempt >= 7:
+            displacement *= 1.6
+        trial_centers[interior] += displacement[interior]
+        trial[:2 * n] = np.clip(trial_centers, 0.001, 0.999).ravel()
+        # This small deflation gives the perturbed centers room to move;
+        # SLSQP subsequently regrows every radius.
+        trial[2 * n:] *= 0.992
+        result = minimize(
+            objective, trial, jac=objective_jac, method="SLSQP",
+            bounds=bounds, constraints=con,
+            options={"maxiter": 750, "ftol": 3e-12, "disp": False}
+        )
+        score = feasible_score(result.x)
+        if score > best_score:
+            best = result.x
+            best_score = score
+
+    centers = best[:2 * n].reshape(n, 2)
+    radii = np.maximum(best[2 * n:], 0.0)
+
+    # Optimizers legitimately stop within a tiny constraint tolerance.  This
+    # common scale factor converts such a result into a strictly valid one.
+    factors = [1.0]
+    for i in range(n):
+        if radii[i] > 0.0:
+            factors.append(min(centers[i, 0], centers[i, 1],
+                               1.0 - centers[i, 0], 1.0 - centers[i, 1])
+                           / radii[i])
+    for i, j in zip(pi, pj):
+        denom = radii[i] + radii[j]
+        if denom > 0.0:
+            factors.append(np.hypot(*(centers[i] - centers[j])) / denom)
+    radii *= max(0.0, min(1.0, min(factors) * (1.0 - 1e-10)))
+
+    return centers, radii, float(np.sum(radii))
+
+
+def compute_max_radii(centers):
+    """
+    Compute the maximum possible radii for each circle position
+    such that they don't overlap and stay within the unit square.
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+
+    Returns:
+        np.array of shape (n) with radius of each circle
+    """
+    n = centers.shape[0]
+    radii = np.ones(n)
+
+    # First, limit by distance to square borders
+    for i in range(n):
+        x, y = centers[i]
+        # Distance to borders
+        radii[i] = min(x, y, 1 - x, 1 - y)
+
+    # Then, limit by distance to other circles
+    # Each pair of circles with centers at distance d can have
+    # sum of radii at most d to avoid overlap
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+
+            # If current radii would cause overlap
+            if radii[i] + radii[j] > dist:
+                # Scale both radii proportionally
+                scale = dist / (radii[i] + radii[j])
+                radii[i] *= scale
+                radii[j] *= scale
+
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

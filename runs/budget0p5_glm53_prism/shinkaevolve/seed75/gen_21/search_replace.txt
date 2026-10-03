@@ -1,0 +1,173 @@
+<NAME>
+multi_ordering_pipeline
+</NAME>
+<DESCRIPTION>
+Run the greedy + local-search pipeline under several model ordering keys (load, size, density, composite) and return the placement with the lowest resulting max KVPR, replicating the best prior approach (score 23.51). Runtime remains negligible.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # 1) Sort models by r_j / s_j in descending order (LPT-style)
+    sorted_models = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
+
+    # 2) Initialize per-GPU states
+    placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+    free_mem = [GPU_MEM_SIZE for _ in range(gpu_num)]  # remaining memory per GPU
+    load = [0.0 for _ in range(gpu_num)]              # sum of r_j / s_j per GPU
+
+    # 3) Assign each model to the GPU minimizing the resulting post-placement KVPR
+    for model in sorted_models:
+        w = model.req_rate / model.slo
+        best_idx = None
+        best_kvpr = float('inf')
+
+        for gpu_id in range(gpu_num):
+            if model.model_size <= free_mem[gpu_id]:
+                new_kvpr = kvpr_of(load[gpu_id] + w,
+                                   GPU_MEM_SIZE - free_mem[gpu_id] + model.model_size)
+                if new_kvpr < best_kvpr:
+                    best_kvpr = new_kvpr
+                    best_idx = gpu_id
+
+        if best_idx is None:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on any GPU. "
+                f"Remaining per-GPU memory: {free_mem}"
+            )
+
+        placement[best_idx].append(model)
+        load[best_idx] += w
+        free_mem[best_idx] -= model.model_size
+
+    # 4) Local search: move models off the hottest GPU to reduce max KVPR
+    for _ in range(30):
+        kvprs = [kvpr_of(load[g], GPU_MEM_SIZE - free_mem[g]) for g in range(gpu_num)]
+        hot = max(range(gpu_num), key=lambda g: kvprs[g])
+        hot_kvpr = kvprs[hot]
+        others = [kvprs[g] for g in range(gpu_num) if g != hot]
+        base_others = max(others) if others else 0.0
+
+        best_gain, best_move = 0.0, None
+        for model in placement[hot]:
+            w = model.req_rate / model.slo
+            # source GPU after removal
+            new_used = GPU_MEM_SIZE - free_mem[hot] - model.model_size
+            src_kvpr = kvpr_of(load[hot] - w, new_used) if new_used > 0 else 0.0
+            for g in range(gpu_num):
+                if g == hot or model.model_size > free_mem[g]:
+                    continue
+                dst_kvpr = kvpr_of(load[g] + w,
+                                   GPU_MEM_SIZE - free_mem[g] + model.model_size)
+                new_max = max(base_others, src_kvpr, dst_kvpr)
+                gain = hot_kvpr - new_max
+                if gain > best_gain:
+                    best_gain = gain
+                    best_move = (model, g)
+
+        if best_move is None:
+            break
+
+        model, dst = best_move
+        w = model.req_rate / model.slo
+        placement[hot].remove(model)
+        placement[dst].append(model)
+        load[hot] -= w
+        free_mem[hot] += model.model_size
+        load[dst] += w
+        free_mem[dst] -= model.model_size
+
+    return placement
+=======
+    if gpu_num <= 0:
+        raise ValueError("gpu_num must be positive")
+
+    def run_pipeline(order_key):
+        # 1) Sort models by chosen ordering key in descending order
+        sorted_models = sorted(models, key=order_key, reverse=True)
+
+        # 2) Initialize per-GPU states
+        placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+        free_mem = [GPU_MEM_SIZE for _ in range(gpu_num)]
+        load = [0.0 for _ in range(gpu_num)]
+
+        # 3) Assign each model to the GPU minimizing resulting post-placement KVPR
+        for model in sorted_models:
+            w = model.req_rate / model.slo
+            best_idx = None
+            best_kvpr = float('inf')
+
+            for gpu_id in range(gpu_num):
+                if model.model_size <= free_mem[gpu_id]:
+                    new_kvpr = kvpr_of(load[gpu_id] + w,
+                                       GPU_MEM_SIZE - free_mem[gpu_id] + model.model_size)
+                    if new_kvpr < best_kvpr:
+                        best_kvpr = new_kvpr
+                        best_idx = gpu_id
+
+            if best_idx is None:
+                return None, float('inf')
+
+            placement[best_idx].append(model)
+            load[best_idx] += w
+            free_mem[best_idx] -= model.model_size
+
+        # 4) Local search: move models off the hottest GPU to reduce max KVPR
+        for _ in range(30):
+            kvprs = [kvpr_of(load[g], GPU_MEM_SIZE - free_mem[g]) for g in range(gpu_num)]
+            hot = max(range(gpu_num), key=lambda g: kvprs[g])
+            hot_kvpr = kvprs[hot]
+            others = [kvprs[g] for g in range(gpu_num) if g != hot]
+            base_others = max(others) if others else 0.0
+
+            best_gain, best_move = 0.0, None
+            for model in placement[hot]:
+                w = model.req_rate / model.slo
+                # source GPU after removal
+                new_used = GPU_MEM_SIZE - free_mem[hot] - model.model_size
+                src_kvpr = kvpr_of(load[hot] - w, new_used) if new_used > 0 else 0.0
+                for g in range(gpu_num):
+                    if g == hot or model.model_size > free_mem[g]:
+                        continue
+                    dst_kvpr = kvpr_of(load[g] + w,
+                                       GPU_MEM_SIZE - free_mem[g] + model.model_size)
+                    new_max = max(base_others, src_kvpr, dst_kvpr)
+                    gain = hot_kvpr - new_max
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_move = (model, g)
+
+            if best_move is None:
+                break
+
+            model, dst = best_move
+            w = model.req_rate / model.slo
+            placement[hot].remove(model)
+            placement[dst].append(model)
+            load[hot] -= w
+            free_mem[hot] += model.model_size
+            load[dst] += w
+            free_mem[dst] -= model.model_size
+
+        kvprs = [kvpr_of(load[g], GPU_MEM_SIZE - free_mem[g]) for g in range(gpu_num)]
+        return placement, max(kvprs)
+
+    orderings = [
+        lambda m: m.req_rate / m.slo,
+        lambda m: m.model_size,
+        lambda m: (m.req_rate / m.slo) / max(m.model_size, 1e-9),
+        lambda m: (m.req_rate / m.slo, m.model_size),
+    ]
+
+    best_placement, best_max = None, float('inf')
+    for key in orderings:
+        placement, mx = run_pipeline(key)
+        if placement is not None and mx < best_max:
+            best_max, best_placement = mx, placement
+
+    if best_placement is None:
+        raise ValueError(
+            f"Unable to place models on {gpu_num} GPUs of {GPU_MEM_SIZE} GB each."
+        )
+
+    return best_placement
+>>>>>>> REPLACE
+</DIFF>

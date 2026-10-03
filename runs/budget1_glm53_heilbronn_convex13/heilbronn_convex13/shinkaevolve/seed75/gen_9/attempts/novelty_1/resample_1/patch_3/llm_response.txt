@@ -1,0 +1,146 @@
+<NAME>
+heilbronn_multistart_hillclimb</NAME>
+<DESCRIPTION>
+The editable region is short, so I replace the entire body (numpy import, fixed-seed RNG random points, return) with a deterministic multi-start hill-climbing optimizer. Strategy: (1) multiple deterministic seeds (regular 13-gon, jittered 13-gons, center+12-ring, disk-random via seeded RNG); (2) targeted moves that perturb vertices of the current smallest triangle plus a reflection move across the opposite edge midpoint — a classic max-min heuristic; (3) geometrically decaying step sizes for coarse-to-fine convergence; (4) score = smallest of the C(13,3)=286 triangle areas divided by convex hull area (scale-invariant), final rescaling to unit hull area; (5) wall-clock deadline for bounded runtime; (6) pure-Python monotone-chain hull to avoid scipy dependency. The fixed seed (42) preserves determinism, and the return type stays a 13x2 numpy array as expected by the harness.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+import numpy as np
+=======
+import numpy as np
+import itertools
+import time
+import random as _random
+import math
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        rng = np.random.default_rng(seed=42)
+        points = rng.random((n, 2))
+        return points
+=======
+    # ---------- Heilbronn n=13: deterministic multi-start hill-climb ----------
+    n = 13
+    rng = _random.Random(42)
+
+    TRI = np.array(list(itertools.combinations(range(n), 3)), dtype=int)
+    TI, TJ, TK = TRI[:, 0], TRI[:, 1], TRI[:, 2]
+
+    def hull_area(P):
+        pts = sorted(set(map(tuple, np.round(P, 12).tolist())))
+        if len(pts) < 3:
+            return 0.0
+
+        def build(seq):
+            h = []
+            for p in seq:
+                while len(h) >= 2 and (
+                    (h[-1][0] - h[-2][0]) * (p[1] - h[-2][1])
+                    - (h[-1][1] - h[-2][1]) * (p[0] - h[-2][0])
+                ) <= 0:
+                    h.pop()
+                h.append(p)
+            return h
+
+        lower = build(pts)
+        upper = build(pts[::-1])
+        poly = lower[:-1] + upper[:-1]
+        m = len(poly)
+        if m < 3:
+            return 0.0
+        s = 0.0
+        for i in range(m):
+            x1, y1 = poly[i]
+            x2, y2 = poly[(i + 1) % m]
+            s += x1 * y2 - x2 * y1
+        return abs(s) * 0.5
+
+    def evaluate(P):
+        H = hull_area(P)
+        if H < 1e-12:
+            return -1.0, (0, 1, 2)
+        ax, ay = P[TI, 0], P[TI, 1]
+        bx, by = P[TJ, 0], P[TJ, 1]
+        cx, cy = P[TK, 0], P[TK, 1]
+        ar = 0.5 * np.abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
+        t = int(np.argmin(ar))
+        return float(ar[t]) / H, (int(TI[t]), int(TJ[t]), int(TK[t]))
+
+    def optimize(P0, iters, s0, deadline):
+        P = P0.copy()
+        best_s, best_tri = evaluate(P)
+        for it in range(iters):
+            if time.time() > deadline:
+                break
+            s = max(s0 * (0.998 ** it), 1e-6)
+            cands = []
+            for v in sorted(set(best_tri)):
+                for _ in range(2):
+                    ang = rng.random() * 2 * math.pi
+                    Q = P.copy()
+                    Q[v, 0] += s * math.cos(ang)
+                    Q[v, 1] += s * math.sin(ang)
+                    cands.append((Q, evaluate(Q)[0]))
+            # Reflection of a worst-triangle vertex across opposite edge midpoint
+            v = best_tri[0]
+            mid = (P[best_tri[1]] + P[best_tri[2]]) * 0.5
+            Q = P.copy()
+            Q[v] = 2 * mid - P[v]
+            cands.append((Q, evaluate(Q)[0]))
+            for _ in range(2):
+                v = rng.randrange(n)
+                ang = rng.random() * 2 * math.pi
+                Q = P.copy()
+                Q[v, 0] += s * math.cos(ang)
+                Q[v, 1] += s * math.sin(ang)
+                cands.append((Q, evaluate(Q)[0]))
+            cands.sort(key=lambda c: -c[1])
+            if cands and cands[0][1] > best_s + 1e-12:
+                P = cands[0][0]
+                best_s, best_tri = evaluate(P)
+        return P, best_s
+
+    # ---- Deterministic seed configurations ----
+    th = np.arange(n) * 2 * np.pi / n
+    ring = np.c_[np.cos(th), np.sin(th)]
+    seeds = [ring]
+    for _ in range(3):
+        jitter = np.array(
+            [[rng.gauss(0.0, 0.08) for _ in range(2)] for _ in range(n)]
+        )
+        seeds.append(ring + jitter)
+    c12 = np.zeros((n, 2))
+    th12 = np.arange(n - 1) * 2 * np.pi / (n - 1)
+    c12[1:, 0] = np.cos(th12)
+    c12[1:, 1] = np.sin(th12)
+    seeds.append(c12)
+    pts = []
+    while len(pts) < n:
+        x, y = rng.random() * 2 - 1, rng.random() * 2 - 1
+        if x * x + y * y <= 1.0:
+            pts.append((x, y))
+    seeds.append(np.array(pts))
+
+    # ---- Multi-start search with wall-clock budget ----
+    deadline = time.time() + 6.0
+    gbest, gs = seeds[0], -1.0
+    for sd in seeds:
+        P, sc = optimize(sd, 2200, 0.12, deadline)
+        if sc > gs:
+            gs, gbest = sc, P
+        if time.time() > deadline:
+            break
+    # Fine polish of the best configuration
+    P, sc = optimize(gbest, 2500, 0.03, time.time() + 2.5)
+    if sc > gs:
+        gs, gbest = sc, P
+
+    # Normalize so the convex hull has unit area (scale invariance)
+    H = hull_area(gbest)
+    if H > 1e-12:
+        gbest = gbest / math.sqrt(H)
+    points = np.array([[float(x), float(y)] for x, y in gbest])
+    return points
+>>>>>>> REPLACE
+</DIFF>

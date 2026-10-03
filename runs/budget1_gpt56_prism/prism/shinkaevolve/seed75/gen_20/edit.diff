@@ -1,0 +1,408 @@
+--- a/original.py
++++ b/original.py
+@@ -1,256 +1,263 @@
+ GPU_MEM_SIZE = 80 # GB
+ 
+ # EVOLVE-BLOCK-START
+ 
+ def compute_model_placement(gpu_num, models):
+-    """
+-    Place models while minimizing the lexicographic KVPR profile:
+-    first the maximum KVPR, then the second largest, and so on.
+-    """
++    """Compute a memory-feasible placement minimizing maximum KVPR."""
+     if gpu_num <= 0:
+         raise ValueError("gpu_num must be positive")
+ 
+     model_list = list(models)
+     n = len(model_list)
+-
+-    if any(model.model_size > GPU_MEM_SIZE for model in model_list):
+-        too_large = next(model for model in model_list
+-                         if model.model_size > GPU_MEM_SIZE)
++    eps = 1e-10
++
++    if any(model.model_size > GPU_MEM_SIZE + eps for model in model_list):
++        too_large = next(
++            model for model in model_list
++            if model.model_size > GPU_MEM_SIZE + eps
++        )
+         raise ValueError(
+             f"Unable to place model of size {too_large.model_size} GB on any GPU."
+         )
+ 
++    sizes = [model.model_size for model in model_list]
+     weights = [model.req_rate / model.slo for model in model_list]
+-    sizes = [model.model_size for model in model_list]
+-    eps = 1e-10
+-
+-    def ratio(weight, remaining):
+-        if remaining <= eps:
++
++    def ratio(weight, used):
++        free = GPU_MEM_SIZE - used
++        if free <= eps:
+             return float("inf") if weight > eps else 0.0
+-        return weight / remaining
+-
+-    def profile(used_mem, gpu_weight):
+-        pressures = [
+-            ratio(gpu_weight[g], GPU_MEM_SIZE - used_mem[g])
+-            for g in range(gpu_num)
+-        ]
++        return weight / free
++
++    def make_profile(pressures):
+         return tuple(sorted(pressures, reverse=True))
+-
+-    def better(candidate, incumbent):
+-        return candidate < incumbent
+ 
+     def construct(order):
+         bins = [[] for _ in range(gpu_num)]
+-        used_mem = [0.0] * gpu_num
+-        gpu_weight = [0.0] * gpu_num
++        used = [0.0] * gpu_num
++        load = [0.0] * gpu_num
++        pressures = [0.0] * gpu_num
+ 
+         for idx in order:
+             best_gpu = None
+             best_key = None
+-
+-            for g in range(gpu_num):
+-                if used_mem[g] + sizes[idx] > GPU_MEM_SIZE + eps:
++            size = sizes[idx]
++            weight = weights[idx]
++
++            for gpu in range(gpu_num):
++                new_used = used[gpu] + size
++                if new_used > GPU_MEM_SIZE + eps:
+                     continue
+ 
+-                next_used = used_mem[g] + sizes[idx]
+-                next_weight = gpu_weight[g] + weights[idx]
+-                candidate_pressures = [
+-                    ratio(
+-                        next_weight if h == g else gpu_weight[h],
+-                        GPU_MEM_SIZE - (next_used if h == g else used_mem[h]),
+-                    )
+-                    for h in range(gpu_num)
+-                ]
+-
+-                # Prefer the smallest resulting maximum KVPR.  Remaining
+-                # memory is used only as a final deterministic packing tie-break.
++                new_pressure = ratio(load[gpu] + weight, new_used)
++                candidate_pressures = pressures[:]
++                candidate_pressures[gpu] = new_pressure
++                candidate_profile = make_profile(candidate_pressures)
++
+                 key = (
+-                    max(candidate_pressures),
+-                    tuple(sorted(candidate_pressures, reverse=True)),
+-                    GPU_MEM_SIZE - next_used,
+-                    g,
++                    candidate_profile,
++                    GPU_MEM_SIZE - new_used,
++                    gpu,
+                 )
+                 if best_key is None or key < best_key:
+                     best_key = key
+-                    best_gpu = g
++                    best_gpu = gpu
+ 
+             if best_gpu is None:
+                 return None
+ 
+             bins[best_gpu].append(idx)
+-            used_mem[best_gpu] += sizes[idx]
+-            gpu_weight[best_gpu] += weights[idx]
+-
+-        return bins, used_mem, gpu_weight
+-
+-    # Complementary orderings make the construction robust to both memory-heavy
+-    # and request-pressure-heavy workloads.
++            used[best_gpu] += size
++            load[best_gpu] += weight
++            pressures[best_gpu] = ratio(load[best_gpu], used[best_gpu])
++
++        return bins, used, load, pressures
++
++    indices = list(range(n))
+     orderings = [
+-        sorted(range(n), key=lambda i: (-weights[i], -sizes[i], i)),
+-        sorted(range(n), key=lambda i: (-sizes[i], -weights[i], i)),
++        sorted(indices, key=lambda i: (-weights[i], -sizes[i], i)),
++        sorted(indices, key=lambda i: (-sizes[i], -weights[i], i)),
+         sorted(
+-            range(n),
++            indices,
+             key=lambda i: (
+                 -(weights[i] / max(sizes[i], eps)),
++                -weights[i],
++                -sizes[i],
++                i,
++            ),
++        ),
++        sorted(
++            indices,
++            key=lambda i: (
++                -(weights[i] * sizes[i]),
++                -weights[i],
+                 -sizes[i],
+                 i,
+             ),
+         ),
+     ]
+ 
+     best_state = None
+     best_profile = None
+     for order in orderings:
+         state = construct(order)
+         if state is None:
+             continue
+-        state_profile = profile(state[1], state[2])
+-        if best_profile is None or better(state_profile, best_profile):
++        state_profile = make_profile(state[3])
++        if best_profile is None or state_profile < best_profile:
+             best_state = state
+             best_profile = state_profile
+ 
+     if best_state is None:
+-        # Last-resort best-fit decreasing construction, preserving the original
+-        # behavior of raising an error for infeasible placements.
+         bins = [[] for _ in range(gpu_num)]
+-        used_mem = [0.0] * gpu_num
+-        gpu_weight = [0.0] * gpu_num
+-        for idx in sorted(range(n), key=lambda i: (-sizes[i], i)):
++        used = [0.0] * gpu_num
++        load = [0.0] * gpu_num
++        pressures = [0.0] * gpu_num
++
++        for idx in sorted(indices, key=lambda i: (-sizes[i], i)):
+             choices = [
+-                g for g in range(gpu_num)
+-                if used_mem[g] + sizes[idx] <= GPU_MEM_SIZE + eps
++                gpu for gpu in range(gpu_num)
++                if used[gpu] + sizes[idx] <= GPU_MEM_SIZE + eps
+             ]
+             if not choices:
+-                remaining = [GPU_MEM_SIZE - value for value in used_mem]
++                remaining = [GPU_MEM_SIZE - value for value in used]
+                 raise ValueError(
+                     f"Unable to place model of size {sizes[idx]} GB on any GPU. "
+                     f"Remaining per-GPU memory: {remaining}"
+                 )
+-            g = min(choices, key=lambda x: (GPU_MEM_SIZE - used_mem[x] - sizes[idx], x))
+-            bins[g].append(idx)
+-            used_mem[g] += sizes[idx]
+-            gpu_weight[g] += weights[idx]
++
++            gpu = min(
++                choices,
++                key=lambda g: (GPU_MEM_SIZE - used[g] - sizes[idx], g),
++            )
++            bins[gpu].append(idx)
++            used[gpu] += sizes[idx]
++            load[gpu] += weights[idx]
++            pressures[gpu] = ratio(load[gpu], used[gpu])
+     else:
+-        bins, used_mem, gpu_weight = best_state
+-
+-    # Best-improvement local search.  A move is accepted only if it improves
+-    # the full sorted KVPR profile, so maximum pressure can never worsen.
+-    current_profile = profile(used_mem, gpu_weight)
+-    max_rounds = 30
++        bins, used, load, pressures = best_state
++
++    current_profile = make_profile(pressures)
++    max_rounds = 40
+ 
+     for _ in range(max_rounds):
+-        best_move = None
+-        candidate_profile = current_profile
+-
+-        # Try every feasible single-model relocation.
++        best_action = None
++        best_profile = current_profile
++
+         for source in range(gpu_num):
+             for idx in bins[source]:
++                size = sizes[idx]
++                weight = weights[idx]
++                source_pressure = ratio(load[source] - weight, used[source] - size)
++
+                 for target in range(gpu_num):
+-                    if target == source:
++                    if target == source or used[target] + size > GPU_MEM_SIZE + eps:
+                         continue
+-                    if used_mem[target] + sizes[idx] > GPU_MEM_SIZE + eps:
+-                        continue
+-
+-                    trial_mem = used_mem[:]
+-                    trial_weight = gpu_weight[:]
+-                    trial_mem[source] -= sizes[idx]
+-                    trial_weight[source] -= weights[idx]
+-                    trial_mem[target] += sizes[idx]
+-                    trial_weight[target] += weights[idx]
+-                    trial_profile = profile(trial_mem, trial_weight)
+-
+-                    if better(trial_profile, candidate_profile):
+-                        candidate_profile = trial_profile
+-                        best_move = ("move", source, target, idx)
+-
+-        if best_move is not None:
+-            _, source, target, idx = best_move
++
++                    target_pressure = ratio(
++                        load[target] + weight,
++                        used[target] + size,
++                    )
++                    candidate_pressures = pressures[:]
++                    candidate_pressures[source] = source_pressure
++                    candidate_pressures[target] = target_pressure
++                    candidate_profile = make_profile(candidate_pressures)
++
++                    if candidate_profile < best_profile:
++                        best_profile = candidate_profile
++                        best_action = ("move", source, target, idx)
++
++        if best_action is not None:
++            _, source, target, idx = best_action
+             bins[source].remove(idx)
+             bins[target].append(idx)
+-            used_mem[source] -= sizes[idx]
+-            gpu_weight[source] -= weights[idx]
+-            used_mem[target] += sizes[idx]
+-            gpu_weight[target] += weights[idx]
+-            current_profile = candidate_profile
++            used[source] -= sizes[idx]
++            load[source] -= weights[idx]
++            used[target] += sizes[idx]
++            load[target] += weights[idx]
++            pressures[source] = ratio(load[source], used[source])
++            pressures[target] = ratio(load[target], used[target])
++            current_profile = best_profile
+             continue
+ 
+-        # Swaps repair cases where a beneficial relocation needs simultaneous
+-        # memory exchange.  Limiting this for very large model sets keeps the
+-        # algorithm lightweight.
+-        best_swap = None
+-        candidate_profile = current_profile
+         if n <= 160:
+-            for left_gpu in range(gpu_num):
+-                for right_gpu in range(left_gpu + 1, gpu_num):
+-                    for left_idx in bins[left_gpu]:
+-                        for right_idx in bins[right_gpu]:
+-                            left_new_mem = used_mem[left_gpu] - sizes[left_idx] + sizes[right_idx]
+-                            right_new_mem = used_mem[right_gpu] - sizes[right_idx] + sizes[left_idx]
+-
+-                            if (left_new_mem > GPU_MEM_SIZE + eps or
+-                                    right_new_mem > GPU_MEM_SIZE + eps):
++            for left in range(gpu_num):
++                for right in range(left + 1, gpu_num):
++                    for left_idx in bins[left]:
++                        for right_idx in bins[right]:
++                            left_used = used[left] - sizes[left_idx] + sizes[right_idx]
++                            right_used = used[right] - sizes[right_idx] + sizes[left_idx]
++
++                            if (left_used > GPU_MEM_SIZE + eps or
++                                    right_used > GPU_MEM_SIZE + eps):
+                                 continue
+ 
+-                            trial_mem = used_mem[:]
+-                            trial_weight = gpu_weight[:]
+-                            trial_mem[left_gpu] = left_new_mem
+-                            trial_mem[right_gpu] = right_new_mem
+-                            trial_weight[left_gpu] = (
+-                                gpu_weight[left_gpu] - weights[left_idx] + weights[right_idx]
++                            left_load = (
++                                load[left] - weights[left_idx] + weights[right_idx]
+                             )
+-                            trial_weight[right_gpu] = (
+-                                gpu_weight[right_gpu] - weights[right_idx] + weights[left_idx]
++                            right_load = (
++                                load[right] - weights[right_idx] + weights[left_idx]
+                             )
+-                            trial_profile = profile(trial_mem, trial_weight)
+-
+-                            if better(trial_profile, candidate_profile):
+-                                candidate_profile = trial_profile
+-                                best_swap = (
+-                                    left_gpu, right_gpu, left_idx, right_idx
++
++                            candidate_pressures = pressures[:]
++                            candidate_pressures[left] = ratio(left_load, left_used)
++                            candidate_pressures[right] = ratio(right_load, right_used)
++                            candidate_profile = make_profile(candidate_pressures)
++
++                            if candidate_profile < best_profile:
++                                best_profile = candidate_profile
++                                best_action = (
++                                    "swap",
++                                    left,
++                                    right,
++                                    left_idx,
++                                    right_idx,
+                                 )
+ 
+-        if best_swap is None:
++        if best_action is None:
+             break
+ 
+-        left_gpu, right_gpu, left_idx, right_idx = best_swap
+-        bins[left_gpu].remove(left_idx)
+-        bins[right_gpu].remove(right_idx)
+-        bins[left_gpu].append(right_idx)
+-        bins[right_gpu].append(left_idx)
+-
+-        used_mem[left_gpu] += sizes[right_idx] - sizes[left_idx]
+-        used_mem[right_gpu] += sizes[left_idx] - sizes[right_idx]
+-        gpu_weight[left_gpu] += weights[right_idx] - weights[left_idx]
+-        gpu_weight[right_gpu] += weights[left_idx] - weights[right_idx]
+-        current_profile = candidate_profile
++        _, left, right, left_idx, right_idx = best_action
++        bins[left].remove(left_idx)
++        bins[right].remove(right_idx)
++        bins[left].append(right_idx)
++        bins[right].append(left_idx)
++
++        used[left] += sizes[right_idx] - sizes[left_idx]
++        used[right] += sizes[left_idx] - sizes[right_idx]
++        load[left] += weights[right_idx] - weights[left_idx]
++        load[right] += weights[left_idx] - weights[right_idx]
++        pressures[left] = ratio(load[left], used[left])
++        pressures[right] = ratio(load[right], used[right])
++        current_profile = best_profile
+ 
+     return {
+         gpu_id: [model_list[idx] for idx in bins[gpu_id]]
+         for gpu_id in range(gpu_num)
+     }
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ if __name__ == "__main__":
+     # Test the algorithm
+ 
+     from evaluator import generate_test_gpu_models
+     from evaluator import calculate_kvcache_pressure
+     from evaluator import safe_float
+     import numpy as np
+ 
+     test_cases = generate_test_gpu_models()
+     all_kvpr = []
+     for i, (gpu_num, gpu_models) in enumerate(test_cases):
+ 
+         results = compute_model_placement(gpu_num, gpu_models)
+         max_kvpr = calculate_kvcache_pressure(results)
+         all_kvpr.append(safe_float(max_kvpr))
+ 
+     avg_kvpr = np.mean(all_kvpr)
+     if avg_kvpr != 0:
+         avg_kvpr = 1.0 / avg_kvpr
+ 
+ 
+     print(f"Max KVPR: {avg_kvpr:.3f}")

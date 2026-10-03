@@ -1,0 +1,88 @@
+<NAME>
+oriented_slsqp_polish
+</NAME>
+
+<DESCRIPTION>
+Add a deterministic constrained maximin polishing stage after the stochastic search.  In simplex coordinates, signed determinants are normalized triangle areas.  The best simulated-annealing arrangement fixes a locally consistent orientation for every triple; maximizing an epigraph variable subject to those signed determinant constraints lets SLSQP directly equalize the active small-area triangles.  This is substantially more precise than random coordinate perturbations near the optimum, retains the three extremal vertices, and falls back safely to the annealed result if SciPy is unavailable or the polish is not genuinely better.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        if local_best_minimum > best_minimum:
+            best_minimum = local_best_minimum
+            best_points = local_best
+
+    return best_points
+=======
+        if local_best_minimum > best_minimum:
+            best_minimum = local_best_minimum
+            best_points = local_best
+
+    # The annealer is effective at finding the correct combinatorial region,
+    # but its final small random moves are comparatively inaccurate.  Polish
+    # that region directly in reference-simplex coordinates.  A determinant in
+    # (u, v), where x=u+v/2 and y=height*v, is area normalized by the area of
+    # the containing equilateral triangle.
+    try:
+        from scipy.optimize import minimize
+
+        def cartesian_to_simplex(p: np.ndarray) -> np.ndarray:
+            v = p[:, 1] / height
+            return np.column_stack((p[:, 0] - 0.5 * v, v))
+
+        def simplex_determinants(uv: np.ndarray) -> np.ndarray:
+            q = uv[triples]
+            return (
+                (q[:, 1, 0] - q[:, 0, 0]) * (q[:, 2, 1] - q[:, 0, 1])
+                - (q[:, 2, 0] - q[:, 0, 0]) * (q[:, 1, 1] - q[:, 0, 1])
+            )
+
+        start_uv = cartesian_to_simplex(best_points)
+        start_det = simplex_determinants(start_uv)
+        signs = np.sign(start_det)
+        signs[signs == 0.0] = 1.0
+        start_t = float(np.min(np.abs(start_det)))
+
+        # Keep the first three simplex vertices fixed.  Within the orientation
+        # cell found above, these are smooth explicit maximin constraints.
+        def polish_constraints(w: np.ndarray) -> np.ndarray:
+            uv = np.vstack((np.array(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))),
+                            w[:-1].reshape(8, 2)))
+            tail = w[:-1].reshape(8, 2)
+            return np.concatenate((
+                signs * simplex_determinants(uv) - w[-1],
+                tail.ravel(),
+                1.0 - np.sum(tail, axis=1),
+            ))
+
+        polished = minimize(
+            lambda w: -w[-1],
+            np.concatenate((start_uv[3:].ravel(), [start_t])),
+            method="SLSQP",
+            bounds=[(0.0, 1.0)] * 16 + [(0.0, 1.0)],
+            constraints={"type": "ineq", "fun": polish_constraints},
+            options={"maxiter": 2500, "ftol": 1.0e-13, "disp": False},
+        )
+
+        if polished.success:
+            polished_uv = np.vstack((
+                np.array(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))),
+                polished.x[:-1].reshape(8, 2),
+            ))
+            polished_minimum = float(
+                np.min(np.abs(simplex_determinants(polished_uv)))
+            )
+            # Convert normalized determinant back to Cartesian area for the
+            # comparison used by the annealing stage.
+            if polished_minimum * (height * 0.5) > best_minimum + 1.0e-12:
+                best_points = np.column_stack((
+                    polished_uv[:, 0] + 0.5 * polished_uv[:, 1],
+                    height * polished_uv[:, 1],
+                ))
+    except Exception:
+        # The annealed configuration is valid even without optional SciPy.
+        pass
+
+    return best_points
+>>>>>>> REPLACE
+</DIFF>

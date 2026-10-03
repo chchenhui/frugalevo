@@ -1,0 +1,80 @@
+<NAME>
+fix_reversal_damp_flip_elimination</NAME>
+<DESCRIPTION>
+The `_reversal_damp` with `keep=0.25` shrinks sub-threshold sign flips but preserves their sign: `out[k] = out[k-1] + keep*d` still yields a difference opposite to `prev_d`, so a downstream reversal counter still registers a flip. This explains why false_reversals has been pinned at 14.2 across four different suppressor stacks. The fix is true flip elimination: on a detected sub-threshold flip, hold the line (out[k] = out[k-1], keep=0) or average the two conflicting steps, applied in a forward sweep plus a mirrored backward sweep for zero phase. The `prev_d` reference must come from the pre-damp difference (not the post-damp zero difference) to avoid zero-stall — with keep=0 the post-step difference becomes 0, which would kill subsequent flip detection if fed back. We retain the corr >= 0.97 guard with a keep=0.5 retry (partial averaging) if pure elimination trips the guard. The zero-difference steps also slightly reduce slope_changes (fewer direction reversals) without touching the genuine large reversals, improving smoothness and false_reversals at essentially zero cost to lag (flips below threshold are noise-scale, not trend-scale).</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _reversal_damp(y, thresh, keep=0.25):
+    """
+    Suppress sub-noise sign flips in the first difference. Flips whose step
+    magnitude is below `thresh` are damped toward the previous trend (retain
+    only `keep` fraction). Larger (genuine) reversals pass untouched.
+    """
+    n = len(y)
+    if n < 3:
+        return y
+    out = y.copy()
+    prev_d = out[1] - out[0]
+    for k in range(2, n):
+        d = out[k] - out[k - 1]
+        if prev_d * d < 0 and abs(d) < thresh:
+            out[k] = out[k - 1] + keep * d
+        prev_d = out[k] - out[k - 1]
+    return out
+=======
+def _reversal_damp(y, thresh, keep=0.0):
+    """
+    Eliminate sub-noise sign flips in the first difference. On a detected
+    flip (sign change vs. prev step, magnitude below `thresh`), the line is
+    HELD: out[k] = out[k-1] + keep*d with keep=0 gives a zero step, so the
+    output difference sequence truly does not reverse. keep>0 is a softer
+    partial-step fallback (used on guard retry). prev_d is taken from the
+    PRE-damp difference so a zero step does not stall subsequent detection.
+    Forward sweep plus mirrored backward sweep => zero phase.
+    """
+    n = len(y)
+    if n < 3:
+        return y
+    out = y.copy()
+    # Forward sweep
+    prev_d = y[1] - y[0]  # reference from pre-damp differences
+    for k in range(2, n):
+        d = out[k] - out[k - 1]
+        if prev_d * d < 0 and abs(d) < thresh:
+            out[k] = out[k - 1] + keep * d
+        prev_d = out[k] - out[k - 1] if keep > 0 else d
+    # Backward (mirrored) sweep to cancel directional bias
+    prev_d = y[-2] - y[-1]
+    for k in range(n - 3, -1, -1):
+        d = out[k] - out[k + 1]
+        if prev_d * d < 0 and abs(d) < thresh:
+            out[k] = out[k + 1] + keep * d
+        prev_d = out[k] - out[k + 1] if keep > 0 else d
+    return out
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if step_std > 0:
+            y_pre = y.copy()
+            y_try = _reversal_damp(y_pre, 1.5 * step_std, keep=0.25)
+            c = np.corrcoef(y_try, y_pre)[0, 1]
+            if np.isfinite(c) and c >= 0.97:
+                y = y_try
+=======
+        if step_std > 0:
+            y_pre = y.copy()
+            y_try = _reversal_damp(y_pre, 1.5 * step_std, keep=0.0)
+            c = np.corrcoef(y_try, y_pre)[0, 1]
+            if np.isfinite(c) and c >= 0.97:
+                y = y_try
+            else:
+                # Softer retry: partial step retention instead of full hold
+                y_try = _reversal_damp(y_pre, 1.5 * step_std, keep=0.5)
+                c = np.corrcoef(y_try, y_pre)[0, 1]
+                if np.isfinite(c) and c >= 0.97:
+                    y = y_try
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

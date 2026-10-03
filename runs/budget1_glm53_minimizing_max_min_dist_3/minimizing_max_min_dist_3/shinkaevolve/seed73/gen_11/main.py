@@ -1,0 +1,72 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
+
+    Returns
+        points: np.ndarray of shape (14,3) containing the (x,y) coordinates of the 14 points.
+
+    """
+
+    n = 14
+    d = 3
+
+    def score(P):
+        D = np.linalg.norm(P[:, None, :] - P[None, :, :], axis=-1)
+        iu = np.triu_indices(n, 1)
+        dmin = D[iu].min()
+        dmax = D[iu].max()
+        if dmax <= 0:
+            return -1.0, P
+        return (dmin / dmax) ** 2, P
+
+    def relax(P, steps=1200):
+        # Smooth-min (log-sum-exp) surrogate for the minimum pairwise
+        # distance with annealed temperature. Minimizing
+        #   LSE_ij(-d_ij / T)
+        # concentrates the gradient on the closest pairs as T -> 0,
+        # which is exactly maximizing the soft-minimum distance.
+        P = P / np.linalg.norm(P, axis=1, keepdims=True)
+        iu = np.triu_indices(n, 1)
+        for t in range(steps):
+            frac = t / steps
+            T = 0.5 * (0.02 / 0.5) ** frac  # anneal temperature geometrically
+            step = 0.05 * (1.0 - frac) + 1e-4
+            diff = P[:, None, :] - P[None, :, :]
+            dist = np.linalg.norm(diff, axis=-1)
+            w = np.zeros((n, n))
+            dd = dist[iu]
+            # softmax weights over pairs (soft-min of distances)
+            e = np.exp(-(dd - dd.min()) / T)
+            w[iu] = e
+            w = w + w.T  # symmetric pair weights
+            # gradient of LSE wrt points pushes close pairs apart
+            forces = (w[:, :, None] * diff / np.maximum(dist, 1e-12)[:, :, None]).sum(axis=1)
+            P = P + step * forces / n
+            # project onto unit sphere: keeps dmax <= 2 (scale invariance)
+            P = P / np.linalg.norm(P, axis=1, keepdims=True)
+        return P
+
+    best_s, best_P = -1.0, None
+    for seed in range(20):
+        rng = np.random.RandomState(seed)
+        P0 = rng.randn(n, d)
+        # seed 0: cube + antipodal hints (good starting basin)
+        if seed == 0:
+            cube = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], dtype=float)
+            P0 = np.vstack([cube[:7], -cube[:7]])
+        P = relax(P0)
+        s, P = score(P)
+        if s > best_s:
+            best_s, best_P = s, P
+
+    # center and normalize for a clean output
+    best_P = best_P - best_P.mean(axis=0)
+    best_P = best_P / np.abs(best_P).max()
+    return best_P
+
+
+# EVOLVE-BLOCK-END

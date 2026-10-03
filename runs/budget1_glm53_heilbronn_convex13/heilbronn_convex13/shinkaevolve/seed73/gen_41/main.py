@@ -1,0 +1,228 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+_N = 13
+_IDX = np.array(list(combinations(range(_N), 3)))
+_I, _J, _K = _IDX[:, 0], _IDX[:, 1], _IDX[:, 2]
+
+
+def _tri_areas(P):
+    A, B, C = P[_I], P[_J], P[_K]
+    return 0.5 * np.abs((B[:, 0] - A[:, 0]) * (C[:, 1] - A[:, 1])
+                        - (B[:, 1] - A[:, 1]) * (C[:, 0] - A[:, 0]))
+
+
+def _hull_area(P):
+    pts = P[np.lexsort((P[:, 1], P[:, 0]))]
+    if len(pts) < 3:
+        return 1e-12
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = lower[:-1] + upper[:-1]
+    if len(hull) < 3:
+        return 1e-12
+    s = 0.0
+    for i in range(len(hull)):
+        x1, y1 = hull[i]
+        x2, y2 = hull[(i + 1) % len(hull)]
+        s += x1 * y2 - x2 * y1
+    return abs(s) / 2.0
+
+
+def _true_score(P):
+    a = _tri_areas(P)
+    h = _hull_area(P)
+    return a.min() / h if h > 1e-12 else 0.0
+
+
+def _soft_score(P, p_sharp=60.0):
+    """Smooth surrogate: LogSumExp-softmin of triangle areas / hull area."""
+    a = _tri_areas(P)
+    h = _hull_area(P)
+    if h <= 1e-12:
+        return 0.0
+    m = a.min()
+    soft = m + np.log(np.exp(-p_sharp * (a - m)).mean()) / p_sharp
+    # blend: emphasize soft-min but weight true min too
+    return (0.7 * m + 0.3 * soft) / h
+
+
+def _seed_pool(rng):
+    """Diverse, boundary-heavy seeds (26-dim flattened)."""
+    seeds = []
+    # 1) All 13 on unit circle at equal angles (boundary-dominant classic)
+    t = np.linspace(0, 2 * np.pi, _N, endpoint=False)
+    seeds.append(np.column_stack([np.cos(t), np.sin(t)]).ravel())
+    # 2) 13 on ellipse variants
+    for ecc in (0.8, 1.0, 1.2):
+        e = np.column_stack([ecc * np.cos(t), np.sin(t)])
+        seeds.append(e.ravel())
+    # 3) 12 on circle + center
+    t12 = np.linspace(0, 2 * np.pi, 12, endpoint=False)
+    c12 = np.column_stack([np.cos(t12), np.sin(t12)])
+    seeds.append(np.vstack([c12, [[0.0, 0.0]]]).ravel())
+    # 4) triangle boundary: 3 corners + points along edges
+    for inner in (0.0, 0.15, 0.3):
+        tri = np.array([[1.1, 0.0], [-0.55, 0.95], [-0.55, -0.95]])
+        pts = [tri[0], tri[1], tri[2]]
+        for e in range(3):
+            a, b = tri[e], tri[(e + 1) % 3]
+            for f in np.linspace(0.2, 0.8, 3):
+                pts.append(a + f * (b - a))
+        pts.append([inner, 0.0])
+        pts.append([0.4 * inner, -0.5 * inner])
+        seeds.append(np.array(pts[:_N]).ravel())
+    # 5) two rings: 7 outer + 6 inner (rotated)
+    t7 = np.linspace(0, 2 * np.pi, 7, endpoint=False)
+    t6 = np.linspace(0, 2 * np.pi, 6, endpoint=False) + np.pi / 6
+    for r_in in (0.45, 0.55, 0.65):
+        s = np.vstack([np.column_stack([np.cos(t7), np.sin(t7)]),
+                       r_in * np.column_stack([np.cos(t6), np.sin(t6)])])
+        seeds.append(s.ravel())
+    # 6) hexagonal patch: 6 outer + 6 mid + center
+    for r2 in (0.5, 0.6, 0.7):
+        pts = [[0.0, 0.0]]
+        for k in range(6):
+            a = np.pi / 3 * k
+            pts.append([np.cos(a), np.sin(a)])
+            pts.append([r2 * np.cos(a + np.pi / 6), r2 * np.sin(a + np.pi / 6)])
+        seeds.append(np.array(pts).ravel())
+    # 7) random in disk
+    for _ in range(20):
+        r = rng.uniform(0.05, 1.0, _N)
+        a = rng.uniform(0, 2 * np.pi, _N)
+        seeds.append(np.column_stack([r * np.cos(a), r * np.sin(a)]).ravel())
+    # 8) random on/near boundary (biased to hull)
+    for _ in range(20):
+        a = np.sort(rng.uniform(0, 2 * np.pi, _N))
+        rr = rng.uniform(0.7, 1.0, _N)
+        seeds.append(np.column_stack([rr * np.cos(a), rr * np.sin(a)]).ravel())
+    return np.array(seeds)
+
+
+def _polish(P, rounds=30, step0=0.03):
+    """Exact hard-min coordinate descent on the TRUE objective."""
+    P = P.copy()
+    best = _true_score(P)
+    step = step0
+    for _ in range(rounds):
+        improved = False
+        for i in range(_N):
+            for ax in (0, 1):
+                for d in (+1, -1):
+                    for st in (step, 0.5 * step, 0.25 * step):
+                        Q = P.copy()
+                        Q[i, ax] += d * st
+                        sc = _true_score(Q)
+                        if sc > best + 1e-14:
+                            best = sc
+                            P = Q
+                            improved = True
+        if not improved:
+            step *= 0.5
+            if step < 1e-4:
+                break
+    return P
+
+
+def heilbronn_convex13() -> np.ndarray:
+    rng = np.random.default_rng(seed=20250113)
+    n_dim = 2 * _N
+
+    seeds = _seed_pool(rng)
+    pop_size = max(len(seeds), 48)
+    # population: seeds + random fill
+    pop = np.zeros((pop_size, n_dim))
+    pop[:len(seeds)] = seeds
+    i = len(seeds)
+    while i < pop_size:
+        r = rng.uniform(0.1, 1.0, _N)
+        a = rng.uniform(0, 2 * np.pi, _N)
+        pop[i] = np.column_stack([r * np.cos(a), r * np.sin(a)]).ravel()
+        i += 1
+
+    fit = np.array([_soft_score(p.reshape(_N, 2)) for p in pop])
+
+    # --- Differential Evolution (best/1/bin with jitter), deterministic ---
+    F, CR = 0.6, 0.9
+    generations = 120
+    for gen in range(generations):
+        sharp = 40.0 + 2.0 * gen  # anneal soft-min sharpness
+        for t in range(pop_size):
+            idxs = [x for x in range(pop_size) if x != t]
+            a, b, c = rng.choice(idxs, 3, replace=False)
+            best_i = int(np.argmax(fit))
+            mutant = pop[best_i] + F * (pop[a] - pop[b]) + 0.15 * F * (pop[c] - pop[t])
+            cross = rng.random(n_dim) < CR
+            if not cross.any():
+                cross[rng.integers(0, n_dim)] = True
+            trial = np.where(cross, mutant, pop[t])
+            # keep points in a reasonable disk
+            T = trial.reshape(_N, 2)
+            r = np.linalg.norm(T, axis=1)
+            T = T / np.maximum(r, 1e-9)[:, None] * np.minimum(r, 1.3)[:, None]
+            trial = T.ravel()
+            f = _soft_score(T, sharp)
+            if f > fit[t] + 1e-15:
+                pop[t] = trial
+                fit[t] = f
+
+    # --- take top candidates, exact polish on true objective ---
+    order = np.argsort(-fit)
+    best_P, best_ts = None, -1.0
+    for ci in order[:8]:
+        P0 = pop[ci].reshape(_N, 2)
+        try:
+            P1 = _polish(P0, rounds=22, step0=0.02)
+            ts = _true_score(P1)
+            if ts > best_ts:
+                best_ts, best_P = ts, P1.copy()
+            # secondary: re-polish with finer start
+            P2 = _polish(P1, rounds=14, step0=0.004)
+            ts2 = _true_score(P2)
+            if ts2 > best_ts:
+                best_ts, best_P = ts2, P2.copy()
+        except Exception:
+            continue
+
+    # --- deterministic basin hopping around the best ---
+    if best_P is not None:
+        for k in range(5):
+            try:
+                amp = 0.015 * (k + 1)
+                pert = amp * np.sin(np.arange(1, _N + 1)[:, None]
+                                    * np.array([1.3, 2.1])[None, :]
+                                    + 0.7 * k)
+                Q = _polish(best_P + pert, rounds=14, step0=0.01)
+                ts = _true_score(Q)
+                if ts > best_ts:
+                    best_ts, best_P = ts, Q.copy()
+            except Exception:
+                continue
+
+    if best_P is None:
+        t = np.linspace(0, 2 * np.pi, _N, endpoint=False)
+        best_P = np.column_stack([np.cos(t), np.sin(t)])
+
+    # numerical safety: no duplicates
+    for i in range(_N):
+        for j in range(i + 1, _N):
+            if np.linalg.norm(best_P[i] - best_P[j]) < 1e-9:
+                best_P[j, 0] += 1e-6 * (j + 1)
+    return best_P
+
+
+# EVOLVE-BLOCK-END

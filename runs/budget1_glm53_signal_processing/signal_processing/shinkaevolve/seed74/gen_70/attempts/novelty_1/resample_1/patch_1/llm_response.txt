@@ -1,0 +1,78 @@
+<NAME>
+zero_phase_curvature_clamp</NAME>
+<DESCRIPTION>
+The existing pipeline smooths but cannot prevent *alternating* small oscillations whose per-step displacement stays within velocity bounds — these residual slope reversals are the dominant source of the 15.2 slope changes and 11.8 false reversals. A zero-phase curvature clamp directly bounds the second difference |y[k+1] − 2y[k] + y[k−1]| ≤ c·(robust d2 scale of the current output). Because the clamp modifies each point based on both neighbors, a single forward sweep is asymmetric; performing a forward sweep followed by a backward sweep cancels the phase shift (mirroring the existing `_bilateral_one_pole` pattern). To guard against over-smoothing genuine dynamics, we compute the clamped result, check correlation with the unclamped signal, and if corr < 0.97 retry with doubled slack (same retry pattern described for the velocity clamp). The clamp operates on the smoothed output's own robust curvature scale, so it adapts to the local signal amplitude and adds no lag when inactive (limit rarely binds on already-smooth regions). Applying it after the ripple damper and before the output slice keeps the output contract intact.
+</DIFF>
+<<<<<<< SEARCH
+    if alpha < 0.999:
+        y = _bilateral_one_pole(y, alpha)
+
+    # ---------- Slice to output contract ----------
+=======
+    if alpha < 0.999:
+        y = _bilateral_one_pole(y, alpha)
+
+    # ---------- Guarded zero-phase curvature clamp ----------
+    # Bounds second differences to kill alternating oscillations that
+    # survive displacement-level smoothing; forward+backward sweeps keep
+    # it zero-phase, and the corr >= 0.97 retry guards genuine dynamics.
+    y = _curvature_clamp(y)
+
+    # ---------- Slice to output contract ----------
+>>>>>>> REPLACE
+
+<DIFF>
+<<<<<<< SEARCH
+def _bilateral_one_pole(x, alpha):
+=======
+def _curvature_clamp(y, c=1.5, max_retry=4):
+    """Zero-phase clamp on second differences (oscillation killer).
+
+    Limits |y[k+1] - 2 y[k] + y[k-1]| to slack * s2 where s2 is the
+    robust (MAD) second-difference scale of the current signal. A
+    forward sweep followed by a backward sweep makes the operation
+    zero-phase. If the clamped result deviates too much from the input
+    (corr < 0.97), slack is doubled and the clamp retried.
+    """
+    y = np.asarray(y, dtype=float)
+    n = y.size
+    if n < 3:
+        return y.copy()
+    d2 = y[2:] - 2.0 * y[1:-1] + y[:-2]
+    s2 = _mad(d2)
+    if not np.isfinite(s2) or s2 <= 0:
+        return y.copy()
+    y0 = y
+    slack = c
+    for _ in range(max_retry):
+        limit = slack * s2
+        # Forward sweep.
+        out = y0.copy()
+        for k in range(1, n - 1):
+            cur = out[k + 1] - 2.0 * out[k] + out[k - 1]
+            if abs(cur) > limit:
+                # Move the midpoint to satisfy the curvature bound.
+                out[k] = out[k + 1] + out[k - 1] - cur
+                out[k] = out[k + 1] + out[k - 1] - np.sign(cur) * limit
+                out[k] = 0.5 * (out[k + 1] + out[k - 1] - np.sign(cur) * limit)
+        # Backward sweep (mirrors the forward pass -> zero phase).
+        rev = out[::-1].copy()
+        for k in range(1, n - 1):
+            cur = rev[k + 1] - 2.0 * rev[k] + rev[k - 1]
+            if abs(cur) > limit:
+                rev[k] = 0.5 * (rev[k + 1] + rev[k - 1] - np.sign(cur) * limit)
+        out = rev[::-1]
+        # Guard: ensure we haven't distorted genuine dynamics.
+        a = out - np.mean(out)
+        b = y0 - np.mean(y0)
+        denom = np.sqrt((a @ a) * (b @ b))
+        corr = float(a @ b / denom) if denom > 0 else 1.0
+        if corr >= 0.97:
+            return out
+        slack *= 2.0
+    return y0
+
+
+def _bilateral_one_pole(x, alpha):
+>>>>>>> REPLACE
+</DIFF>

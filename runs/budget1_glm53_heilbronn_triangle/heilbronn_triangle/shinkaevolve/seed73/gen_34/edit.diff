@@ -1,0 +1,260 @@
+--- a/original.py
++++ b/original.py
+@@ -1,210 +1,257 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ H = np.sqrt(3.0) / 2.0
+ SQ3 = np.sqrt(3.0)
+ 
+ 
+ def _all_triple_indices(n):
+     idx = [(i, j, k) for i in range(n) for j in range(i + 1, n) for k in range(j + 1, n)]
+     return np.array(idx).T  # shape (3, C(n,3))
+ 
+ 
+ def _all_areas(pts, trip):
+     ax, ay = pts[trip[0, :], 0], pts[trip[0, :], 1]
+     bx, by = pts[trip[1, :], 0], pts[trip[1, :], 1]
+     cx, cy = pts[trip[2, :], 0], pts[trip[2, :], 1]
+     return 0.5 * np.abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay))
+ 
+ 
+ def _min_area(pts, trip):
+     areas = _all_areas(pts, trip)
+     k = int(np.argmin(areas))
+     return areas[k], k
+ 
+ 
+ def _project_inside(pts):
+     x, y = pts[:, 0], pts[:, 1]
+     w1 = x - y / SQ3
+     w2 = 2.0 * y / SQ3
+     w0 = 1.0 - w1 - w2
+     w = np.stack([w0, w1, w2], axis=1)
+     w = np.clip(w, 0.0, None)
+     s = w.sum(axis=1, keepdims=True)
+     s[s == 0] = 1.0
+     w = w / s
+     out = np.empty_like(pts)
+     out[:, 0] = w[:, 1] + 0.5 * w[:, 2]
+     out[:, 1] = H * w[:, 2]
+     return out
+ 
+ 
+ def _soft_objective(areas, frac=0.15, temp=200.0):
+     k = max(3, int(len(areas) * frac))
+     smallest = np.partition(areas, k - 1)[:k]
+     return -np.log(np.mean(np.exp(-smallest * temp)) + 1e-300) / temp
+ 
+ 
+ def _lattice_seed():
+     pts = []
+     rows = [4, 3, 2, 1, 1]
+     nlev = len(rows)
+     for r, cnt in enumerate(rows):
+         y = H * (r + 0.5) / nlev
+         xs = np.linspace(0.0, 1.0, cnt + 2)[1:-1]
+         halfw = 0.5 * (1.0 - y / H)
+         for x in xs:
+             pts.append((0.5 + (x - 0.5) * (2 * halfw) * 0.98, y))
+     return _project_inside(np.array(pts))
+ 
+ 
+ def _rings_seed():
+     # points on concentric scaled triangles + center
+     pts = [(0.5, H / 3.0)]  # centroid
+     for s in (1.0, 0.66, 0.33):
+         for t in np.linspace(0.0, 1.0, 4 if s == 1.0 else 3, endpoint=False)[1:] if False else []:
+             pass
+     # build manually: outer vertices + edge midpoints, mid ring, inner ring
+     out = [(0.0, 0.0), (1.0, 0.0), (0.5, H),
+            (0.5, 0.0), (0.25, H / 2.0), (0.75, H / 2.0)]
+     cx, cy = 0.5, H / 3.0
+     for s in (0.5,):
+         for (vx, vy) in [(0.0, 0.0), (1.0, 0.0), (0.5, H)]:
+             out.append((cx + s * (vx - cx), cy + s * (vy - cy)))
+     for s in (0.25,):
+         for (vx, vy) in [(0.0, 0.0), (1.0, 0.0), (0.5, H)]:
+             out.append((cx + s * (vx - cx), cy + s * (vy - cy)))
+     out.append((cx, cy))
+     return _project_inside(np.array(out[:11]))
+ 
+ 
+ def _hex_perturb_seed(seed=777):
+     rng = np.random.default_rng(seed)
+     # triangular lattice rows 5+4+2 pattern with jitter
+     pts = []
+     rows = [5, 4, 2]
+     nlev = len(rows)
+     for r, cnt in enumerate(rows):
+         y = H * (r + 0.5) / nlev
+         xs = np.linspace(0.0, 1.0, cnt + 2)[1:-1]
+         halfw = 0.5 * (1.0 - y / H) * 0.95
+         for x in xs:
+             px = 0.5 + (x - 0.5) * 2 * halfw + rng.normal(0, 0.02)
+             py = y + rng.normal(0, 0.02)
+             pts.append((px, py))
+     return _project_inside(np.array(pts))
+ 
+ 
+ def _random_start(rng):
+     u, v = rng.random(11), rng.random(11)
+     su = np.sqrt(u)
+     w0, w1, w2 = 1 - su, su * (1 - v), su * v
+     return _project_inside(np.stack([w1 + 0.5 * w2, H * w2], axis=1))
+ 
+ 
+ def _soft_search(pts, trip, step, iters, rng):
+     pts = _project_inside(pts.copy())
+     best = _soft_objective(_all_areas(pts, trip))
+     n = len(pts)
+     NC = 8  # candidates per coordinate probe
+     for it in range(iters):
+         improved = False
+         for i in range(n):
+             for d in range(2):
+                 base = pts[i, d]
+                 deltas = rng.normal(0.0, step, size=(NC, 1))
+                 cands = np.repeat(pts[None, :, :], NC, axis=0).copy()
+                 cands[:, i, d] = base + deltas[:, 0]
+                 cands = _project_inside(cands.reshape(-1, 2)).reshape(NC, n, 2)
+                 vals = np.array([_soft_objective(_all_areas(c, trip)) for c in cands])
+                 k = int(np.argmax(vals))
+                 if vals[k] > best + 1e-13:
+                     pts = cands[k]
+                     best = vals[k]
+                     improved = True
+         if not improved:
+             step *= 0.5
+             if step < 1e-6:
+                 break
+     return pts
+ 
+ 
+ def _hard_refine(pts, trip, step, rounds, rng):
+     pts = _project_inside(pts.copy())
+     best, kmin = _min_area(pts, trip)
+     n = len(pts)
+     for r in range(rounds):
+         improved = False
+         tri = trip[:, kmin]
+         order = list(tri) + [i for i in range(n) if i not in tri]
+         for i in order:
+             for d in range(2):
+                 for s in (+1, -1):
+                     cand = pts.copy()
+                     cand[i, d] += s * step
+                     cand = _project_inside(cand)
+                     val, _ = _min_area(cand, trip)
+                     if val > best + 1e-13:
+                         pts, best = cand, val
+                         improved = True
+         # targeted stochastic kicks on binding points
+         for t in range(25):
+             if rng.random() < 0.7:
+                 i = int(tri[rng.integers(0, 3)])
+             else:
+                 i = int(rng.integers(0, n))
+             cand = pts.copy()
+             cand[i] += rng.normal(0.0, step, size=2)
+             cand = _project_inside(cand)
+             val, _ = _min_area(cand, trip)
+             if val > best + 1e-13:
+                 pts, best = cand, val
+                 improved = True
+         _, kmin = _min_area(pts, trip)
+         if not improved:
+             step *= 0.5
+             if step < 1e-7:
+                 break
+     return pts
+ 
+ 
++def _vertex_binding_scores(pts, trip, k=20):
++    """Mean of the k smallest triangle areas containing each vertex.
++    Low score = vertex participates in many near-minimal (binding) triangles."""
++    areas = _all_areas(pts, trip)
++    n = len(pts)
++    scores = np.zeros(n)
++    for i in range(n):
++        mask = (trip[0, :] == i) | (trip[1, :] == i) | (trip[2, :] == i)
++        a = areas[mask]
++        kk = min(k, len(a))
++        scores[i] = np.mean(np.partition(a, kk - 1)[:kk])
++    return scores
++
++
++def _pair_exchange(pts, trip, rng, attempts=40):
++    """Structured escape: swap a binding vertex (from the smallest triangle)
++    with a non-binding vertex, then short hard polish. Keep only improvements."""
++    pts = _project_inside(pts.copy())
++    best_val, _ = _min_area(pts, trip)
++    n = len(pts)
++    for _ in range(attempts):
++        _, kmin = _min_area(pts, trip)
++        tri = trip[:, kmin]
++        scores = _vertex_binding_scores(pts, trip)
++        # binding vertex: smallest score among minimal-triangle vertices
++        bi = min(tri, key=lambda v: scores[v])
++        # non-binding candidates: top-scoring vertices not in tri
++        cand = [i for i in range(n) if i not in tri]
++        cand.sort(key=lambda v: -scores[v])
++        ni = cand[rng.integers(0, min(5, len(cand)))]
++        sw = pts.copy()
++        sw[bi], sw[ni] = sw[ni].copy(), sw[bi].copy()
++        # small displacement of the moved point to break symmetry
++        sw[bi] = sw[bi] + rng.normal(0.0, 0.01, size=2)
++        sw = _project_inside(sw)
++        sw = _hard_refine(sw, trip, 0.01, 20, rng)
++        val, _ = _min_area(sw, trip)
++        if val > best_val + 1e-12:
++            pts, best_val = sw, val
++    return pts
++
++
+ def _optimize():
+     trip = _all_triple_indices(11)
+     rng = np.random.default_rng(20240517)
+     starts = [_lattice_seed(), _rings_seed(), _hex_perturb_seed(777),
+               _hex_perturb_seed(4242)]
+     starts.append(_random_start(rng))
+     starts.append(_random_start(rng))
+     starts.append(_random_start(rng))
+     best_pts, best_val = None, -1.0
+     for s in starts:
+         cand = _soft_search(s, trip, 0.02, 40, rng)
+         cand = _hard_refine(cand, trip, 0.005, 50, rng)
+         val, _ = _min_area(cand, trip)
+         if val > best_val:
+             best_pts, best_val = cand, val
+     # extra polish pass on the winner
+     cand = _hard_refine(best_pts, trip, 0.002, 40, rng)
+     val, _ = _min_area(cand, trip)
+     if val > best_val:
+         best_pts, best_val = cand, val
++    # structured pair-exchange escape from the local basin
++    cand = _pair_exchange(best_pts, trip, rng)
++    val, _ = _min_area(cand, trip)
++    if val > best_val:
++        best_pts, best_val = cand, val
+     return _project_inside(best_pts)
+ 
+ 
+ try:
+     _POINTS = _optimize()
+ except Exception:
+     _POINTS = _lattice_seed()
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+     Construct an arrangement of n points on or inside a convex region in order to maximize the area of the
+     smallest triangle formed by these points. Here n = 11.
+ 
+     Returns:
+         points: np.ndarray of shape (11,2) with the x,y coordinates of the points.
+     """
+     return _POINTS.copy()
+ 
+ # EVOLVE-BLOCK-END

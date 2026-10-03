@@ -1,0 +1,203 @@
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a memory-feasible placement minimizing the maximum KVPR.
+    """
+
+    def weight(model):
+        return model.req_rate / model.slo
+
+    def intrinsic_pressure(model):
+        remaining = GPU_MEM_SIZE - model.model_size
+        return float("inf") if remaining <= 0 else weight(model) / remaining
+
+    # Large models with high request pressure are the hardest to place safely.
+    sorted_models = sorted(models, key=intrinsic_pressure, reverse=True)
+    placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+    remaining = [GPU_MEM_SIZE for _ in range(gpu_num)]
+    load = [0.0 for _ in range(gpu_num)]
+
+    def ratio(gpu_id):
+        if remaining[gpu_id] <= 0:
+            return float("inf") if load[gpu_id] else 0.0
+        return load[gpu_id] / remaining[gpu_id]
+
+    for model in sorted_models:
+        model_weight = weight(model)
+        best_gpu = None
+        best_score = None
+
+        for gpu_id in range(gpu_num):
+            if model.model_size > remaining[gpu_id]:
+                continue
+
+            new_remaining = remaining[gpu_id] - model.model_size
+            new_ratio = (
+                float("inf") if new_remaining <= 0
+                else (load[gpu_id] + model_weight) / new_remaining
+            )
+            score = max(
+                new_ratio,
+                max((ratio(other) for other in range(gpu_num) if other != gpu_id),
+                    default=0.0),
+            )
+            candidate = (score, new_ratio, -new_remaining)
+            if best_score is None or candidate < best_score:
+                best_score = candidate
+                best_gpu = gpu_id
+
+        if best_gpu is None:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on any GPU. "
+                f"Remaining per-GPU memory: {remaining}"
+            )
+
+        placement[best_gpu].append(model)
+        load[best_gpu] += model_weight
+        remaining[best_gpu] -= model.model_size
+
+    # Relocate a model whenever it lowers the actual global bottleneck KVPR.
+    while True:
+        current_max = max(ratio(gpu_id) for gpu_id in range(gpu_num))
+        best_move = None
+        best_max = current_max
+
+        for source in range(gpu_num):
+            if ratio(source) < current_max:
+                continue
+            for model in placement[source]:
+                model_weight = weight(model)
+                for target in range(gpu_num):
+                    if target == source or model.model_size > remaining[target]:
+                        continue
+
+                    source_remaining = remaining[source] + model.model_size
+                    target_remaining = remaining[target] - model.model_size
+                    source_ratio = (load[source] - model_weight) / source_remaining
+                    target_ratio = (
+                        float("inf") if target_remaining <= 0
+                        else (load[target] + model_weight) / target_remaining
+                    )
+                    candidate_max = max(
+                        source_ratio,
+                        target_ratio,
+                        max(
+                            (ratio(gpu_id) for gpu_id in range(gpu_num)
+                             if gpu_id != source and gpu_id != target),
+                            default=0.0,
+                        ),
+                    )
+                    if candidate_max < best_max:
+                        best_max = candidate_max
+                        best_move = (source, target, model, model_weight)
+
+        if best_move is None:
+            break
+
+        source, target, model, model_weight = best_move
+        placement[source].remove(model)
+        placement[target].append(model)
+        remaining[source] += model.model_size
+        remaining[target] -= model.model_size
+        load[source] -= model_weight
+        load[target] += model_weight
+
+    # A beneficial relocation can be blocked by memory fragmentation.  Exchange
+    # one model from a bottleneck GPU with another GPU to escape such optima.
+    while True:
+        current_max = max(ratio(gpu_id) for gpu_id in range(gpu_num))
+        best_swap = None
+        best_max = current_max
+
+        for source in range(gpu_num):
+            if ratio(source) < current_max:
+                continue
+            for source_model in placement[source]:
+                source_weight = weight(source_model)
+                for target in range(gpu_num):
+                    if target == source:
+                        continue
+                    for target_model in placement[target]:
+                        target_weight = weight(target_model)
+                        source_remaining = (
+                            remaining[source] + source_model.model_size
+                            - target_model.model_size
+                        )
+                        target_remaining = (
+                            remaining[target] + target_model.model_size
+                            - source_model.model_size
+                        )
+                        if source_remaining < 0 or target_remaining < 0:
+                            continue
+
+                        source_load = load[source] - source_weight + target_weight
+                        target_load = load[target] - target_weight + source_weight
+                        source_ratio = (
+                            source_load / source_remaining
+                            if source_remaining > 0
+                            else (float("inf") if source_load else 0.0)
+                        )
+                        target_ratio = (
+                            target_load / target_remaining
+                            if target_remaining > 0
+                            else (float("inf") if target_load else 0.0)
+                        )
+                        candidate_max = max(
+                            source_ratio,
+                            target_ratio,
+                            max(
+                                (ratio(gpu_id) for gpu_id in range(gpu_num)
+                                 if gpu_id != source and gpu_id != target),
+                                default=0.0,
+                            ),
+                        )
+                        if candidate_max < best_max - 1e-12:
+                            best_max = candidate_max
+                            best_swap = (
+                                source, target, source_model, target_model,
+                                source_weight, target_weight,
+                            )
+
+        if best_swap is None:
+            break
+
+        source, target, source_model, target_model, source_weight, target_weight = best_swap
+        placement[source].remove(source_model)
+        placement[target].remove(target_model)
+        placement[source].append(target_model)
+        placement[target].append(source_model)
+        remaining[source] += source_model.model_size - target_model.model_size
+        remaining[target] += target_model.model_size - source_model.model_size
+        load[source] += target_weight - source_weight
+        load[target] += source_weight - target_weight
+
+    return placement
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

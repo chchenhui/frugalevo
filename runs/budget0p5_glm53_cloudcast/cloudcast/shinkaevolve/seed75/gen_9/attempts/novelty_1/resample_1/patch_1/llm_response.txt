@@ -1,0 +1,94 @@
+<NAME>
+steiner_bcast_router</NAME>
+<DESCRIPTION>
+Restructured into a layered pipeline: (1) a RouteIndex that computes single-source Dijkstra once (instead of per-destination), (2) a SharedPrefixCache that reuses overlapping path segments to avoid redundant transfers, and (3) a partition splitter that assigns edge-disjoint/diverse paths per partition to balance load across networks. This reduces total cost by spreading partitions over parallel low-cost routes while sharing common prefixes, and improves maintainability through clear separation of concerns.</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+
+
+# ---------- Layer 1: Route Index ----------
+class RouteIndex:
+    """Computes single-source shortest paths once, reused for all destinations."""
+
+    def __init__(self, G: nx.DiGraph, src: str):
+        self.G = G
+        self.src = src
+        h = G.copy()
+        h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+        self.dist, self.pred = nx.dijkstra_predecessor_and_distance(h, src, weight="cost")
+        self._cache: Dict[str, List[str]] = {}
+
+    def cheapest_path(self, dst: str) -> List[str]:
+        if dst in self._cache:
+            return self._cache[dst]
+        if dst == self.src:
+            return [self.src]
+        if dst not in self.pred or not self.pred[dst]:
+            raise nx.NetworkXNoPath(f"No path from {self.src} to {dst}")
+        node = dst
+        path = [dst]
+        while node != self.src:
+            node = self.pred[node][0]
+            path.append(node)
+        path.reverse()
+        self._cache[dst] = path
+        return path
+
+    def diverse_path(self, dst: str, used_edges: set) -> List[str]:
+        """Find a path avoiding (as much as possible) already-used edges."""
+        h = self.G.copy()
+        h.remove_edges_from(list(h.in_edges(self.src)) + list(nx.selfloop_edges(h)))
+        to_remove = [e for e in h.edges() if e in used_edges]
+        h.remove_edges_from(to_remove)
+        try:
+            return nx.dijkstra_path(h, self.src, dst, weight="cost")
+        except nx.NetworkXNoPath:
+            # fallback: cheapest path ignoring diversity
+            return self.cheapest_path(dst)
+
+
+# ---------- Layer 2: Shared Prefix Cache ----------
+class SharedPrefixCache:
+    """Tracks already-delivered (node, partition) pairs so shared prefixes
+    are not re-transferred redundantly."""
+
+    def __init__(self):
+        self.delivered: set = set()
+
+    def needs_transfer(self, s: str, t: str, partition: int) -> bool:
+        return (s, t, partition) not in self.delivered
+
+    def mark_transferred(self, s: str, t: str, partition: int):
+        self.delivered.add((s, t, partition))
+
+
+# ---------- Layer 3: Broadcast Planner ----------
+class BroadcastPlanner:
+    def __init__(self, src, dsts, G, num_partitions):
+        self.src = src
+        self.dsts = list(dsts)
+        self.num_partitions = num_partitions
+        self.index = RouteIndex(G, src)
+        self.prefix_cache = SharedPrefixCache()
+        self.topology = BroadCastTopology(src, self.dsts, num_partitions)
+        self.edge_usage: Dict[tuple, int] = {}
+
+    def plan(self) -> "BroadCastTopology":
+        # Order destinations by cheapest-path cost so common prefixes are
+        # established early and reused by later destinations.
+        ordered = sorted(self.dsts, key=lambda d: self.index.dist.get(d, float("inf")))
+        base_path = self.index.cheapest_path(self.src, ordered[0]) if ordered else None
+
+        for dst in ordered:
+            for p in range(self.num_partitions):
+                if base_path is not None and self._shared_prefix_ok(base_path, dst, p):
+                    path = base_path
+                else:
+                    # diversify across partitions to balance network load
+                    used = {e for e in self.edge_usage if self.edge_usage[e] >= 1}

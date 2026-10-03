@@ -1,0 +1,293 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+try:
+    from scipy.optimize import minimize
+    HAVE_SCIPY = True
+except Exception:
+    HAVE_SCIPY = False
+
+
+def _iu(n):
+    return np.triu_indices(n, 1)
+
+
+def _ratio_sq(pts):
+    """Exact (dmin / dmax)^2."""
+    diff = pts[:, None, :] - pts[None, :, :]
+    d = np.sqrt(np.sum(diff * diff, axis=-1))
+    dv = d[_iu(len(pts))]
+    dx = dv.max()
+    if dx <= 0:
+        return 0.0
+    return (dv.min() / dx) ** 2
+
+
+def _recentre(pts):
+    """Center at centroid and scale so dmax = 1 (keeps squared dists in (0,1])."""
+    pts = pts - pts.mean(axis=0)
+    diff = pts[:, None, :] - pts[None, :, :]
+    d = np.sqrt(np.sum(diff * diff, axis=-1))
+    mx = d[_iu(len(pts))].max()
+    if mx > 0:
+        pts = pts / mx
+    return pts
+
+
+def _moment_grad(flat, n, q, ij):
+    """Value and analytic gradient of the scale-invariant moment product
+    f = log(sum s^q) + log(sum s^{-q}) over squared pair distances s.
+    Annealing q upward sharpens this toward -log(dmin^2/dmax^2)."""
+    pts = flat.reshape(n, 3)
+    diff = pts[:, None, :] - pts[None, :, :]
+    D2 = np.sum(diff * diff, axis=-1)
+    i, j = ij
+    s = D2[i, j] + 1e-12
+    ls = np.log(s)
+    # log-sum-exp in log-space (overflow/underflow safe)
+    la = q * ls
+    amax = la.max()
+    lse_a = amax + np.log(np.sum(np.exp(la - amax)))
+    lb = -q * ls
+    bmax = lb.max()
+    lse_b = bmax + np.log(np.sum(np.exp(lb - bmax)))
+    wa = np.exp(la - lse_a)          # normalized weights, sum(wa)=1
+    wb = np.exp(lb - lse_b)
+    # df/ds_k = q/s_k * (wa_k - wb_k)
+    gs = (q / s) * (wa - wb)
+    contrib = (2.0 * gs)[:, None] * diff[i, j]
+    grad = np.zeros((n, 3))
+    np.add.at(grad, i, contrib)
+    np.add.at(grad, j, -contrib)
+    return lse_a + lse_b, grad.ravel()
+
+
+def _exact_ratio_grad(flat, n):
+    """Value and analytic gradient of -(dmin/dmax)^2 (nonsmooth, for polish)."""
+    pts = flat.reshape(n, 3)
+    diff = pts[:, None, :] - pts[None, :, :]
+    d = np.sqrt(np.sum(diff * diff, axis=-1) + 1e-12)
+    i, j = _iu(n)
+    dv = d[i, j]
+    im = int(np.argmin(dv))
+    iM = int(np.argmax(dv))
+    dmin = dv[im]
+    dmax = max(dv[iM], 1e-12)
+    r = dmin / dmax
+    grad = np.zeros((n, 3))
+
+    def add_pair(k, coef):
+        a, b = i[k], j[k]
+        u = (pts[a] - pts[b]) / dv[k]
+        grad[a] += coef * u
+        grad[b] -= coef * u
+
+    add_pair(im, 2.0 * r / dmax)
+    add_pair(iM, -2.0 * r * dmin / (dmax ** 2))
+    return -r * r, grad.ravel()
+
+
+def _repulse(pts, iters=100, lr=0.05):
+    """Coulomb-like spreading (gradient descent on sum 1/|pi-pj|^2),
+    used only to turn random seeds into quasi-uniform starting shapes."""
+    n = len(pts)
+    for _ in range(iters):
+        diff = pts[:, None, :] - pts[None, :, :]
+        d2 = np.sum(diff * diff, axis=-1) + 1e-9
+        np.fill_diagonal(d2, np.inf)
+        inv = 1.0 / d2
+        np.fill_diagonal(inv, 0.0)
+        # descent on U = sum 1/s: p_i <- p_i + 2*sum_j (p_i - p_j)/s^2
+        push = 2.0 * np.einsum('ij,ijk->ik', inv, diff)
+        pts = pts + lr * push / n
+        pts = _recentre(pts)
+    return pts
+
+
+def _epigraph_refine(pts):
+    """Exact epigraph stage: maximize t s.t. t <= |xi-xj|^2 <= 1 for all pairs.
+    Vectorized SLSQP constraints with analytic Jacobian."""
+    if not HAVE_SCIPY:
+        return None
+    n = len(pts)
+    i, j = _iu(n)
+    m = len(i)
+    # normalize so dmax^2 = 1
+    diff0 = pts[:, None, :] - pts[None, :, :]
+    d0 = np.sqrt(np.sum(diff0 * diff0, axis=-1))
+    P = pts / d0[i, j].max()
+    D2 = np.sum((P[:, None, :] - P[None, :, :]) ** 2, axis=-1)
+    t0 = D2[i, j].min()
+    z0 = np.concatenate([P.ravel(), [t0]])
+    nv = 3 * n + 1
+
+    def obj(z):
+        return -z[-1]
+
+    def obj_jac(z):
+        g = np.zeros(nv)
+        g[-1] = -1.0
+        return g
+
+    def cf(z):
+        P = z[:3 * n].reshape(n, 3)
+        diff = P[:, None, :] - P[None, :, :]
+        d2 = np.sum(diff * diff, axis=-1)[i, j]
+        return np.concatenate([d2 - z[-1], 1.0 - d2])
+
+    def cj(z):
+        P = z[:3 * n].reshape(n, 3)
+        diff = P[:, None, :] - P[None, :, :]
+        uv = 2.0 * diff[i, j]
+        G = np.zeros((2 * m, nv))
+        rows = np.arange(m)
+        ca = 3 * i[:, None] + np.arange(3)[None, :]
+        cb = 3 * j[:, None] + np.arange(3)[None, :]
+        G[rows[:, None], ca] = uv
+        G[rows[:, None], cb] = -uv
+        G[:m, -1] = -1.0
+        G[m:, :3 * n] = -G[:m, :3 * n]
+        return G
+
+    try:
+        res = minimize(obj, z0, jac=obj_jac, method="SLSQP",
+                       constraints=[{"type": "ineq", "fun": cf, "jac": cj}],
+                       options={"maxiter": 400, "ftol": 1e-14})
+        Pn = res.x[:3 * n].reshape(n, 3)
+        if np.all(np.isfinite(Pn)) and _ratio_sq(Pn) > _ratio_sq(P):
+            return Pn
+    except Exception:
+        pass
+    return None
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    n = 14
+    rng = np.random.default_rng(42)
+    ij = _iu(n)
+
+    # ---------------- seed families ----------------
+    starts = []
+    phi = (1 + np.sqrt(5)) / 2
+    ico = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    ], dtype=float) / np.sqrt(1 + phi ** 2)
+    starts.append(np.vstack([ico, [[0, 0, 1.2], [0, 0, -1.2]]]))
+    starts.append(np.vstack([ico, [[1.3, 0, 0], [-1.3, 0, 0]]]))
+    cube = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1)
+                     for z in (-1, 1)], dtype=float)
+    starts.append(np.vstack([cube,
+                             [[1.5, 0, 0], [-1.5, 0, 0], [0, 1.5, 0],
+                              [0, -1.5, 0], [0, 0, 1.5], [0, 0, -1.5]]]))
+    # staggered hexagonal double-rings + poles (strong basin for n=14)
+    ang = np.linspace(0, 2 * np.pi, 6, endpoint=False)
+    for h, r, off, pz in ((0.55, 1.0, np.pi / 6, 1.4),
+                          (0.45, 1.05, np.pi / 6, 1.35),
+                          (0.60, 1.0, 0.0, 1.45),
+                          (0.50, 1.0, np.pi / 12, 1.4),
+                          (0.65, 0.95, np.pi / 6, 1.5),
+                          (0.50, 0.90, np.pi / 6, 1.3)):
+        ring1 = np.stack([r * np.cos(ang), r * np.sin(ang), np.full(6, h)], axis=1)
+        ring2 = np.stack([r * np.cos(ang + off), r * np.sin(ang + off),
+                          np.full(6, -h)], axis=1)
+        starts.append(np.vstack([ring1, ring2, [[0, 0, pz], [0, 0, -pz]]]))
+    # antipodal 7-direction seeds
+    for _ in range(2):
+        dirs = rng.standard_normal((7, 3))
+        dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+        starts.append(np.vstack([dirs, -dirs]))
+    # repulsion-spread random seeds (avoid wasted clustered trials)
+    for _ in range(10):
+        starts.append(_repulse(rng.standard_normal((n, 3))))
+
+    for s in starts:
+        assert s.shape == (n, 3), f"seed shape {s.shape}"
+
+    # ---------------- homotopy anneal helper ----------------
+    def anneal(pts, qs, maxiter):
+        for q in qs:
+            if HAVE_SCIPY:
+                res = minimize(lambda x, q=q: _moment_grad(x, n, q, ij),
+                               pts.ravel(), jac=True, method="L-BFGS-B",
+                               options={"maxiter": maxiter,
+                                        "ftol": 1e-14, "gtol": 1e-12})
+                pts = res.x.reshape(n, 3)
+            else:
+                x = pts.ravel()
+                for _ in range(300):
+                    _, g = _moment_grad(x, n, q, ij)
+                    x = x - 0.02 * g
+                pts = x.reshape(n, 3)
+            pts = _recentre(pts)
+        return pts
+
+    # ---------------- exact nonsmooth polish ----------------
+    def exact_polish(pts, rounds, amp0):
+        best = pts.copy()
+        bv = _ratio_sq(best)
+        if not HAVE_SCIPY:
+            return best, bv
+        for r in range(rounds):
+            amp = amp0 * (0.55 ** r)
+            x0 = best if r == 0 else best + amp * rng.standard_normal((n, 3))
+            try:
+                res = minimize(lambda x: _exact_ratio_grad(x, n), x0.ravel(),
+                               jac=True, method="L-BFGS-B",
+                               options={"maxiter": 400, "ftol": 1e-16,
+                                        "gtol": 1e-12})
+                cand = res.x.reshape(n, 3)
+                if np.all(np.isfinite(cand)):
+                    v = _ratio_sq(cand)
+                    if v > bv:
+                        bv = v
+                        best = cand.copy()
+            except Exception:
+                pass
+        return best, bv
+
+    # ---------------- tier 1: cheap screen over all seeds ----------------
+    screened = []
+    for s in starts:
+        p = anneal(s.copy(), (0.6, 2.5), 120)
+        screened.append((_ratio_sq(p), p))
+    screened.sort(key=lambda t: -t[0])
+
+    # ---------------- tier 2: deep anneal + exact polish, top basins ------
+    finals = []
+    for _, p in screened[:5]:
+        p = anneal(p, (6.0, 20.0), 250)
+        p, v = exact_polish(p, 6, 0.02)
+        finals.append((v, p))
+    finals.sort(key=lambda t: -t[0])
+    best_val, best_pts = finals[0]
+
+    # ---------------- tier 3: epigraph SLSQP + intensive jitter polish -----
+    if HAVE_SCIPY:
+        for v0, p0 in finals[:2]:
+            cand = _epigraph_refine(p0)
+            if cand is not None:
+                v = _ratio_sq(cand)
+                if v > best_val:
+                    best_val = v
+                    best_pts = cand
+        best_pts, best_val = exact_polish(best_pts, 8, 0.015)
+
+    if best_pts is None or not np.all(np.isfinite(best_pts)):
+        best_pts = np.zeros((n, 3))
+        best_pts[:, 0] = np.arange(n)
+        best_val = _ratio_sq(best_pts)
+
+    # normalize output: dmax = 1 (objective is scale invariant)
+    best_pts = best_pts - best_pts.mean(axis=0)
+    diff = best_pts[:, None, :] - best_pts[None, :, :]
+    d = np.sqrt(np.sum(diff * diff, axis=-1))
+    mx = d[_iu(n)].max()
+    if mx > 0:
+        best_pts = best_pts / mx
+
+    return np.asarray(best_pts, dtype=float)
+
+
+# EVOLVE-BLOCK-END

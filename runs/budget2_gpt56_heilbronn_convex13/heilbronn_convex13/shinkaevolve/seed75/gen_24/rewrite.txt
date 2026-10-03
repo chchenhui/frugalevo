@@ -1,0 +1,276 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+_TRIPLES = np.asarray(
+    [(i, j, k) for i in range(13) for j in range(i + 1, 13) for k in range(j + 1, 13)],
+    dtype=np.intp,
+)
+
+_CORNERS = np.asarray(
+    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+    dtype=np.float64,
+)
+
+_CACHED = None
+
+
+def _areas_batch(points: np.ndarray) -> np.ndarray:
+    """Return all doubled triangle areas for one configuration or a batch."""
+    if points.ndim == 2:
+        points = points[None, :, :]
+    tri = points[:, _TRIPLES, :]
+    u = tri[:, :, 1] - tri[:, :, 0]
+    v = tri[:, :, 2] - tri[:, :, 0]
+    return np.abs(u[:, :, 0] * v[:, :, 1] - u[:, :, 1] * v[:, :, 0])
+
+
+def _keys(areas: np.ndarray) -> np.ndarray:
+    """
+    Lexicographic quality statistics.
+
+    Column zero is always the true maximin objective.  Remaining columns
+    reward a healthier active-constraint tail without ever sacrificing it.
+    """
+    low = np.partition(areas, 11, axis=1)[:, :12]
+    low.sort(axis=1)
+    return np.column_stack(
+        (
+            low[:, 0],
+            low[:, :4].mean(axis=1),
+            low[:, :8].mean(axis=1),
+            low[:, :12].mean(axis=1),
+        )
+    )
+
+
+def _better(candidate: np.ndarray, reference: np.ndarray, eps: float = 2e-13) -> bool:
+    """Numerically stable lexicographic comparison of two objective keys."""
+    for a, b in zip(candidate, reference):
+        if a > b + eps:
+            return True
+        if a < b - eps:
+            return False
+    return False
+
+
+def _initial_point_sets(rng: np.random.Generator, count: int) -> np.ndarray:
+    """
+    Mixed jittered lattice / irrational-shift initialization.
+
+    The shifted layouts specifically avoid the persistent horizontal, vertical,
+    and diagonal collinearities of a plain 3-by-3 grid.
+    """
+    base = np.asarray(
+        [
+            [0.18, 0.17], [0.48, 0.14], [0.79, 0.20],
+            [0.13, 0.46], [0.48, 0.48], [0.84, 0.45],
+            [0.22, 0.79], [0.52, 0.82], [0.77, 0.72],
+        ],
+        dtype=np.float64,
+    )
+    sets = np.empty((count, 13, 2), dtype=np.float64)
+    sets[:, :4] = _CORNERS
+
+    for r in range(count):
+        phase = (r + 0.5) / count
+        index = np.arange(9, dtype=np.float64)
+        shear_x = 0.070 * np.sin(2.0 * np.pi * (index * 0.61803398875 + phase))
+        shear_y = 0.070 * np.sin(2.0 * np.pi * (index * 0.41421356237 + 1.73 * phase))
+        noise = rng.normal(0.0, 0.055, size=(9, 2))
+        sets[r, 4:, 0] = base[:, 0] + shear_x + noise[:, 0]
+        sets[r, 4:, 1] = base[:, 1] + shear_y + noise[:, 1]
+
+    sets[:, 4:] = np.clip(sets[:, 4:], 0.035, 0.965)
+    return sets
+
+
+def _search_one(start: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """
+    Batched active-triangle optimization.
+
+    A batch contains both random local moves and moves correlated with the
+    centroid/normal geometry of presently limiting triples.  This supplies
+    much richer proposals than one-coordinate simulated annealing while
+    preserving deterministic reproducibility.
+    """
+    points = start.copy()
+    areas = _areas_batch(points)[0]
+    key = _keys(areas[None, :])[0]
+
+    batch_size = 28
+    stages = (
+        (0.110, 900, 0.0018),
+        (0.052, 1100, 0.00065),
+        (0.023, 1250, 0.00018),
+        (0.0090, 1450, 0.000035),
+        (0.0032, 1650, 0.0),
+        (0.0010, 1400, 0.0),
+    )
+
+    for initial_scale, iterations, slack in stages:
+        for iteration in range(iterations):
+            decay = 1.0 - 0.60 * iteration / max(1, iterations - 1)
+            scale = initial_scale * decay
+
+            limiting = np.argpartition(areas, 13)[:14]
+            candidates = np.repeat(points[None, :, :], batch_size, axis=0)
+
+            for q in range(batch_size):
+                tri = _TRIPLES[limiting[q % len(limiting)]]
+                movable = tri[tri >= 4]
+
+                if len(movable) and q < 22:
+                    idx = int(movable[q % len(movable)])
+                else:
+                    idx = int(rng.integers(4, 13))
+
+                old = points[idx]
+                direction = rng.normal(0.0, 1.0, 2)
+
+                # Several candidates use a normal to an edge of an active
+                # triangle, directly changing its determinant efficiently.
+                if q % 4 == 0 and len(movable):
+                    others = tri[tri != idx]
+                    edge = points[others[1]] - points[others[0]]
+                    normal = np.array([-edge[1], edge[0]])
+                    normal /= max(np.linalg.norm(normal), 1e-12)
+                    direction = normal * (1.0 if (q // 4) % 2 else -1.0)
+                elif q % 4 == 1 and len(movable):
+                    others = tri[tri != idx]
+                    center = 0.5 * (points[others[0]] + points[others[1]])
+                    direction = old - center
+                    direction /= max(np.linalg.norm(direction), 1e-12)
+                else:
+                    direction /= max(np.linalg.norm(direction), 1e-12)
+
+                # Occasional paired motion prevents the search from becoming
+                # trapped by an individual point's local feasible cone.
+                candidates[q, idx] = np.clip(old + scale * direction, 0.027, 0.973)
+                if q >= 22:
+                    idx2 = int(rng.integers(4, 13))
+                    if idx2 != idx:
+                        candidates[q, idx2] = np.clip(
+                            points[idx2] + rng.normal(0.0, scale * 0.55, 2),
+                            0.027,
+                            0.973,
+                        )
+
+            trial_areas = _areas_batch(candidates)
+            trial_keys = _keys(trial_areas)
+
+            # Select best batch member lexicographically.
+            order = np.lexsort(
+                (
+                    trial_keys[:, 3],
+                    trial_keys[:, 2],
+                    trial_keys[:, 1],
+                    trial_keys[:, 0],
+                )
+            )
+            winner = int(order[-1])
+            new_key = trial_keys[winner]
+
+            if _better(new_key, key):
+                points = candidates[winner]
+                areas = trial_areas[winner]
+                key = new_key
+            elif slack > 0.0:
+                # Small deterministic annealed acceptance based only on the
+                # primary objective; never used during final strict stages.
+                loss = key[0] - new_key[0]
+                temperature = slack * (1.0 - iteration / iterations) ** 2
+                if loss >= 0.0 and rng.random() < np.exp(-loss / max(temperature, 1e-15)):
+                    points = candidates[winner]
+                    areas = trial_areas[winner]
+                    key = new_key
+
+    return points
+
+
+def _strict_polish(points: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Final low-tail lexicographic coordinate polish."""
+    areas = _areas_batch(points)[0]
+    key = _keys(areas[None, :])[0]
+
+    for scale, rounds in ((0.0014, 900), (0.00048, 1100), (0.00016, 900)):
+        for _ in range(rounds):
+            limiting = np.argpartition(areas, 8)[:9]
+            tri = _TRIPLES[limiting[rng.integers(9)]]
+            movable = tri[tri >= 4]
+            idx = int(movable[rng.integers(len(movable))]) if len(movable) else int(rng.integers(4, 13))
+
+            proposals = np.repeat(points[None, :, :], 12, axis=0)
+            delta = rng.normal(0.0, scale, size=(12, 2))
+            proposals[:, idx] = np.clip(points[idx] + delta, 0.025, 0.975)
+
+            candidate_areas = _areas_batch(proposals)
+            candidate_keys = _keys(candidate_areas)
+            order = np.lexsort(
+                (
+                    candidate_keys[:, 3],
+                    candidate_keys[:, 2],
+                    candidate_keys[:, 1],
+                    candidate_keys[:, 0],
+                )
+            )
+            best = int(order[-1])
+
+            if _better(candidate_keys[best], key):
+                points = proposals[best]
+                areas = candidate_areas[best]
+                key = candidate_keys[best]
+
+    return points
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Deterministically construct thirteen points in a unit-area convex square.
+
+    Returns
+    -------
+    np.ndarray
+        A finite float64 array with shape (13, 2).  The first four points are
+        the square corners, hence all returned points lie in a convex region
+        of area exactly one.
+    """
+    global _CACHED
+    if _CACHED is not None:
+        return _CACHED.copy()
+
+    rng = np.random.default_rng(13031957)
+    starts = _initial_point_sets(rng, 7)
+
+    best = None
+    best_key = None
+    for start in starts:
+        candidate = _search_one(start, rng)
+        candidate_areas = _areas_batch(candidate)
+        candidate_key = _keys(candidate_areas)[0]
+        if best is None or _better(candidate_key, best_key):
+            best = candidate
+            best_key = candidate_key
+
+    best = _strict_polish(best, rng)
+
+    if best.shape != (13, 2) or not np.all(np.isfinite(best)):
+        best = np.vstack(
+            (
+                _CORNERS,
+                np.asarray(
+                    [
+                        [0.17, 0.18], [0.48, 0.13], [0.80, 0.21],
+                        [0.12, 0.48], [0.49, 0.48], [0.84, 0.45],
+                        [0.21, 0.79], [0.52, 0.83], [0.77, 0.73],
+                    ],
+                    dtype=np.float64,
+                ),
+            )
+        )
+
+    _CACHED = np.asarray(best, dtype=np.float64)
+    return _CACHED.copy()
+
+
+# EVOLVE-BLOCK-END

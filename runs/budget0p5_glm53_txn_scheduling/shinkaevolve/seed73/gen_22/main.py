@@ -1,0 +1,159 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Find a low-makespan schedule via simulated annealing over complete
+    transaction permutations, seeded by greedy constructions, with a final
+    insertion-based steepest descent polish.
+    """
+    n = workload.num_txns
+    if n == 0:
+        return 0, []
+    if n == 1:
+        return workload.get_opt_seq_cost([0]), [0]
+
+    start_time = time.time()
+    budget = 27.0
+
+    def cost_of(seq):
+        return workload.get_opt_seq_cost(seq)
+
+    def greedy_construct(sample_cap=None):
+        start = random.randrange(n)
+        seq = [start]
+        rem = [x for x in range(n) if x != start]
+        while rem:
+            cands = rem
+            if sample_cap and len(rem) > sample_cap:
+                cands = random.sample(rem, sample_cap)
+            best_c = None
+            best_ts = []
+            for t in cands:
+                c = cost_of(seq + [t])
+                if best_c is None or c < best_c:
+                    best_c = c
+                    best_ts = [t]
+                elif c == best_c:
+                    best_ts.append(t)
+            pick = random.choice(best_ts)
+            seq.append(pick)
+            rem.remove(pick)
+        return cost_of(seq), seq
+
+    def insertion_descent(seq, cost, deadline):
+        """Best-improvement insertion local search."""
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            best_gain = 0
+            best_cand = None
+            for i in range(n):
+                txn = seq[i]
+                rest = seq[:i] + seq[i+1:]
+                for j in range(n - 1):
+                    cand = rest[:j] + [txn] + rest[j:]
+                    c = cost_of(cand)
+                    if c < cost - best_gain:
+                        best_gain = cost - c
+                        best_cand = cand
+            if best_cand is not None:
+                seq = best_cand
+                cost -= best_gain
+                improved = True
+        return seq, cost
+
+    best_cost = None
+    best_seq = None
+
+    # Seed pool: mix of full and sampled greedy constructions
+    seed_deadline = start_time + budget * 0.35
+    seeds = []
+    while time.time() < seed_deadline and len(seeds) < 12:
+        if len(seeds) % 2 == 0 and n <= 40:
+            c, s = greedy_construct(None)
+        else:
+            c, s = greedy_construct(sample_cap=15)
+        seeds.append((c, s))
+        if best_cost is None or c < best_cost:
+            best_cost, best_seq = c, s
+
+    # Simulated annealing from best seeds
+    if not seeds:
+        c, s = greedy_construct(sample_cap=15)
+        seeds.append((c, s))
+        best_cost, best_seq = c, s
+
+    sa_deadline = start_time + budget * 0.85
+    seed_idx = 0
+    cur_cost, cur_seq = seeds[0]
+    # temperature schedule based on observed costs
+    t0 = max(1.0, (best_cost or 10) * 0.05)
+    temp = t0
+    alpha = 0.999
+    it = 0
+    while time.time() < sa_deadline:
+        # occasionally restart SA from best-known solution
+        if it % 800 == 0:
+            if best_seq is not None:
+                cur_seq = best_seq[:]
+                cur_cost = best_cost
+                temp = t0
+        if n >= 3 and random.random() < 0.5:
+            # swap move
+            i, j = random.randrange(n), random.randrange(n)
+            if i == j:
+                continue
+            cand = cur_seq[:]
+            cand[i], cand[j] = cand[j], cand[i]
+        else:
+            # insertion move
+            i = random.randrange(n)
+            j = random.randrange(n)
+            txn = cur_seq[i]
+            cand = cur_seq[:i] + [txn] + cur_seq[i+1:]
+            rest = cur_seq[:i] + cur_seq[i+1:]
+            cand = rest[:j] + [txn] + rest[j:]
+        c = cost_of(cand)
+        delta = c - cur_cost
+        if delta <= 0 or random.random() < pow(2.718281828, -delta / max(temp, 1e-9)):
+            cur_seq, cur_cost = cand, c
+            if cur_cost < best_cost:
+                best_cost, best_seq = cur_cost, cur_seq[:]
+        temp *= alpha
+        it += 1
+
+    # Final polish: insertion descent on best solution
+    if best_seq is not None:
+        best_seq, best_cost = insertion_descent(best_seq, best_cost, start_time + budget)
+
+    assert best_seq is not None and len(set(best_seq)) == n
+    return best_cost, best_seq
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

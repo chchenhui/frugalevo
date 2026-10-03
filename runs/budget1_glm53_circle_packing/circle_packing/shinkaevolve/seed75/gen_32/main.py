@@ -1,0 +1,165 @@
+# EVOLVE-BLOCK-START
+"""Hexagonal-lattice seed + LP radius optimization for n=26 circles."""
+import numpy as np
+
+try:
+    from scipy.optimize import linprog
+    _HAS_SCIPY = True
+except Exception:
+    _HAS_SCIPY = False
+
+
+def seed_layout():
+    """Staggered hexagonal lattice: rows of 5,4,5,4,5,3 circles."""
+    n = 26
+    centers = np.zeros((n, 2))
+    s = 1.0 / (1.0 + 5.0 * np.sqrt(3.0) / 2.0)
+    h = s * np.sqrt(3.0) / 2.0
+    r = s / 2.0
+    row_counts = [5, 4, 5, 4, 5, 3]
+    idx = 0
+    for row, count in enumerate(row_counts):
+        y = r + row * h
+        offset = s / 2.0 if row % 2 == 1 else 0.0
+        for j in range(count):
+            centers[idx] = [r + offset + j * s, y]
+            idx += 1
+    return centers
+
+
+def _pairwise_dist(centers):
+    diff = centers[:, None, :] - centers[None, :, :]
+    return np.sqrt((diff ** 2).sum(-1))
+
+
+def _scaling_radii(centers):
+    """Fast proportional scaling fallback for radii."""
+    n = centers.shape[0]
+    x, y = centers[:, 0], centers[:, 1]
+    radii = np.minimum(np.minimum(x, y), np.minimum(1 - x, 1 - y))
+    dist = _pairwise_dist(centers)
+    iu = np.triu_indices(n, 1)
+    for _ in range(150):
+        s = radii[iu[0]] + radii[iu[1]]
+        bad = s > dist[iu]
+        if not bad.any():
+            break
+        idx = np.nonzero(bad)[0]
+        i, j = iu[0][idx], iu[1][idx]
+        scale = dist[iu][idx] / s[idx]
+        radii[i] *= scale
+        radii[j] *= scale
+    return radii
+
+
+def refine_positions(centers, n_steps=120, pressure=1.06):
+    """Light vectorized relaxation: push overlapping circles apart."""
+    lr = 0.25
+    for step in range(n_steps):
+        radii = _scaling_radii(centers)
+        dist = _pairwise_dist(centers)
+        np.fill_diagonal(dist, np.inf)
+        overlap = radii[:, None] * pressure + radii[None, :] * pressure - dist
+        np.fill_diagonal(overlap, -np.inf)
+        overlap = np.maximum(overlap, 0.0)
+        diff = centers[:, None, :] - centers[None, :, :]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            unit = np.where(dist[:, :, None] > 1e-12,
+                            diff / np.maximum(dist[:, :, None], 1e-12), 0.0)
+        push = (unit * (overlap * 0.5)[:, :, None]).sum(axis=1)
+        push -= (unit * (overlap * 0.5)[:, :, None]).sum(axis=0)
+        t = radii * pressure
+        wl = np.maximum(t - centers[:, 0], 0)
+        wr = -np.maximum(centers[:, 0] + t - 1, 0)
+        wb = np.maximum(t - centers[:, 1], 0)
+        wt = -np.maximum(centers[:, 1] + t - 1, 0)
+        wall = np.stack([wl + wr, wb + wt], axis=1)
+        centers = centers + lr * (push + wall)
+        centers = np.clip(centers, 1e-4, 1 - 1e-4)
+        lr = max(lr * 0.99, 0.02)
+    return centers
+
+
+def solve_radii(centers):
+    """Exact maximum-sum radii at fixed centers via LP."""
+    n = centers.shape[0]
+    if _HAS_SCIPY:
+        dist = _pairwise_dist(centers)
+        iu = np.triu_indices(n, 1)
+        m = len(iu[0])
+        A_pairs = np.zeros((m, n))
+        A_pairs[np.arange(m), iu[0]] = 1.0
+        A_pairs[np.arange(m), iu[1]] = 1.0
+        b_pairs = dist[iu]
+        x, y = centers[:, 0], centers[:, 1]
+        A_wall = np.zeros((n, n))
+        A_wall[np.arange(n), np.arange(n)] = 1.0
+        b_wall = np.minimum(np.minimum(x, y), np.minimum(1 - x, 1 - y))
+        A_ub = np.vstack([A_pairs, A_wall])
+        b_ub = np.concatenate([b_pairs, b_wall])
+        res = linprog(c=-np.ones(n), A_ub=A_ub, b_ub=b_ub,
+                      bounds=[(0, 0.5)] * n, method="highs")
+        if res.success:
+            return np.maximum(res.x, 0.0)
+    return _scaling_radii(centers)
+
+
+def compute_max_radii(centers):
+    """Public API: max valid radii for given centers."""
+    return solve_radii(centers)
+
+
+def construct_packing():
+    """Construct arrangement of 26 circles maximizing sum of radii."""
+    centers = seed_layout()
+    centers = refine_positions(centers)
+    radii = solve_radii(centers)
+    return centers, radii, float(np.sum(radii))
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

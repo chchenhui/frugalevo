@@ -1,0 +1,98 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+_SQRT3 = np.sqrt(3.0)
+_TRIPLETS = np.array(list(combinations(range(11), 3)), dtype=int)
+
+
+def _to_xy(b):
+    """Barycentric (u toward B(1,0), v toward C(0.5,sqrt3/2)) -> xy."""
+    return np.column_stack([b[:, 0] + 0.5 * b[:, 1], 0.5 * _SQRT3 * b[:, 1]])
+
+
+def _clamp_simplex(b):
+    """Project rows of b onto simplex u>=0, v>=0, u+v<=1."""
+    b = np.clip(b, 0.0, 1.0)
+    s = b.sum(axis=1)
+    over = s > 1.0
+    if np.any(over):
+        b[over] *= (1.0 / s[over])[:, None]
+    return b
+
+
+def _min_doubled_area(b):
+    xy = _to_xy(b)
+    p = xy[_TRIPLETS[:, 0]]
+    q = xy[_TRIPLETS[:, 1]]
+    r = xy[_TRIPLETS[:, 2]]
+    cross = np.abs((q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1])
+                   - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0]))
+    return cross.min()
+
+
+def _local_search(b, rng, iters=2500):
+    """Greedy local search with randomized jitter moves at decreasing scales."""
+    cur = _clamp_simplex(b.copy())
+    cur_val = _min_doubled_area(cur)
+    scales = [0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002, 0.0001]
+    for sc in scales:
+        stuck = 0
+        for _ in range(iters // len(scales) + 200):
+            cand = cur.copy()
+            # random subset of 1-2 points perturbed with random per-coordinate jitter
+            k = int(rng.integers(0, 11))
+            cand[k] += rng.normal(0.0, sc, 2)
+            if rng.random() < 0.2:
+                k2 = int(rng.integers(0, 11))
+                cand[k2] += rng.normal(0.0, sc, 2)
+            cand = _clamp_simplex(cand)
+            val = _min_doubled_area(cand)
+            if val > cur_val + 1e-15:
+                cur, cur_val = cand, val
+                stuck = 0
+            else:
+                stuck += 1
+                if stuck > 400:
+                    break
+    return cur, cur_val
+
+
+def _seed_config(seed):
+    rng = np.random.default_rng(seed)
+    b = rng.random((11, 2)) * 0.9
+    # pin the three container vertices for large-scale spread
+    b[0] = [0.0, 0.0]
+    b[1] = [1.0, 0.0]
+    b[2] = [0.0, 1.0]
+    return _clamp_simplex(b)
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of 11 points on or inside the equilateral triangle
+    (0,0),(1,0),(0.5,sqrt(3)/2) maximizing the smallest triangle area.
+    """
+    try:
+        best_b, best_val = None, -1.0
+        for seed in (1, 7, 42, 123, 2024):
+            rng = np.random.default_rng(seed)
+            b0 = _seed_config(seed)
+            b, val = _local_search(b0, rng)
+            if val > best_val:
+                best_b, best_val = b, val
+        if best_b is None or not np.isfinite(best_val):
+            raise RuntimeError("search failed")
+        return _to_xy(_clamp_simplex(best_b))
+    except Exception:
+        # Fallback: deterministic feasible configuration
+        b = np.array([
+            [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+            [0.5, 0.0], [0.25, 0.25], [0.5, 0.5],
+            [0.0, 0.5], [0.25, 0.0], [0.75, 0.25],
+            [0.0, 0.25], [0.5, 0.25],
+        ])
+        return _to_xy(b)
+
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,169 @@
+<NAME>
+soft_quadratic_reversal_damp
+</NAME>
+<DESCRIPTION>
+Replace the hard hold (keep=0.0) in the guarded reversal damping with a magnitude-proportional quadratic soft damp: out[k] = out[k-1] + d*(1 - (|d|/thresh)^2) for sub-threshold flips. The hard hold creates flat zero-step segments that inflate avg_error/lag while leaving residual flips from the mirrored backward sweep re-introducing what the forward sweep removed. The quadratic falloff pins tiny flips to (nearly) zero while passing near-threshold steps almost intact, so a single unguarded sweep pair suffices — no guard retry escalation (which previously halted smoothing too early at the 0.97 correlation check). Guard instead with a single hard abort: correlation against the original input slice must stay >= 0.93, otherwise revert to the pre-damp signal. All sanitization and the rest of the pipeline remain untouched.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _reversal_damp(y, thresh, keep=0.0):
+    """
+    Eliminate sub-noise sign flips in the first difference. On a detected
+    flip (sign change vs. prev step, magnitude below `thresh`), the line is
+    HELD: out[k] = out[k-1] + keep*d with keep=0 gives a zero step, so the
+    output difference sequence truly does not reverse. keep>0 is a softer
+    partial-step fallback (used on guard retry). prev_d is taken from the
+    PRE-damp difference so a zero step does not stall subsequent detection.
+    Forward sweep plus mirrored backward sweep => zero phase.
+    """
+    n = len(y)
+    if n < 3:
+        return y
+    out = y.copy()
+    # Forward sweep
+    prev_d = y[1] - y[0]  # reference from pre-damp differences
+    for k in range(2, n):
+        d = out[k] - out[k - 1]
+        if prev_d * d < 0 and abs(d) < thresh:
+            out[k] = out[k - 1] + keep * d
+        prev_d = out[k] - out[k - 1] if keep > 0 else d
+    # Backward (mirrored) sweep to cancel directional bias
+    prev_d = y[-2] - y[-1]
+    for k in range(n - 3, -1, -1):
+        d = out[k] - out[k + 1]
+        if prev_d * d < 0 and abs(d) < thresh:
+            out[k] = out[k + 1] + keep * d
+        prev_d = out[k] - out[k + 1] if keep > 0 else d
+    return out
+=======
+def _reversal_damp(y, thresh):
+    """
+    Magnitude-proportional quadratic soft damping of sub-threshold sign
+    flips in the first difference. On a detected flip (sign change vs.
+    prev step, |d| < thresh), the step is scaled by (1 - (|d|/thresh)^2):
+    tiny noise flips -> ~0 (pinned), near-threshold steps -> pass nearly
+    intact. Unlike a hard hold this leaves no flat zero-step segments
+    (which inflate lag/avg_error), and the smooth falloff means a single
+    forward + mirrored backward sweep pair suffices. prev_d is taken from
+    the PRE-damp difference so damping cannot stall later detection.
+    """
+    n = len(y)
+    if n < 3:
+        return y
+    out = y.copy()
+    thresh2 = thresh * thresh if thresh > 0 else 1e-30
+    # Forward sweep
+    prev_d = y[1] - y[0]
+    for k in range(2, n):
+        d = out[k] - out[k - 1]
+        if prev_d * d < 0 and abs(d) < thresh:
+            out[k] = out[k - 1] + d * (1.0 - (d * d) / thresh2)
+        prev_d = d
+    # Backward (mirrored) sweep to cancel directional bias
+    prev_d = y[-2] - y[-1]
+    for k in range(n - 3, -1, -1):
+        d = out[k] - out[k + 1]
+        if prev_d * d < 0 and abs(d) < thresh:
+            out[k] = out[k + 1] + d * (1.0 - (d * d) / thresh2)
+        prev_d = d
+    return out
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Guarded sub-noise reversal damping ---
+    # Suppress step-to-step sign flips below the robust noise floor of the
+    # output's first differences; genuine reversals exceed the threshold.
+    # Correlation guard disables the step if it distorts the signal.
+    if n >= 3:
+        dy_o = np.diff(y)
+        if dy_o.size > 2:
+            step_std = np.median(np.abs(dy_o - np.median(dy_o))) / 0.6745
+        else:
+            step_std = 0.0
+        if step_std > 0:
+            y_pre = y.copy()
+            y_try = _reversal_damp(y_pre, 1.5 * step_std, keep=0.0)
+            c = np.corrcoef(y_try, y_pre)[0, 1]
+            if np.isfinite(c) and c >= 0.97:
+                y = y_try
+            else:
+                # Softer retry: partial step retention instead of full hold
+                y_try = _reversal_damp(y_pre, 1.5 * step_std, keep=0.5)
+                c = np.corrcoef(y_try, y_pre)[0, 1]
+                if np.isfinite(c) and c >= 0.97:
+                    y = y_try
+=======
+    # --- Unguarded soft sub-noise reversal damping with hard abort check ---
+    # Quadratic magnitude-proportional damping of flips below the robust
+    # noise floor of the output's first differences. Run unguarded (a 0.97
+    # correlation guard halts smoothing too early for this soft operator),
+    # but verify correlation with the ORIGINAL input slice as a hard abort:
+    # if the damped output drifts below 0.93 correlation with the input,
+    # revert to the pre-damp signal.
+    if n >= 3:
+        dy_o = np.diff(y)
+        if dy_o.size > 2:
+            step_std = np.median(np.abs(dy_o - np.median(dy_o))) / 0.6745
+        else:
+            step_std = 0.0
+        if step_std > 0:
+            y_pre = y.copy()
+            y_try = _reversal_damp(y_pre, 1.5 * step_std)
+            x_ref = x[window_size - 1:] if x.size >= window_size else x
+            if x_ref.size > y_try.size:
+                x_ref = x_ref[: y_try.size]
+            if x_ref.size == y_try.size and np.std(x_ref) > 0 and np.std(y_try) > 0:
+                c_in = np.corrcoef(y_try, x_ref)[0, 1]
+                if np.isfinite(c_in) and c_in < 0.93:
+                    y_try = y_pre
+            y = y_try
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        y_base = y.copy()
+        flips_base = _count_flips(y_base)
+        target_flips = 12
+        thresh = 1.5 * step_std if step_std > 0 else 1e-12
+        best_y = y_base
+        best_flips = flips_base
+        cur = y_base
+        for _iter in range(4):
+            if best_flips <= target_flips:
+                break
+            cand = _reversal_damp(cur, thresh, keep=0.0)
+            cand = _bilateral_one_pole(cand, 0.85)
+            c = np.corrcoef(cand, y_base)[0, 1]
+            if not np.isfinite(c) or c < 0.97:
+                break
+=======
+        y_base = y.copy()
+        flips_base = _count_flips(y_base)
+        target_flips = 12
+        thresh = 1.5 * step_std if step_std > 0 else 1e-12
+        x_ref2 = x[window_size - 1:] if x.size >= window_size else x
+        if x_ref2.size > y_base.size:
+            x_ref2 = x_ref2[: y_base.size]
+        best_y = y_base
+        best_flips = flips_base
+        cur = y_base
+        for _iter in range(4):
+            if best_flips <= target_flips:
+                break
+            cand = _reversal_damp(cur, thresh)
+            cand = _bilateral_one_pole(cand, 0.85)
+            c = (
+                np.corrcoef(cand, x_ref2)[0, 1]
+                if x_ref2.size == cand.size
+                and np.std(x_ref2) > 0
+                and np.std(cand) > 0
+                else 1.0
+            )
+            if not np.isfinite(c) or c < 0.93:
+                break
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

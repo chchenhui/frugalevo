@@ -1,0 +1,110 @@
+<NAME>
+threshold_packing_seed
+</NAME>
+
+<DESCRIPTION>
+Add an objective-aligned bin-packing initializer. For a target maximum KVPR `p`, a GPU is feasible exactly when each assigned model contributes `weight + p * size` within capacity `p * GPU_MEM_SIZE`. Best-fit packing under this transformed capacity directly targets the KVPR objective while respecting memory. Binary search finds increasingly lower successful thresholds, and every successful assignment is verified using the actual KVPR before becoming a local-search seed.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        return assignments, loads, remaining
+
+    # Different orderings reduce sensitivity to greedy placement order.
+=======
+        return assignments, loads, remaining
+
+    def pack_for_threshold(threshold):
+        """Best-fit pack for load + threshold * size <= threshold * memory."""
+        capacity = threshold * GPU_MEM_SIZE
+        effective_sizes = [
+            weights[model_id] + threshold * sizes[model_id]
+            for model_id in range(model_count)
+        ]
+        order = sorted(
+            range(model_count),
+            key=lambda model_id: (-effective_sizes[model_id], -sizes[model_id]),
+        )
+
+        assignments = [-1] * model_count
+        loads = [0.0] * gpu_num
+        remaining = [float(GPU_MEM_SIZE)] * gpu_num
+        used = [0.0] * gpu_num
+
+        for model_id in order:
+            effective_size = effective_sizes[model_id]
+            best_gpu = None
+            best_key = None
+
+            for gpu_id in range(gpu_num):
+                if sizes[model_id] > remaining[gpu_id] + EPSILON:
+                    continue
+                if used[gpu_id] + effective_size > capacity + EPSILON:
+                    continue
+
+                # Best-fit reduces transformed-capacity fragmentation.
+                key = (capacity - used[gpu_id] - effective_size, gpu_id)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_gpu = gpu_id
+
+            if best_gpu is None:
+                return None
+
+            assignments[model_id] = best_gpu
+            loads[best_gpu] += weights[model_id]
+            remaining[best_gpu] -= sizes[model_id]
+            used[best_gpu] += effective_size
+
+        return assignments, loads, remaining
+
+    # Different orderings reduce sensitivity to greedy placement order.
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    if best_solution is None:
+        raise ValueError(
+            "Unable to place all models on available GPUs. "
+            "The models do not fit under the memory constraints."
+        )
+
+    assignments, loads, remaining = best_solution
+=======
+    if best_solution is None:
+        raise ValueError(
+            "Unable to place all models on available GPUs. "
+            "The models do not fit under the memory constraints."
+        )
+
+    # A KVPR bound p transforms each GPU into a bin of capacity p * memory:
+    # sum(weight + p * size) <= p * GPU_MEM_SIZE.  Successful transformed
+    # packings are valid placements, so use them to obtain a stronger seed.
+    if best_score > EPSILON and best_score < float("inf"):
+        low = 0.0
+        high = best_score
+
+        for _ in range(36):
+            middle = (low + high) / 2.0
+            candidate = pack_for_threshold(middle)
+
+            if candidate is None:
+                low = middle
+                continue
+
+            candidate_score = objective(candidate[1], candidate[2])
+            if candidate_score <= middle + EPSILON:
+                if candidate_score < best_score - EPSILON:
+                    best_solution = candidate
+                    best_score = candidate_score
+
+                # The actual pressure can be below the transformed bound;
+                # feeding it back tightens the next packing attempt.
+                high = min(middle, candidate_score)
+            else:
+                low = middle
+
+    assignments, loads, remaining = best_solution
+>>>>>>> REPLACE
+</DIFF>

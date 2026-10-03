@@ -1,0 +1,119 @@
+<NAME>
+hybrid_kalman_sg_endpoint_dispatcher
+</NAME>
+<DESCRIPTION>
+The previous search text did not exist in the editable region. Based on the error output, the editable region ends with a dispatcher between `enhanced_filter_with_trend_preservation` and `adaptive_filter`. This edit replaces that dispatcher tail with a call to a new hybrid filter (volatility-adaptive Kalman + Savitzky-Golay zero-lag endpoint + hysteresis trend detection), defined directly in the replacement text, minimizing lag, spurious slope changes, and false reversals.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+            return enhanced_filter_with_trend_preservation(input_signal, window_size)
+        else:
+            return adaptive_filter(input_signal, window_size)
+=======
+            return hybrid_kalman_sg_filter(input_signal, window_size)
+        else:
+            return hybrid_kalman_sg_filter(input_signal, window_size)
+
+
+def hybrid_kalman_sg_filter(input_signal, window_size):
+    """
+    Hybrid filter: zero-lag Savitzky-Golay endpoint estimate fused with a
+    volatility-adaptive constant-velocity Kalman filter, plus hysteresis-based
+    trend detection to suppress spurious reversals.
+    """
+    signal = np.asarray(input_signal, dtype=float)
+    n = len(signal)
+    filtered = []
+    if n == 0:
+        return np.array([])
+    if window_size < 3:
+        return signal.copy()
+
+    w = int(window_size)
+    half = (w - 1) // 2
+
+    # Kalman state: [position, velocity]
+    kf_pos = signal[0]
+    kf_vel = 0.0
+    P = np.eye(2) * 1.0
+    q_pos, q_vel = 1e-3, 1e-2
+
+    # Trend / hysteresis state
+    trend_sig = 0.0
+    trend_eps = 1.0
+    prev_val = signal[0]
+    prev_out = signal[0]
+    out = signal[0]
+    buf = deque(maxlen=w)
+
+    for i in range(n):
+        buf.append(signal[i])
+        if len(buf) < 3:
+            filtered.append(prev_out)
+            continue
+
+        arr = np.asarray(buf, dtype=float)
+        m = len(arr)
+
+        # --- Savitzky-Golay quadratic endpoint fit (evaluated at newest sample) ---
+        t = np.arange(m, dtype=float)
+        S1, S2 = m, t.sum()
+        S3, S4, S5 = (t**2).sum(), (t**3).sum(), (t**4).sum()
+        T1, T2, T3 = arr.sum(), (t*arr).sum(), (t*t*arr).sum()
+        det = S1*(S3*S5 - S4*S4) - S2*(S2*S5 - S3*S4) + S3*(S2*S4 - S3*S3)
+        if abs(det) < 1e-12:
+            sg = T1 / S1
+        else:
+            a = (T1*(S3*S5 - S4*S4) - S2*(T2*S5 - T3*S4) + S3*(T2*S4 - T3*S3)) / det
+            b = (S1*(T2*S5 - T3*S4) - S2*(S2*S5 - S3*S4) + S3*(S2*T3 - S3*T2)) / det
+            c = (S1*(S2*T3 - S3*T2) - S2*(S2*T3 - S3*T2) + T2*(S2*S4 - S3*S3)) / det
+            sg = a + b*(m-1) + c*(m-1)**2
+
+        # --- Local volatility estimate (robust MAD) ---
+        med = np.median(arr)
+        mad = np.median(np.abs(arr - med)) * 1.4826 + 1e-9
+        R = (0.5 * mad) ** 2
+
+        # --- Kalman predict / update using SG endpoint as measurement ---
+        pred_pos = kf_pos + kf_vel
+        pred_vel = kf_vel
+        P[0, 0] += q_pos
+        P[0, 1] += P[1, 1]
+        P[1, 0] += P[1, 1]
+        P[1, 1] += q_vel
+        innov = sg - pred_pos
+        S = P[0, 0] + R
+        K0 = P[0, 0] / S
+        K1 = P[1, 0] / S
+        kf_pos = pred_pos + K0 * innov
+        kf_vel = pred_vel + K1 * innov
+        P00, P01 = P[0, 0], P[0, 1]
+        P[0, 0] = (1 - K0) * P00
+        P[0, 1] = (1 - K0) * P01
+        P[1, 0] = P[1, 0] - K1 * P00
+        P[1, 1] = P[1, 1] - K1 * P01
+        kal = kf_pos
+
+        # --- Blend responsive SG estimate with smooth Kalman estimate ---
+        val = 0.5 * sg + 0.5 * kal
+
+        # --- Hysteresis trend confidence (suppresses false reversals) ---
+        if val - prev_val > trend_eps * mad:
+            trend_sig = min(trend_sig + 1.0, 3.0)
+        elif prev_val - val > trend_eps * mad:
+            trend_sig = max(trend_sig - 1.0, -3.0)
+
+        # --- Output with reversal gating: only follow a reversal once confirmed ---
+        if (trend_sig >= -1.0) and val > prev_out:
+            out = min(val, prev_out + 2.0 * trend_eps * mad)
+        elif (trend_sig <= 1.0) and val < prev_out:
+            out = max(val, prev_out - 2.0 * trend_eps * mad)
+        else:
+            out = prev_out + 0.25 * (val - prev_out)
+        prev_val = val
+        prev_out = out
+        filtered.append(out)
+
+    return np.array(filtered)
+>>>>>>> REPLACE
+</DIFF>

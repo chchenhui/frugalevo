@@ -1,0 +1,334 @@
+<NAME>
+trie_safe_reorder
+</NAME>
+
+<DESCRIPTION>
+The validation failure did not include a Python traceback; the stdout only shows that execution reached the reorder path for two datasets. The underlying implementation was nevertheless invalid because it could fabricate or misalign rows during recursive assignment, merge/drop columns, reset row indexes, overwrite column labels, and finally returned an empty `column_orderings` list. It also optimized squared cell statistics and adjacent recursion behavior instead of the evaluator's serialized character-Trie objective.
+
+This replacement preserves every input row and value, uses object dtype for mixed data, returns a valid column ordering for every output row, keeps row identity through the original DataFrame index, and evaluates a bounded set of candidate column-order constructions using exact sorted serialized-string LCP reuse. It includes a global frequency-ranked ordering and a conditional grouping alternative while honoring column merge groups and one-way dependency ordering constraints without modifying stored values.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import heapq
+from collections import Counter, defaultdict
+from typing import List, Tuple
+
+import pandas as pd
+from solver import Algorithm
+
+
+class Evolved(Algorithm):
+    """
+    Bounded row-specific column ordering for serialized prefix reuse.
+
+    The returned frame uses its positional columns as the serialized output
+    positions.  `column_orderings[row]` identifies which original source
+    column supplied each position for that row.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    @staticmethod
+    def _serialized_value(value) -> str:
+        """Match evaluator normalization without changing the stored value."""
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, bool) and missing:
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(value)
+
+    @staticmethod
+    def _lcp(left: str, right: str) -> int:
+        if left == right:
+            return len(left)
+        limit = min(len(left), len(right))
+        lo, hi = 0, limit
+        # Prefix slicing delegates the character comparison to C and avoids a
+        # Python loop over potentially long values.
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if left[:mid] == right[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    @classmethod
+    def _trie_score(cls, strings: List[str]) -> int:
+        if len(strings) < 2:
+            return 0
+        ordered = sorted(strings)
+        return sum(cls._lcp(ordered[i - 1], ordered[i])
+                   for i in range(1, len(ordered)))
+
+    @staticmethod
+    def _topological_order(items, edges, preferred):
+        """Stable Kahn ordering, using preferred order to break ties."""
+        item_set = set(items)
+        successors = {item: set() for item in items}
+        indegree = {item: 0 for item in items}
+        for before, after in edges:
+            if before in item_set and after in item_set and after not in successors[before]:
+                successors[before].add(after)
+                indegree[after] += 1
+
+        rank = {item: pos for pos, item in enumerate(preferred)}
+        queue = [(rank.get(item, len(rank)), item) for item in items if indegree[item] == 0]
+        heapq.heapify(queue)
+        result = []
+        while queue:
+            _, item = heapq.heappop(queue)
+            result.append(item)
+            for child in successors[item]:
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    heapq.heappush(queue, (rank.get(child, len(rank)), child))
+
+        # Cyclic user constraints cannot all be satisfied.  Retain the stable
+        # proposed ordering rather than dropping or duplicating any column.
+        if len(result) != len(items):
+            return list(preferred)
+        return result
+
+    def _make_blocks(self, columns, col_merge, one_way_dep):
+        """Create contiguous merge blocks and dependency-safe internal orders."""
+        count = len(columns)
+        parent = list(range(count))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            a, b = find(a), find(b)
+            if a != b:
+                parent[b] = a
+
+        positions = defaultdict(list)
+        for pos, name in enumerate(columns):
+            positions[name].append(pos)
+
+        # Existing API uses names.  For duplicate names, the first occurrence
+        # is used consistently; values themselves remain untouched.
+        def locate(name):
+            if name in positions:
+                return positions[name][0]
+            return None
+
+        for group in col_merge or []:
+            found = [locate(name) for name in group]
+            found = [pos for pos in found if pos is not None]
+            for pos in found[1:]:
+                union(found[0], pos)
+
+        groups = defaultdict(list)
+        for pos in range(count):
+            groups[find(pos)].append(pos)
+        blocks = list(groups.values())
+        blocks.sort(key=lambda group: min(group))
+        col_to_block = {}
+        for block_id, group in enumerate(blocks):
+            for pos in group:
+                col_to_block[pos] = block_id
+
+        dependencies = []
+        for source, target in one_way_dep or []:
+            # Preserve historical substring lookup behavior, but never assert
+            # or alter data when a requested name is absent/ambiguous.
+            source_matches = [i for i, name in enumerate(columns) if str(source) in str(name)]
+            target_matches = [i for i, name in enumerate(columns) if str(target) in str(name)]
+            if len(source_matches) == 1 and len(target_matches) == 1:
+                dependencies.append((source_matches[0], target_matches[0]))
+
+        internal = []
+        block_edges = []
+        for block_id, group in enumerate(blocks):
+            group_set = set(group)
+            local_edges = [(a, b) for a, b in dependencies if a in group_set and b in group_set]
+            internal.append(self._topological_order(group, local_edges, group))
+        for before, after in dependencies:
+            left, right = col_to_block[before], col_to_block[after]
+            if left != right:
+                block_edges.append((left, right))
+
+        return blocks, internal, block_edges
+
+    @staticmethod
+    def _block_scores(block_keys):
+        scores = []
+        for keys in block_keys:
+            counts = Counter(keys)
+            score = 0
+            for key, amount in counts.items():
+                if amount > 1:
+                    score += sum(map(len, key)) * amount * (amount - 1)
+            scores.append(score)
+        return scores
+
+    def _conditional_orders(self, block_keys, block_scores, block_edges):
+        """Build a bounded conditional prefix partition tree."""
+        rows = len(block_keys[0]) if block_keys else 0
+        block_count = len(block_keys)
+        global_order = sorted(range(block_count), key=lambda b: (-block_scores[b], b))
+        result = [None] * rows
+        if not rows:
+            return result
+
+        # On very wide inputs only inspect the most promising fields at nodes.
+        candidate_set = set(global_order[:min(48, block_count)])
+        node_budget = 2048
+        max_depth = min(block_count, 12)
+        used_nodes = 0
+
+        def finish(indices, prefix, remaining):
+            preferred = prefix + [b for b in global_order if b in remaining]
+            ordered = self._topological_order(
+                list(range(block_count)), block_edges, preferred
+            )
+            for row in indices:
+                result[row] = ordered
+
+        def visit(indices, remaining, prefix, depth):
+            nonlocal used_nodes
+            if (len(indices) < 2 or not remaining or depth >= max_depth
+                    or used_nodes >= node_budget):
+                finish(indices, prefix, remaining)
+                return
+            used_nodes += 1
+
+            options = [b for b in remaining if b in candidate_set]
+            if not options:
+                finish(indices, prefix, remaining)
+                return
+
+            best_block = None
+            best_score = 0
+            for block in options:
+                counts = Counter(block_keys[block][row] for row in indices)
+                score = sum(
+                    sum(map(len, key)) * amount * (amount - 1)
+                    for key, amount in counts.items() if amount > 1
+                )
+                if score > best_score or (score == best_score and
+                                          best_block is not None and block < best_block):
+                    best_block, best_score = block, score
+
+            if best_block is None or best_score <= 0:
+                finish(indices, prefix, remaining)
+                return
+
+            partitions = defaultdict(list)
+            for row in indices:
+                partitions[block_keys[best_block][row]].append(row)
+            rest = [b for b in remaining if b != best_block]
+            for part in partitions.values():
+                visit(part, rest, prefix + [best_block], depth + 1)
+
+        visit(list(range(rows)), list(range(block_count)), [], 0)
+        return result
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        del early_stop, row_stop, col_stop, distinct_value_threshold, parallel
+
+        rows, cols = df.shape
+        if cols == 0:
+            return df.copy(), [[] for _ in range(rows)]
+        if rows == 0:
+            return df.copy(), []
+
+        columns = list(df.columns)
+        # Object arrays preserve mixed source values, including pd.NA, exactly.
+        source_values = df.to_numpy(dtype=object, copy=True)
+        text = [
+            [self._serialized_value(source_values[row, col]) for col in range(cols)]
+            for row in range(rows)
+        ]
+
+        blocks, internal_orders, block_edges = self._make_blocks(
+            columns, col_merge, one_way_dep
+        )
+        block_keys = [
+            [tuple(text[row][col] for col in internal_orders[block_id])
+             for row in range(rows)]
+            for block_id in range(len(blocks))
+        ]
+        scores = self._block_scores(block_keys)
+
+        global_blocks = sorted(range(len(blocks)), key=lambda b: (-scores[b], b))
+        global_blocks = self._topological_order(
+            list(range(len(blocks))), block_edges, global_blocks
+        )
+        global_order = [
+            col for block in global_blocks for col in internal_orders[block]
+        ]
+
+        # Candidate 1 is a no-rearrangement baseline.  Candidate 2 is the
+        # required frequency-ranked global order.  Candidate 3 is conditional.
+        identity_order = list(range(cols))
+        conditional_blocks = self._conditional_orders(block_keys, scores, block_edges)
+        conditional_orders = [
+            [col for block in block_order for col in internal_orders[block]]
+            for block_order in conditional_blocks
+        ]
+
+        candidates = [
+            [identity_order for _ in range(rows)],
+            [global_order for _ in range(rows)],
+            conditional_orders,
+        ]
+
+        best_orders = candidates[0]
+        best_score = -1
+        for orders in candidates:
+            serialized = [
+                "".join(text[row][col] for col in orders[row])
+                for row in range(rows)
+            ]
+            score = self._trie_score(serialized)
+            if score > best_score:
+                best_score = score
+                best_orders = orders
+
+        final_strings = [
+            "".join(text[row][col] for col in best_orders[row])
+            for row in range(rows)
+        ]
+        row_order = sorted(range(rows), key=lambda row: (final_strings[row], row))
+
+        output_values = [
+            [source_values[row, col] for col in best_orders[row]]
+            for row in row_order
+        ]
+        # Positional labels remain stable; per-row source labels are supplied
+        # through column_orderings and every source value occurs exactly once.
+        output = pd.DataFrame(
+            output_values,
+            index=df.index.take(row_order),
+            columns=df.columns,
+            dtype=object,
+        )
+        column_orderings = [
+            [columns[col] for col in best_orders[row]]
+            for row in row_order
+        ]
+        return output, column_orderings
+
+# EVOLVE-BLOCK-END
+```

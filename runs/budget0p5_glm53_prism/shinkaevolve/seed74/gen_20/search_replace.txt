@@ -1,0 +1,59 @@
+<NAME>
+add_local_search_refinement</NAME>
+<DESCRIPTION>
+The current greedy assigns each model to the GPU with the lowest current KVPR, but never refines the result. Adding a local-search pass that repeatedly moves a model off the GPU with maximum KVPR to another GPU (when it strictly lowers the max KVPR) directly reduces the objective. This is the same refinement that helped the second prior program reach a higher score (21.52 vs 20.89 max_kvpr), and it is deterministic, fast, and keeps the same feasibility guarantees (moves only allowed when the model fits in the destination GPU's remaining memory).
+</DIFF>
+```diff
+<<<<<<< SEARCH
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    return placement
+=======
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    # 4) Local-search refinement: move models off the hottest GPU when it lowers max KVPR
+    def gpu_kvpr(gpu_id):
+        den = GPU_MEM_SIZE - sum(m.model_size for m in placement[gpu_id])
+        if den <= 0:
+            return float('inf')
+        return sum(m.req_rate / m.slo for m in placement[gpu_id]) / den
+
+    for _ in range(200):
+        kvs = [gpu_kvpr(g) for g in range(gpu_num)]
+        cur_max = max(kvs)
+        src = max(range(gpu_num), key=lambda g: kvs[g])
+        improved = False
+        for model in placement[src]:
+            w = model.req_rate / model.slo
+            for dst in range(gpu_num):
+                if dst == src or model.model_size > shared_kv[dst]:
+                    continue
+                src_den = shared_kv[src] + model.model_size
+                dst_den = shared_kv[dst] - model.model_size
+                if src_den <= 0 or dst_den <= 0:
+                    continue
+                new_src = (weighted_req_rate[src] - w) / src_den
+                new_dst = (weighted_req_rate[dst] + w) / dst_den
+                others = max([kvs[i] for i in range(gpu_num) if i not in (src, dst)] or [0.0])
+                if max(new_src, new_dst, others) < cur_max - 1e-12:
+                    placement[src].remove(model)
+                    placement[dst].append(model)
+                    shared_kv[src] += model.model_size
+                    shared_kv[dst] -= model.model_size
+                    weighted_req_rate[src] -= w
+                    weighted_req_rate[dst] += w
+                    improved = True
+                    break
+            if improved:
+                break
+        if not improved:
+            break
+
+    return placement
+>>>>>>> REPLACE
+```
+</DIFF>

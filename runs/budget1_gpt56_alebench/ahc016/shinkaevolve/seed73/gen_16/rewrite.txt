@@ -1,0 +1,338 @@
+// EVOLVE-BLOCK-START
+#include <bits/stdc++.h>
+using namespace std;
+
+struct EdgeCountCodec {
+    int M = 0;
+    int N = 4;
+    int L = 6;
+    double eps = 0.0;
+    vector<int> counts;
+    vector<double> means;
+    vector<double> boundaries;
+
+    static double normal_cdf(double x) {
+        return 0.5 * erfc(-x / sqrt(2.0));
+    }
+
+    static int edge_count(int n) {
+        return n * (n - 1) / 2;
+    }
+
+    EdgeCountCodec(int m, double e) : M(m), eps(e) {
+        choose_n_and_codebook();
+    }
+
+    vector<int> make_counts(int candidate_l) const {
+        vector<int> result(M);
+        for (int i = 0; i < M; ++i) {
+            result[i] = (int)llround((double)i * candidate_l / (M - 1));
+        }
+
+        for (int i = 1; i < M; ++i) {
+            result[i] = max(result[i], result[i - 1] + 1);
+        }
+        for (int i = M - 2; i >= 0; --i) {
+            result[i] = min(result[i], result[i + 1] - 1);
+        }
+        for (int& x : result) x = max(0, min(candidate_l, x));
+        return result;
+    }
+
+    double estimate_average_error(int candidate_l, const vector<int>& code) const {
+        if (eps <= 0.0) return 0.0;
+
+        const double sigma = sqrt(candidate_l * eps * (1.0 - eps));
+        const double slope = 1.0 - 2.0 * eps;
+        if (sigma <= 1e-15 || slope <= 1e-15) return 1.0;
+
+        vector<double> mu(M);
+        for (int i = 0; i < M; ++i) {
+            mu[i] = eps * candidate_l + slope * code[i];
+        }
+
+        double total_error = 0.0;
+        for (int i = 0; i < M; ++i) {
+            double ok = 1.0;
+
+            if (i > 0) {
+                double left_boundary = 0.5 * (mu[i - 1] + mu[i]);
+                ok -= normal_cdf((left_boundary - mu[i]) / sigma);
+            }
+            if (i + 1 < M) {
+                double right_boundary = 0.5 * (mu[i] + mu[i + 1]);
+                ok -= 1.0 - normal_cdf((right_boundary - mu[i]) / sigma);
+            }
+
+            ok = max(0.0, min(1.0, ok));
+            total_error += 1.0 - ok;
+        }
+        return total_error / M;
+    }
+
+    void choose_n_and_codebook() {
+        double best_value = -1e100;
+        int best_n = 100;
+        vector<int> best_counts;
+
+        for (int candidate_n = 4; candidate_n <= 100; ++candidate_n) {
+            int candidate_l = edge_count(candidate_n);
+            if (candidate_l < M - 1) continue;
+
+            vector<int> candidate_counts = make_counts(candidate_l);
+            double p_error = estimate_average_error(candidate_l, candidate_counts);
+
+            // E[0.9^E] for 100 independent queries:
+            // (1 - 0.1 * p_error)^100.
+            double value =
+                100.0 * log(max(1e-300, 1.0 - 0.1 * p_error))
+                - log((double)candidate_n);
+
+            if (value > best_value) {
+                best_value = value;
+                best_n = candidate_n;
+                best_counts = move(candidate_counts);
+            }
+        }
+
+        N = best_n;
+        L = edge_count(N);
+        counts = move(best_counts);
+
+        means.resize(M);
+        for (int i = 0; i < M; ++i) {
+            means[i] = eps * L + (1.0 - 2.0 * eps) * counts[i];
+        }
+
+        boundaries.resize(max(0, M - 1));
+        for (int i = 0; i + 1 < M; ++i) {
+            boundaries[i] = 0.5 * (means[i] + means[i + 1]);
+        }
+    }
+
+    string graph_string(int id) const {
+        string result(L, '0');
+        for (int i = 0; i < counts[id]; ++i) result[i] = '1';
+        return result;
+    }
+
+    int decode(const string& h) const {
+        int edges = 0;
+        for (char c : h) edges += (c == '1');
+
+        int lo = 0;
+        int hi = M - 1;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if ((double)edges <= boundaries[mid]) hi = mid;
+            else lo = mid + 1;
+        }
+        return lo;
+    }
+};
+
+struct ZeroNoiseCodec {
+    int M = 0;
+    int N = 4;
+    int L = 6;
+
+    vector<vector<int>> permutations;
+    vector<array<int, 15>> transformed_bit;
+    vector<int> owner;
+    vector<int> representatives;
+    vector<int> selected;
+    vector<int> representative_to_message;
+
+    static int edge_count(int n) {
+        return n * (n - 1) / 2;
+    }
+
+    ZeroNoiseCodec(int m) : M(m) {
+        if (M <= 11) N = 4;
+        else if (M <= 34) N = 5;
+        else N = 6;
+        L = edge_count(N);
+
+        build_permutations();
+        enumerate_orbits();
+        choose_codewords();
+    }
+
+    int bit_index(int a, int b) const {
+        if (a > b) swap(a, b);
+        int index = 0;
+        for (int i = 0; i < a; ++i) index += N - i - 1;
+        return index + (b - a - 1);
+    }
+
+    void build_permutations() {
+        vector<int> p(N);
+        iota(p.begin(), p.end(), 0);
+
+        do {
+            permutations.push_back(p);
+
+            array<int, 15> mapping{};
+            int pos = 0;
+            for (int i = 0; i < N; ++i) {
+                for (int j = i + 1; j < N; ++j) {
+                    mapping[pos++] = bit_index(p[i], p[j]);
+                }
+            }
+            transformed_bit.push_back(mapping);
+        } while (next_permutation(p.begin(), p.end()));
+    }
+
+    int transform_mask(int mask, const array<int, 15>& mapping) const {
+        int result = 0;
+        for (int b = 0; b < L; ++b) {
+            if (mask & (1 << b)) result |= 1 << mapping[b];
+        }
+        return result;
+    }
+
+    void enumerate_orbits() {
+        const int all_masks = 1 << L;
+        owner.assign(all_masks, -1);
+
+        for (int mask = 0; mask < all_masks; ++mask) {
+            if (owner[mask] != -1) continue;
+
+            representatives.push_back(mask);
+            for (const auto& mapping : transformed_bit) {
+                owner[transform_mask(mask, mapping)] = mask;
+            }
+        }
+    }
+
+    int graph_distance(int a, int b) const {
+        int best = L + 1;
+        for (const auto& mapping : transformed_bit) {
+            best = min(best, __builtin_popcount((unsigned)(a ^ transform_mask(b, mapping))));
+        }
+        return best;
+    }
+
+    void choose_codewords() {
+        const int R = (int)representatives.size();
+        vector<int> chosen_rep_index;
+        vector<char> used(R, false);
+        vector<int> min_distance(R, L + 1);
+
+        int empty_rep = owner[0];
+        int full_rep = owner[(1 << L) - 1];
+
+        auto rep_index_of = [&](int mask) {
+            for (int i = 0; i < R; ++i) {
+                if (representatives[i] == mask) return i;
+            }
+            return 0;
+        };
+
+        auto add_rep = [&](int idx) {
+            if (used[idx]) return;
+            used[idx] = true;
+            chosen_rep_index.push_back(idx);
+            for (int j = 0; j < R; ++j) {
+                min_distance[j] = min(min_distance[j],
+                                      graph_distance(representatives[idx], representatives[j]));
+            }
+        };
+
+        add_rep(rep_index_of(empty_rep));
+        if ((int)chosen_rep_index.size() < M) add_rep(rep_index_of(full_rep));
+
+        while ((int)chosen_rep_index.size() < M) {
+            int best_idx = -1;
+            int best_score = -1;
+
+            for (int i = 0; i < R; ++i) {
+                if (used[i]) continue;
+                if (min_distance[i] > best_score) {
+                    best_score = min_distance[i];
+                    best_idx = i;
+                }
+            }
+
+            if (best_idx == -1) break;
+            add_rep(best_idx);
+        }
+
+        selected.resize(M);
+        for (int i = 0; i < M; ++i) {
+            selected[i] = representatives[chosen_rep_index[i % chosen_rep_index.size()]];
+        }
+
+        representative_to_message.assign(1 << L, -1);
+        for (int i = 0; i < M; ++i) {
+            representative_to_message[selected[i]] = i;
+        }
+    }
+
+    string graph_string(int id) const {
+        string result(L, '0');
+        int mask = selected[id];
+        for (int i = 0; i < L; ++i) {
+            if (mask & (1 << i)) result[i] = '1';
+        }
+        return result;
+    }
+
+    int decode(const string& h) const {
+        int mask = 0;
+        for (int i = 0; i < L; ++i) {
+            if (h[i] == '1') mask |= 1 << i;
+        }
+
+        int representative = owner[mask];
+        int answer = representative_to_message[representative];
+        return answer >= 0 ? answer : 0;
+    }
+};
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int M;
+    double eps;
+    cin >> M >> eps;
+
+    // At exactly zero noise, unlabeled graph identity is perfectly preserved.
+    // For all noisy cases, the edge-count channel is much more stable under
+    // random vertex relabeling.
+    if (eps < 1e-12) {
+        ZeroNoiseCodec codec(M);
+
+        cout << codec.N << '\n';
+        for (int i = 0; i < M; ++i) {
+            cout << codec.graph_string(i) << '\n';
+        }
+        cout.flush();
+
+        for (int q = 0; q < 100; ++q) {
+            string h;
+            cin >> h;
+            cout << codec.decode(h) << '\n';
+            cout.flush();
+        }
+    } else {
+        EdgeCountCodec codec(M, eps);
+
+        cout << codec.N << '\n';
+        for (int i = 0; i < M; ++i) {
+            cout << codec.graph_string(i) << '\n';
+        }
+        cout.flush();
+
+        for (int q = 0; q < 100; ++q) {
+            string h;
+            cin >> h;
+            cout << codec.decode(h) << '\n';
+            cout.flush();
+        }
+    }
+
+    return 0;
+}
+// EVOLVE-BLOCK-END

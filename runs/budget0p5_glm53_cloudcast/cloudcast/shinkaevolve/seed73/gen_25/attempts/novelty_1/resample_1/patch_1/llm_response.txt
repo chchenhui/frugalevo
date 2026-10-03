@@ -1,0 +1,124 @@
+<NAME>
+greedy_steiner_tree_reuse_routing</NAME>
+
+<DESCRIPTION>
+The current algorithm routes each partition of each destination independently with only intra-destination congestion awareness, paying full cost on every edge for every partition. Since this is a broadcast (multicast) problem, edges already used by a prior destination's route can carry additional traffic at near-zero marginal cost. The best-performing prior generations (1035→1025 costs) showed that candidate selection and per-partition spreading help, but none combined (a) cross-destination edge reuse via a Steiner-tree-style heuristic with (b) per-partition load spreading. I implement a shortest-path-union Steiner heuristic: maintain a working "tree" graph whose edges, once paid for by any destination, cost a small epsilon for all subsequent destinations and partitions. Each partition of each destination runs Dijkstra on this reduced-cost working copy; since tree edges are nearly free, later destinations naturally route through the existing broadcast tree instead of paying for fresh parallel links, eliminating redundant transfers. After routing, each used edge's cost in the working copy drops to epsilon, so the union of paths approximates a directed Steiner tree. Edges are still emitted exactly as `[s, t, G[s][t]]` via `append_dst_partition_path`, and the original G/h are never mutated, avoiding the fatal failure modes of earlier generations. The per-partition load counter is retained (with a mild congestion penalty on the working copy) so the num_partitions copies of each partition still spread across parallel paths when beneficial.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    # Parameters
+    K_PATHS = 4              # bounded number of candidate paths per destination
+    CONGESTION_WEIGHT = 0.5  # penalty per concurrent load on an edge
+
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    def edge_cost(s, t):
+        base = h[s][t].get("cost")
+        if base is None:
+            base = 1e9
+        return base
+
+    def path_cost(path, edge_load):
+        c = 0.0
+        for i in range(len(path) - 1):
+            c += edge_cost(path[i], path[i + 1])
+            c += CONGESTION_WEIGHT * edge_load.get((path[i], path[i + 1]), 0)
+        return c
+
+    for dst in dsts:
+        if dst == src:
+            continue
+        # Bounded k-shortest simple paths via generator (never materialize all)
+        candidates = []
+        try:
+            count = 0
+            for path in nx.shortest_simple_paths(h, src, dst, weight="cost"):
+                candidates.append(path)
+                count += 1
+                if count >= K_PATHS:
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            candidates = []
+
+        if not candidates:
+            # Fallback: single Dijkstra path
+            try:
+                candidates = [nx.dijkstra_path(h, src, dst, weight="cost")]
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+
+        # Track congestion for this destination's partitions so
+        # successive partitions get spread across parallel paths.
+        edge_load = {}
+        for j in range(num_partitions):
+            best_c, best_p = None, None
+            for p in candidates:
+                c = path_cost(p, edge_load)
+                if best_c is None or c < best_c:
+                    best_c, best_p = c, p
+            for i in range(len(best_p) - 1):
+                key = (best_p[i], best_p[i + 1])
+                edge_load[key] = edge_load.get(key, 0) + 1
+                s, t = best_p[i], best_p[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    # Parameters
+    REUSE_EPSILON = 1e-9    # near-zero marginal cost on already-paid tree edges
+    CONGESTION_WEIGHT = 0.05  # mild penalty to spread partitions across parallel links
+
+    # Sanitized copy of G: no in-edges of src, no self loops (read-only).
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    # Working copy with mutable costs: used for greedy Steiner-tree routing.
+    # Edges already paid for by any destination become nearly free, so later
+    # destinations and partitions reuse the shared broadcast tree instead of
+    # paying for redundant parallel transfers.
+    w = h.copy()
+    for u, v in w.edges():
+        c = w[u][v].get("cost")
+        w[u][v]["cost"] = c if c is not None else 1e9
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Per-partition load per (dst, edge) to spread partitions over parallel paths.
+    edge_load = {}
+    paid_edges = set()
+
+    for dst in dsts:
+        if dst == src or dst not in h:
+            continue
+        for j in range(num_partitions):
+            # Apply congestion penalty on top of current (reuse-discounted) costs.
+            for (u, v), load in edge_load.items():
+                if w.has_edge(u, v):
+                    w[u][v]["cost"] += CONGESTION_WEIGHT * load
+
+            try:
+                path = nx.dijkstra_path(w, src, dst, weight="cost")
+            except (nx.NetworkXNoPath, nx.NetworkXError, nx.NodeNotFound):
+                # Retry on the pristine sanitized graph before giving up.
+                try:
+                    path = nx.dijkstra_path(h, src, dst, weight="cost")
+                except (nx.NetworkXNoPath, nx.NetworkXError, nx.NodeNotFound):
+                    continue
+
+            for i in range(len(path) - 1):
+                s, t = path[i], path[i + 1]
+                key = (s, t)
+                edge_load[key] = edge_load.get(key, 0) + 1
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+                if key not in paid_edges:
+                    paid_edges.add(key)
+                    # Edge is now part of the shared tree: marginal cost ~ 0.
+                    if w.has_edge(s, t):
+                        w[s][t]["cost"] = REUSE_EPSILON
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

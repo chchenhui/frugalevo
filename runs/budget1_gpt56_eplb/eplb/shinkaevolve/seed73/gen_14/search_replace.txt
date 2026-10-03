@@ -1,0 +1,81 @@
+<NAME>
+scalar_free_packing_and_replication
+</NAME>
+
+<DESCRIPTION>
+`balanced_packing` performs its greedy assignment in Python, but its current inner loop repeatedly indexes PyTorch scalar tensors and accumulates scalar tensors in a Python list. This creates substantial dispatcher and scalar-object overhead for every group assignment. Convert each sorted row and its weights to Python lists once, so the greedy LPT-with-capacity policy operates on native Python integers/floats while preserving the same ordering and assignment rule.
+
+`replicate_experts` also allocates a fresh division result for every redundant replica. Reuse a preallocated floating-point score buffer with `torch.div(..., out=...)`. Replica selections remain strictly sequential, so the existing `argmax(weight / logcnt)` greedy behavior is unchanged after every count update.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+=======
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    # The greedy policy is inherently sequential, but keeping its scalar
+    # bookkeeping out of PyTorch avoids a tensor dispatch per assignment.
+    weight_rows = weight.cpu().tolist()
+    index_rows = indices.tolist()
+    for i, (row_weight, row_indices) in enumerate(
+            zip(weight_rows, index_rows)):
+        pack_weights = [0.0] * num_packs
+        pack_items = [0] * num_packs
+        for group in row_indices:
+            pack = min(
+                (pack for pack in range(num_packs)
+                 if pack_items[pack] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += row_weight[group]
+            pack_items[pack] += 1
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+=======
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    replica_scores = torch.empty_like(weight, dtype=torch.float32)
+    for i in range(num_log, num_phy):
+        # Reuse the temporary while retaining the sequential greedy choice:
+        # every iteration observes the counts updated by the prior iteration.
+        torch.div(weight, logcnt, out=replica_scores)
+        redundant_indices = replica_scores.max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+>>>>>>> REPLACE
+</DIFF>

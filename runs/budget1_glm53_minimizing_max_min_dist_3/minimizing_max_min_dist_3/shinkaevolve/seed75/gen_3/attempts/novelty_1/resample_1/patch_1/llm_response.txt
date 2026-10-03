@@ -1,0 +1,95 @@
+<NAME>
+slsqp_pairwise_gap_optimizer</NAME>
+<DESCRIPTION>
+Replace the random-point placeholder with a constrained-optimization pipeline. The ratio dmin/dmax is scale-invariant, so we fix dmax ≤ 1 via explicit constraints and maximize a slack variable t subject to t² ≤ ||xi−xj||² for every pair, solved with SLSQP. The code is modularized into: seeding (deterministic multi-start candidates including an icosahedral configuration), constraint builders (vectorized pair distance functions), a solve stage, and a best-of restarts selection with final ratio-based renormalization. This directly attacks the true metric (squared ratio) instead of relying on luck, and targets the known reference ratio 1/4.1658 for 14 points in 3D.</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+from scipy.optimize import minimize
+
+N = 14
+D = 3
+
+
+def pair_indices():
+    return np.array(list(combinations(range(N), 2)))
+
+
+def pairwise_sq_dists(X, IJ):
+    diff = X[IJ[:, 0]] - X[IJ[:, 1]]
+    return np.sum(diff * diff, axis=1)
+
+
+def normalize(X):
+    X = X - X.mean(axis=0)
+    dm = np.sqrt(pairwise_sq_dists(X, pair_indices()).max())
+    return X / dm
+
+
+def seed_candidates():
+    cands = []
+    rng = np.random.default_rng(12345)
+    for _ in range(8):
+        cands.append(rng.normal(size=(N, D)))
+    # icosahedron + 2 poles
+    p = (1 + np.sqrt(5)) / 2
+    ico = np.array([
+        [-1, p, 0], [1, p, 0], [-1, -p, 0], [1, -p, 0],
+        [0, -1, p], [0, 1, p], [0, -1, -p], [0, 1, -p],
+        [p, 0, -1], [p, 0, 1], [-p, 0, -1], [-p, 0, 1],
+    ], dtype=float)
+    for s in (0.5, 0.7, 0.9):
+        cands.append(np.vstack([ico * s, [[0, 0, 1.0], [0, 0, -1.0]]]))
+    # small cubic-lattice-based start
+    g = np.array(np.meshgrid([-1, 0, 1], [-1, 0, 1], [-1, 0, 1])).reshape(3, -1).T
+    cands.append(g[rng.choice(len(g), size=N, replace=False)])
+    return [normalize(c) for c in cands]
+
+
+def solve(X0, IJ):
+    X0 = normalize(X0)
+    d2 = pairwise_sq_dists(X0, IJ)
+    t0 = np.sqrt(d2.min())
+    z0 = np.concatenate([X0.ravel(), [t0]])
+
+    def obj(z):
+        return -z[-1]
+
+    def cons_f(z):
+        X = z[:N * D].reshape(N, D)
+        t2 = z[-1] ** 2
+        d2 = pairwise_sq_dists(X, IJ)
+        return np.concatenate([t2 - d2, d2 - 1.0])
+
+    res = minimize(obj, z0, method="SLSQP",
+                   constraints=[{"type": "ineq", "fun": cons_f}],
+                   options={"maxiter": 300, "ftol": 1e-12})
+    X = res.x[:N * D].reshape(N, D)
+    return X
+
+
+def score(X):
+    d2 = pairwise_sq_dists(X, pair_indices())
+    return d2.min() / d2.max()
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    IJ = pair_indices()
+    best, best_s = None, -1.0
+    for cand in seed_candidates():
+        for rep in range(3):
+            X = solve(cand, IJ)
+            s = score(X)
+            if s > best_s:
+                best_s, best = s, X
+            cand = normalize(X)
+            if best_s > 0.2395:
+                break
+    best = normalize(best)
+    assert np.isfinite(best).all() and best.shape == (N, D)
+    return best
+# EVOLVE-BLOCK-END
+```
+</CODE>

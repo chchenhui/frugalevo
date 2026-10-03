@@ -1,0 +1,213 @@
+--- a/original.py
++++ b/original.py
+@@ -1,94 +1,140 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def min_max_dist_dim3_14() -> np.ndarray:
+-    """
+-    Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
++    """Construct 14 points in 3D maximizing min pairwise / max pairwise distance."""
++    from scipy.optimize import minimize
++    from scipy.special import logsumexp
+ 
+-    Returns
+-        points: np.ndarray of shape (14,3) containing the (x,y) coordinates of the 14 points.
++    n, d = 14, 3
++    iu = np.triu_indices(n, 1)
+ 
+-    """
++    def dists(p):
++        diff = p[:, None, :] - p[None, :, :]
++        return np.sqrt(np.maximum((diff * diff).sum(-1), 1e-16))[iu]
+ 
+-    n = 14
+-    d = 3
++    def ratio(p):
++        D = dists(p)
++        return D.min() / D.max()
+ 
+-    np.random.seed(42)
++    def norm_pts(p):
++        p = p - p.mean(axis=0)
++        s = np.linalg.norm(p, axis=1).max()
++        return p / max(s, 1e-12)
+ 
+-    # Start from an icosahedron (12 well-spread vertices) + 2 extra points
++    rng = np.random.default_rng(0)
++    best_pts, best_r = None, -1.0
++
++    # --- Seed set: dense D6 family scan + icosahedron + random ---
++    def d6_seed(h, r, pz):
++        t = 2 * np.pi * np.arange(6) / 6.0
++        r1 = np.stack([r * np.cos(t), r * np.sin(t), np.full(6, h)], axis=1)
++        r2 = np.stack([r * np.cos(t + np.pi / 6), r * np.sin(t + np.pi / 6),
++                       np.full(6, -h)], axis=1)
++        return np.vstack([r1, r2, [[0, 0, pz], [0, 0, -pz]]])
++
++    seeds = [d6_seed(h, r, pz) for h in (0.25, 0.3, 0.35, 0.4, 0.45, 0.5)
++             for r in (0.9, 1.0, 1.1) for pz in (1.0, 1.1)]
++    # icosahedron + 2 poles
+     phi = (1 + np.sqrt(5)) / 2
+-    verts = []
+-    for a, b in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+-        pass
+-    base = np.array([
++    ico = np.array([
+         [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+         [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+-        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+-    ], dtype=float)
+-    base /= np.linalg.norm(base, axis=1, keepdims=True)
+-    # two extra points near opposite poles, slightly perturbed to break symmetry
+-    extra = np.array([[0.0, 0.0, 1.05], [0.1, -0.1, -1.05]])
+-    points = np.vstack([base, extra])
++        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1]], dtype=float)
++    ico /= np.linalg.norm(ico, axis=1, keepdims=True)
++    for pz in (1.0, 1.15):
++        seeds.append(np.vstack([ico, [[0, 0, pz], [0, 0, -pz]]]))
++    for _ in range(4):
++        p = rng.normal(size=(n, d))
++        seeds.append(p / np.linalg.norm(p, axis=1, keepdims=True))
+ 
+-    def pairwise(pts):
+-        diff = pts[:, None, :] - pts[None, :, :]
+-        return np.sqrt(np.sum(diff * diff, axis=-1) + 1e-12)
++    T_LADDER = (0.06, 0.03, 0.012, 0.005, 0.002, 0.001)
+ 
+-    def objective(flat, tau):
+-        P = flat.reshape(n, d)
+-        D = pairwise(P)
+-        iu = np.triu_indices(n, 1)
+-        dv = D[iu]
+-        smin = -tau * np.log(np.sum(np.exp(-dv / tau)))
+-        smax = tau * np.log(np.sum(np.exp(dv / tau)))
+-        return -(smin / smax)
++    def anneal(pts, ladder=T_LADDER, maxit=400):
++        for T in ladder:
++            def loss(x, T=T):
++                p = x.reshape(n, d)
++                p = p - p.mean(axis=0)
++                D = dists(p)
++                D = D / max(D.max(), 1e-9)
++                smin = -T * logsumexp(-D / T)
++                smax = T * logsumexp(D / T)
++                return -(smin / smax)
++            res = minimize(loss, pts.ravel(), method="L-BFGS-B",
++                           options={"maxiter": maxit, "maxfun": 4 * maxit})
++            q = res.x.reshape(n, d)
++            if np.isfinite(q).all():
++                pts = norm_pts(q)
++        return pts
+ 
+-    # Coordinate descent over annealed temperatures with local random restarts
+-    best_pts = points.copy()
+-    def true_ratio(P):
+-        D = pairwise(P)[np.triu_indices(n, 1)]
+-        return D.min() / D.max()
++    # --- Targeted pair-move polish: push closest pair apart, pull diameter in ---
++    def pair_polish(pts, steps=(0.02, 0.01, 0.005, 0.002), rounds=40):
++        pts = pts.copy()
++        cur = ratio(pts)
++        for _ in range(rounds):
++            improved = False
++            Dfull = np.sqrt(np.maximum(
++                ((pts[:, None] - pts[None]) ** 2).sum(-1), 1e-16))
++            Dp = Dfull[iu]
++            imin, jmin = iu[0][np.argmin(Dp)], iu[1][np.argmin(Dp)]
++            imax, jmax = iu[0][np.argmax(Dp)], iu[1][np.argmax(Dp)]
++            for s in steps:
++                Q = pts.copy()
++                u = Q[imin] - Q[jmin]
++                u /= (np.linalg.norm(u) + 1e-12)
++                Q[imin] += s * u
++                Q[jmin] -= s * u
++                v = Q[imax] - Q[jmax]
++                v /= (np.linalg.norm(v) + 1e-12)
++                Q[imax] -= s * v
++                Q[jmax] += s * v
++                r = ratio(Q)
++                if r > cur + 1e-12:
++                    pts, cur, improved = Q, r, True
++                    break
++                # also try pure closest-pair move only
++                Q2 = pts.copy()
++                Q2[imin] += s * u
++                Q2[jmin] -= s * u
++                r2 = ratio(Q2)
++                if r2 > cur + 1e-12:
++                    pts, cur, improved = Q2, r2, True
++                    break
++            if not improved:
++                break
++        return pts
+ 
+-    best_val = true_ratio(best_pts)
+-    rng = np.random.RandomState(0)
+-    try:
+-        from scipy.optimize import minimize
+-        for trial in range(6):
+-            if trial == 0:
+-                P0 = points.copy()
+-            else:
+-                P0 = best_pts + 0.05 * rng.randn(n, d)
+-            for tau in [0.1, 0.05, 0.02, 0.01]:
+-                res = minimize(objective, P0.ravel(), args=(tau,),
+-                               method="L-BFGS-B",
+-                               options={"maxiter": 400})
+-                P0 = res.x.reshape(n, d)
+-            v = true_ratio(P0)
+-            if v > best_val:
+-                best_val = v
+-                best_pts = P0.copy()
+-    except Exception:
+-        # scipy unavailable: fall back to simple centroid-based relaxation
+-        for _ in range(200):
+-            D = pairwise(best_pts)
+-            iu = np.triu_indices(n, 1)
+-            dmin = D[iu].min()
+-            dmax = D[iu].max()
+-            for i in range(n):
+-                d_i = np.delete(D[i], i)
+-                nearest = np.argmin(np.delete(D[i], i))
+-                others = np.delete(np.arange(n), i)
+-                best_pts[i] += 0.02 * (best_pts[i] - best_pts[others[nearest]]) / max(dmin, 1e-9)
++    # --- Main optimization over seeds ---
++    for P0 in seeds:
++        pts = anneal(norm_pts(np.asarray(P0, float)))
++        r = ratio(pts)
++        if r > best_r:
++            best_r, best_pts = r, pts.copy()
+ 
+-    points = best_pts
++    # --- Perturb-restart cycles with pair polish ---
++    for trial in range(12):
++        scale = 0.015 + 0.012 * trial
++        P0 = best_pts + scale * rng.normal(size=(n, d)) / np.sqrt(3)
++        pts = anneal(norm_pts(P0), ladder=(0.02, 0.008, 0.003, 0.001), maxit=300)
++        pts = pair_polish(pts)
++        r = ratio(pts)
++        if r > best_r:
++            best_r, best_pts = r, pts.copy()
+ 
+-    # Normalize: translate centroid to origin, scale so max distance = 1
++    # Final full anneal + polish from the best
++    pts = pair_polish(anneal(best_pts, ladder=(0.004, 0.001), maxit=600))
++    if ratio(pts) > best_r:
++        best_pts = pts
++
++    points = np.asarray(best_pts, dtype=float)
+     points = points - points.mean(axis=0)
+-    D = pairwise(points)[np.triu_indices(n, 1)]
+-    points = points / D.max()
+-
++    Dm = dists(points).max()
++    if (not np.isfinite(points).all()) or points.shape != (n, d) or Dm <= 0:
++        points = np.random.default_rng(1).normal(size=(n, d))
++    else:
++        points = points / Dm
+     return points
+ 
+ 
+ # EVOLVE-BLOCK-END

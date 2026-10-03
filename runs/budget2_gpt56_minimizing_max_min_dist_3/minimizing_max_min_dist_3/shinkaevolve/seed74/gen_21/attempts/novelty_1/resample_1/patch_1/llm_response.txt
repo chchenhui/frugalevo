@@ -1,0 +1,205 @@
+<NAME>
+projective_contact_portfolio
+</NAME>
+
+<DESCRIPTION>
+This implementation uses a portfolio of two complementary geometric searches rather than relying only on smooth min/max distance surrogates.
+
+The first search exploits a useful structural hypothesis for diameter-ratio packings: strong configurations often contain nearly antipodal pairs. It therefore optimizes seven unoriented lines on the sphere and expands them into fourteen antipodal points. This converts the problem into minimizing the largest absolute inner product between seven directions, using a Riemannian projected optimizer with staged sharpness.
+
+The second search remains fully unconstrained, but uses a rank-based contact-force model instead of differentiating smooth extrema. The closest pairs receive repulsive forces and the farthest pairs receive attractive forces. Since weights are based on distance ranks, the optimization is less sensitive to abrupt changes in the active contact graph. Both searches use deterministic multistart, continuation, incumbent perturbations, and exact pairwise-ratio selection.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct 14 three-dimensional points maximizing the minimum squared
+    pairwise distance divided by the maximum squared pairwise distance.
+
+    A deterministic portfolio is used:
+      * a projective/spherical search over seven antipodal line pairs;
+      * a general rank-contact force search over all fourteen points.
+    """
+    n, d = 14, 3
+    pi, pj = np.triu_indices(n, 1)
+    rng = np.random.default_rng(731942)
+
+    def normalize(x):
+        x = x - x.mean(axis=0, keepdims=True)
+        scale = np.sqrt(np.mean(np.sum(x * x, axis=1)))
+        return x / max(scale, 1e-15)
+
+    def ratio(x):
+        z = x[pi] - x[pj]
+        q = np.einsum("ij,ij->i", z, z)
+        return float(q.min() / q.max())
+
+    def unit_rows(x):
+        return x / np.sqrt(np.sum(x * x, axis=1, keepdims=True) + 1e-15)
+
+    best = None
+    best_value = -1.0
+
+    # ------------------------------------------------------------------
+    # Projective search: seven lines represent fourteen antipodal points.
+    # For unit lines the diameter is exactly 2, and the objective is
+    # (1 - max |u_i dot u_j|) / 2.
+    # ------------------------------------------------------------------
+    anti_best = None
+    anti_value = -1.0
+    li, lj = np.triu_indices(7, 1)
+    sharpness_stages = (4.0, 11.0, 30.0, 85.0, 240.0)
+
+    for restart in range(42):
+        if restart < 28 or anti_best is None:
+            lines = unit_rows(rng.standard_normal((7, 3)))
+        else:
+            lines = unit_rows(
+                anti_best + 0.16 * rng.standard_normal((7, 3))
+            )
+
+        # Independent tangent-space Adam states at each continuation level
+        # avoid carrying broad-stage momentum into a contact-stage solve.
+        for stage, beta in enumerate(sharpness_stages):
+            m = np.zeros_like(lines)
+            v = np.zeros_like(lines)
+            count = 230
+
+            for it in range(count):
+                dots = lines @ lines.T
+                values = dots[li, lj] ** 2
+
+                # Soft active-set average of squared correlations.
+                shift = values.max()
+                weights = np.exp(beta * (values - shift))
+                weights /= weights.sum()
+
+                wmat = np.zeros((7, 7))
+                deriv = 2.0 * weights * dots[li, lj]
+                wmat[li, lj] = deriv
+                wmat[lj, li] = deriv
+
+                # Euclidean gradient of the weighted correlation energy.
+                grad = wmat @ lines
+
+                # Riemannian projection to the tangent planes of S^2.
+                grad -= np.sum(grad * lines, axis=1, keepdims=True) * lines
+
+                m = 0.88 * m + 0.12 * grad
+                v = 0.985 * v + 0.015 * (grad * grad)
+                direction = m / (np.sqrt(v) + 1e-8)
+
+                # Minimize coherence; later stages take smaller steps.
+                frac = it / max(count - 1, 1)
+                step = (0.060 / (1.0 + 0.22 * stage)) * (1.0 - 0.58 * frac)
+                lines = unit_rows(lines - step * direction)
+
+                if it % 40 == 0 or it == count - 1:
+                    coherence = np.max(np.abs((lines @ lines.T)[li, lj]))
+                    value = 0.5 * (1.0 - coherence)
+                    if value > anti_value:
+                        anti_value = value
+                        anti_best = lines.copy()
+
+        candidate = np.vstack((lines, -lines))
+        value = ratio(candidate)
+        if value > best_value:
+            best_value = value
+            best = candidate.copy()
+
+    if anti_best is not None:
+        candidate = np.vstack((anti_best, -anti_best))
+        value = ratio(candidate)
+        if value > best_value:
+            best_value = value
+            best = candidate.copy()
+
+    # ------------------------------------------------------------------
+    # General search: rank-weighted nearest/farthest contact dynamics.
+    # Rank forces make this distinct from a direct soft-min/soft-max
+    # objective and allow contact graphs to exchange during optimization.
+    # ------------------------------------------------------------------
+    general_best = best.copy()
+
+    for restart in range(26):
+        if restart < 17:
+            points = normalize(rng.standard_normal((n, d)))
+        else:
+            points = normalize(
+                general_best + 0.105 * rng.standard_normal((n, d))
+            )
+
+        velocity = np.zeros_like(points)
+
+        for it in range(1550):
+            delta = points[pi] - points[pj]
+            q = np.einsum("ij,ij->i", delta, delta)
+
+            order = np.argsort(q)
+            ranks = np.empty_like(order)
+            ranks[order] = np.arange(order.size)
+
+            progress = it / 1549.0
+
+            # Broad rank neighborhoods initially establish a balanced
+            # framework; narrow neighborhoods later polish active contacts.
+            low_width = 18.0 - 14.8 * progress
+            high_width = 16.0 - 13.2 * progress
+
+            low = np.exp(-ranks / low_width)
+            high = np.exp(-(order.size - 1 - ranks) / high_width)
+            low /= low.sum()
+            high /= high.sum()
+
+            # Normalize each side by its current characteristic distance.
+            # This approximates a scale-free ratio force while retaining
+            # rank-only contact selection.
+            low_scale = float(np.dot(low, q))
+            high_scale = float(np.dot(high, q))
+            pair_force = low / max(low_scale, 1e-14) - high / max(high_scale, 1e-14)
+
+            matrix = np.zeros((n, n))
+            matrix[pi, pj] = pair_force
+            matrix[pj, pi] = pair_force
+
+            grad = 2.0 * (
+                matrix.sum(axis=1)[:, None] * points - matrix @ points
+            )
+            grad -= grad.mean(axis=0, keepdims=True)
+
+            gnorm = np.sqrt(np.mean(np.sum(grad * grad, axis=1)))
+            grad /= max(gnorm, 1e-14)
+
+            # Heavy momentum during framework formation, reduced during
+            # late contact polishing.
+            momentum = 0.82 - 0.30 * progress
+            velocity = momentum * velocity + (1.0 - momentum) * grad
+            vnorm = np.sqrt(np.mean(np.sum(velocity * velocity, axis=1)))
+            velocity /= max(vnorm, 1e-14)
+
+            step = 0.050 * (1.0 - 0.72 * progress)
+            points = normalize(points + step * velocity)
+
+            if it % 31 == 0 or it == 1549:
+                value = ratio(points)
+                if value > best_value:
+                    best_value = value
+                    best = points.copy()
+                    general_best = points.copy()
+
+        value = ratio(points)
+        if value > best_value:
+            best_value = value
+            best = points.copy()
+            general_best = points.copy()
+
+    return np.asarray(best, dtype=float)
+
+
+# EVOLVE-BLOCK-END
+```

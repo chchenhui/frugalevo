@@ -1,0 +1,156 @@
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles"""
+import numpy as np
+
+
+def _init_hex(s):
+    """Hexagonal lattice layout: 6 staggered rows with counts 4,5,4,5,4,4."""
+    n = 26
+    centers = np.zeros((n, 2))
+    sqrt3_2 = np.sqrt(3.0) / 2.0
+    h = sqrt3_2 * s
+    row_counts = [4, 5, 4, 5, 4, 4]
+    idx = 0
+    for r_i, cnt in enumerate(row_counts):
+        y = s / 2.0 + r_i * h
+        x0 = 0.5 - (cnt - 1) * s / 2.0
+        if r_i % 2 == 1:
+            x0 += s / 2.0
+        for c in range(cnt):
+            centers[idx] = [x0 + c * s, y]
+            idx += 1
+    return centers
+
+
+def _compute_max_radii(centers):
+    """Vectorized max radii: border limits then iterative pairwise scaling."""
+    radii = np.minimum(
+        np.minimum(centers[:, 0], 1 - centers[:, 0]),
+        np.minimum(centers[:, 1], 1 - centers[:, 1]),
+    )
+    n = centers.shape[0]
+    for _ in range(200):
+        diff = centers[:, None, :] - centers[None, :, :]   # (n, n, 2)
+        dist = np.sqrt((diff ** 2).sum(-1))                # (n, n)
+        np.fill_diagonal(dist, np.inf)
+        total = radii[:, None] + radii[None, :]
+        overlap = total > dist
+        if not overlap.any():
+            break
+        # For each overlapping pair, shrink both proportionally.
+        # Process upper triangle to keep it symmetric-ish and convergent.
+        iu = np.triu_indices(n, k=1)
+        d = dist[iu]
+        t = radii[iu[0]] + radii[iu[1]]
+        bad = t > d
+        if not bad.any():
+            break
+        bi, bj = iu[0][bad], iu[1][bad]
+        scale = d[bad] / t[bad]
+        # Apply sequentially (accumulate via minimum scale per circle)
+        for a, b, sc in zip(bi, bj, scale):
+            radii[a] *= sc
+            radii[b] *= sc
+    return radii
+
+
+def _relax(centers, n_iters=150):
+    """Alternate: compute radii, then push overlapping circles apart."""
+    centers = centers.copy()
+    for _ in range(n_iters):
+        radii = _compute_max_radii(centers)
+        diff = centers[:, None, :] - centers[None, :, :]
+        dist = np.sqrt((diff ** 2).sum(-1))
+        np.fill_diagonal(dist, np.inf)
+        overlap_amt = radii[:, None] + radii[None, :] - dist
+        if (overlap_amt <= 1e-10).all():
+            break
+        move = np.zeros_like(centers)
+        iu = np.triu_indices(centers.shape[0], k=1)
+        ov = overlap_amt[iu]
+        mask = ov > 1e-12
+        if not mask.any():
+            break
+        ii, jj = iu[0][mask], iu[1][mask]
+        d = dist[ii, jj][:, None]
+        u = (centers[ii] - centers[jj]) / d
+        push = 0.5 * 0.1 * ov[mask][:, None] * u
+        np.add.at(move, ii, push)
+        np.add.at(move, jj, -push)
+        centers += move
+        # Keep circles off walls by their current radii
+        r = _compute_max_radii(centers)
+        centers[:, 0] = np.clip(centers[:, 0], r, 1 - r)
+        centers[:, 1] = np.clip(centers[:, 1], r, 1 - r)
+    return centers
+
+
+def construct_packing():
+    """
+    Construct a specific arrangement of 26 circles in a unit square
+    that attempts to maximize the sum of their radii.
+
+    Returns:
+        Tuple of (centers, radii, sum_of_radii)
+    """
+    sqrt3_2 = np.sqrt(3.0) / 2.0
+    best = None
+    # Try a range of lattice spacings, relax each, keep the best.
+    for s in [0.155, 0.17, 0.185, 0.19, 1.0 / (5.0 + sqrt3_2)]:
+        centers = _init_hex(s)
+        centers = _relax(centers)
+        radii = _compute_max_radii(centers)
+        total = radii.sum()
+        if best is None or total > best[2]:
+            best = (centers, radii, total)
+
+    centers, radii, sum_radii = best
+    return centers, radii, sum_radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

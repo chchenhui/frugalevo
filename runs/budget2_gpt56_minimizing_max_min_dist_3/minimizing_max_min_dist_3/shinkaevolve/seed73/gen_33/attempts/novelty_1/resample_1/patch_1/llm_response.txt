@@ -1,0 +1,83 @@
+<NAME>
+exact_coherence_polish
+</NAME>
+
+<DESCRIPTION>
+For the antipodal construction, the squared distance ratio is exactly `(1 - max_abs_dot) / 2`, so minimizing the maximum absolute inter-line dot product is the exact hard objective rather than merely a surrogate. Replace the final single-candidate selection with a reproducible batched hard-objective polishing phase over all ten retained candidates.
+
+Each iteration constructs deterministic soft-contact descent proposals plus tangent-space perturbations. Half of the perturbations affect all directions and half emphasize individual-line contact exchanges. A proposal is accepted only when its exact maximum absolute dot product improves, preserving the best hard ratio throughout and allowing the search to escape the contact patterns favored by the late log-sum-exp stages.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    dots = np.abs(np.einsum("aid,ajd->aij", directions, directions))
+    dots[:, np.arange(n_lines), np.arange(n_lines)] = 0.0
+    best = directions[np.argmin(np.max(dots, axis=(1, 2)))]
+
+    points = np.vstack((best, -best))
+    return points
+=======
+    # The hard objective for antipodal points is monotone in the coherence
+    # max_{i != j} |vi dot vj|.  Do a final batched search with acceptance
+    # based on that exact quantity, rather than selecting solely by the
+    # finite-beta surrogate used above.
+    polish_rng = np.random.default_rng(314159)
+    n_candidates = directions.shape[0]
+    batch = 20
+    diagonal = np.arange(n_lines)
+
+    def coherence(v):
+        c = np.abs(np.einsum("aid,ajd->aij", v, v))
+        c[:, diagonal, diagonal] = 0.0
+        return np.max(c, axis=(1, 2))
+
+    current = directions.copy()
+    current_value = coherence(current)
+
+    for iteration in range(1050):
+        dots = np.einsum("aid,ajd->aij", current, current)
+        absolute = np.abs(dots)
+        absolute[:, diagonal, diagonal] = 0.0
+
+        # A sharp, stable contact weighting supplies a useful descent
+        # direction while hard acceptance below remains the true criterion.
+        beta = 180.0 + 850.0 * iteration / 1049.0
+        shifted = beta * (absolute - np.max(absolute, axis=(1, 2), keepdims=True))
+        weights = np.exp(shifted)
+        weights[:, diagonal, diagonal] = 0.0
+        weights /= np.sum(weights, axis=(1, 2), keepdims=True)
+        force = np.einsum("aij,aij,ajd->aid", weights, np.sign(dots), current)
+        force -= np.sum(force * current, axis=2, keepdims=True) * current
+
+        fraction = 1.0 - iteration / 1050.0
+        step = 0.015 * fraction + 0.0015
+        noise_size = 0.018 * fraction + 0.0007
+        noise = polish_rng.normal(size=(n_candidates, batch, n_lines, 3))
+        noise -= np.sum(noise * current[:, None], axis=3, keepdims=True) * current[:, None]
+        noise *= noise_size
+        noise[:, 0] = 0.0
+
+        # Localized perturbations are especially useful when replacing one
+        # member of a nearly active contact set.
+        for b in range(batch // 2, batch):
+            moved = polish_rng.integers(n_lines, size=n_candidates)
+            keep = np.zeros((n_candidates, n_lines, 1))
+            keep[np.arange(n_candidates), moved, 0] = 1.0
+            noise[:, b] *= keep
+
+        proposal = current[:, None] - step * force[:, None] + noise
+        proposal /= np.linalg.norm(proposal, axis=3, keepdims=True)
+        proposal_dots = np.abs(np.einsum("abid,abjd->abij", proposal, proposal))
+        proposal_dots[:, :, diagonal, diagonal] = 0.0
+        proposal_value = np.max(proposal_dots, axis=(2, 3))
+        choice = np.argmin(proposal_value, axis=1)
+        chosen_value = proposal_value[np.arange(n_candidates), choice]
+        improved = chosen_value < current_value
+        current[improved] = proposal[np.arange(n_candidates)[improved], choice[improved]]
+        current_value[improved] = chosen_value[improved]
+
+    best = current[np.argmin(current_value)]
+    points = np.vstack((best, -best))
+    return points
+>>>>>>> REPLACE
+</DIFF>

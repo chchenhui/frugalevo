@@ -1,0 +1,285 @@
+<NAME>
+trie_prefix_reuse_fix</NAME>
+<DESCRIPTION>
+The original program failed validation because it fundamentally violated the output contract and data-preservation rules: it added an extra "original_index" column, dropped/merged cells via merge, left the returned `column_orderings` as an empty list (invalid per-row orderings), sorted rows destroying row identity, and built a fragile value-grouping recursion (attribute-based `getattr(row, col)`, `df.stack()` Counters) that altered/dropped data and could crash. The fix replaces the algorithm with a correct, bounded construction: serialize all cells once, build three candidate per-row column orderings — (1) a global order ranked by sum len(v)*count(v)*(count(v)-1), (2) an alternative len-weighted pair-repetition ranking, and (3) a recursive conditional partition tree that branches on the column with the largest length-weighted repeated-pair savings inside each group — then score each candidate with the exact ideal character-Trie reuse (sum of LCPs of lexicographically adjacent serialized rows, computed with C-speed slice comparisons and binary-search LCP), select the best, and emit a per-row permuted DataFrame (object dtype, all original values preserved) plus matching per-row column orderings. Column merges and one-way dependencies are honored as adjacency constraints in each row's ordering. No extra columns, no dropped rows, no fabricated values.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List, Dict
+from collections import Counter
+
+
+class Evolved(Algorithm):
+    """
+    Trie-prefix-cache-aware column reordering.
+
+    Builds a small set of candidate per-row column orderings, scores each with
+    the exact ideal character-Trie reuse objective (sum of LCPs between
+    lexicographically adjacent serialized rows), and returns the best one.
+    All original cell values and rows are preserved; only the per-row column
+    permutation changes.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+        self.row_stop = None
+        self.col_stop = None
+
+    # ------------------------------------------------------------------ #
+    # serialization / scoring helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _ser_series(s: pd.Series) -> List[str]:
+        """Serialized cell strings; missing values become ''."""
+        return s.astype(object).where(s.notna(), "").astype(str).tolist()
+
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        n = min(len(a), len(b))
+        if n == 0:
+            return 0
+        if a[:n] == b[:n]:
+            return n
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    @classmethod
+    def _trie_reuse(cls, strings: List[str]) -> int:
+        """Ideal Trie reuse = sum of adjacent LCPs over sorted unique strings."""
+        if not strings:
+            return 0
+        reuse = 0
+        prev = None
+        for s in sorted(strings):
+            if prev is not None:
+                reuse += cls._lcp(prev, s)
+            prev = s
+        return reuse
+
+    @staticmethod
+    def _row_strings(sers: Dict, order: List, n_rows: int) -> List[str]:
+        parts = [sers[c] for c in order]
+        return ["".join(col[i] for col in parts) for i in range(n_rows)]
+
+    # ------------------------------------------------------------------ #
+    # candidate constructions
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _rank_cols(cols: List, sers: Dict, mode: str) -> List:
+        scores = {}
+        for c in cols:
+            cnt = Counter(sers[c])
+            if mode == "pair_weighted":
+                scores[c] = sum(len(v) * k * (k - 1) for v, k in cnt.items())
+            else:  # "len_weighted"
+                scores[c] = sum(len(v) * (k - 1) for v, k in cnt.items())
+        pos = {c: i for i, c in enumerate(cols)}
+        return sorted(cols, key=lambda c: (-scores[c], pos[c]))
+
+    def _cond_orderings(
+        self,
+        idxs: List[int],
+        cols: List,
+        sers: Dict,
+        branchable: set,
+        tail_rank: Dict,
+        early_stop: int,
+        depth: int,
+    ) -> List[List]:
+        """Recursive conditional partition tree; returns per-row orderings."""
+        n = len(idxs)
+        tail = [c for c in tail_rank["_order"] if c in cols]
+        tail = tail + [c for c in cols if c not in set(tail)]
+        if (
+            n <= 1
+            or not cols
+            or (self.col_stop is not None and depth >= self.col_stop)
+            or (self.row_stop is not None and depth >= self.row_stop)
+        ):
+            return [list(tail) for _ in range(n)]
+
+        best_col, best_sav = None, 0
+        for c in cols:
+            if c not in branchable:
+                continue
+            cnt = Counter(sers[c][i] for i in idxs)
+            if len(cnt) < 2:
+                continue
+            sav = sum(len(v) * k * (k - 1) for v, k in cnt.items())
+            if sav > best_sav:
+                best_sav, best_col = sav, c
+
+        if best_col is None or best_sav <= max(early_stop, 0):
+            return [list(tail) for _ in range(n)]
+
+        groups: Dict[str, List[int]] = {}
+        for i in idxs:
+            groups.setdefault(sers[best_col][i], []).append(i)
+
+        remaining = [c for c in cols if c != best_col]
+        orderings: Dict[int, List] = {}
+        for _, gidx in groups.items():
+            sub = self._cond_orderings(
+                gidx, remaining, sers, branchable, tail_rank, early_stop, depth + 1
+            )
+            for i, o in zip(gidx, sub):
+                orderings[i] = [best_col] + o
+        return [orderings[i] for i in idxs]
+
+    # ------------------------------------------------------------------ #
+    # adjacency constraints (column merges, one-way dependencies)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _apply_group_constraints(order: List, groups: List[List]) -> List:
+        if not groups:
+            return list(order)
+        present = set(order)
+        group_of = {}
+        for g in groups:
+            for c in g:
+                group_of[c] = g
+        out, used = [], set()
+        for c in order:
+            if c in used:
+                continue
+            g = group_of.get(c)
+            if g is None:
+                out.append(c)
+                used.add(c)
+            else:
+                for gc in g:
+                    if gc in present and gc not in used:
+                        out.append(gc)
+                        used.add(gc)
+        for c in order:  # safety: never drop columns
+            if c not in used:
+                out.append(c)
+                used.add(c)
+        return out
+
+    # ------------------------------------------------------------------ #
+    # public API
+    # ------------------------------------------------------------------ #
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        if df is None:
+            return pd.DataFrame(), []
+
+        n_rows, cols = df.shape[0], list(df.columns)
+
+        # Trivial cases: nothing to permute.
+        if n_rows == 0 or len(cols) <= 1:
+            return df.copy(), [list(cols) for _ in range(n_rows)]
+
+        self.row_stop = row_stop
+        self.col_stop = col_stop
+
+        # Serialize every cell once (missing -> "").
+        sers = {c: self._ser_series(df[c]) for c in cols}
+
+        # Candidate 1: global order ranked by len(v)*count*(count-1).
+        orderA = self._rank_cols(cols, sers, "pair_weighted")
+        # Candidate 2: alternative length/frequency tradeoff.
+        orderC = self._rank_cols(cols, sers, "len_weighted")
+
+        # Too-distinct columns are excluded as partition candidates but kept
+        # in the ordering (placed by the global rank tail).
+        too_distinct = {
+            c
+            for c in cols
+            if len(set(sers[c])) > max(1, int(len(df) * distinct_value_threshold))
+        }
+        branchable = set(cols) - too_distinct
+
+        tail_rank = {"_order": orderA}
+
+        candA: List[List] = [list(orderA) for _ in range(n_rows)]
+        candC: List[List] = [list(orderC) for _ in range(n_rows)]
+        candB = self._cond_orderings(
+            list(range(n_rows)),
+            cols,
+            sers,
+            branchable,
+            tail_rank,
+            early_stop,
+            0,
+        )
+
+        # Score all candidates with the exact ideal Trie reuse objective.
+        total_chars = sum(
+            len(s) for c in cols for s in sers[c]
+        )
+
+        def score(orderings: List[List]) -> int:
+            strs = [
+                "".join(sers[c][i] for c in order)
+                for i, order in enumerate(orderings)
+            ]
+            return self._trie_reuse(strs)
+
+        scored = [
+            (score(candA), candA),
+            (score(candB), candB),
+            (score(candC), candC),
+        ]
+        scored.sort(key=lambda t: -t[0])
+        best_reuse, orderings = scored[0]
+
+        # Adjacency constraints: merged column groups and one-way dependencies
+        # (dependent column placed right after its source).
+        adj_groups: List[List] = []
+        for g in (col_merge or []):
+            members = [c for c in g if c in set(cols)]
+            if len(members) > 1:
+                adj_groups.append(members)
+        for dep in (one_way_dep or []):
+            a, b = dep[0], dep[1]
+            a = a if a in set(cols) else next((c for c in cols if a in str(c)), None)
+            b = b if b in set(cols) else next((c for c in cols if b in str(c)), None)
+            if a is not None and b is not None and a != b:
+                adj_groups.append([a, b])
+        if adj_groups:
+            orderings = [self._apply_group_constraints(o, adj_groups) for o in orderings]
+
+        # Build the output DataFrame: per-row permutation of the original
+        # cell values. Position p of row i holds the value of column
+        # orderings[i][p]. All original values are preserved verbatim.
+        colidx = {c: j for j, c in enumerate(cols)}
+        out = pd.DataFrame(
+            np.empty((n_rows, len(cols)), dtype=object),
+            columns=cols,
+            index=df.index,
+        )
+        values = df.values
+        for i in range(n_rows):
+            row_vals = values[i]
+            order = orderings[i]
+            out.iloc[i] = [row_vals[colidx[c]] for c in order]
+
+        assert out.shape == df.shape
+
+        return out, orderings
+
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

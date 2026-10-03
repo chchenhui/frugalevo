@@ -1,0 +1,227 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+try:
+    from scipy.optimize import minimize
+    HAVE_SCIPY = True
+except Exception:
+    HAVE_SCIPY = False
+
+N, D = 14, 3
+_IU = np.triu_indices(N, 1)
+PI_, PJ = _IU
+TARGET = 0.2404  # reference squared-ratio ~ 1/4.165849767
+
+
+def _true_score(points):
+    d2 = np.sum((points[PI_] - points[PJ]) ** 2, axis=1)
+    dx2 = d2.max()
+    if dx2 <= 0:
+        return 0.0
+    return d2.min() / dx2
+
+
+def _sanitize(pts, rng=None):
+    pts = np.asarray(pts, dtype=float)
+    if pts.shape != (N, D) or not np.all(np.isfinite(pts)):
+        if rng is None:
+            rng = np.random.default_rng(0)
+        pts = rng.standard_normal((N, D))
+    return pts
+
+
+def _unit(v):
+    return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+
+
+def _dists(P):
+    return np.linalg.norm(P[PI_] - P[PJ], axis=1)
+
+
+# ---- antipodal parameterization: 7 free vectors, points are v_i and -v_i ----
+
+def _build_from_pairs(v):
+    V = v.reshape(7, 3)
+    return np.vstack([V, -V])
+
+
+def _antipodal_opt(V0, betas=(30.0, 150.0, 600.0), maxiter=300):
+    """Optimize 7 free vectors so that the 14 points (+-v_i) maximize
+    min distance under diameter <= 1. Reduced 21-dim problem."""
+    if not HAVE_SCIPY:
+        return None
+    V = np.asarray(V0, dtype=float).copy()
+    P = _build_from_pairs(V)
+    dm = _dists(P).max()
+    if not np.isfinite(dm) or dm <= 0:
+        return None
+    V = V / dm
+
+    def pdists(v):
+        return _dists(_build_from_pairs(v))
+
+    def obj_soft(v, beta):
+        ds = pdists(v)
+        a = -beta * ds
+        amax = a.max()
+        return (amax + np.log(np.sum(np.exp(a - amax)))) / beta
+
+    cur = V.ravel().copy()
+    for beta in betas:
+        try:
+            res = minimize(obj_soft, cur, args=(beta,), method='SLSQP',
+                           constraints={'type': 'ineq',
+                                       'fun': lambda f: 1.0 - pdists(f).max()},
+                           options={'maxiter': maxiter, 'ftol': 1e-14})
+        except Exception:
+            break
+        if res.x.size != 21 or not np.all(np.isfinite(res.x)):
+            break
+        cur = res.x
+        dm = pdists(cur).max()
+        if np.isfinite(dm) and dm > 1e-12:
+            cur = cur / dm
+    P = _build_from_pairs(cur)
+    P = _sanitize(P)
+    s = _true_score(P)
+    if s <= 0:
+        return None
+    return P, s
+
+
+# ---- full 42-dim escalating SLSQP (used sparingly) ----
+
+def _slsqp_packing(P0, betas=(60.0, 300.0), maxiter=300):
+    if not HAVE_SCIPY:
+        return None
+    P = _sanitize(P0)
+    P = P - P.mean(axis=0)
+    dm = _dists(P).max()
+    if not np.isfinite(dm) or dm <= 0:
+        return None
+    P = P / dm
+
+    def obj_soft(flat, beta):
+        ds = _dists(flat.reshape(N, D))
+        a = -beta * ds
+        amax = a.max()
+        return (amax + np.log(np.sum(np.exp(a - amax)))) / beta
+
+    cur = P.ravel().copy()
+    for beta in betas:
+        try:
+            res = minimize(obj_soft, cur, args=(beta,), method='SLSQP',
+                           constraints={'type': 'ineq',
+                                       'fun': lambda f: 1.0 - _dists(f.reshape(N, D)).max()},
+                           options={'maxiter': maxiter, 'ftol': 1e-14})
+        except Exception:
+            break
+        if res.x.size != N * D or not np.all(np.isfinite(res.x)):
+            break
+        cur = res.x
+        dm = _dists(cur.reshape(N, D)).max()
+        if np.isfinite(dm) and dm > 1e-12:
+            cur = (cur.reshape(N, D) / dm).ravel()
+    P = _sanitize(cur.reshape(N, D))
+    s = _true_score(P)
+    if s <= 0:
+        return None
+    return P, s
+
+
+# ---- extract antipodal pairs from a config, if centrally symmetric ----
+
+def _extract_pairs(P):
+    P = _unit(P - P.mean(axis=0))
+    cost = np.linalg.norm(P[:, None, :] + P[None, :, :], axis=2)
+    np.fill_diagonal(cost, np.inf)
+    partner = np.argmin(cost, axis=1)
+    if not np.all(partner[partner] == np.arange(N)):
+        return None
+    reps, seen = [], set()
+    for i in range(N):
+        if i not in seen:
+            reps.append(P[i] - P[partner[i]])
+            seen.add(i)
+            seen.add(partner[i])
+    if len(reps) != 7:
+        return None
+    return np.array(reps)
+
+
+def _icosahedron():
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    ico = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    ], dtype=float)
+    return _unit(ico)
+
+
+def _seed_list():
+    """Small, ordered-by-prioritized seed list. ico+poles first."""
+    seeds = []
+    ico = _icosahedron()
+    # swept pole heights for ico+2poles family
+    for h in (1.15, 1.0, 1.3, 0.85, 0.7):
+        seeds.append(np.vstack([ico, [[0, 0, h], [0, 0, -h]]]))
+    # twisted double ring (7+7, inherently antipodal)
+    t = np.linspace(0, 2 * np.pi, 7, endpoint=False)
+    r1 = np.stack([np.cos(t), np.sin(t), 0.5 * np.ones(7)], axis=1)
+    r2 = np.stack([np.cos(t + np.pi / 7), np.sin(t + np.pi / 7), -0.5 * np.ones(7)], axis=1)
+    seeds.append(np.vstack([r1, r2]))
+    # Fibonacci sphere
+    k = np.arange(N) + 0.5
+    ph = np.arccos(1.0 - 2.0 * k / N)
+    th = np.pi * (1.0 + 5.0 ** 0.5) * k
+    seeds.append(np.stack([np.cos(th) * np.sin(ph),
+                           np.sin(th) * np.sin(ph), np.cos(ph)], axis=1))
+    # cube + octahedron
+    cube = _unit(np.array([[i, j, k] for i in (-1, 1) for j in (-1, 1)
+                           for k in (-1, 1)], dtype=float))
+    octa = np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0],
+                     [0, 0, 1], [0, 0, -1]], dtype=float)
+    seeds.append(np.vstack([cube, 1.05 * octa]))
+    # few random fallbacks
+    for seed in range(4):
+        v = np.random.RandomState(seed).randn(N, D)
+        seeds.append(_unit(v))
+    return seeds
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    rng = np.random.default_rng(7)
+    best_pts, best = None, -1.0
+
+    for seed in _seed_list():
+        seed = _unit(seed)
+        # fast antipodal reduced optimization (21 params)
+        V = _extract_pairs(seed)
+        if V is not None:
+            out = _antipodal_opt(V)
+            if out is not None and out[1] > best:
+                best, best_pts = out
+        # full-space polish on the seed itself
+        out = _slsqp_packing(seed)
+        if out is not None and out[1] > best:
+            best, best_pts = out
+        # try antipodal re-extraction from polished config
+        if out is not None:
+            V2 = _extract_pairs(out[0])
+            if V2 is not None:
+                out2 = _antipodal_opt(V2, betas=(300.0,), maxiter=200)
+                if out2 is not None and out2[1] > best:
+                    best, best_pts = out2
+        if best >= TARGET:
+            break
+
+    if best_pts is None:
+        best_pts = rng.standard_normal((N, D))
+    best_pts = _sanitize(best_pts, rng)
+    best_pts = best_pts - best_pts.mean(axis=0)
+    scale = np.max(np.abs(best_pts))
+    if scale > 0:
+        best_pts = best_pts / scale
+    return np.asarray(best_pts, dtype=float)
+# EVOLVE-BLOCK-END

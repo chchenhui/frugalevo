@@ -1,0 +1,85 @@
+<NAME>
+steiner_mst_shared_tree
+</NAME>
+<DESCRIPTION>
+The current approach sends every destination along its own independent shortest path, so no edge sharing actually happens even though tree_edges are tracked. To reduce total transfer cost, replace this with a classic Kou–Markowsky–Berman-Ramaiyer Steiner-tree heuristic: (1) run Dijkstra once from src on the sanitized graph `h`, (2) build a metric closure over {src} ∪ dsts using pairwise shortest path costs (computed via all-pairs Dijkstra restricted to terminals), (3) compute an MST on that closure, (4) union the corresponding src→dst shortest paths to form a shared directed tree, and (5) use the unique src→dst path inside that tree for each destination when appending partition paths via `append_dst_partition_path`. This prunes expensive redundant edges: multiple destinations routed through a common hub now reuse the same upstream path, lowering overall $/GB while keeping the exact validated I/O contract (whole-edge appends, edge data read from `h`, all partitions still receive a path).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Compute shortest paths from src to all reachable nodes once.
+    dist, paths = nx.single_source_dijkstra(h, src, weight="cost")
+
+    # Build a Steiner-ish shared tree by greedily attaching destinations
+    # in order of increasing path cost, so cheaper (shared) edges are
+    # added first and reused by subsequent destinations.
+    tree_edges = set()
+    ordered_dsts = sorted(
+        (d for d in dsts if d in dist),
+        key=lambda d: dist[d],
+    )
+
+    for dst in ordered_dsts:
+        path = paths[dst]
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            if (s, t) not in tree_edges:
+                tree_edges.add((s, t))
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, h[s][t]])
+
+    bc_topology.tree_edges = tree_edges
+    return bc_topology
+=======
+    # Terminals: src plus reachable destinations
+    terminals = [src] + [d for d in dsts if nx.has_path(h, src, d)]
+
+    # Metric closure over terminals: pairwise shortest-path distances
+    # (computed on the sanitized directed graph h).
+    closure = nx.Graph()
+    for t in terminals:
+        dist_t, paths_t = nx.single_source_dijkstra(h, t, weight="cost")
+        for u in terminals:
+            if u == t or u not in dist_t:
+                continue
+            closure.add_edge(t, u, weight=dist_t, path=paths_t[u])
+
+    # MST on the metric closure (Kou-Markowsky Steiner heuristic)
+    if closure.number_of_edges() > 0:
+        mst = nx.minimum_spanning_tree(closure, weight="weight")
+    else:
+        mst = closure
+
+    # Union the shortest paths corresponding to MST edges to form a
+    # shared directed tree rooted at src.
+    tree_edges = set()
+    for t, u, data in mst.edges(data=True):
+        path = data.get("path", [])
+        if not path:
+            _, path = nx.single_source_dijkstra(h, t, weight="cost")
+            path = path.get(u, [])
+        for i in range(0, len(path) - 1):
+            tree_edges.add((path[i], path[i + 1]))
+
+    # Build the routing tree as a directed graph so we can extract the
+    # unique src -> dst path inside the shared tree for each dst.
+    tree = nx.DiGraph()
+    tree.add_nodes_from(h.nodes())
+    for (s, t) in tree_edges:
+        tree.add_edge(s, t)
+
+    for dst in dsts:
+        # Prefer the shared-tree path; fall back to plain Dijkstra in h
+        # if the dst is not connected inside the tree.
+        try:
+            path = nx.dijkstra_path(tree, src, dst)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, h[s][t]])
+
+    bc_topology.tree_edges = tree_edges
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

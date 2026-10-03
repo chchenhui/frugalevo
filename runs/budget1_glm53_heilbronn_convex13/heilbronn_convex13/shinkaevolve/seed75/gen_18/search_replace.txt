@@ -1,0 +1,144 @@
+<NAME>
+bottleneck_directed_moves_and_restarts</NAME>
+<DESCRIPTION>
+Expert insight on Heilbronn-type problems: the objective is bottleneck-driven — the minimum-area triangle improves only when its three vertices are moved to increase that specific triangle's area while not collapsing another. Pure random single-point moves waste most proposals. A directed move strategy that (a) identifies the current minimum triangle, and (b) moves one of its vertices along the direction that increases that triangle's altitude (perpendicular to the opposite edge, away from it), drastically improves proposal quality. Additionally, the 0.67→0.71 results show that multi-restart from the best configuration (basin hopping) is highly effective: local optima for n=13 are numerous and shallow. Finally, since the score is the ratio min_area/hull_area, shrinking the hull can raise the ratio — so after optimization we apply a cheap affine "shrink-to-hull" rescale: translate points so the centroid of the hull is at origin, then isotropically rescale by a factor slightly less than 1 and re-evaluate, keeping the rescaling only if it improves the exact score (deterministic line search). This exploits the fact that any convex rescaling of a valid configuration is still valid, and can turn a plateau in min-area into a gain in the normalized score.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _anneal(pts, rng, deadline, T0=0.01, T_min=1e-6):
+    """Simulated annealing on the normalized score."""
+    pts = pts.copy()
+    sc = _score(pts)
+    best, best_sc = pts.copy(), sc
+    T = T0
+    sigma = 0.1
+    since_best = 0
+    while time.time() < deadline:
+        for _ in range(150):
+            cand = pts.copy()
+            # focus moves on bottleneck vertex half the time
+            if rng.random() < 0.5:
+                i = _bottleneck_vertex(pts)
+            else:
+                i = int(rng.integers(13))
+            cand[i] += rng.normal(0, sigma, 2)
+            csc = _score(cand)
+            d = csc - sc
+            if d > 0 or (T > 0 and rng.random() < np.exp(d / max(T, 1e-12))):
+                pts, sc = cand, csc
+                if sc > best_sc + 1e-14:
+                    best, best_sc = cand.copy(), sc
+                    since_best = 0
+        since_best += 1
+        T = max(T * 0.92, T_min)
+        if since_best > 4:
+            sigma = max(sigma * 0.7, 1e-4)
+            since_best = 0
+        elif since_best == 0:
+            sigma = min(sigma * 1.25, 0.3)
+    return best, best_sc
+=======
+def _bottleneck_tri(pts):
+    """Indices (i,j,k) of the smallest-area triangle."""
+    p = pts[TRI_IDX]
+    a = p[:, 0]
+    v1 = p[:, 1] - a
+    v2 = p[:, 2] - a
+    cr = np.abs(v1[:, 0]*v2[:, 1] - v1[:, 1]*v2[:, 0])
+    return TRI_IDX[int(np.argmin(cr))]
+
+
+def _directed_candidate(pts, rng, sigma):
+    """Directed move: push a vertex of the bottleneck triangle away from
+    the opposite edge (increases that triangle's altitude/area)."""
+    cand = pts.copy()
+    if rng.random() < 0.25:
+        # occasional random move for exploration
+        i = int(rng.integers(13))
+        cand[i] += rng.normal(0, sigma, 2)
+        return cand
+    tri = _bottleneck_tri(pts)
+    i = int(rng.choice(tri))
+    other = [j for j in tri if j != i]
+    d = pts[other[1]] - pts[other[0]]
+    nd = np.linalg.norm(d)
+    if nd < 1e-9:
+        cand[i] += rng.normal(0, sigma, 2)
+        return cand
+    perp = np.array([-d[1], d[0]]) / nd
+    # sign the perpendicular so the move increases |cross|
+    v = pts[i] - pts[other[0]]
+    if np.dot(perp, v) < 0:
+        perp = -perp
+    cand[i] = pts[i] + perp * abs(rng.normal(0, sigma)) + rng.normal(0, 0.3*sigma, 2)
+    return cand
+
+
+def _anneal(pts, rng, deadline, T0=0.01, T_min=1e-6):
+    """Simulated annealing with bottleneck-directed proposals."""
+    pts = pts.copy()
+    sc = _score(pts)
+    best, best_sc = pts.copy(), sc
+    T = T0
+    sigma = 0.1
+    since_best = 0
+    while time.time() < deadline:
+        for _ in range(150):
+            cand = _directed_candidate(pts, rng, sigma)
+            csc = _score(cand)
+            d = csc - sc
+            if d > 0 or (T > 0 and rng.random() < np.exp(d / max(T, 1e-12))):
+                pts, sc = cand, csc
+                if sc > best_sc + 1e-14:
+                    best, best_sc = cand.copy(), sc
+                    since_best = 0
+        since_best += 1
+        T = max(T * 0.92, T_min)
+        if since_best > 4:
+            sigma = max(sigma * 0.7, 1e-4)
+            since_best = 0
+        elif since_best == 0:
+            sigma = min(sigma * 1.25, 0.3)
+    return best, best_sc
+
+
+def _shrink_polish(pts):
+    """Deterministic isotropic shrink line search: since the score is
+    min_area/hull_area, shrinking the configuration about the hull
+    centroid can raise the ratio; keep only improvements."""
+    best, best_sc = pts.copy(), _score(pts)
+    c = pts.mean(axis=0)
+    for f in (0.99, 0.97, 0.94, 0.90, 0.85, 0.80):
+        cand = c + f * (pts - c)
+        sc = _score(cand)
+        if sc > best_sc + 1e-15:
+            best, best_sc = cand, sc
+    return best, best_sc
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    best_pts = np.asarray(best_pts, dtype=float)
+    if not np.all(np.isfinite(best_pts)) or best_pts.shape != (13, 2):
+        t = np.linspace(0, 2*np.pi, 13, endpoint=False)
+        best_pts = np.column_stack([np.cos(t), np.sin(t)])
+    return best_pts
+=======
+    # Basin-hopping restarts from the best configuration until time runs out
+    while time.time() - t_start < time_limit - 0.05:
+        kick = best_pts + rng.normal(0, 0.05, best_pts.shape)
+        deadline = min(time.time() + 0.25, t_start + time_limit)
+        pts, sc = _anneal(kick, rng, deadline)
+        if sc > best_sc:
+            best_sc, best_pts = sc, pts.copy()
+
+    # Deterministic shrink polish on the final configuration
+    best_pts, best_sc = _shrink_polish(best_pts)
+
+    best_pts = np.asarray(best_pts, dtype=float)
+    if not np.all(np.isfinite(best_pts)) or best_pts.shape != (13, 2):
+        t = np.linspace(0, 2*np.pi, 13, endpoint=False)
+        best_pts = np.column_stack([np.cos(t), np.sin(t)])
+    return best_pts
+>>>>>>> REPLACE
+</DIFF>

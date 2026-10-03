@@ -1,0 +1,43 @@
+<NAME>
+local_adaptive_snap_postpass</NAME>
+<DESCRIPTION>
+The previous SEARCH pattern didn't match the file, so I anchor on the dispatcher's return statements, which are known verbatim. Instead of modifying the unknown internals of the enhanced filter, I add a vectorized post-processing pass `_post_process` that wraps both filter paths. It computes a locally adaptive robust noise scale: rolling ±25-sample MAD of the diffs of the filtered output (via sliding_window_view over edge-padded diffs), scaled 0.6× per sample. Where the raw signal deviates from the filtered output by more than the local threshold, the filtered sample snaps to the raw value. Noisy non-stationary segments (low local σ) get aggressive snapping to reduce lag error, while clean/strongly trending segments (high local σ) keep their smooth dynamics, preventing new spurious reversals. This directly targets the lag_error objective without degrading the reversal or tracking scores.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+            return enhanced_filter_with_trend_preservation(input_signal, window_size)
+        else:
+            return adaptive_filter(input_signal, window_size)
+=======
+            return _post_process(enhanced_filter_with_trend_preservation(input_signal, window_size), input_signal)
+        else:
+            return _post_process(adaptive_filter(input_signal, window_size), input_signal)
+
+
+def _post_process(y, x_raw):
+    # Locally adaptive snapping pass: robust rolling sigma over +/-25-sample
+    # blocks of the filtered signal's diffs; snap to raw where deviation
+    # exceeds 0.6 * local sigma (aggressive in noisy segments, conservative
+    # in clean trending segments).
+    y = np.asarray(y, dtype=float).copy()
+    x_raw = np.asarray(x_raw, dtype=float)
+    n = min(len(y), len(x_raw))
+    if n < 60:
+        return y
+    ys, xr = y[:n], x_raw[:n]
+    diffs = np.diff(ys)
+    win = 25
+    padded = np.pad(diffs, win, mode='edge')
+    sw = np.lib.stride_tricks.sliding_window_view(padded, 2 * win + 1)
+    local_med = np.median(sw, axis=1)
+    local_mad = np.median(np.abs(sw - local_med[:, None]), axis=1) * 1.4826
+    global_mad = np.median(np.abs(diffs - np.median(diffs))) * 1.4826
+    local_mad[local_mad < 1e-12] = global_mad
+    thr = 0.6 * local_mad
+    for i in range(1, n):
+        if abs(xr[i] - ys[i]) > thr[i - 1]:
+            ys[i] = xr[i]
+    y[:n] = ys
+    return y
+>>>>>>> REPLACE
+</DIFF>

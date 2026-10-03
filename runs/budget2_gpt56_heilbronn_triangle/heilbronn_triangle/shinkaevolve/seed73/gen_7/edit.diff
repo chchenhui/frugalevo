@@ -1,0 +1,237 @@
+--- a/original.py
++++ b/original.py
+@@ -1,120 +1,149 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+-    Construct eleven points in the reference equilateral triangle.
++    Construct eleven points in the equilateral triangle with vertices
++    (0, 0), (1, 0), and (1/2, sqrt(3)/2).
+ 
+-    The search is performed in coordinates (u, v) such that
+-    (x, y) = (u + v/2, sqrt(3)*v/2).  In these coordinates the
+-    absolute 3-by-3 determinant is precisely the triangle area
+-    normalized by the area of the containing equilateral triangle.
++    Search is performed in reference-simplex coordinates (u, v), where
++    u >= 0, v >= 0, u + v <= 1.  Determinants in these coordinates are
++    triangle areas normalized by the containing triangle area.
+     """
+     rng = np.random.default_rng(11031987)
++    h = np.sqrt(3.0) * 0.5
++    anchors = np.array(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)), dtype=float)
+ 
+-    # Triangle indices, shared by every member of the population.
+     triples = np.array(
+         [(i, j, k) for i in range(11) for j in range(i + 1, 11)
+          for k in range(j + 1, 11)],
+         dtype=np.intp,
+     )
+ 
+-    def score(configurations: np.ndarray) -> np.ndarray:
+-        """Minimum normalized triangle area for each barycentric layout."""
+-        a = configurations[:, triples[:, 0]]
+-        b = configurations[:, triples[:, 1]]
+-        c = configurations[:, triples[:, 2]]
+-        determinants = (
+-            (b[:, :, 0] - a[:, :, 0]) * (c[:, :, 1] - a[:, :, 1])
+-            - (b[:, :, 1] - a[:, :, 1]) * (c[:, :, 0] - a[:, :, 0])
++    def project_simplex(values: np.ndarray) -> np.ndarray:
++        """Safely project coordinate pairs onto u,v >= 0, u+v <= 1."""
++        result = np.maximum(values, 0.0)
++        total = result.sum(axis=-1, keepdims=True)
++        result /= np.maximum(total, 1.0)
++        return result
++
++    def score(interior: np.ndarray) -> np.ndarray:
++        """Return the minimum normalized area for every candidate layout."""
++        count = interior.shape[0]
++        layouts = np.empty((count, 11, 2), dtype=float)
++        layouts[:, :3] = anchors
++        layouts[:, 3:] = interior
++
++        a = layouts[:, triples[:, 0]]
++        b = layouts[:, triples[:, 1]]
++        c = layouts[:, triples[:, 2]]
++        determinants = np.abs(
++            (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
++            - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
+         )
+-        return np.min(np.abs(determinants), axis=1)
++        return determinants.min(axis=1)
+ 
+-    def fold_into_simplex(p: np.ndarray) -> np.ndarray:
+-        """Fold proposed barycentric coordinates into u>=0, v>=0, u+v<=1."""
+-        p = np.abs(p)
+-        total = p[..., 0] + p[..., 1]
+-        outside = total > 1.0
+-        p[outside] = 1.0 - p[outside]
+-        # The preceding reflection is sufficient for the small search moves;
+-        # this final normalization also makes unusually large proposals safe.
+-        p = np.maximum(p, 0.0)
+-        total = p[..., 0] + p[..., 1]
+-        over = total > 1.0
+-        p[over] /= total[over, None]
+-        return p
++    population_size = 128
+ 
+-    population_size = 160
+-    layouts = np.empty((population_size, 11, 2), dtype=float)
++    # Folded square samples are uniform in the reference simplex.
++    population = rng.random((population_size, 8, 2))
++    outside = population.sum(axis=2) > 1.0
++    population[outside] = 1.0 - population[outside]
++    fitness = score(population)
+ 
+-    # Anchoring the hull at the container vertices is both geometrically natural
+-    # and leaves the search free to optimize all nontrivial point positions.
+-    layouts[:, :3] = np.array(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)))
+-    raw = rng.exponential(1.0, size=(population_size, 8, 3))
+-    raw /= raw.sum(axis=2, keepdims=True)
+-    layouts[:, 3:, 0] = raw[:, :, 1]
+-    layouts[:, 3:, 1] = raw[:, :, 2]
++    # Differential evolution supplies large-scale geometric rearrangements.
++    generations = 2800
++    for generation in range(generations):
++        ia = rng.permutation(population_size)
++        ib = rng.permutation(population_size)
++        ic = rng.permutation(population_size)
+ 
+-    values = score(layouts)
+-    best_index = int(np.argmax(values))
+-    best_layout = layouts[best_index].copy()
+-    best_value = float(values[best_index])
++        # A modestly varying differential weight avoids a fixed-scale plateau.
++        differential_weight = 0.70 + 0.12 * rng.random()
++        mutant = population[ia] + differential_weight * (
++            population[ib] - population[ic]
++        )
++        mutant = project_simplex(mutant)
+ 
+-    # Population annealing avoids the severe local traps caused by a single
+-    # active minimum-area triangle.  Every operation is vectorized over layouts.
+-    iterations = 4200
+-    for iteration in range(iterations):
+-        fraction = iteration / (iterations - 1)
+-        step = 0.085 * (1.0 - fraction) + 0.0012 * fraction
+-        temperature = 0.006 * (1.0 - fraction) ** 2 + 0.000015
++        mask = rng.random((population_size, 8, 2)) < 0.84
++        forced = rng.integers(0, 16, size=population_size)
++        mask.reshape(population_size, 16)[np.arange(population_size), forced] = True
++        trial = np.where(mask, mutant, population)
++        trial_fitness = score(trial)
+ 
+-        proposal = layouts.copy()
+-        changed = rng.integers(3, 11, size=population_size)
+-        proposal[np.arange(population_size), changed] += rng.normal(
+-            scale=step, size=(population_size, 2)
++        accepted = trial_fitness >= fitness
++        population[accepted] = trial[accepted]
++        fitness[accepted] = trial_fitness[accepted]
++
++        # Preserve exploration by replacing weak members with perturbed elites.
++        if generation % 140 == 139:
++            elite = population[int(np.argmax(fitness))]
++            scale = 0.040 * (1.0 - 0.65 * generation / generations)
++            injected = project_simplex(
++                elite + rng.normal(0.0, scale, size=(16, 8, 2))
++            )
++            injected_fitness = score(injected)
++            weakest = np.argsort(fitness)[:16]
++            population[weakest] = injected
++            fitness[weakest] = injected_fitness
++
++    best = population[int(np.argmax(fitness))].copy()
++    best_value = float(score(best[None, ...])[0])
++
++    # Batched local maximin search is inexpensive and handles final active
++    # determinant constraints more effectively than another population phase.
++    for iteration in range(1800):
++        batch_size = 48
++        candidates = np.broadcast_to(best, (batch_size, 8, 2)).copy()
++        changed = rng.integers(0, 8, size=batch_size)
++        scale = 0.024 * (0.08 ** (iteration / 1800.0))
++        candidates[np.arange(batch_size), changed] += rng.normal(
++            0.0, scale, size=(batch_size, 2)
+         )
+-        proposal[:, 3:] = fold_into_simplex(proposal[:, 3:])
++        candidates = project_simplex(candidates)
++        values = score(candidates)
++        winner = int(np.argmax(values))
++        if values[winner] > best_value:
++            best = candidates[winner]
++            best_value = float(values[winner])
+ 
+-        proposal_values = score(proposal)
+-        improvement = proposal_values - values
+-        accept = (improvement >= 0.0) | (
+-            rng.random(population_size) < np.exp(np.minimum(improvement / temperature, 0.0))
+-        )
+-        layouts[accept] = proposal[accept]
+-        values[accept] = proposal_values[accept]
+-
+-        current_best = int(np.argmax(values))
+-        if values[current_best] > best_value:
+-            best_value = float(values[current_best])
+-            best_layout = layouts[current_best].copy()
+-
+-    # A reproducible coordinate stencil gives the saved best layout a final
+-    # maximin polish without depending on optional external optimizers.
++    # A compact deterministic stencil removes reproducibility-sensitive noise.
+     directions = np.array(
+         ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
+-         (0.70710678, 0.70710678), (-0.70710678, -0.70710678))
++         (0.707106781, 0.707106781), (0.707106781, -0.707106781),
++         (-0.707106781, 0.707106781), (-0.707106781, -0.707106781))
+     )
+-    for step in (0.012, 0.006, 0.003, 0.0015):
+-        improved = True
+-        while improved:
++    for step in (0.004, 0.002, 0.001):
++        for _ in range(3):
+             improved = False
+-            for point_index in range(3, 11):
+-                for direction in directions:
+-                    candidate = best_layout.copy()
+-                    candidate[point_index] += step * direction
+-                    candidate[3:] = fold_into_simplex(candidate[3:])
+-                    candidate_value = float(score(candidate[None, ...])[0])
+-                    if candidate_value > best_value:
+-                        best_layout = candidate
+-                        best_value = candidate_value
+-                        improved = True
++            for point_index in range(8):
++                candidates = np.broadcast_to(best, (8, 8, 2)).copy()
++                candidates[:, point_index] += step * directions
++                candidates = project_simplex(candidates)
++                values = score(candidates)
++                winner = int(np.argmax(values))
++                if values[winner] > best_value:
++                    best = candidates[winner]
++                    best_value = float(values[winner])
++                    improved = True
++            if not improved:
++                break
+ 
+-    # Convert barycentric coordinates back to Cartesian coordinates.
++    reference = np.vstack((anchors, best))
+     points = np.empty((11, 2), dtype=float)
+-    points[:, 0] = best_layout[:, 0] + 0.5 * best_layout[:, 1]
+-    points[:, 1] = (np.sqrt(3.0) / 2.0) * best_layout[:, 1]
++    points[:, 0] = reference[:, 0] + 0.5 * reference[:, 1]
++    points[:, 1] = h * reference[:, 1]
++
++    if not np.all(np.isfinite(points)):
++        return np.array(
++            ((0.0, 0.0), (1.0, 0.0), (0.5, h), (0.25, 0.0),
++             (0.75, 0.0), (0.125, 0.25 * h), (0.625, 0.25 * h),
++             (0.25, 0.5 * h), (0.75, 0.5 * h), (0.375, 0.75 * h),
++             (0.5, 0.25 * h)),
++            dtype=float,
++        )
+     return points
+ 
+ 
+ # EVOLVE-BLOCK-END

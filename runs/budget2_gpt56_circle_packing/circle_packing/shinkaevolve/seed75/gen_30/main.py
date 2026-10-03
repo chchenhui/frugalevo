@@ -1,0 +1,312 @@
+# EVOLVE-BLOCK-START
+"""High-quality unequal-circle packing constructor for n=26."""
+import numpy as np
+
+
+def construct_packing():
+    """
+    Find a dense packing of 26 variable-radius circles in the unit square.
+
+    Several row-contact topologies are explored.  Each local solve optimizes
+    all center coordinates and radii simultaneously; the best feasible result
+    is returned after a strict final geometric scaling.
+    """
+    n = 26
+    pair_i, pair_j = np.triu_indices(n, 1)
+    pair_count = len(pair_i)
+    variable_count = 3 * n
+
+    def unpack(z):
+        return z[:2 * n].reshape(n, 2), z[2 * n:]
+
+    def objective(z):
+        return -np.sum(z[2 * n:])
+
+    def objective_jac(z):
+        g = np.zeros(variable_count)
+        g[2 * n:] = -1.0
+        return g
+
+    def constraints(z):
+        centers, radii = unpack(z)
+        d = centers[pair_i] - centers[pair_j]
+        # Squared pair constraints are smooth away from coincident centers and
+        # considerably cheaper than 325 norm evaluations.
+        pair_gap = np.einsum("ij,ij->i", d, d) - (
+            radii[pair_i] + radii[pair_j]
+        ) ** 2
+
+        wall_gap = np.concatenate((
+            centers[:, 0] - radii,
+            1.0 - centers[:, 0] - radii,
+            centers[:, 1] - radii,
+            1.0 - centers[:, 1] - radii,
+        ))
+        return np.concatenate((pair_gap, wall_gap))
+
+    def constraint_jac(z):
+        centers, radii = unpack(z)
+        jac = np.zeros((pair_count + 4 * n, variable_count))
+
+        rows = np.arange(pair_count)
+        dx = centers[pair_i, 0] - centers[pair_j, 0]
+        dy = centers[pair_i, 1] - centers[pair_j, 1]
+        rs = radii[pair_i] + radii[pair_j]
+
+        jac[rows, 2 * pair_i] = 2.0 * dx
+        jac[rows, 2 * pair_i + 1] = 2.0 * dy
+        jac[rows, 2 * pair_j] = -2.0 * dx
+        jac[rows, 2 * pair_j + 1] = -2.0 * dy
+        jac[rows, 2 * n + pair_i] = -2.0 * rs
+        jac[rows, 2 * n + pair_j] = -2.0 * rs
+
+        k = np.arange(n)
+        offset = pair_count
+
+        jac[offset + k, 2 * k] = 1.0
+        jac[offset + k, 2 * n + k] = -1.0
+
+        jac[offset + n + k, 2 * k] = -1.0
+        jac[offset + n + k, 2 * n + k] = -1.0
+
+        jac[offset + 2 * n + k, 2 * k + 1] = 1.0
+        jac[offset + 2 * n + k, 2 * n + k] = -1.0
+
+        jac[offset + 3 * n + k, 2 * k + 1] = -1.0
+        jac[offset + 3 * n + k, 2 * n + k] = -1.0
+
+        return jac
+
+    def strictly_feasible_radii(centers, radii):
+        """Apply a common safety scale preserving the optimized geometry."""
+        factors = [1.0]
+        for k in range(n):
+            r = radii[k]
+            if r > 0.0:
+                x, y = centers[k]
+                factors.extend((x / r, (1.0 - x) / r,
+                                y / r, (1.0 - y) / r))
+
+        d = centers[pair_i] - centers[pair_j]
+        distances = np.sqrt(np.einsum("ij,ij->i", d, d))
+        radius_sums = radii[pair_i] + radii[pair_j]
+        mask = radius_sums > 0.0
+        factors.extend((distances[mask] / radius_sums[mask]).tolist())
+
+        scale = min(1.0, min(factors) * (1.0 - 2e-10))
+        return radii * max(0.0, scale)
+
+    def layered_seed(row_sizes, phase, rng):
+        """
+        Produce a wall-aware staggered seed.  Row-level displacements explore
+        contact graphs that independent point noise rarely reaches.
+        """
+        rows = len(row_sizes)
+        points = []
+        for row, count in enumerate(row_sizes):
+            # Broad vertical span permits eventual top and bottom wall contacts.
+            y = 0.085 + 0.830 * row / max(rows - 1, 1)
+
+            # Six-circle rows tend to contact side walls; shorter rows are inset.
+            inset = 0.075 if count >= 6 else (
+                0.115 if count == 5 else 0.170
+            )
+            xs = np.linspace(inset, 1.0 - inset, count)
+
+            row_shift = 0.010 * np.sin(phase + 1.71 * row)
+            row_lift = 0.009 * np.cos(phase + 1.19 * row)
+
+            for col, x in enumerate(xs):
+                # Coherent stagger plus small deterministic asymmetry breaks
+                # artificial reflection-stationary configurations.
+                stagger = 0.012 * ((row + col) & 1) - 0.006
+                wiggle_x = 0.004 * np.sin(2.31 * (row + 1) *
+                                           (col + 1) + phase)
+                wiggle_y = 0.004 * np.cos(1.47 * (row + 2) *
+                                           (col + 1) + phase)
+                points.append((
+                    np.clip(x + row_shift + stagger + wiggle_x,
+                            0.025, 0.975),
+                    np.clip(y + row_lift + wiggle_y, 0.025, 0.975),
+                ))
+
+        result = np.asarray(points, dtype=float)
+
+        # A tiny deterministic global deformation diversifies equivalent row
+        # patterns without destroying their triangular-lattice structure.
+        result += rng.normal(0.0, 0.0012, result.shape)
+        return np.clip(result, 0.02, 0.98)
+
+    # The defect location changes which circles can acquire wall contacts and
+    # is therefore much more consequential than repeated random perturbations.
+    templates = (
+        (5, 6, 5, 5, 5),
+        (5, 5, 6, 5, 5),
+        (5, 5, 5, 6, 5),
+        (6, 5, 5, 5, 5),
+        (5, 5, 5, 5, 6),
+        (4, 6, 5, 6, 5),
+        (5, 4, 6, 5, 6),
+        (6, 5, 4, 6, 5),
+        (5, 6, 4, 5, 6),
+    )
+
+    rng = np.random.default_rng(26031926)
+    best_centers = None
+    best_radii = None
+    best_value = -np.inf
+
+    # A dependency-free valid fallback.
+    fallback_r = 0.099999
+    fallback_rows = (5, 6, 5, 6, 4)
+    fallback = []
+    for row, count in enumerate(fallback_rows):
+        y = fallback_r + row * np.sqrt(3.0) * fallback_r
+        if count == 6:
+            xs = np.linspace(fallback_r, 1.0 - fallback_r, count)
+        else:
+            xs = np.linspace(2.0 * fallback_r, 1.0 - 2.0 * fallback_r, count)
+        fallback.extend((x, y) for x in xs)
+    best_centers = np.asarray(fallback, dtype=float)
+    best_radii = np.full(n, fallback_r)
+    best_value = float(np.sum(best_radii))
+
+    try:
+        from scipy.optimize import minimize
+
+        bounds = (
+            [(0.00001, 0.99999)] * (2 * n) +
+            [(0.000001, 0.30)] * n
+        )
+
+        starts = []
+        for t, template in enumerate(templates):
+            starts.append(layered_seed(template, 0.43 * t, rng))
+
+        # Include a slightly compressed regular hexagonal arrangement as a
+        # separate basin from the defect-focused layered arrangements.
+        regular = layered_seed((5, 6, 5, 6, 4), 4.31, rng)
+        regular[:, 1] = 0.5 + 0.965 * (regular[:, 1] - 0.5)
+        starts.append(np.clip(regular, 0.02, 0.98))
+
+        for attempt, center_start in enumerate(starts):
+            # Very small initial disks make every seed feasible and allow SLSQP
+            # to select unequal radii rather than inherit a fixed-radius mesh.
+            initial_radius = 0.003 if attempt < len(templates) else 0.006
+            z0 = np.concatenate((
+                center_start.ravel(),
+                np.full(n, initial_radius),
+            ))
+
+            result = minimize(
+                objective,
+                z0,
+                jac=objective_jac,
+                method="SLSQP",
+                bounds=bounds,
+                constraints={
+                    "type": "ineq",
+                    "fun": constraints,
+                    "jac": constraint_jac,
+                },
+                options={
+                    "maxiter": 1050,
+                    "ftol": 2e-11,
+                    "disp": False,
+                },
+            )
+
+            if result.x is None:
+                continue
+
+            centers, radii = unpack(result.x)
+            radii = strictly_feasible_radii(centers, radii)
+            value = float(np.sum(radii))
+
+            # Check actual geometry, rather than trusting optimizer status.
+            if value > best_value and np.min(constraints(
+                    np.concatenate((centers.ravel(), radii))
+            )) >= -2e-9:
+                best_centers = centers.copy()
+                best_radii = radii.copy()
+                best_value = value
+
+    except Exception:
+        pass
+
+    # One final conservative scaling makes output robust to platform-level
+    # floating point differences in the evaluator's overlap test.
+    best_radii = strictly_feasible_radii(best_centers, best_radii)
+    best_value = float(np.sum(best_radii))
+    return best_centers, best_radii, best_value
+
+
+def compute_max_radii(centers):
+    """
+    Compute conservative radii for supplied centers such that circles stay
+    inside the unit square and do not overlap.
+    """
+    n = centers.shape[0]
+    radii = np.ones(n)
+
+    for i in range(n):
+        x, y = centers[i]
+        radii[i] = min(x, y, 1.0 - x, 1.0 - y)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            distance = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if radii[i] + radii[j] > distance:
+                scale = distance / (radii[i] + radii[j])
+                radii[i] *= scale
+                radii[j] *= scale
+
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

@@ -1,0 +1,107 @@
+<NAME>
+packing_swap_refinement
+</NAME>
+
+<DESCRIPTION>
+Add a bounded local-search refinement after largest-processing-time packing. The existing heap policy is fast, but it can become trapped when equal-cardinality packs contain a heavy item paired with a medium item while a lighter pack has a compensating item. A swap preserves the mandatory number of experts/groups per pack and can reduce the maximum GPU/node load without changing replica counts or mappings.
+
+The refinement evaluates swaps only between the currently most-loaded pack and less-loaded packs, chooses the best max-load reduction, and caps work to two improving swaps per layer. This keeps the additional CPU cost small while directly optimizing the bottleneck load that determines expert-parallel execution time.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Largest-processing-time scheduling with a cardinality constraint.
+    # The heap contains only packs that still have capacity.
+    for layer, ordered_groups in enumerate(indices.tolist()):
+        pack_heap = [(0.0, pack) for pack in range(num_packs)]
+        heapq.heapify(pack_heap)
+        pack_items = [0] * num_packs
+        layer_weights = cpu_weight[layer].tolist()
+
+        for group in ordered_groups:
+            current_weight, pack = heapq.heappop(pack_heap)
+            rank = pack_items[pack]
+            pack_index[layer, group] = pack
+            rank_in_pack[layer, group] = rank
+            pack_items[pack] = rank + 1
+
+            if rank + 1 < groups_per_pack:
+                heapq.heappush(pack_heap,
+                               (current_weight + layer_weights[group], pack))
+
+    return pack_index, rank_in_pack
+=======
+    # Largest-processing-time scheduling with a cardinality constraint.
+    # The heap contains only packs that still have capacity.
+    for layer, ordered_groups in enumerate(indices.tolist()):
+        pack_heap = [(0.0, pack) for pack in range(num_packs)]
+        heapq.heapify(pack_heap)
+        pack_items = [0] * num_packs
+        pack_members = [[] for _ in range(num_packs)]
+        layer_weights = cpu_weight[layer].tolist()
+
+        for group in ordered_groups:
+            current_weight, pack = heapq.heappop(pack_heap)
+            rank = pack_items[pack]
+            pack_index[layer, group] = pack
+            rank_in_pack[layer, group] = rank
+            pack_items[pack] = rank + 1
+            pack_members[pack].append(group)
+
+            if rank + 1 < groups_per_pack:
+                heapq.heappush(pack_heap,
+                               (current_weight + layer_weights[group], pack))
+
+        # LPT is fast but can miss beneficial equal-cardinality exchanges.
+        # A small number of best swaps directly reduces the bottleneck pack
+        # while preserving exactly groups_per_pack items in every pack.
+        pack_loads = [
+            sum(layer_weights[group] for group in members)
+            for members in pack_members
+        ]
+        for _ in range(2):
+            heavy_pack = max(range(num_packs), key=pack_loads.__getitem__)
+            current_peak = pack_loads[heavy_pack]
+            best_peak = current_peak
+            best_swap = None
+
+            for light_pack in range(num_packs):
+                if light_pack == heavy_pack:
+                    continue
+                other_peak = max(
+                    (pack_loads[pack] for pack in range(num_packs)
+                     if pack != heavy_pack and pack != light_pack),
+                    default=0.0,
+                )
+                for heavy_group in pack_members[heavy_pack]:
+                    heavy_weight = layer_weights[heavy_group]
+                    for light_group in pack_members[light_pack]:
+                        light_weight = layer_weights[light_group]
+                        new_heavy = current_peak - heavy_weight + light_weight
+                        new_light = (pack_loads[light_pack] - light_weight +
+                                     heavy_weight)
+                        candidate_peak = max(other_peak, new_heavy, new_light)
+                        if candidate_peak < best_peak:
+                            best_peak = candidate_peak
+                            best_swap = (light_pack, heavy_group, light_group)
+
+            if best_swap is None:
+                break
+
+            light_pack, heavy_group, light_group = best_swap
+            heavy_rank = pack_members[heavy_pack].index(heavy_group)
+            light_rank = pack_members[light_pack].index(light_group)
+            pack_members[heavy_pack][heavy_rank] = light_group
+            pack_members[light_pack][light_rank] = heavy_group
+            pack_index[layer, heavy_group] = light_pack
+            rank_in_pack[layer, heavy_group] = light_rank
+            pack_index[layer, light_group] = heavy_pack
+            rank_in_pack[layer, light_group] = heavy_rank
+            pack_loads[heavy_pack] += (layer_weights[light_group] -
+                                       layer_weights[heavy_group])
+            pack_loads[light_pack] += (layer_weights[heavy_group] -
+                                       layer_weights[light_group])
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,235 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Find a low-makespan schedule via beam search with randomized restarts,
+    then refine the best candidates with time-budgeted local search
+    (insertion + swap moves) evaluated by actual makespan cost.
+    """
+    import time
+
+    n = workload.num_txns
+    if n == 0:
+        return 0, []
+
+    start_time = time.time()
+    time_budget = 20.0
+
+    best_cost = float('inf')
+    best_seq = None
+
+    # ---------- Phase 1: beam search with randomized restarts ----------
+    num_restarts = max(1, min(8, 200 // max(1, n)))
+    max_beam_width = max(2, min(6, 400 // max(1, n)))
+
+    candidates = []
+    for restart in range(num_restarts):
+        if time.time() - start_time >= time_budget * 0.5:
+            break
+        # seed beam with a few starting transactions (incl. txn 0 and random)
+        seeds = set()
+        seeds.add(0)
+        seeds.add(random.randrange(n))
+        if n > 1:
+            seeds.add(random.randrange(n))
+        beam = []
+        for s in seeds:
+            seq = [s]
+            rem = [x for x in range(n) if x != s]
+            c = workload.get_opt_seq_cost(seq)
+            beam.append((c, seq, rem))
+        beam.sort(key=lambda x: x[0])
+        beam = beam[:max_beam_width]
+
+        while beam and len(beam[0][1]) < n:
+            # adaptive beam width: wide early (branching choices compound
+            # most there), narrow toward the end to save evaluations
+            depth = len(beam[0][1])
+            frac = depth / max(1, n)
+            if frac < 0.2:
+                beam_width = max_beam_width
+            elif frac < 0.6:
+                beam_width = max(3, max_beam_width - 2)
+            else:
+                beam_width = max(2, max_beam_width - 3)
+            cands = []
+            for c, seq, rem in beam:
+                if not rem:
+                    continue
+                # expand with all remaining transactions (full lookahead)
+                for t in rem:
+                    new_seq = seq + [t]
+                    new_rem = [x for x in rem if x != t]
+                    cost = workload.get_opt_seq_cost(new_seq)
+                    cands.append((cost, new_seq, new_rem))
+            if not cands:
+                break
+            cands.sort(key=lambda x: x[0])
+            beam = cands[:beam_width]
+
+        if beam:
+            for c, seq, rem in beam:
+                final_cost = workload.get_opt_seq_cost(seq)
+                candidates.append((final_cost, seq))
+                if final_cost < best_cost:
+                    best_cost = final_cost
+                    best_seq = seq
+
+    if best_seq is None:
+        # fallback: trivial sequence
+        best_seq = list(range(n))
+        best_cost = workload.get_opt_seq_cost(best_seq)
+        candidates.append((best_cost, best_seq[:]))
+
+    # ---------- Phase 1b: randomized greedy constructions (diversity) ----------
+    def greedy_construct(sample_rate):
+        start = random.randrange(n)
+        seq = [start]
+        rem = [x for x in range(n) if x != start]
+        while rem:
+            if random.random() < sample_rate:
+                k = min(len(rem), 10)
+                best_t, best_c = None, float('inf')
+                for t in random.sample(rem, k):
+                    c = workload.get_opt_seq_cost(seq + [t])
+                    if c < best_c:
+                        best_c, best_t = c, t
+                t = best_t
+            else:
+                t = random.choice(rem)
+            seq.append(t)
+            rem.remove(t)
+        return workload.get_opt_seq_cost(seq), seq
+
+    while time.time() - start_time < time_budget * 0.6:
+        c, seq = greedy_construct(random.choice([0.5, 0.8, 1.0]))
+        candidates.append((c, seq))
+        if c < best_cost:
+            best_cost, best_seq = c, seq
+
+    # ---------- Phase 2: iterated local search with rich neighborhoods ----------
+    def local_search(seq, cur_cost, deadline):
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            # insertion moves (first-improvement)
+            for i in range(n):
+                if time.time() >= deadline:
+                    return seq, cur_cost
+                t = seq[i]
+                base = seq[:i] + seq[i+1:]
+                for j in range(n):
+                    if j == i:
+                        continue
+                    cand = base[:j] + [t] + base[j:]
+                    c = workload.get_opt_seq_cost(cand)
+                    if c < cur_cost:
+                        seq, cur_cost, improved = cand, c, True
+                        break
+            # swap moves (first-improvement)
+            for i in range(n):
+                if time.time() >= deadline:
+                    return seq, cur_cost
+                for j in range(i + 1, n):
+                    cand = seq[:]
+                    cand[i], cand[j] = cand[j], cand[i]
+                    c = workload.get_opt_seq_cost(cand)
+                    if c < cur_cost:
+                        seq, cur_cost, improved = cand, c, True
+                        break
+            # or-opt: reinsert short contiguous blocks (size 2-3) elsewhere
+            for blk in (2, 3):
+                for i in range(n - blk + 1):
+                    if time.time() >= deadline:
+                        return seq, cur_cost
+                    block = seq[i:i + blk]
+                    rest = seq[:i] + seq[i + blk:]
+                    for j in range(len(rest) + 1):
+                        cand = rest[:j] + block + rest[j:]
+                        if cand == seq:
+                            continue
+                        c = workload.get_opt_seq_cost(cand)
+                        if c < cur_cost:
+                            seq, cur_cost, improved = cand, c, True
+                            break
+                    else:
+                        continue
+                    break
+            # 2-opt: reverse a segment (flips many pairwise orders at once)
+            for i in range(n - 1):
+                if time.time() >= deadline:
+                    return seq, cur_cost
+                for j in range(i + 2, n):
+                    cand = seq[:i+1] + seq[i+1:j+1][::-1] + seq[j+1:]
+                    c = workload.get_opt_seq_cost(cand)
+                    if c < cur_cost:
+                        seq, cur_cost, improved = cand, c, True
+                        break
+                else:
+                    continue
+                break
+        return seq, cur_cost
+
+    candidates.sort(key=lambda x: x[0])
+    seen = set()
+    top = []
+    for c, s in candidates:
+        key = tuple(s)
+        if key not in seen:
+            seen.add(key)
+            top.append((c, s))
+        if len(top) >= 4:
+            break
+
+    for c_cost, c_seq in top:
+        if time.time() - start_time >= time_budget:
+            break
+        seq, cur_cost = local_search(c_seq[:], c_cost, start_time + time_budget)
+        if cur_cost < best_cost:
+            best_cost, best_seq = cur_cost, seq
+        # ILS: perturbation restarts from the incumbent
+        while time.time() - start_time < time_budget:
+            pseq = seq[:]
+            i = random.randrange(n)
+            j = min(n, i + random.randint(2, 8))
+            seg = pseq[i:j]
+            random.shuffle(seg)
+            pseq[i:j] = seg
+            pc = workload.get_opt_seq_cost(pseq)
+            pseq, pc = local_search(pseq, pc, start_time + time_budget)
+            if pc < cur_cost:
+                seq, cur_cost = pseq, pc
+            if cur_cost < best_cost:
+                best_cost, best_seq = cur_cost, seq
+
+    assert best_seq is not None and len(set(best_seq)) == n
+    return best_cost, best_seq
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

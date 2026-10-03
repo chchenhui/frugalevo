@@ -1,0 +1,111 @@
+<NAME>
+whittaker_fixed_lambda_polish</NAME>
+<DESCRIPTION>
+Replace the final zero-phase bilateral one-pole damper with a fixed-λ Whittaker–Henderson polish (second-order difference penalty). Rationale: the one-pole damper, even applied bilaterally, has a gently sloping passband that leaves residual ripple (slope_changes 20.4, false_reversals 14.2) while its exponential smearing contributes to the lag error (0.34). A second-order-difference Whittaker smoother has a much flatter passband and sharper stopband: it preserves genuine low-curvature trends nearly untouched while strongly suppressing high-curvature noise ripple, and being a global symmetric least-squares solve it adds zero phase delay. Critically, λ is held CONSTANT over the whole signal (uniform curvature penalty), so no segment gets a "curvature-relaxed" penalty through which noise leaks — the failure mode of previous adaptive-λ variants. λ is set from the residual ripple-to-noise ratio already available in the function: λ = clip(25·(r_std/σ_r)², 1, 200). When the Kalman/RTS output is already clean (r_std ≪ σ_r), λ is small and the signal passes nearly untouched (dynamics preserved); when ripple remains, λ grows and suppresses it. The system is pentadiagonal (I + λ·D2ᵀD2), solved in O(n) with scipy's banded symmetric Cholesky (`solveh_banded`, bandwidth 5), with a dense-solve fallback — preserving the 0.05s runtime budget. The polish is applied at full length BEFORE the final slice, so the `len(y) = n − window_size + 1` output contract is exactly preserved (the length-changing-post-smoother failure of Gen 23 is avoided).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _bilateral_one_pole(x, alpha):
+    """Forward then reversed one-pole smoothing — net zero phase delay."""
+    y = np.empty_like(x)
+    acc = x[0]
+    y[0] = acc
+    for i in range(1, len(x)):
+        acc = alpha * x[i] + (1.0 - alpha) * acc
+        y[i] = acc
+    acc = y[-1]
+    out = y.copy()
+    for i in range(len(x) - 2, -1, -1):
+        acc = alpha * y[i] + (1.0 - alpha) * acc
+        out[i] = acc
+    return out
+=======
+def _whittaker_polish(y, lam):
+    """Fixed-lambda Whittaker-Henderson smoother with a second-order
+    difference penalty:  min ||z - y||^2 + lam * ||D2 z||^2.
+    Solved via banded (bandwidth-5) symmetric Cholesky -> O(n).
+    Flatter passband / sharper stopband than a cascaded one-pole damper:
+    kills residual ripple (spurious slope reversals, slope changes)
+    without the lag a stronger causal smoother would add."""
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    if n < 5 or lam <= 0:
+        return y.copy()
+
+    # A = I + lam * D2^T D2  (symmetric positive definite, pentadiagonal)
+    # Exact diagonals of D2^T D2 for the interior, with edge corrections.
+    main = np.full(n, 6.0)
+    main[0] = main[-1] = 1.0
+    if n > 2:
+        main[1] = main[-2] = 5.0
+    main = main * lam + 1.0
+
+    off1 = np.full(n - 1, -4.0)
+    if n > 2:
+        off1[0] = off1[-1] = -2.0
+    off1 = off1 * lam
+
+    off2 = np.full(n - 2, 1.0) * lam
+
+    try:
+        from scipy.linalg import solveh_banded
+        ab = np.zeros((3, n))
+        ab[2, :] = main
+        ab[1, 1:] = off1
+        ab[0, 2:] = off2
+        return solveh_banded(ab, y, lower=False, check_finite=False)
+    except Exception:
+        pass
+
+    # Fallback: dense solve (fine for moderate n); identity as last resort
+    if n <= 2500:
+        A = np.eye(n)
+        np.fill_diagonal(A, main)
+        for i in range(n - 1):
+            A[i, i + 1] += off1[i]
+            A[i + 1, i] += off1[i]
+        for i in range(n - 2):
+            A[i, i + 2] += off2[i]
+            A[i + 2, i] += off2[i]
+        try:
+            return np.linalg.solve(A, y)
+        except np.linalg.LinAlgError:
+            return y.copy()
+    return y.copy()
+>>>>>>> REPLACE
+<DIFF>
+<<<<<<< SEARCH
+    # --- Zero-phase bidirectional one-pole pass (crossover element) ---
+    # Damps residual ripple from the smoother without adding lag.
+    # Alpha chosen from residual noise of the smoothed output: clean
+    # signals pass nearly untouched; noisy outputs get more suppression.
+    dy = np.diff(y)
+    if dy.size > 2:
+        r_std = np.median(np.abs(dy - np.median(dy))) / (0.6745 * np.sqrt(2.0))
+    else:
+        r_std = 0.0
+    if r_std > 0:
+        alpha = float(np.clip(0.55 + 0.4 * np.tanh(2.0 * sigma_r / max(r_std, 1e-12) - 2.0), 0.55, 0.95))
+    else:
+        alpha = 1.0
+    if alpha < 0.999:
+        y = _bilateral_one_pole(y, alpha)
+=======
+    # --- Fixed-lambda Whittaker-Henderson polish (zero-phase) ---
+    # min ||z - y||^2 + lam * ||D2 z||^2. The second-order difference
+    # penalty has a flatter passband / sharper stopband than a cascaded
+    # one-pole damper: it removes residual ripple (spurious slope
+    # reversals) without the lag a stronger causal smoother adds.
+    # Lambda is CONSTANT over the whole signal (uniform penalty, so no
+    # curvature-relaxed segment leaks noise) and scaled by the residual
+    # ripple-to-noise ratio: clean Kalman/RTS output -> tiny lambda ->
+    # dynamics pass nearly untouched; residual ripple -> larger lambda.
+    dy = np.diff(y)
+    if dy.size > 2:
+        r_std = np.median(np.abs(dy - np.median(dy))) / (0.6745 * np.sqrt(2.0))
+    else:
+        r_std = 0.0
+    lam = float(np.clip(25.0 * (r_std / max(sigma_r, 1e-12)) ** 2, 1.0, 200.0))
+    y = _whittaker_polish(y, lam)
+>>>>>>> REPLACE
+</DIFF>

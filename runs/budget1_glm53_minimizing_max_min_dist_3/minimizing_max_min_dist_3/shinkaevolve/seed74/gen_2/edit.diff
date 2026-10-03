@@ -1,0 +1,114 @@
+--- a/original.py
++++ b/original.py
+@@ -1,24 +1,99 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
++from itertools import combinations
+ 
++def _ratio(P):
++    D = np.linalg.norm(P[:, None, :] - P[None, :, :], axis=-1)
++    iu = np.triu_indices(len(P), 1)
++    d = D[iu]
++    dmin, dmax = d.min(), d.max()
++    if dmax <= 0:
++        return 0.0
++    return (dmin / dmax) ** 2
+ 
+ def min_max_dist_dim3_14() -> np.ndarray:
+-    """
+-    Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
++    n = 14
++    pairs = np.array(list(combinations(range(n), 2)))
++    ii, jj = pairs[:, 0], pairs[:, 1]
+ 
+-    Returns
+-        points: np.ndarray of shape (14,3) containing the (x,y) coordinates of the 14 points.
++    def loss(P, k):
++        d = np.linalg.norm(P[ii] - P[jj], axis=1)
++        # smooth min barrier (want d large) and smooth max barrier (want d small)
++        # soft-min of d: -logsumexp(-k*d)/k ; soft-max: logsumexp(k*d)/k
++        smin = -np.log(np.sum(np.exp(-k * (d - d.min()))) ) / k + d.min()
++        smax = np.log(np.sum(np.exp(k * (d - d.max())))) / k + d.max()
++        return -(smin / smax) ** 2
+ 
+-    """
++    def loss_grad(P, k):
++        # numerical-free gradient via autodiff-like manual: use analytic on soft quantities
++        diff = P[ii] - P[jj]
++        d = np.sqrt(np.sum(diff ** 2, axis=1)) + 1e-12
++        w_min = np.exp(-k * d); w_min /= w_min.sum()
++        w_max = np.exp(k * d); w_max /= w_max.sum()
++        smin = d @ w_min - np.log(w_max.shape[0] * 0 + 1) * 0  # not used
++        # recompute soft min/max consistently (same as in loss, shifted)
++        a = d.min(); b = d.max()
++        smin = -np.log(np.sum(np.exp(-k * (d - a)))) / k + a
++        smax = np.log(np.sum(np.exp(k * (d - b)))) / k + b
++        r = smin / smax
++        # d(smin)/d = w_min ; d(smax)/d = w_max
++        G = np.zeros_like(P)
++        coef = (-2 * r / smax ** 2) * w_min + (2 * r ** 2 / smax) * w_max
++        for idx in range(len(ii)):
++            G[ii[idx]] += coef[idx] * diff[idx] / d[idx]
++            G[jj[idx]] -= coef[idx] * diff[idx] / d[idx]
++        return -(r ** 2), G
+ 
+-    n = 14
+-    d = 3
++    rng = np.random.default_rng(42)
++    best_P, best_r = None, -1.0
+ 
+-    # places points randomly
+-    np.random.seed(42)
+-    points = np.random.randn(n, d)
++    def refine(P, ks=(4.0, 8.0, 16.0, 32.0)):
++        nonlocal best_P, best_r
++        cur = P.copy()
++        step = 0.05
++        for k in ks:
++            f, g = loss_grad(cur, k)
++            for _ in range(60):
++                trial = cur - step * g / (np.linalg.norm(g) + 1e-12) * np.linalg.norm(cur) * 0.05
++                # re-center and normalize scale occasionally
++                ft, _ = loss_grad(trial, k)
++                if ft < f:
++                    step *= 0.5
++                    if step < 1e-9:
++                        break
++                    continue
++                cur = trial
++                f, g = loss_grad(cur, k)
++                step *= 1.1
++            cur -= cur.mean(axis=0)
++            cur /= np.max(np.linalg.norm(cur - cur.mean(axis=0), axis=1))  # scale fix
++        r = _ratio(cur)
++        if r > best_r:
++            best_r, best_P = r, cur.copy()
++        return r
+ 
+-    return points
++    # multi-start optimization
++    n_starts = 400
++    for s in range(n_starts):
++        mode = s % 4
++        if mode == 0:
++            P = rng.standard_normal((n, 3))
++        elif mode == 1:
++            P = rng.standard_normal((n, 3)) * 0.3
++            P[:7] += np.array([1.0, 0, 0]); P[7:] -= np.array([1.0, 0, 0])
++        elif mode == 2:
++            # points on two parallel circles (antiprism-like)
++            t = np.linspace(0, 2 * np.pi, 7, endpoint=False)
++            c = np.stack([np.cos(t), np.sin(t), np.full(7, 1.0)], axis=1)
++            P = np.vstack([c, c[:, [1, 0, 2]] * [1, -1, -1]])
++            P += rng.standard_normal((n, 3)) * 0.15
++        else:
++            # cube vertices (8) + 6 octahedral
++            g = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], dtype=float)
++            o = np.array([[1.5, 0, 0], [-1.5, 0, 0], [0, 1.5, 0], [0, -1.5, 0], [0, 0, 1.5], [0, 0, -1.5]], dtype=float)
++            P = np.vstack([g, o]) + rng.standard_normal((n, 3)) * 0.15
++        P -= P.mean(axis=0)
++        refine(P)
+ 
+-
++    return best_P
+ # EVOLVE-BLOCK-END

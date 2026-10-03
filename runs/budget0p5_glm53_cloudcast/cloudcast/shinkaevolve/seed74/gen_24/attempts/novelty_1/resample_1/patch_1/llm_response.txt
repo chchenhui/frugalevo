@@ -1,0 +1,143 @@
+<NAME>
+iterated_reuse_discounting
+</NAME>
+<DESCRIPTION>
+Current approach splits partitions across pre-enumerated k paths, but never lets a later destination (or partition) "hitch a ride" on a trunk already paid for. Since all partitions originate at the same src, once a set of edges has been used, sending additional partitions/destinations over those edges adds (near) zero incremental cost. So: route each partition greedily with Dijkstra on a working copy of the graph whose edge costs are discounted (to ~0) for edges already used in the current pass. Then add an outer refinement loop: re-run the whole routing pass with used_edges warm-started from the previous pass, keeping the pass with the lowest true (undiscounted) total cost. This encourages shared trunks across destinations and partitions, reduces redundant transfers, and converges in 2-3 passes at trivial compute cost.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions, k_paths=4):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Track how many partitions are already assigned to each edge so we can
+    # spread load across parallel network paths.
+    edge_load = {}
+
+    def path_cost(path):
+        return sum(h[path[i]][path[i + 1]].get("cost") or 0.0
+                   for i in range(len(path) - 1))
+
+    for dst in dsts:
+        # Gather up to k candidate simple paths (cheapest first).
+        try:
+            path_generator = nx.shortest_simple_paths(h, src, dst, weight="cost")
+            candidates = []
+            for p in path_generator:
+                candidates.append(p)
+                if len(candidates) >= k_paths:
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            candidates = []
+        except Exception:
+            candidates = []
+
+        if not candidates:
+            try:
+                candidates = [nx.dijkstra_path(h, src, dst, weight="cost")]
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+
+        # Score each candidate path: cheap and lightly-loaded edges are better.
+        def score(path):
+            c = path_cost(path)
+            load_penalty = 0.0
+            for i in range(len(path) - 1):
+                load_penalty += edge_load.get((path[i], path[i + 1]), 0)
+            return (c + 1e-9) / (1.0 + load_penalty)
+
+        candidates = sorted(candidates, key=score)
+
+        # Weighted assignment: give the best path half the partitions and
+        # spread the rest over the ranked alternatives to balance load.
+        n = bc_topology.num_partitions
+        if len(candidates) == 1:
+            weights = [n]
+        else:
+            weights = [max(1, (n + 1) // 2)]
+            remaining = n - weights[0]
+            for idx in range(1, len(candidates)):
+                if remaining <= 0:
+                    break
+                if idx == len(candidates) - 1:
+                    weights.append(remaining)
+                    remaining = 0
+                else:
+                    take = max(1, remaining // 2)
+                    weights.append(take)
+                    remaining -= take
+
+        j = 0
+        for path, w in zip(candidates, weights):
+            for _ in range(w):
+                if j >= n:
+                    break
+                for i in range(0, len(path) - 1):
+                    s, t = path[i], path[i + 1]
+                    bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+                    edge_load[(s, t)] = edge_load.get((s, t), 0) + 1
+                j += 1
+        # Safety: fill any remaining partitions with the best path.
+        while j < n:
+            path = candidates[0]
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+                edge_load[(s, t)] = edge_load.get((s, t), 0) + 1
+            j += 1
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions, k_paths=4, discount=0.0, num_passes=3):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    def true_cost(edges):
+        return sum(G[s][t].get("cost") or 0.0 for s, t in edges)
+
+    def route_pass(used_edges):
+        """Route every (dst, partition) greedily on a graph where edges
+        already carrying traffic are (nearly) free, encouraging shared trunks."""
+        # Working graph with discounted edge costs.
+        w = h.copy()
+        for s, t in w.edges():
+            c = w[s][t].get("cost") or 0.0
+            if (s, t) in used_edges:
+                w[s][t]["cost"] = c * discount
+            else:
+                w[s][t]["cost"] = c + 1e-9  # break ties deterministically
+
+        topo = BroadCastTopology(src, dsts, num_partitions)
+        pass_used = set(used_edges)
+        for dst in dsts:
+            for j in range(num_partitions):
+                try:
+                    path = nx.dijkstra_path(w, src, dst, weight="cost")
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    continue
+                for i in range(0, len(path) - 1):
+                    s, t = path[i], path[i + 1]
+                    topo.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+                    pass_used.add((s, t))
+        return topo, pass_used
+
+    best_topo = None
+    best_edges = None
+    best_cost = float("inf")
+    used = set()
+    for _ in range(num_passes):
+        topo, used = route_pass(used)
+        cost = true_cost(used)
+        if cost < best_cost:
+            best_cost = cost
+            best_topo = topo
+            best_edges = used
+        else:
+            break  # converged; no improvement from further passes
+
+    if best_topo is None:
+        best_topo = BroadCastTopology(src, dsts, num_partitions)
+    return best_topo
+>>>>>>> REPLACE
+</DIFF>

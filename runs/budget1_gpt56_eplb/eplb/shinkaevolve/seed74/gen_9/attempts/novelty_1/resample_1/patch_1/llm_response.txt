@@ -1,0 +1,81 @@
+<NAME>
+bounded_swap_polish
+</NAME>
+
+<DESCRIPTION>
+Add a small bounded local-search refinement after the batched LPT packing pass. LPT provides a fast initial feasible assignment, but it can leave avoidable imbalance when a heavy item in the most-loaded pack can be exchanged with a light item in the least-loaded pack.
+
+The refinement performs at most four batched exchanges per row, preserves the exact per-pack capacity constraint, and only accepts an exchange when it strictly reduces the maximum load of the affected pair. Since the number of rounds is constant and operations are fully vectorized across layers, this adds little planner overhead while improving both node-group and GPU-level placement quality. Replica ranks are exchanged together with their items so the returned pack/rank representation remains a valid permutation of slots.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    return pack_index, rank_in_pack
+
+
+def _replicate_by_pressure(
+=======
+    # LPT is fast but can leave a heavy item stranded in the most-loaded pack.
+    # Perform a few capacity-preserving exchanges between the currently heaviest
+    # and lightest packs.  Exchanges are accepted only if they reduce the
+    # maximum load of that pair, so the global packing makespan never worsens.
+    for _ in range(min(capacity, 4)):
+        source_pack = loads.argmax(dim=1)
+        target_pack = loads.argmin(dim=1)
+
+        source_mask = pack_index.eq(source_pack.unsqueeze(1))
+        target_mask = pack_index.eq(target_pack.unsqueeze(1))
+        source_item = weight.float().masked_fill(
+            ~source_mask, float("-inf")
+        ).argmax(dim=1)
+        target_item = weight.float().masked_fill(
+            ~target_mask, float("inf")
+        ).argmin(dim=1)
+
+        source_load = weight[row_ids, source_item].float()
+        target_load = weight[row_ids, target_item].float()
+        transfer = source_load - target_load
+
+        old_source = loads.gather(1, source_pack.unsqueeze(1)).squeeze(1)
+        old_target = loads.gather(1, target_pack.unsqueeze(1)).squeeze(1)
+        new_source = old_source - transfer
+        new_target = old_target + transfer
+        improve = (source_pack != target_pack) & (
+            torch.maximum(new_source, new_target)
+            < torch.maximum(old_source, old_target)
+        )
+        transfer = torch.where(improve, transfer, torch.zeros_like(transfer))
+
+        loads.scatter_add_(
+            1, source_pack.unsqueeze(1), (-transfer).unsqueeze(1)
+        )
+        loads.scatter_add_(
+            1, target_pack.unsqueeze(1), transfer.unsqueeze(1)
+        )
+
+        source_rank = rank_in_pack[row_ids, source_item]
+        target_rank = rank_in_pack[row_ids, target_item]
+        new_source_pack = torch.where(improve, target_pack, source_pack)
+        new_target_pack = torch.where(improve, source_pack, target_pack)
+        new_source_rank = torch.where(improve, target_rank, source_rank)
+        new_target_rank = torch.where(improve, source_rank, target_rank)
+
+        pack_index.scatter_(
+            1, source_item.unsqueeze(1), new_source_pack.unsqueeze(1)
+        )
+        pack_index.scatter_(
+            1, target_item.unsqueeze(1), new_target_pack.unsqueeze(1)
+        )
+        rank_in_pack.scatter_(
+            1, source_item.unsqueeze(1), new_source_rank.unsqueeze(1)
+        )
+        rank_in_pack.scatter_(
+            1, target_item.unsqueeze(1), new_target_rank.unsqueeze(1)
+        )
+
+    return pack_index, rank_in_pack
+
+
+def _replicate_by_pressure(
+>>>>>>> REPLACE
+</DIFF>

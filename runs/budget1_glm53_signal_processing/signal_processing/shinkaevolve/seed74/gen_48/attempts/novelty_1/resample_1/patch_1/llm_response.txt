@@ -1,0 +1,91 @@
+<NAME>
+local_block_mad_q
+</NAME>
+<DESCRIPTION>
+Make the process noise Q locally adaptive via robust block-MAD statistics rather than a single global (or EWMA/recursive) estimate. After the first Kalman+RTS pass produces the denoised y1, compute second differences of y1 in overlapping blocks of length ≈ window_size (50% overlap). Because y1 is already denoised, its d2 reflects genuine dynamics (e.g., the 5 Hz component) that a single global Q under-serves. Per block: robust σ from MAD, subtract the (σ_r/√w)·√6 propagated noise floor, floor at 0.05·σ_r, cap at 1.5·σ_r, then linearly interpolate block values to a per-sample q_k sequence used in the second (refinement) pass's prediction step as 0.25·q_k. Busy segments get larger process noise (better tracking, lower lag_error and avg_error in oscillatory regions) while quiet segments are smoothed harder (fewer slope_changes / false_reversals). Block medians are robust to transients, unlike EWMA which chases bursts — the Gen-42 EWMA-adaptive R scored 0.68 with lag_error 0.34; the robust block counterpart targets the same objectives without over-trusting noisy segments.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        G = Pf[k] @ F.T @ Ppred_inv
+        xs[k] = xf[k] + G @ (xs[k + 1] - xp[k + 1])
+
+    y = xs[:, 0].copy()
+
+    # --- Iterated RTS refinement: second forward+backward pass on the
+    # smoothed output with Q reduced 4x (variational refinement), reusing
+    # the adaptive Rseq from the first pass. The first-pass output is
+    # already de-noised, so a tighter process noise sharpens the minimum-
+    # variance estimate further without adding phase lag. ---
+    if n >= 2:
+        q2 = 0.25 * qa
+        Q2 = q2 * np.array([[0.25, 0.5], [0.5, 1.0]])
+        x_est = np.array([y[0], 0.0])
+=======
+        G = Pf[k] @ F.T @ Ppred_inv
+        xs[k] = xf[k] + G @ (xs[k + 1] - xp[k + 1])
+
+    y = xs[:, 0].copy()
+
+    # --- Locally adaptive process noise via robust block-MAD statistics
+    # (explicitly NOT recursive/EWMA). y1 (the first-pass smoothed output)
+    # is already denoised, so its second differences reflect genuine
+    # dynamics (e.g., the 5 Hz component) that a single global Q
+    # under-serves. Compute sigma_acc in overlapping blocks of length
+    # ~window_size (50% overlap), subtract the propagated noise floor
+    # (sigma_r/sqrt(w))*sqrt(6), floor at 0.05*sigma_r, cap at
+    # 1.5*sigma_r, and linearly interpolate to per-sample q_k. Block
+    # medians are robust to transients, unlike EWMA estimates that chase
+    # bursts and over-trust noisy segments. ---
+    Qbase = np.array([[0.25, 0.5], [0.5, 1.0]])
+    step = max(1, w_r // 2)
+    block_vals = []
+    centers = []
+    for start in range(0, max(1, n - w_r + 1), step):
+        seg = y[start:start + w_r]
+        if seg.size < 3:
+            continue
+        d2s = seg[2:] - 2.0 * seg[1:-1] + seg[:-2]
+        mad_b = np.median(np.abs(d2s - np.median(d2s))) / 0.6745
+        noise_d2_b = (sigma_r / np.sqrt(w_r)) * np.sqrt(6.0)
+        var_b = mad_b * mad_b - noise_d2_b * noise_d2_b
+        s_b = np.sqrt(max(var_b, 0.0))
+        s_b = float(np.clip(s_b, 0.05 * sigma_r, 1.5 * sigma_r))
+        block_vals.append(s_b)
+        centers.append(start + w_r // 2)
+    if len(block_vals) >= 2:
+        qseq = np.interp(
+            np.arange(n, dtype=float),
+            np.asarray(centers, dtype=float),
+            np.asarray(block_vals, dtype=float),
+        ) ** 2
+    elif len(block_vals) == 1:
+        qseq = np.full(n, block_vals[0] ** 2)
+    else:
+        qseq = np.full(n, qa)
+
+    # --- Iterated RTS refinement: second forward+backward pass on the
+    # smoothed output using the locally adaptive Q (scaled 0.25x),
+    # reusing the adaptive Rseq from the first pass. Busy segments get
+    # larger process noise (better tracking, less lag) while quiet
+    # segments are smoothed harder (fewer spurious reversals). ---
+    if n >= 2:
+        x_est = np.array([y[0], 0.0])
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+            if k == 0:
+                xp[k] = x_est
+                Pp[k] = P
+            else:
+                xp[k] = F @ x_est
+                Pp[k] = F @ P @ F.T + Q2
+=======
+            if k == 0:
+                xp[k] = x_est
+                Pp[k] = P
+            else:
+                xp[k] = F @ x_est
+                Q2k = 0.25 * qseq[k] * Qbase
+                Pp[k] = F @ P @ F.T + Q2k
+>>>>>>> REPLACE
+</DIFF>

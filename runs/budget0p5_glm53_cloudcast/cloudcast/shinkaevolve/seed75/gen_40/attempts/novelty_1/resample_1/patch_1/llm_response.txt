@@ -1,0 +1,215 @@
+<NAME>
+sorted_dst_steiner_tree
+</NAME>
+<DESCRIPTION>
+The current Steiner-tree program already achieves the lowest cost (759.09). The recommendation says to try destination-ordering: sort destinations by ascending true Dijkstra cost from src so cheap central paths form the backbone first, then far destinations attach onto the shared tree. I keep the incremental greedy Steiner tree construction (multi-source Dijkstra from tree nodes), but seed the attachment order by ascending single-source Dijkstra distance. I also build the tree once and reuse it across all partitions (the tree per partition is identical since the graph doesn't change), reducing runtime. All sanitization, path-reconstruction guards, and append logic are preserved.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+
+
+def _build_partition_tree(src, dsts, G, h):
+    """
+    Build a Steiner-like multicast tree rooted at src reaching all reachable dsts.
+    Destinations are processed in ascending single-source Dijkstra cost order so
+    cheap central paths form the backbone and expensive/far destinations attach
+    onto already-paid shared segments.
+    Returns:
+        parent: dict node -> parent node (tree edges), src has no parent
+        reachable_dsts: list of dsts connected (sorted by dist ascending)
+    """
+    reachable_dsts = [d for d in dsts if d in h and nx.has_path(h, src, d)]
+    unreachable = set(dsts) - set(reachable_dsts)
+    if unreachable:
+        print(f"Unreachable destinations from {src}: {sorted(unreachable)}")
+
+    # Single-source Dijkstra once: used both for ordering and fallback
+    dijkstra_dist, dijkstra_paths = nx.single_source_dijkstra(h, src, weight="cost")
+
+    # Sort destinations by ascending true Dijkstra cost from src (cheapest first)
+    reachable_dsts.sort(key=lambda d: dijkstra_dist.get(d, float("inf")))
+
+    tree_nodes = {src}
+    parent = {}
+    remaining = list(reachable_dsts)
+
+    for d in remaining:
+        if d in tree_nodes:
+            continue
+        # multi-source dijkstra from current tree: prefix inside tree is free
+        try:
+            dist, paths_from = nx.multi_source_dijkstra(h, tree_nodes, weight="cost")
+        except nx.NetworkXNoPath:
+            continue
+        if d not in dist:
+            # cannot attach from tree; fall back to plain src path
+            try:
+                path = nx.dijkstra_path(h, src, d, weight="cost")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+            for i in range(len(path) - 1):
+                s, t = path[i], path[i + 1]
+                if t not in tree_nodes:
+                    tree_nodes.add(t)
+                    parent[t] = s
+            continue
+        path = paths_from[d]
+        for i in range(len(path) - 1):
+            s, t = path[i], path[i + 1]
+            if t not in tree_nodes:
+                tree_nodes.add(t)
+                parent[t] = s
+
+    return parent, reachable_dsts
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Build the multicast tree once (destinations sorted cheapest-first),
+    # then emit the shared tree for every partition.
+    parent, reachable_dsts = _build_partition_tree(src, dsts, G, h)
+
+    for dst in reachable_dsts:
+        # reconstruct complete src -> dst chain from tree parents
+        chain = []
+        node = dst
+        safety = 0
+        ok = True
+        while node != src:
+            p = parent.get(node)
+            if p is None:
+                ok = False
+                break
+            chain.append((p, node))
+            node = p
+            safety += 1
+            if safety > len(h.nodes) + 1:
+                ok = False
+                break
+
+        if not ok or not chain:
+            # guard: never emit partial/empty path; recompute via dijkstra
+            try:
+                path = nx.dijkstra_path(h, src, dst, weight="cost")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+            for j in range(num_partitions):
+                for i in range(len(path) - 1):
+                    s, t = path[i], path[i + 1]
+                    bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+            continue
+
+        chain_edges = list(reversed(chain))
+        for j in range(num_partitions):
+            for s, t in chain_edges:
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]  # [[src, dst, edge data]]
+
+
+class BroadCastTopology:
+    def __init__(self, src: str, dsts: List[str], num_partitions: int = 4, paths: Dict[str, SingleDstPath] = None):
+        self.src = src  # single str
+        self.dsts = dsts  # list of strs
+        self.num_partitions = num_partitions
+
+        # dict(dst) --> dict(partition) --> list(nx.edges)
+        # example: {dst1: {partition1: [src->node1, node1->dst1], partition 2: [src->dst1]}}
+        if paths is not None:
+            self.paths = paths
+            self.set_graph()
+        else:
+            self.paths = {dst: {str(i): None for i in range(num_partitions)} for dst in dsts}
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        """
+        Set paths for partition = partition to reach dst
+        """
+        partition = str(partition)
+        self.paths[dst][partition] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        """
+        Append path for partition = partition to reach dst
+        """
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    """
+    Default graph with capacity constraints and cost info
+    nodes: regions, edges: links
+    per edge:
+        throughput: max tput achievable (gbps)
+        cost: $/GB
+        flow: actual flow (gbps), must be < throughput, default = 0
+    """
+    # Use relative path from this file's location
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if cost_path is None:
+        cost = pd.read_csv(os.path.join(current_dir, "profiles/cost.csv"))
+    else:
+        cost = pd.read_csv(cost_path)
+
+    if throughput_path is None:
+        throughput = pd.read_csv(os.path.join(current_dir, "profiles/throughput.csv"))
+    else:
+        throughput = pd.read_csv(throughput_path)
+
+    G = nx.DiGraph()
+    for _, row in throughput.iterrows():
+        if row["src_region"] == row["dst_region"]:
+            continue
+        G.add_edge(row["src_region"], row["dst_region"], cost=None, throughput=num_vms * row["throughput_sent"] / 1e9)
+
+    for _, row in cost.iterrows():
+        if row["src"] in G and row["dest"] in G[row["src"]]:
+            G[row["src"]][row["dest"]]["cost"] = row["cost"]
+
+    # some pairs not in the cost grid
+    no_cost_pairs = []
+    for edge in G.edges.data():
+        src, dst = edge[0], edge[1]
+        if edge[-1]["cost"] is None:
+            no_cost_pairs.append((src, dst))
+    print("Unable to get costs for: ", no_cost_pairs)
+
+    return G
+
+
+# EVOLVE-BLOCK-END
+
+# Helper functions that won't be evolved
+def create_broadcast_topology(src: str, dsts: List[str], num_partitions: int = 4):
+    """Create a broadcast topology instance"""
+    return BroadCastTopology(src, dsts, num_partitions)
+
+def run_search_algorithm(src: str, dsts: List[str], G, num_partitions: int):
+    """Run the search algorithm and return the topology"""
+    return search_algorithm(src, dsts, G, num_partitions)
+```
+</CODE>

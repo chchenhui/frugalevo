@@ -1,0 +1,354 @@
+# EVOLVE-BLOCK-START
+#include <bits/stdc++.h>
+using namespace std;
+
+static constexpr int LIM = 100000;
+static constexpr int MAX_VERTICES = 1000;
+static constexpr long long MAX_PERIMETER = 400000;
+
+struct Point {
+    int x, y;
+    bool operator==(const Point& other) const {
+        return x == other.x && y == other.y;
+    }
+};
+
+struct Fish {
+    int x, y, w;
+};
+
+struct RNG {
+    uint64_t s;
+    RNG() : s(chrono::steady_clock::now().time_since_epoch().count()) {}
+    uint64_t next() {
+        s ^= s << 7;
+        s ^= s >> 9;
+        return s;
+    }
+    int next_int(int n) {
+        return n ? int(next() % n) : 0;
+    }
+};
+
+struct Rectangle {
+    int xl, xr, yb, yt;
+};
+
+class CoarseRectangleSearch {
+    static constexpr int G = 96;
+    int cell;
+    vector<vector<int>> grid;
+
+public:
+    CoarseRectangleSearch() : cell((LIM + 1 + G - 1) / G),
+                              grid(G, vector<int>(G, 0)) {}
+
+    void add(const Fish& f) {
+        int cx = min(G - 1, f.x / cell);
+        int cy = min(G - 1, f.y / cell);
+        grid[cy][cx] += f.w;
+    }
+
+    Rectangle solve() const {
+        int best = INT_MIN;
+        int bx1 = 0, bx2 = 0, by1 = 0, by2 = 0;
+
+        for (int left = 0; left < G; ++left) {
+            vector<int> rows(G, 0);
+            for (int right = left; right < G; ++right) {
+                for (int y = 0; y < G; ++y) rows[y] += grid[y][right];
+
+                int cur = 0, start = 0;
+                for (int y = 0; y < G; ++y) {
+                    if (cur <= 0) {
+                        cur = rows[y];
+                        start = y;
+                    } else {
+                        cur += rows[y];
+                    }
+                    if (cur > best) {
+                        best = cur;
+                        bx1 = left;
+                        bx2 = right;
+                        by1 = start;
+                        by2 = y;
+                    }
+                }
+            }
+        }
+
+        int xl = bx1 * cell;
+        int xr = min(LIM, (bx2 + 1) * cell - 1);
+        int yb = by1 * cell;
+        int yt = min(LIM, (by2 + 1) * cell - 1);
+
+        if (xl == xr) xr = min(LIM, xl + 1);
+        if (yb == yt) yt = min(LIM, yb + 1);
+        return {xl, xr, yb, yt};
+    }
+};
+
+class PolygonTools {
+public:
+    static long long perimeter(const vector<Point>& p) {
+        long long ans = 0;
+        for (int i = 0; i < (int)p.size(); ++i) {
+            const Point& a = p[i];
+            const Point& b = p[(i + 1) % p.size()];
+            ans += llabs((long long)a.x - b.x) + llabs((long long)a.y - b.y);
+        }
+        return ans;
+    }
+
+    static void simplify(vector<Point>& p) {
+        bool changed = true;
+        while (changed && p.size() >= 4) {
+            changed = false;
+            vector<Point> q;
+            int n = (int)p.size();
+
+            for (int i = 0; i < n; ++i) {
+                Point a = p[(i - 1 + n) % n];
+                Point b = p[i];
+                Point c = p[(i + 1) % n];
+
+                if ((a.x == b.x && b.x == c.x) ||
+                    (a.y == b.y && b.y == c.y)) {
+                    changed = true;
+                } else {
+                    q.push_back(b);
+                }
+            }
+            if (q.size() >= 4) p.swap(q);
+            else break;
+        }
+    }
+
+    static bool valid_basic(const vector<Point>& p) {
+        if (p.size() < 4 || p.size() > MAX_VERTICES) return false;
+        set<pair<int, int>> seen;
+
+        for (int i = 0; i < (int)p.size(); ++i) {
+            const Point& a = p[i];
+            const Point& b = p[(i + 1) % p.size()];
+
+            if (a.x < 0 || a.x > LIM || a.y < 0 || a.y > LIM) return false;
+            if (!seen.insert({a.x, a.y}).second) return false;
+            if (a.x != b.x && a.y != b.y) return false;
+            if (a.x == b.x && a.y == b.y) return false;
+        }
+        return perimeter(p) <= MAX_PERIMETER;
+    }
+
+    static vector<Point> rectangle(const Rectangle& r) {
+        return {
+            {r.xl, r.yb},
+            {r.xr, r.yb},
+            {r.xr, r.yt},
+            {r.xl, r.yt}
+        };
+    }
+};
+
+class BandedContourBuilder {
+    const vector<Fish>& fish;
+    Rectangle core;
+
+    struct Band {
+        int y0, y1;
+        int left, right;
+    };
+
+    vector<Band> bands;
+
+    int band_of(int y) const {
+        for (int i = 0; i < (int)bands.size(); ++i) {
+            if (i + 1 == (int)bands.size()) {
+                if (bands[i].y0 <= y && y <= bands[i].y1) return i;
+            } else {
+                if (bands[i].y0 <= y && y < bands[i].y1) return i;
+            }
+        }
+        return -1;
+    }
+
+    void optimize_band(int id, const vector<Fish>& fs) {
+        int best_left = core.xl;
+        int best_right = core.xr;
+
+        vector<Fish> lefts, rights;
+        for (const Fish& f : fs) {
+            if (f.x < core.xl) lefts.push_back(f);
+            else if (f.x > core.xr) rights.push_back(f);
+        }
+
+        sort(lefts.begin(), lefts.end(), [](const Fish& a, const Fish& b) {
+            return a.x > b.x;
+        });
+        sort(rights.begin(), rights.end(), [](const Fish& a, const Fish& b) {
+            return a.x < b.x;
+        });
+
+        int sum = 0, best = 0;
+        for (const Fish& f : lefts) {
+            sum += f.w;
+            if (sum > best) {
+                best = sum;
+                best_left = f.x;
+            }
+        }
+
+        sum = 0;
+        best = 0;
+        for (const Fish& f : rights) {
+            sum += f.w;
+            if (sum > best) {
+                best = sum;
+                best_right = f.x;
+            }
+        }
+
+        bands[id].left = best_left;
+        bands[id].right = best_right;
+    }
+
+    void smooth_boundaries() {
+        const int MAX_STEP = 1300;
+
+        for (int pass = 0; pass < 4; ++pass) {
+            for (int i = 1; i < (int)bands.size(); ++i) {
+                bands[i].left = max(bands[i].left, bands[i - 1].left - MAX_STEP);
+                bands[i].left = min(bands[i].left, bands[i - 1].left + MAX_STEP);
+
+                bands[i].right = max(bands[i].right, bands[i - 1].right - MAX_STEP);
+                bands[i].right = min(bands[i].right, bands[i - 1].right + MAX_STEP);
+
+                bands[i].left = min(bands[i].left, core.xl);
+                bands[i].right = max(bands[i].right, core.xr);
+            }
+            for (int i = (int)bands.size() - 2; i >= 0; --i) {
+                bands[i].left = max(bands[i].left, bands[i + 1].left - MAX_STEP);
+                bands[i].left = min(bands[i].left, bands[i + 1].left + MAX_STEP);
+
+                bands[i].right = max(bands[i].right, bands[i + 1].right - MAX_STEP);
+                bands[i].right = min(bands[i].right, bands[i + 1].right + MAX_STEP);
+
+                bands[i].left = min(bands[i].left, core.xl);
+                bands[i].right = max(bands[i].right, core.xr);
+            }
+        }
+    }
+
+public:
+    BandedContourBuilder(const vector<Fish>& fish_, Rectangle core_)
+        : fish(fish_), core(core_) {}
+
+    vector<Point> build() {
+        int height = max(1, core.yt - core.yb);
+        int count = min(64, max(1, height / 450 + 1));
+        count = min(count, 128);
+
+        bands.resize(count);
+        for (int i = 0; i < count; ++i) {
+            int y0 = core.yb + (long long)height * i / count;
+            int y1 = core.yb + (long long)height * (i + 1) / count;
+            if (i + 1 == count) y1 = core.yt;
+            if (y1 <= y0) y1 = min(LIM, y0 + 1);
+            bands[i] = {y0, y1, core.xl, core.xr};
+        }
+
+        vector<vector<Fish>> in_band(count);
+        for (const Fish& f : fish) {
+            if (f.y < core.yb || f.y > core.yt) continue;
+            int id = band_of(f.y);
+            if (id >= 0) in_band[id].push_back(f);
+        }
+
+        for (int i = 0; i < count; ++i) optimize_band(i, in_band[i]);
+        smooth_boundaries();
+
+        vector<Point> poly;
+        poly.reserve(2 * count + 4);
+
+        poly.push_back({bands[0].left, bands[0].y0});
+        poly.push_back({bands[0].right, bands[0].y0});
+
+        for (int i = 0; i < count; ++i) {
+            poly.push_back({bands[i].right, bands[i].y1});
+            if (i + 1 < count) {
+                poly.push_back({bands[i + 1].right, bands[i].y1});
+            }
+        }
+
+        for (int i = count - 1; i >= 0; --i) {
+            poly.push_back({bands[i].left, bands[i].y0});
+            if (i > 0) {
+                poly.push_back({bands[i - 1].left, bands[i].y0});
+            }
+        }
+
+        vector<Point> unique_poly;
+        for (const Point& p : poly) {
+            if (unique_poly.empty() || !(unique_poly.back() == p)) unique_poly.push_back(p);
+        }
+        if (unique_poly.size() >= 2 && unique_poly.front() == unique_poly.back()) {
+            unique_poly.pop_back();
+        }
+
+        PolygonTools::simplify(unique_poly);
+        return unique_poly;
+    }
+};
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int n;
+    cin >> n;
+
+    vector<Fish> fish;
+    fish.reserve(2 * n);
+
+    for (int i = 0; i < n; ++i) {
+        int x, y;
+        cin >> x >> y;
+        fish.push_back({x, y, +1});
+    }
+    for (int i = 0; i < n; ++i) {
+        int x, y;
+        cin >> x >> y;
+        fish.push_back({x, y, -1});
+    }
+
+    CoarseRectangleSearch search;
+    for (const Fish& f : fish) search.add(f);
+
+    Rectangle core = search.solve();
+
+    vector<Point> answer;
+    {
+        BandedContourBuilder builder(fish, core);
+        answer = builder.build();
+    }
+
+    if (!PolygonTools::valid_basic(answer)) {
+        answer = PolygonTools::rectangle(core);
+    }
+
+    if (!PolygonTools::valid_basic(answer)) {
+        answer = {
+            {0, 0},
+            {1, 0},
+            {1, 1},
+            {0, 1}
+        };
+    }
+
+    cout << answer.size() << '\n';
+    for (const Point& p : answer) {
+        cout << p.x << ' ' << p.y << '\n';
+    }
+    return 0;
+}
+# EVOLVE-BLOCK-END

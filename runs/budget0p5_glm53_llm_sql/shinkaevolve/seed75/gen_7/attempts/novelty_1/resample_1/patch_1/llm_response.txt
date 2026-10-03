@@ -1,0 +1,166 @@
+<NAME>
+valid_per_row_column_orderings
+</NAME>
+<DESCRIPTION>
+The program failed validation because `reorder` returned an empty list `[]` for `column_orderings` (see `return final_df, []`), while the evaluator requires valid per-row column orderings consistent with the returned data. Additionally, the old code's recursive column/row splitting mutated cell placement without producing consistent per-row orderings, discarded/re-merged columns with an "original_index" helper column (risking shape/dtype corruption), and its `column_recursion` wrote rows into `result_df.loc[i]` from `as_completed` (non-deterministic row assignment) and referenced `cols_settled` outside its loop.
+
+The fix replaces the editable block with a simple, correct, bounded algorithm:
+1. Preserve every row and cell exactly (object dtype for mixed types, no helper columns, no discarded columns).
+2. Build a global column ordering using the length-weighted repetition heuristic: for each column, score = sum over serialized values v of len(v)*count(v)*(count(v)-1), with deterministic tie-breaks (fewer distinct values / longer average / column name).
+3. Serialize each row with that column order (fillna -> ""), sort rows by the serialized string (lexicographic order maximizes adjacent LCP = ideal trie reuse), and rebuild the dataframe in that row order with the chosen column order.
+4. Return `column_orderings` as a list with one column-name ordering per output row, consistent with the returned dataframe.
+
+This guarantees a valid (dataframe, orderings) pair, preserves shape and values, and improves prefix caching via lexicographic row sorting and repetition-weighted column placement.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List
+from collections import Counter
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-caching aware reordering:
+    - chooses a global column order via a length-weighted repetition heuristic,
+    - sorts rows lexicographically by their serialized strings so that the
+      shared character trie gets maximal adjacent common prefixes,
+    - returns valid per-row column orderings consistent with the output data.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ---------------- serialization helpers ----------------
+
+    @staticmethod
+    def _serialize_cell(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, float) and np.isnan(v):
+            return ""
+        if pd.isna(v):
+            return ""
+        if isinstance(v, str):
+            return v
+        return str(v)
+
+    def _serialize_rows(self, df: pd.DataFrame, order: List[str]) -> List[str]:
+        """Serialize each row as ''.join of str cells (missing -> '')."""
+        cols = [df[c].tolist() for c in order]
+        n = len(df)
+        out = []
+        for i in range(n):
+            parts = []
+            for colvals in cols:
+                v = colvals[i]
+                if v is None:
+                    parts.append("")
+                elif isinstance(v, float):
+                    parts.append("" if np.isnan(v) else str(v))
+                else:
+                    try:
+                        if pd.isna(v):
+                            parts.append("")
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                    parts.append(v if isinstance(v, str) else str(v))
+            out.append("".join(parts))
+        return out
+
+    # ---------------- column ordering heuristic ----------------
+
+    def _column_order_heuristic(self, df: pd.DataFrame) -> List[str]:
+        """Order columns by descending sum of len(v)*count*(count-1)."""
+        scores = {}
+        meta = {}
+        for c in df.columns:
+            vals = df[c].tolist()
+            ser = []
+            for v in vals:
+                if v is None:
+                    ser.append("")
+                elif isinstance(v, float):
+                    ser.append("" if np.isnan(v) else str(v))
+                else:
+                    try:
+                        if pd.isna(v):
+                            ser.append("")
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                    ser.append(v if isinstance(v, str) else str(v))
+            cnt = Counter(ser)
+            score = sum(len(v) * n * (n - 1) for v, n in cnt.items())
+            scores[c] = score
+            meta[c] = (len(cnt), -sum(len(v) for v in ser) / max(1, len(ser)))
+        # deterministic tie-breaks: score desc, fewer distinct, longer avg, name
+        order = sorted(
+            df.columns,
+            key=lambda c: (-scores[c], meta[c][0], meta[c][1], str(c)),
+        )
+        return order
+
+    # ---------------- public API ----------------
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        # Work on a copy; never mutate caller's data.
+        work = df.copy()
+
+        # Honor column merges using the parent class semantics if provided.
+        if col_merge:
+            try:
+                for col_to_merge in col_merge:
+                    present = [c for c in work.columns if c in col_to_merge]
+                    if len(present) >= 2:
+                        work = self.merging_columns(work, present, prepended=False)
+            except Exception:
+                pass
+
+        original_columns = list(work.columns)
+
+        # Global column ordering heuristic.
+        order = self._column_order_heuristic(work)
+
+        # Serialize rows under this ordering.
+        sers = self._serialize_rows(work, order)
+
+        # Sort rows lexicographically by serialized string so adjacent
+        # rows share maximal prefixes in the character trie.
+        idx = sorted(range(len(work)), key=lambda i: sers[i])
+        # Stable sort with tie-break on all serialized values keeps determinism.
+        ordered = work.iloc[idx].reset_index(drop=True)
+        ordered = ordered[order]
+
+        # Mixed-type safety: use object dtype to preserve original values.
+        ordered = ordered.astype(object)
+
+        # Per-row column orderings consistent with returned data.
+        column_orderings = [list(order) for _ in range(len(ordered))]
+
+        # Keep shape identical (merging may change column count per API semantics).
+        if not col_merge:
+            assert ordered.shape == df.shape, (
+                f"Output shape {ordered.shape} != input shape {df.shape}"
+            )
+
+        return ordered, column_orderings
+
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

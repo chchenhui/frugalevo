@@ -1,0 +1,233 @@
+<NAME>
+hybrid_tail_de11
+</NAME>
+
+<DESCRIPTION>
+This redesign replaces the single-point population annealer with a modular hybrid differential-evolution search. It uses a progressively decaying low-tail objective during global exploration, vectorized population scoring, elitist preservation, periodic local perturbation around the best configuration, and a final deterministic bottleneck-focused coordinate polish. The triangular-domain projection and Cartesian conversion are isolated into reusable helpers, making the optimization flow clearer and more robust.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Return eleven points in the equilateral triangle with vertices
+    (0, 0), (1, 0), and (1/2, sqrt(3)/2).
+
+    Internally, points use simplex coordinates (u, v):
+        x = u + v / 2
+        y = sqrt(3) * v / 2
+    where u >= 0, v >= 0, u + v <= 1.
+
+    In these coordinates, the absolute determinant of a point triple
+    equals its area normalized by the containing triangle's area.
+    """
+    rng = np.random.default_rng(11031987)
+
+    n_points = 11
+    fixed_count = 3
+    mutable_count = n_points - fixed_count
+
+    triples = np.asarray(
+        [
+            (i, j, k)
+            for i in range(n_points)
+            for j in range(i + 1, n_points)
+            for k in range(j + 1, n_points)
+        ],
+        dtype=np.intp,
+    )
+
+    anchors = np.asarray(
+        ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)),
+        dtype=float,
+    )
+
+    def project_simplex(values: np.ndarray) -> np.ndarray:
+        """Project arbitrary (..., 2) coordinates safely into the simplex."""
+        result = np.asarray(values, dtype=float).copy()
+        result = np.maximum(result, 0.0)
+
+        total = result[..., 0] + result[..., 1]
+        outside = total > 1.0
+        if np.any(outside):
+            result[outside] /= total[outside, None]
+        return result
+
+    def random_simplex(count: int) -> np.ndarray:
+        """Uniform barycentric samples represented by their last two weights."""
+        weights = rng.exponential(1.0, size=(count, mutable_count, 3))
+        weights /= weights.sum(axis=2, keepdims=True)
+        return weights[:, :, 1:]
+
+    def areas(layouts: np.ndarray) -> np.ndarray:
+        """Return all normalized absolute triple areas for each layout."""
+        a = layouts[:, triples[:, 0]]
+        b = layouts[:, triples[:, 1]]
+        c = layouts[:, triples[:, 2]]
+        return np.abs(
+            (b[:, :, 0] - a[:, :, 0]) * (c[:, :, 1] - a[:, :, 1])
+            - (b[:, :, 1] - a[:, :, 1]) * (c[:, :, 0] - a[:, :, 0])
+        )
+
+    def evaluate(layouts: np.ndarray, tail_count: int = 10) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return true bottleneck area and the mean of the low-area tail.
+        The tail supplies a smoother evolutionary signal before final polish.
+        """
+        all_areas = areas(layouts)
+        smallest = np.partition(all_areas, tail_count - 1, axis=1)[:, :tail_count]
+        return smallest[:, 0], smallest.mean(axis=1)
+
+    def make_population(size: int) -> np.ndarray:
+        population = np.empty((size, n_points, 2), dtype=float)
+        population[:, :fixed_count] = anchors
+        population[:, fixed_count:] = random_simplex(size)
+
+        # A second distribution biased toward edges improves coverage of
+        # configurations in which several good points lie on the boundary.
+        edge_start = size // 3
+        edge_data = rng.random((size - edge_start, mutable_count, 2))
+        edge_axis = rng.integers(0, 3, size=(size - edge_start, mutable_count))
+
+        for axis in range(3):
+            mask = edge_axis == axis
+            if axis == 0:
+                edge_data[..., 1][mask] = 0.0
+            elif axis == 1:
+                edge_data[..., 0][mask] = 0.0
+            else:
+                total = edge_data[..., 0] + edge_data[..., 1]
+                edge_data[..., 0][mask] /= total[mask]
+                edge_data[..., 1][mask] /= total[mask]
+
+        population[edge_start:, fixed_count:] = project_simplex(edge_data)
+        return population
+
+    def exact_value(layout: np.ndarray) -> float:
+        return float(evaluate(layout[None, :, :], tail_count=1)[0][0])
+
+    population_size = 156
+    generations = 2850
+    population = make_population(population_size)
+
+    minimum, tail = evaluate(population)
+    best_index = int(np.argmax(minimum))
+    best_layout = population[best_index].copy()
+    best_value = float(minimum[best_index])
+
+    # Differential evolution supplies global moves, while the annealed tail
+    # reward avoids spending early generations on layouts with many nearly
+    # degenerate triples.
+    for generation in range(generations):
+        progress = generation / float(generations - 1)
+        tail_weight = 0.072 * (1.0 - progress) + 0.018 * progress
+
+        ranking = minimum + tail_weight * tail
+
+        order = rng.permutation(population_size)
+        a = population[order]
+        b = population[np.roll(order, 1)]
+        c = population[np.roll(order, 2)]
+
+        mutation_scale = 0.76 - 0.24 * progress
+        donor = a[:, fixed_count:] + mutation_scale * (
+            b[:, fixed_count:] - c[:, fixed_count:]
+        )
+
+        # Periodically pull proposals toward the current strongest incumbent.
+        if generation % 11 == 0:
+            donor = (
+                best_layout[fixed_count:]
+                + (0.32 - 0.20 * progress)
+                * (donor - best_layout[fixed_count:])
+            )
+
+        donor = project_simplex(donor)
+        trial = population.copy()
+
+        crossover_rate = 0.83 - 0.18 * progress
+        mask = rng.random((population_size, mutable_count, 2)) < crossover_rate
+
+        # Every mutable point receives at least one donor coordinate.
+        mandatory_point = rng.integers(0, mutable_count, size=population_size)
+        mandatory_axis = rng.integers(0, 2, size=population_size)
+        mask[np.arange(population_size), mandatory_point, mandatory_axis] = True
+
+        current_mutable = trial[:, fixed_count:]
+        current_mutable[mask] = donor[mask]
+        trial[:, fixed_count:] = project_simplex(current_mutable)
+
+        trial_minimum, trial_tail = evaluate(trial)
+        trial_ranking = trial_minimum + tail_weight * trial_tail
+        accepted = trial_ranking >= ranking
+
+        population[accepted] = trial[accepted]
+        minimum[accepted] = trial_minimum[accepted]
+        tail[accepted] = trial_tail[accepted]
+
+        generation_best = int(np.argmax(minimum))
+        if minimum[generation_best] > best_value:
+            best_value = float(minimum[generation_best])
+            best_layout = population[generation_best].copy()
+
+        # Maintain an exact incumbent in the population.  Replacing only the
+        # current worst member preserves diversity while preventing regression.
+        if generation % 23 == 22:
+            worst = int(np.argmin(minimum + tail_weight * tail))
+            population[worst] = best_layout
+            minimum[worst], tail[worst] = evaluate(population[worst:worst + 1])
+
+    # Deterministic final refinement directly targets the true maximin score.
+    directions = np.asarray(
+        (
+            (1.0, 0.0), (-1.0, 0.0),
+            (0.0, 1.0), (0.0, -1.0),
+            (0.7071067811865476, 0.7071067811865476),
+            (0.7071067811865476, -0.7071067811865476),
+            (-0.7071067811865476, 0.7071067811865476),
+            (-0.7071067811865476, -0.7071067811865476),
+        ),
+        dtype=float,
+    )
+
+    for step in (0.010, 0.005, 0.0025, 0.0012, 0.00055):
+        improved = True
+        rounds = 0
+
+        while improved and rounds < 6:
+            improved = False
+            rounds += 1
+
+            # Visit points participating in bottleneck triples first.
+            local_areas = areas(best_layout[None, :, :])[0]
+            active = triples[np.argsort(local_areas)[:12]].ravel()
+            priority = list(dict.fromkeys(active.tolist()))
+            priority.extend(i for i in range(fixed_count, n_points) if i not in priority)
+
+            for point_index in priority:
+                if point_index < fixed_count:
+                    continue
+
+                for direction in directions:
+                    candidate = best_layout.copy()
+                    candidate[point_index] += step * direction
+                    candidate[point_index] = project_simplex(candidate[point_index][None, :])[0]
+
+                    candidate_value = exact_value(candidate)
+                    if candidate_value > best_value + 1e-13:
+                        best_layout = candidate
+                        best_value = candidate_value
+                        improved = True
+
+    points = np.empty((n_points, 2), dtype=float)
+    points[:, 0] = best_layout[:, 0] + 0.5 * best_layout[:, 1]
+    points[:, 1] = (np.sqrt(3.0) * 0.5) * best_layout[:, 1]
+    return points
+
+
+# EVOLVE-BLOCK-END
+```

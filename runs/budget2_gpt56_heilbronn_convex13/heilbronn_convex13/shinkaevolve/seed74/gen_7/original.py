@@ -1,0 +1,85 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct 13 points in the unit square using deterministic maximin search.
+
+    Four points are fixed at the square corners, so the convex hull has area
+    exactly one.  Consequently the smallest Euclidean triangle area is also
+    the normalized objective used by the evaluator.
+    """
+    rng = np.random.default_rng(seed=137)
+    corners = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        dtype=float,
+    )
+    triangles = np.array(
+        [(i, j, k) for i in range(13) for j in range(i + 1, 13)
+         for k in range(j + 1, 13)],
+        dtype=np.intp,
+    )
+
+    def minimum_triangle_areas(interior: np.ndarray) -> np.ndarray:
+        """Evaluate all 286 unsigned triangle areas for a batch of layouts."""
+        count = interior.shape[0]
+        layouts = np.empty((count, 13, 2), dtype=float)
+        layouts[:, :4, :] = corners
+        layouts[:, 4:, :] = interior
+        u = layouts[:, triangles[:, 1]] - layouts[:, triangles[:, 0]]
+        v = layouts[:, triangles[:, 2]] - layouts[:, triangles[:, 0]]
+        areas = 0.5 * np.abs(u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0])
+        return areas.min(axis=1)
+
+    population_size = 96
+    generations = 700
+    population = rng.uniform(0.025, 0.975, size=(population_size, 9, 2))
+
+    # A mildly perturbed regular seed gives the population a useful initial
+    # length scale without retaining the lattice's collinear triples.
+    grid = np.array(
+        [[x, y] for y in (0.2, 0.5, 0.8) for x in (0.2, 0.5, 0.8)],
+        dtype=float,
+    )
+    population[0] = np.clip(grid + rng.normal(0.0, 0.035, size=(9, 2)), 0.0, 1.0)
+    scores = minimum_triangle_areas(population)
+    best_index = int(np.argmax(scores))
+    best = population[best_index].copy()
+    best_score = float(scores[best_index])
+
+    for generation in range(generations):
+        fraction = generation / (generations - 1)
+        step = 0.11 * (0.035 / 0.11) ** fraction
+
+        # Three independent proposals per layout permit selection around the
+        # nonsmooth minimum-area objective while retaining the current point.
+        noise = rng.normal(0.0, step, size=(population_size, 3, 9, 2))
+        pull = (
+            rng.uniform(0.0, 0.16, size=(population_size, 3, 1, 1))
+            * (best[None, None, :, :] - population[:, None, :, :])
+        )
+        proposals = np.clip(population[:, None, :, :] + noise + pull, 0.0, 1.0)
+        candidates = np.concatenate((population[:, None, :, :], proposals), axis=1)
+        candidate_scores = minimum_triangle_areas(candidates.reshape(-1, 9, 2))
+        candidate_scores = candidate_scores.reshape(population_size, 4)
+
+        choices = np.argmax(candidate_scores, axis=1)
+        population = candidates[np.arange(population_size), choices]
+        scores = candidate_scores[np.arange(population_size), choices]
+
+        current_index = int(np.argmax(scores))
+        if scores[current_index] > best_score:
+            best_score = float(scores[current_index])
+            best = population[current_index].copy()
+
+        # Controlled deterministic restarts preserve global-search diversity.
+        if generation in (220, 440):
+            worst = np.argsort(scores)[: population_size // 4]
+            population[worst] = rng.uniform(0.02, 0.98, size=(len(worst), 9, 2))
+            scores[worst] = minimum_triangle_areas(population[worst])
+
+    return np.vstack((corners, best))
+
+
+# EVOLVE-BLOCK-END

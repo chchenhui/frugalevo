@@ -1,0 +1,143 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _min_tri_area(points: np.ndarray) -> float:
+    n = len(points)
+    best = np.inf
+    for i in range(n - 2):
+        for j in range(i + 1, n - 1):
+            for k in range(j + 1, n):
+                ax, ay = points[i]
+                bx, by = points[j]
+                cx, cy = points[k]
+                area = abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay)) * 0.5
+                if area < best:
+                    best = area
+    return best
+
+
+def _hull_area(points: np.ndarray) -> float:
+    # Shoelace on convex hull (monotone chain)
+    pts = sorted(map(tuple, points))
+    if len(pts) <= 2:
+        return 0.0
+
+    def cross(o, a, b):
+        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = lower[:-1] + upper[:-1]
+    a = 0.0
+    m = len(hull)
+    for i in range(m):
+        x1, y1 = hull[i]
+        x2, y2 = hull[(i + 1) % m]
+        a += x1 * y2 - x2 * y1
+    return abs(a) * 0.5
+
+
+def _optimize(seed: int, iters: int = 600) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    n = 13
+
+    # Symmetric initialization: 3-fold rotational structure + center
+    base = rng.random((4, 2)) * 0.8 + 0.1
+    pts = [np.array([0.5, 0.5])]
+    for b in base:
+        for r in range(3):
+            th = 2 * np.pi * r / 3
+            R = np.array([[np.cos(th), -np.sin(th)],
+                          [np.sin(th), np.cos(th)]])
+            c = R @ (b - 0.5) + 0.5
+            pts.append(c)
+    P = np.array(pts)
+
+    alpha = 8.0  # softmin temperature
+    step = 0.004
+    best_P = P.copy()
+    best_val = _min_tri_area(P) / _hull_area(P)
+
+    for it in range(iters):
+        areas = []
+        idxs = []
+        for i in range(n - 2):
+            for j in range(i + 1, n - 1):
+                for k in range(j + 1, n):
+                    ax, ay = P[i]
+                    bx, by = P[j]
+                    cx, cy = P[k]
+                    areas.append((bx-ax)*(cy-ay) - (cx-ax)*(by-ay))
+                    idxs.append((i, j, k))
+        A = np.array(areas)
+        idxs = np.array(idxs)
+        absA = np.abs(A)
+
+        # softmin weighting over small areas
+        w = np.exp(-alpha * (absA - absA.min()))
+        w /= w.sum()
+
+        G = np.zeros_like(P)
+        for t, (i, j, k) in enumerate(idxs):
+            s = np.sign(A[t]) if A[t] != 0 else 0.0
+            gi = np.array([-(P[j][1]-P[k][1]), (P[j][0]-P[k][0])]) * s
+            gj = np.array([(P[k][1]-P[i][1]), -(P[k][0]-P[i][0])]) * s
+            gk = np.array([(P[i][1]-P[j][1]), -(P[i][0]-P[j][0])]) * s
+            G[i] += 0.5 * w[t] * gi
+            G[j] += 0.5 * w[t] * gj
+            G[k] += 0.5 * w[t] * gk
+
+        # barrier toward staying inside [eps,1-eps]^2 box; also pull mildly to center
+        box_grad = np.zeros_like(P)
+        eps = 0.05
+        box_grad[:, 0] = -1.0 / np.maximum(P[:, 0] - eps, 1e-3) + 1.0 / np.maximum(1 - eps - P[:, 0], 1e-3)
+        box_grad[:, 1] = -1.0 / np.maximum(P[:, 1] - eps, 1e-3) + 1.0 / np.maximum(1 - eps - P[:, 1], 1e-3)
+        G += 1e-5 * box_grad
+
+        P = P + step * G / (np.linalg.norm(G) + 1e-9) * np.sqrt(len(P))
+        cur = _min_tri_area(P) / _hull_area(P)
+        if cur > best_val:
+            best_val = cur
+            best_P = P.copy()
+        step *= 0.999
+
+    return best_P
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct an arrangement of 13 points in a convex region maximizing
+    the smallest triangle area (Heilbronn problem, n=13).
+
+    Returns:
+        points: np.ndarray of shape (13,2) with x,y coordinates.
+    """
+    # Deterministic multi-start over fixed seeds; pick best
+    best_P = None
+    best_val = -1.0
+    for seed in (42, 7, 123, 2024):
+        P = _optimize(seed, iters=400)
+        val = _min_tri_area(P) / _hull_area(P)
+        if val > best_val:
+            best_val = val
+            best_P = P
+
+    # Rescale so convex hull has unit area (points stay in convex position set)
+    ha = _hull_area(best_P)
+    if ha > 1e-12:
+        c = best_P.mean(axis=0)
+        best_P = (best_P - c) / np.sqrt(ha) + c
+
+    return best_P
+
+
+# EVOLVE-BLOCK-END

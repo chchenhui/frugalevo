@@ -1,0 +1,177 @@
+<NAME>
+lean_seeds_gradient_restarts
+</NAME>
+<DESCRIPTION>
+Keeps the proven machinery (soft-min/soft-max annealed L-BFGS polish plus exact greedy hill-climb) but restructures the compute budget per the recommendation: Phase 1 is trimmed to a compact seed library (D6 ring grid, Tammes seed, a twisted-heptagon antiprism family, and two random seeds) instead of an expensive sweep, and the saved time is reinvested in many perturb-and-reanneal restarts around the incumbent. The anneal chain uses a scale-invariant free-space objective (soft-min of distances plus soft-max) so both the numerator and denominator of the ratio are optimized jointly, and each annealed candidate is hill-climbed on the exact ratio for fine polish. Everything is deterministic (fixed seeds) and normalized to unit diameter before return.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.optimize import minimize
+from scipy.special import logsumexp
+
+N = 14
+D = 3
+_IU = np.triu_indices(N, 1)
+
+
+def pair_dists(P):
+    Dm = np.linalg.norm(P[:, None] - P[None, :], axis=-1)
+    return Dm[_IU]
+
+
+def ratio(P):
+    d = pair_dists(P)
+    return d.min() / d.max()
+
+
+def d6_family(R, h, z0):
+    th = np.arange(6) * (np.pi / 3.0)
+    r1 = np.stack([R * np.cos(th), R * np.sin(th), np.full(6, h)], axis=1)
+    r2 = np.stack([R * np.cos(th + np.pi / 6), R * np.sin(th + np.pi / 6),
+                   np.full(6, -h)], axis=1)
+    poles = np.array([[0.0, 0.0, z0], [0.0, 0.0, -z0]])
+    return np.vstack([r1, r2, poles])
+
+
+def hept_antiprism(R, h, twist):
+    th = np.arange(7) * (2 * np.pi / 7)
+    r1 = np.stack([R * np.cos(th), R * np.sin(th), np.full(7, h)], axis=1)
+    r2 = np.stack([R * np.cos(th + twist), R * np.sin(th + twist),
+                   np.full(7, -h)], axis=1)
+    return np.vstack([r1, r2])
+
+
+def anneal_chain(P0, taus=(0.05, 0.02, 0.008, 0.003, 0.001, 0.0004)):
+    """Scale-invariant annealed soft-min/soft-max polish in free space."""
+    P = (P0 - P0.mean(axis=0)).copy()
+    P = P / pair_dists(P).max()
+    x = P.ravel()
+    IJ = np.array([(i, j) for i in range(N) for j in range(i + 1, N)])
+
+    def obj(z, tau):
+        X = z.reshape(N, D)
+        diff = X[IJ[:, 0]] - X[IJ[:, 1]]
+        d2 = np.sum(diff * diff, axis=1)
+        return tau * (logsumexp(-d2 / tau) + logsumexp(d2 / tau))
+
+    for tau in taus:
+        res = minimize(lambda z, t=tau: obj(z, t), x, method="L-BFGS-B",
+                       options={"maxiter": 300, "ftol": 1e-14, "gtol": 1e-12})
+        if np.isfinite(res.x).all():
+            x = res.x
+    X = x.reshape(N, D)
+    X = X - X.mean(axis=0)
+    X = X / pair_dists(X).max()
+    return X
+
+
+def climb(P, steps=(0.01, 0.003, 8e-4, 2e-4, 6e-5)):
+    """Greedy hill-climb on the exact ratio with coordinated pair moves."""
+    P = (P - P.mean(axis=0)).copy()
+    P = P / pair_dists(P).max()
+    best_r = ratio(P)
+    for step in steps:
+        while True:
+            d = pair_dists(P)
+            imin = int(np.argmin(d))
+            imax = int(np.argmax(d))
+            i0, j0 = int(_IU[0][imin]), int(_IU[1][imin])
+            i1, j1 = int(_IU[0][imax]), int(_IU[1][imax])
+            cands = []
+            u = P[j0] - P[i0]
+            if np.linalg.norm(u) > 1e-12:
+                u = u / np.linalg.norm(u)
+                Q = P.copy(); Q[i0] -= 0.5 * step * u; Q[j0] += 0.5 * step * u
+                cands.append(Q)
+                Q = P.copy(); Q[i0] -= step * u; cands.append(Q)
+                Q = P.copy(); Q[j0] += step * u; cands.append(Q)
+            v = P[j1] - P[i1]
+            if np.linalg.norm(v) > 1e-12:
+                v = v / np.linalg.norm(v)
+                Q = P.copy(); Q[i1] += 0.5 * step * v; Q[j1] -= 0.5 * step * v
+                cands.append(Q)
+                Q = P.copy(); Q[i1] += step * v; cands.append(Q)
+                Q = P.copy(); Q[j1] -= step * v; cands.append(Q)
+            for a in range(N):
+                for c in range(D):
+                    for s in (step, -step):
+                        Q = P.copy(); Q[a, c] += s; cands.append(Q)
+            improved = False
+            for Q in cands:
+                r = ratio(Q)
+                if r > best_r + 1e-15:
+                    best_r = r
+                    P = Q
+                    improved = True
+                    break
+            if not improved:
+                break
+    return P, best_r
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    rng = np.random.default_rng(11)
+
+    # --- Compact seed library ---
+    seeds = []
+    # D6 family coarse grid (small, high-value region)
+    best_r, best_p = -1.0, None
+    for h in np.linspace(0.2, 1.3, 12):
+        for z0 in np.linspace(h + 0.05, 2.6, 20):
+            P = d6_family(1.0, h, z0)
+            r = ratio(P)
+            if r > best_r:
+                best_r, best_p = r, P.copy()
+    seeds.append(best_p)
+    # Heptagonal antiprism with twist parameter
+    best_r, best_p = -1.0, None
+    for R in np.linspace(0.4, 1.4, 8):
+        for h in np.linspace(0.1, 1.0, 8):
+            for tw in (np.pi / 7, np.pi / 7 * 0.4):
+                P = hept_antiprism(R, h, tw)
+                r = ratio(P)
+                if r > best_r:
+                    best_r, best_p = r, P.copy()
+    seeds.append(best_p)
+    # Two random seeds for diversity
+    for _ in range(2):
+        P = rng.normal(size=(N, D))
+        seeds.append(P)
+
+    best, best_r = None, -1.0
+    for P0 in seeds:
+        Q = anneal_chain(P0)
+        rq = ratio(Q)
+        if rq > best_r:
+            best_r, best = rq, Q.copy()
+        Qc, rc = climb(Q)
+        if rc > best_r:
+            best_r, best = rc, Qc.copy()
+
+    # --- Perturb-and-reanneal restarts around incumbent ---
+    for rep in range(14):
+        prng = np.random.default_rng(3000 + rep)
+        mag = 0.10 * (0.92 ** rep)
+        start = best + mag * prng.normal(size=best.shape)
+        Q = anneal_chain(start)
+        rq = ratio(Q)
+        if rq > best_r + 1e-13:
+            best_r, best = rq, Q.copy()
+        Qc, rc = climb(Q)
+        if rc > best_r + 1e-13:
+            best_r, best = rc, Qc.copy()
+        # occasionally climb the raw perturbed start too
+        if rep % 3 == 0:
+            Qc, rc = climb(start)
+            if rc > best_r + 1e-13:
+                best_r, best = rc, Qc.copy()
+
+    points = np.asarray(best, dtype=float)
+    assert points.shape == (N, D) and np.isfinite(points).all()
+    assert pair_dists(points).max() > 0
+    return points
+# EVOLVE-BLOCK-END
+```
+</CODE>

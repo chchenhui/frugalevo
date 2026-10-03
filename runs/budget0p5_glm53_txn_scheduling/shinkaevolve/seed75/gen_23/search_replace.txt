@@ -1,0 +1,177 @@
+<NAME>
+greedy_restarts_local_search</NAME>
+<DESCRIPTION>
+The current beam search is expensive (it evaluates O(n·beam_width) full-sequence costs per level, which is very slow for n=100) yet scored worse (301) than the earlier program that combined randomized greedy restarts with a swap+reinsertion local search (292). Step-by-step reasoning:
+
+1. **Restart-based randomized greedy is a strong constructive heuristic**: each restart uses the *true* makespan (via `get_opt_seq_cost`) to pick the next transaction that increases makespan the least, sampling a few candidates per step. Multiple random starts diversify the search over orderings since conflict structure makes the cost landscape rugged.
+
+2. **Local search refines constructive solutions**: pairwise swaps and single-transaction reinsertion (a form of "or-opt" move) fix locally suboptimal orderings that greedy commits to. This directly targets makespan, unlike static heuristics (length, write count).
+
+3. **Budget management**: Instead of beam search (slow, low quality here), we allocate the time to many greedy restarts followed by local search only on the best candidates. We cap the number of improvement rounds to keep runtime bounded.
+
+4. **Keep best-so-far across everything**: we track the global best schedule found by any restart or local search, guaranteeing we never return something worse than the greedy best.
+
+This should match or beat the 292 makespan of the second prior program since it uses the same core (greedy restarts + swap/reinsertion local search) while being the proven-best-performing structure among the evaluated variants.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using beam search over greedy cost expansions
+    combined with multiple randomized restarts.
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    n = workload.num_txns
+
+    def beam_search(start_txn, beam_width):
+        # Each beam entry: (cost, sequence_tuple, frozenset of used txns)
+        beam = [(workload.get_opt_seq_cost([start_txn]), (start_txn,), frozenset([start_txn]))]
+        for _ in range(n - 1):
+            candidates = []
+            for cost, seq, used in beam:
+                remaining = [t for t in range(n) if t not in used]
+                for t in remaining:
+                    test_seq = list(seq) + [t]
+                    c = workload.get_opt_seq_cost(test_seq)
+                    candidates.append((c, seq + (t,), used | {t}))
+            # keep the best beam_width distinct states (dedupe by used-set)
+            candidates.sort(key=lambda x: x[0])
+            new_beam = []
+            seen = set()
+            for c, s, u in candidates:
+                key = u
+                if key not in seen:
+                    seen.add(key)
+                    new_beam.append((c, s, u))
+                if len(new_beam) >= beam_width:
+                    break
+            beam = new_beam
+        best = min(beam, key=lambda x: x[0])
+        return best[0], list(best[1])
+
+    def greedy_cost(num_samples, sample_rate):
+        # randomized greedy using true makespan cost
+        start_txn = random.randint(0, n - 1)
+        txn_seq = [start_txn]
+        remaining = [x for x in range(n) if x != start_txn]
+        while remaining:
+            sample = random.random()
+            if sample > sample_rate and len(remaining) > 1:
+                idx = random.randint(0, len(remaining) - 1)
+                txn_seq.append(remaining.pop(idx))
+                continue
+            num = min(num_samples, len(remaining))
+            sampled = random.sample(remaining, num)
+            best_cost = None
+            best_txn = sampled[0]
+            for t in sampled:
+                cost = workload.get_opt_seq_cost(txn_seq + [t])
+                if best_cost is None or cost < best_cost:
+                    best_cost = cost
+                    best_txn = t
+            txn_seq.append(best_txn)
+            remaining.remove(best_txn)
+        return workload.get_opt_seq_cost(txn_seq), txn_seq
+
+    best_cost, best_seq = None, None
+    # beam search from a few different starting transactions
+    beam_width = 3 if n > 30 else 4
+    num_beam_starts = min(n, 3)
+    starts = random.sample(range(n), num_beam_starts) if n > num_beam_starts else list(range(n))
+    for s in starts:
+        c, seq = beam_search(s, beam_width)
+        if best_cost is None or c < best_cost:
+            best_cost, best_seq = c, seq
+
+    # randomized greedy restarts to complement beam search
+    for _ in range(8):
+        c, seq = greedy_cost(8, 0.9)
+        if c < best_cost:
+            best_cost, best_seq = c, seq
+
+    return best_cost, best_seq
+=======
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using randomized greedy restarts (true makespan
+    sampled cost) combined with swap + reinsertion local search.
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    n = workload.num_txns
+
+    def greedy_cost(num_samples, sample_rate):
+        # randomized greedy using true makespan cost
+        start_txn = random.randint(0, n - 1)
+        txn_seq = [start_txn]
+        remaining = [x for x in range(n) if x != start_txn]
+        while remaining:
+            if random.random() > sample_rate and len(remaining) > 1:
+                idx = random.randint(0, len(remaining) - 1)
+                txn_seq.append(remaining.pop(idx))
+                continue
+            num = min(num_samples, len(remaining))
+            sampled = random.sample(remaining, num)
+            best_cost = None
+            best_txn = sampled[0]
+            for t in sampled:
+                cost = workload.get_opt_seq_cost(txn_seq + [t])
+                if best_cost is None or cost < best_cost:
+                    best_cost = cost
+                    best_txn = t
+            txn_seq.append(best_txn)
+            remaining.remove(best_txn)
+        return workload.get_opt_seq_cost(txn_seq), txn_seq
+
+    def local_search(seq, max_rounds=30):
+        cur = seq.copy()
+        cur_cost = workload.get_opt_seq_cost(cur)
+        for _ in range(max_rounds):
+            improved = False
+            # pairwise swaps
+            for i in range(len(cur)):
+                for j in range(i + 1, len(cur)):
+                    cand = cur.copy()
+                    cand[i], cand[j] = cand[j], cand[i]
+                    c = workload.get_opt_seq_cost(cand)
+                    if c < cur_cost:
+                        cur, cur_cost = cand, c
+                        improved = True
+            # reinsertion moves
+            for i in range(len(cur)):
+                t = cur.pop(i)
+                placed = False
+                for j in range(len(cur) + 1):
+                    cand = cur.copy()
+                    cand.insert(j, t)
+                    c = workload.get_opt_seq_cost(cand)
+                    if c < cur_cost:
+                        cur, cur_cost = cand, c
+                        improved = True
+                        placed = True
+                        break
+                if not placed:
+                    cur.insert(i, t)
+            if not improved:
+                break
+        return cur_cost, cur
+
+    best_cost, best_seq = None, None
+
+    # randomized greedy restarts
+    restarts = 20 if n > 30 else 40
+    for _ in range(restarts):
+        c, seq = greedy_cost(6, 0.95)
+        if best_cost is None or c < best_cost:
+            best_cost, best_seq = c, seq
+
+    # local search from the best greedy solution
+    c, seq = local_search(best_seq)
+    if c < best_cost:
+        best_cost, best_seq = c, seq
+
+    return best_cost, best_seq
+>>>>>>> REPLACE
+</DIFF>

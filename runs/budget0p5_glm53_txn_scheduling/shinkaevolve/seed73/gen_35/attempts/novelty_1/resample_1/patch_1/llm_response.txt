@@ -1,0 +1,191 @@
+<NAME>
+beam_cost_reuse_and_ils_refactor</NAME>
+<DESCRIPTION>
+Reasoning step-by-step:
+
+1. **Diagnose the bottleneck.** In the beam loop, every child's cost is computed once via `get_opt_seq_cost(new_seq)` and stored in the candidate tuple — yet at the end of each restart the code calls `get_opt_seq_cost(seq)` *again* on every beam entry. This is pure wasted evaluation. Reusing the already-stored cost `c` frees budget for wider beams / more restarts.
+
+2. **Phase 2 is the biggest lever.** The top prior program (combined score 3623.19, makespan 275) used *iterated local search* (ILS) — first-improvement insertion, swap, or-opt block moves, and segment-reversal — with perturbation restarts, and it beat every simulated-annealing variant tried (3521, 3546, 3584). SA wastes many accepted uphill moves; ILS spends nearly all evaluations on improving or perturb-then-improve moves, which empirically yields better makespans here.
+
+3. **Diversity matters.** The winning ILS program also deduplicated candidates by sequence so the local search budget isn't spent re-optimizing identical seeds.
+
+So I apply: (a) reuse stored beam costs, (b) replace the SA phase with the proven ILS (first-improvement local search + shuffled-segment perturbation restarts), (c) dedupe candidates. This should recover the best-known performance while keeping the beam construction phase unchanged.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        if beam:
+            for c, seq, rem in beam:
+                final_cost = workload.get_opt_seq_cost(seq)
+                candidates.append((final_cost, seq))
+                if final_cost < best_cost:
+                    best_cost = final_cost
+                    best_seq = seq
+=======
+        if beam:
+            for c, seq, rem in beam:
+                # reuse the already-computed cost (no extra evaluation)
+                candidates.append((c, seq))
+                if c < best_cost:
+                    best_cost = c
+                    best_seq = seq
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ---------- Phase 2: simulated annealing from top candidates ----------
+    candidates.sort(key=lambda x: x[0])
+    rng = random.Random(1234)
+    for c_cost, c_seq in candidates[:4]:
+        if time.time() - start_time >= time_budget:
+            break
+        seq = c_seq[:]
+        cur_cost = c_cost
+        local_best_cost, local_best_seq = cur_cost, seq[:]
+        # temperature schedule: start hot, cool with elapsed time
+        T0 = max(1.0, cur_cost * 0.05)
+        rem_budget = max(0.001, time_budget - (time.time() - start_time))
+        cand_start = time.time()
+        while True:
+            elapsed = time.time() - cand_start
+            if elapsed >= rem_budget or time.time() - start_time >= time_budget:
+                break
+            frac = elapsed / rem_budget
+            T = T0 * (1.0 - frac) + 1e-6
+            # random move: insertion or swap
+            if rng.random() < 0.5:
+                i = rng.randrange(n)
+                j = rng.randrange(n)
+                if i == j:
+                    continue
+                cand = seq[:i] + seq[i+1:]
+                cand.insert(j, seq[i])
+            else:
+                i = rng.randrange(n)
+                j = rng.randrange(n)
+                if i == j:
+                    continue
+                cand = seq[:]
+                cand[i], cand[j] = cand[j], cand[i]
+            c = workload.get_opt_seq_cost(cand)
+            delta = c - cur_cost
+            if delta < 0 or rng.random() < math.exp(-delta / T):
+                seq, cur_cost = cand, c
+                if cur_cost < local_best_cost:
+                    local_best_cost, local_best_seq = cur_cost, seq[:]
+                    # intensify: greedy insertion sweep around new best
+                    for i2 in range(n):
+                        best_c, best_cand = local_best_cost, None
+                        for j2 in range(n):
+                            if i2 == j2:
+                                continue
+                            trial = local_best_seq[:i2] + local_best_seq[i2+1:]
+                            trial.insert(j2, local_best_seq[i2])
+                            tc = workload.get_opt_seq_cost(trial)
+                            if tc < best_c:
+                                best_c, best_cand = tc, trial
+                        if best_cand is not None:
+                            local_best_cost = best_c
+                            local_best_seq = best_cand
+                    seq, cur_cost = local_best_seq[:], local_best_cost
+        if local_best_cost < best_cost:
+            best_cost, best_seq = local_best_cost, local_best_seq
+=======
+    # ---------- Phase 2: iterated local search on top candidates ----------
+    def local_search(seq, cur_cost, deadline):
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            # insertion moves (first-improvement)
+            for i in range(n):
+                if time.time() >= deadline:
+                    return seq, cur_cost
+                t = seq[i]
+                base = seq[:i] + seq[i+1:]
+                for j in range(n):
+                    if j == i:
+                        continue
+                    cand = base[:j] + [t] + base[j:]
+                    c = workload.get_opt_seq_cost(cand)
+                    if c < cur_cost:
+                        seq, cur_cost, improved = cand, c, True
+                        break
+            # swap moves (first-improvement)
+            for i in range(n):
+                if time.time() >= deadline:
+                    return seq, cur_cost
+                for j in range(i + 1, n):
+                    cand = seq[:]
+                    cand[i], cand[j] = cand[j], cand[i]
+                    c = workload.get_opt_seq_cost(cand)
+                    if c < cur_cost:
+                        seq, cur_cost, improved = cand, c, True
+                        break
+            # or-opt: move short contiguous blocks (size 2-3) elsewhere
+            for blk in (2, 3):
+                for i in range(n - blk + 1):
+                    if time.time() >= deadline:
+                        return seq, cur_cost
+                    block = seq[i:i + blk]
+                    rest = seq[:i] + seq[i + blk:]
+                    for j in range(len(rest) + 1):
+                        cand = rest[:j] + block + rest[j:]
+                        if cand == seq:
+                            continue
+                        c = workload.get_opt_seq_cost(cand)
+                        if c < cur_cost:
+                            seq, cur_cost, improved = cand, c, True
+                            break
+                    else:
+                        continue
+                    break
+            # 2-opt: reverse a segment (changes many pairwise orders at once)
+            for i in range(n - 1):
+                if time.time() >= deadline:
+                    return seq, cur_cost
+                for j in range(i + 2, n):
+                    cand = seq[:i+1] + seq[i+1:j+1][::-1] + seq[j+1:]
+                    c = workload.get_opt_seq_cost(cand)
+                    if c < cur_cost:
+                        seq, cur_cost, improved = cand, c, True
+                        break
+                else:
+                    continue
+                break
+        return seq, cur_cost
+
+    candidates.sort(key=lambda x: x[0])
+    seen = set()
+    top = []
+    for c, s in candidates:
+        key = tuple(s)
+        if key not in seen:
+            seen.add(key)
+            top.append((c, s))
+        if len(top) >= 4:
+            break
+
+    for c_cost, c_seq in top:
+        if time.time() - start_time >= time_budget:
+            break
+        seq, cur_cost = local_search(c_seq[:], c_cost, start_time + time_budget)
+        if cur_cost < best_cost:
+            best_cost, best_seq = cur_cost, seq
+        # perturbation restarts (iterated local search)
+        while time.time() - start_time < time_budget:
+            pseq = seq[:]
+            # perturb: shuffle a short random segment
+            i = random.randrange(n)
+            j = min(n, i + random.randint(2, 8))
+            seg = pseq[i:j]
+            random.shuffle(seg)
+            pseq[i:j] = seg
+            pc = workload.get_opt_seq_cost(pseq)
+            pseq, pc = local_search(pseq, pc, start_time + time_budget)
+            if pc < cur_cost:
+                seq, cur_cost = pseq, pc
+            if cur_cost < best_cost:
+                best_cost, best_seq = cur_cost, seq
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

@@ -1,0 +1,168 @@
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles.
+
+Multi-scale skeleton (corners + perimeter chain + staggered hex interior)
+with Gauss-Seidel radius relaxation and a deterministic pressure-release
+polish loop.
+"""
+import numpy as np
+
+N = 26
+
+
+def _initial_centers():
+    """Explicit multi-scale skeleton of 26 circle centers."""
+    c = np.zeros((N, 2))
+
+    idx = 0
+    # 4 corner circles (walls support larger radii here)
+    for cx, cy in [(0.11, 0.11), (0.89, 0.11), (0.11, 0.89), (0.89, 0.89)]:
+        c[idx] = (cx, cy); idx += 1
+
+    # Perimeter chain: 3 on bottom edge, 2 on each other edge (asymmetric)
+    perim = [
+        (0.30, 0.09), (0.50, 0.10), (0.70, 0.09),          # bottom
+        (0.35, 0.905), (0.65, 0.905),                       # top
+        (0.085, 0.35), (0.085, 0.65),                       # left
+        (0.905, 0.35), (0.905, 0.65),                       # right
+    ]
+    for cx, cy in perim:
+        c[idx] = (cx, cy); idx += 1
+
+    # Interior staggered hex lattice: rows 5-4-4-4
+    for x in [0.14, 0.32, 0.50, 0.68, 0.86]:
+        c[idx] = (x, 0.50); idx += 1
+    for y in [0.27, 0.73]:
+        for x in [0.23, 0.41, 0.59, 0.77]:
+            c[idx] = (x, y); idx += 1
+
+    assert idx == N
+    return c
+
+
+def _border_dist(c):
+    return np.minimum(np.minimum(c[:, 0], c[:, 1]),
+                      np.minimum(1 - c[:, 0], 1 - c[:, 1]))
+
+
+def _relax_radii(c, iters=300):
+    """Gauss-Seidel fixed point: r_i = min(border_i, min_j(d_ij - r_j)).
+
+    Guaranteed feasible (r_i + r_j <= d_ij for all pairs, r_i <= border).
+    """
+    n = c.shape[0]
+    r = _border_dist(c).copy()
+    D = np.sqrt(((c[:, None, :] - c[None, :, :]) ** 2).sum(-1))
+    np.fill_diagonal(D, np.inf)
+    for _ in range(iters):
+        r_new = np.minimum(_border_dist(c), (D - r[:, None]).min(axis=1) if False else
+                           np.min(D - r[None, :], axis=1))
+        # D - r[j] for each i: subtract other's radius from distance
+        r_new = np.minimum(_border_dist(c), (D - r).min(axis=1))
+        r_new = np.maximum(r_new, 0.0)
+        if np.max(np.abs(r_new - r)) < 1e-12:
+            r = r_new
+            break
+        r = r_new
+    return r
+
+
+def _pressure_step(c, r, pad=0.01):
+    """Deterministic repulsion away from tight contacts and walls."""
+    n = c.shape[0]
+    F = np.zeros_like(c)
+    diff = c[:, None, :] - c[None, :, :]
+    D = np.sqrt((diff ** 2).sum(-1))
+    np.fill_diagonal(D, np.inf)
+    overlap = (r[:, None] + r[None, :] + pad) - D  # positive = tight
+    np.fill_diagonal(overlap, -np.inf)
+    w = np.maximum(overlap, 0.0)
+    # unit vectors i away from j
+    with np.errstate(invalid='ignore', divide='ignore'):
+        u = diff / D[:, :, None]
+    u[~np.isfinite(u)] = 0.0
+    F += (w[:, :, None] * u).sum(axis=1)
+    # wall pressures: push inward if circle bulges out
+    b = _border_dist(c)
+    wall = np.maximum(r + pad - b, 0.0)
+    F[:, 0] += np.where(c[:, 0] < 0.5, wall, -wall)
+    F[:, 1] += np.where(c[:, 1] < 0.5, wall, -wall)
+    return F
+
+
+def construct_packing():
+    """Construct 26 circles in the unit square maximizing sum of radii."""
+    c = _initial_centers()
+    r = _relax_radii(c)
+    best_c, best_r = c.copy(), r.copy()
+    best_sum = r.sum()
+
+    step = 0.004
+    for it in range(600):
+        F = _pressure_step(c, r)
+        nrm = np.linalg.norm(F, axis=1, keepdims=True)
+        nrm[nrm == 0] = 1.0
+        c = c + step * F / nrm  # bounded move per circle
+        c = np.clip(c, 0.001, 0.999)
+        r = _relax_radii(c, iters=80)
+        s = r.sum()
+        if s > best_sum:
+            best_sum = s
+            best_c, best_r = c.copy(), r.copy()
+        step *= 0.997
+
+    centers = best_c
+    radii = _relax_radii(centers, iters=500)  # final guaranteed-feasible radii
+    sum_radii = float(radii.sum())
+    return centers, radii, sum_radii
+
+
+def compute_max_radii(centers):
+    """Feasible radii via Gauss-Seidel min-relaxation fixed point."""
+    return _relax_radii(centers, iters=500)
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

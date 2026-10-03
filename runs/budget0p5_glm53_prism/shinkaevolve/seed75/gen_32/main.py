@@ -1,0 +1,231 @@
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+class GpuState:
+    """Encapsulates the state of a single GPU: resident models, load, memory."""
+    __slots__ = ("models", "load", "used_mem")
+
+    def __init__(self):
+        self.models = []
+        self.load = 0.0        # sum of req_rate / slo
+        self.used_mem = 0.0    # sum of model sizes
+
+    @staticmethod
+    def _kvpr(load, used):
+        if used <= 0:
+            return 0.0 if load <= 0 else float('inf')
+        return load / used
+
+    def kvpr(self):
+        return self._kvpr(self.load, self.used_mem)
+
+    def fits(self, size):
+        return self.used_mem + size <= GPU_MEM_SIZE
+
+    def kvpr_after_add(self, w, size):
+        return self._kvpr(self.load + w, self.used_mem + size)
+
+    def kvpr_after_remove(self, w, size):
+        return self._kvpr(self.load - w, self.used_mem - size)
+
+    def add(self, model, w):
+        self.models.append(model)
+        self.load += w
+        self.used_mem += model.model_size
+
+    def remove(self, model, w):
+        self.models.remove(model)
+        self.load -= w
+        self.used_mem -= model.model_size
+
+
+def _model_weight(model):
+    return model.req_rate / model.slo
+
+
+def _greedy_seed(gpus, models):
+    """Place models (heaviest load first) on the GPU minimizing resulting KVPR."""
+    for model in sorted(models, key=_model_weight, reverse=True):
+        w = _model_weight(model)
+        best_idx, best_kvpr = None, float('inf')
+        for i, gpu in enumerate(gpus):
+            if not gpu.fits(model.model_size):
+                continue
+            k = gpu.kvpr_after_add(w, model.model_size)
+            if k < best_kvpr:
+                best_kvpr, best_idx = k, i
+        if best_idx is None:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on any GPU."
+            )
+        gpus[best_idx].add(model, w)
+
+
+def _others_max(kvprs, skip):
+    return max((kvprs[i] for i in range(len(kvprs)) if i not in skip), default=0.0)
+
+
+def _local_search(gpus, max_iters=30):
+    """Apply best single-model move and pairwise swap that reduce max KVPR."""
+    n = len(gpus)
+    for _ in range(max_iters):
+        kvprs = [g.kvpr() for g in gpus]
+        cur_max = max(kvprs)
+        best_op, best_new_max = None, cur_max
+
+        # Single-model moves
+        for src in range(n):
+            if not gpus[src].models:
+                continue
+            for model in list(gpus[src].models):
+                w = _model_weight(model)
+                src_after = gpus[src].kvpr_after_remove(w, model.model_size)
+                for dst in range(n):
+                    if dst == src or not gpus[dst].fits(model.model_size):
+                        continue
+                    dst_after = gpus[dst].kvpr_after_add(w, model.model_size)
+                    new_max = max(_others_max(kvprs, {src, dst}), src_after, dst_after)
+                    if new_max < best_new_max - 1e-12:
+                        best_new_max, best_op = new_max, ("move", src, dst, model, w)
+
+        # Pairwise swaps
+        for a in range(n):
+            for b in range(a + 1, n):
+                for m1 in list(gpus[a].models):
+                    for m2 in list(gpus[b].models):
+                        # feasibility after swap
+                        if gpus[a].used_mem - m1.model_size + m2.model_size > GPU_MEM_SIZE:
+                            continue
+                        if gpus[b].used_mem - m2.model_size + m1.model_size > GPU_MEM_SIZE:
+                            continue
+                        w1, w2 = _model_weight(m1), _model_weight(m2)
+                        a_after = GpuState._kvpr(gpus[a].load - w1 + w2,
+                                                 gpus[a].used_mem - m1.model_size + m2.model_size)
+                        b_after = GpuState._kvpr(gpus[b].load - w2 + w1,
+                                                 gpus[b].used_mem - m2.model_size + m1.model_size)
+                        new_max = max(_others_max(kvprs, {a, b}), a_after, b_after)
+                        if new_max < best_new_max - 1e-12:
+                            best_new_max, best_op = new_max, ("swap", a, b, m1, m2, w1, w2)
+
+        if best_op is None:
+            break
+        if best_op[0] == "move":
+            _, src, dst, model, w = best_op
+            gpus[src].remove(model, w)
+            gpus[dst].add(model, w)
+        else:
+            _, a, b, m1, m2, w1, w2 = best_op
+            gpus[a].remove(m1, w1)
+            gpus[b].remove(m2, w2)
+            gpus[a].add(m2, w2)
+            gpus[b].add(m1, w1)
+
+
+def _cyclic_search(gpus, max_iters=20):
+    """Bounded 3-way rotation: move m1 worst->a, m2 a->b, m3 b->worst."""
+    n = len(gpus)
+    if n < 3:
+        return
+    for _ in range(max_iters):
+        kvprs = [g.kvpr() for g in gpus]
+        cur_max = max(kvprs)
+        worst = max(range(n), key=lambda i: kvprs[i])
+        improved = False
+        best_gain, best_cycle = 1e-12, None
+
+        for a in range(n):
+            if a == worst or not gpus[a].models:
+                continue
+            for b in range(n):
+                if b in (worst, a) or not gpus[b].models:
+                    continue
+                for m1 in list(gpus[worst].models):
+                    # worst -> a requires a to have room for m1
+                    if not gpus[a].fits(m1.model_size):
+                        continue
+                    w1 = _model_weight(m1)
+                    for m2 in list(gpus[a].models):
+                        if m2 is m1:
+                            continue
+                        # a -> b: a frees m2, gains m1; b must fit m2 after losing m3
+                        for m3 in list(gpus[b].models):
+                            if m3 is m2:
+                                continue
+                            # memory feasibility on a and b
+                            a_mem = gpus[a].used_mem - m2.model_size + m1.model_size
+                            b_mem = gpus[b].used_mem - m3.model_size + m2.model_size
+                            worst_mem = gpus[worst].used_mem - m1.model_size + m3.model_size
+                            if a_mem > GPU_MEM_SIZE or b_mem > GPU_MEM_SIZE or worst_mem > GPU_MEM_SIZE:
+                                continue
+                            w2, w3 = _model_weight(m2), _model_weight(m3)
+                            k_worst = GpuState._kvpr(gpus[worst].load - w1 + w3, worst_mem)
+                            k_a = GpuState._kvpr(gpus[a].load - w2 + w1, a_mem)
+                            k_b = GpuState._kvpr(gpus[b].load - w3 + w2, b_mem)
+                            new_max = max(_others_max(kvprs, {worst, a, b}), k_worst, k_a, k_b)
+                            if new_max < cur_max - best_gain:
+                                best_gain = cur_max - new_max
+                                best_cycle = (worst, a, b, m1, m2, m3, w1, w2, w3)
+
+        if best_cycle is None:
+            break
+        worst, a, b, m1, m2, m3, w1, w2, w3 = best_cycle
+        gpus[worst].remove(m1, w1)
+        gpus[a].remove(m2, w2)
+        gpus[b].remove(m3, w3)
+        gpus[a].add(m1, w1)
+        gpus[b].add(m2, w2)
+        gpus[worst].add(m3, w3)
+        improved = True
+
+    if improved:
+        _local_search(gpus)
+
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        A placement (dict gpu_id -> list of models)
+    """
+    if gpu_num <= 0:
+        raise ValueError("gpu_num must be positive")
+
+    gpus = [GpuState() for _ in range(gpu_num)]
+
+    _greedy_seed(gpus, models)
+    _local_search(gpus)
+    _cyclic_search(gpus)
+
+    return {i: gpus[i].models for i in range(gpu_num)}
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

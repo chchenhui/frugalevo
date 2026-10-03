@@ -1,0 +1,196 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using multi-start greedy construction +
+    iterated local search with ruin-and-recreate perturbation and a
+    local search combining 2-opt, relocation, swap, and Or-opt moves.
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    import time
+
+    n = workload.num_txns
+
+    def cost_of(seq):
+        return workload.get_opt_seq_cost(seq)
+
+    def get_full_greedy(perturb_rate):
+        # Full greedy: at each step evaluate ALL remaining transactions
+        # with the true makespan cost and append the cheapest one.
+        start_txn = random.randint(0, n - 1)
+        txn_seq = [start_txn]
+        remaining_txns = [x for x in range(n) if x != start_txn]
+        while remaining_txns:
+            min_cost = None
+            min_txn = -1
+            if random.random() < perturb_rate:
+                idx = random.randint(0, len(remaining_txns) - 1)
+                min_txn = remaining_txns[idx]
+                min_cost = cost_of(txn_seq + [min_txn])
+            else:
+                for t in remaining_txns:
+                    c = cost_of(txn_seq + [t])
+                    if min_cost is None or c < min_cost:
+                        min_cost = c
+                        min_txn = t
+            txn_seq.append(min_txn)
+            remaining_txns.remove(min_txn)
+        assert len(set(txn_seq)) == n
+        return cost_of(txn_seq), txn_seq
+
+    def two_opt_descent(seq, cost, deadline):
+        # First-improvement 2-opt: reverse segment [i:j].
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            for i in range(n - 1):
+                for j in range(i + 2, n):
+                    if time.time() >= deadline:
+                        return cost, seq
+                    cand = seq[:]
+                    cand[i:j] = reversed(cand[i:j])
+                    c = cost_of(cand)
+                    if c < cost:
+                        seq, cost = cand, c
+                        improved = True
+                        break
+                else:
+                    continue
+                break
+        return cost, seq
+
+    def local_search(seq, cost, deadline, max_moves_per_pass=200):
+        # 2-opt descent followed by random relocation/swap/Or-opt descent.
+        cost, seq = two_opt_descent(seq, cost, deadline)
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            moves = []
+            for _ in range(min(max_moves_per_pass, n * 2)):
+                i = random.randint(0, n - 1)
+                j = random.randint(0, n - 1)
+                if i != j:
+                    moves.append((i, j))
+            for i, j in moves:
+                if time.time() >= deadline:
+                    break
+                cand = seq[:]
+                r = random.random()
+                if r < 0.3:
+                    # relocation
+                    t = cand.pop(i)
+                    cand.insert(j, t)
+                elif r < 0.6:
+                    # swap
+                    cand[i], cand[j] = cand[j], cand[i]
+                else:
+                    # Or-opt: relocate a contiguous segment of length 2-3
+                    seg_len = random.randint(2, 3)
+                    i2 = min(i, n - seg_len)
+                    seg = cand[i2:i2 + seg_len]
+                    rest = cand[:i2] + cand[i2 + seg_len:]
+                    j2 = max(0, min(j, len(rest)))
+                    cand = rest[:j2] + seg + rest[j2:]
+                c = cost_of(cand)
+                if c < cost:
+                    seq = cand
+                    cost = c
+                    improved = True
+        return cost, seq
+
+    def perturb_best(seq):
+        # Ruin-and-recreate: remove either a contiguous segment or a
+        # scattered set of txns and greedily reinsert each at the
+        # position minimizing the true makespan.
+        k = random.randint(3, min(8, n - 1))
+        if random.random() < 0.6:
+            start = random.randint(0, n - k)
+            removed = seq[start:start + k]
+            cand = seq[:start] + seq[start + k:]
+        else:
+            idxs = set(random.sample(range(n), k))
+            removed = [seq[i] for i in sorted(idxs)]
+            cand = [seq[i] for i in range(n) if i not in idxs]
+        for t in removed:
+            best_c = None
+            best_pos = 0
+            for pos in range(len(cand) + 1):
+                trial = cand[:pos] + [t] + cand[pos:]
+                c = cost_of(trial)
+                if best_c is None or c < best_c:
+                    best_c = c
+                    best_pos = pos
+                if time.time() >= deadline:
+                    best_pos = pos
+                    break
+            cand = cand[:best_pos] + [t] + cand[best_pos:]
+        return cand
+
+    time_budget = 20.0  # seconds per workload
+    deadline = time.time() + time_budget
+
+    # Multi-start construction: build a small pool of diverse seeds.
+    pool = []
+    pool_deadline = min(deadline, time.time() + time_budget * 0.3)
+    while time.time() < pool_deadline and len(pool) < 3:
+        cost, seq = get_full_greedy(0.05)
+        slice_deadline = min(deadline, time.time() + 2.0)
+        cost, seq = local_search(seq, cost, slice_deadline)
+        pool.append((cost, seq))
+        pool.sort(key=lambda x: x[0])
+    if pool:
+        best_cost, best_seq = pool[0]
+    else:
+        best_cost, best_seq = get_full_greedy(0.05)
+
+    # Iterated local search: perturb the incumbent (occasionally the
+    # second-best seed or a fresh greedy for diversity) and re-polish.
+    while time.time() < deadline:
+        r = random.random()
+        if r < 0.15 and len(pool) > 1:
+            cand = perturb_best(pool[1][1])
+        elif r < 0.25:
+            cand_cost, cand = get_full_greedy(0.05)
+        else:
+            cand = perturb_best(best_seq)
+            cand_cost = cost_of(cand)
+        slice_deadline = min(deadline, time.time() + 2.0)
+        cand_cost, cand = local_search(cand, cand_cost, slice_deadline)
+        if cand_cost < best_cost:
+            best_cost = cand_cost
+            best_seq = cand
+            pool.append((cand_cost, cand))
+            pool.sort(key=lambda x: x[0])
+            pool = pool[:3]
+    return best_cost, best_seq
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

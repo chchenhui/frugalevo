@@ -1,0 +1,321 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List, Dict
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-caching oriented reordering.
+
+    Strategy: build a small number of cheap candidate row-column orderings
+    (global frequency-ranked order, a length-free variant, and a conditional
+    partition tree), score each with the exact serial character-Trie objective
+    (sum of adjacent LCPs over sorted serialized rows), and return the best.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------
+    # serialization helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _serialize_cell(v):
+        if v is None:
+            return ""
+        if isinstance(v, float) and np.isnan(v):
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except Exception:
+            pass
+        if isinstance(v, bool):
+            return "True" if v else "False"
+        return str(v)
+
+    def _serialize_columns(self, df: pd.DataFrame) -> Dict[object, List[str]]:
+        out = {}
+        for c in df.columns:
+            col = df[c]
+            try:
+                vals = col.tolist()
+            except Exception:
+                vals = list(col)
+            out[c] = [self._serialize_cell(v) for v in vals]
+        return out
+
+    # ------------------------------------------------------------------
+    # exact ideal Trie objective: sum of adjacent LCPs of sorted strings
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        if a == b:
+            return len(a)
+        hi = min(len(a), len(b))
+        lo = 0
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_score(self, row_strings: List[str]) -> int:
+        if not row_strings:
+            return 0
+        s = sorted(row_strings)
+        total = 0
+        prev = s[0]
+        for cur in s[1:]:
+            total += self._lcp(prev, cur)
+            prev = cur
+        return total
+
+    # ------------------------------------------------------------------
+    # candidate constructions
+    # ------------------------------------------------------------------
+    def _col_scores(self, ser: Dict[object, List[str]], n: int, use_len: bool = True):
+        """score[col] = sum over values v of len(v)*cnt*(cnt-1) (or cnt*(cnt-1))."""
+        scores = {}
+        for c, vals in ser.items():
+            cnt = Counter(vals)
+            s = 0
+            for v, k in cnt.items():
+                if k > 1:
+                    if use_len:
+                        s += len(v) * k * (k - 1)
+                    else:
+                        s += k * (k - 1)
+            scores[c] = s
+        return scores
+
+    def _global_order(self, df: pd.DataFrame, scores: Dict[object, int]) -> List[object]:
+        cols = list(df.columns)
+        return sorted(cols, key=lambda c: (-scores.get(c, 0), cols.index(c)))
+
+    def _apply_global(self, df: pd.DataFrame, order: List[object]):
+        return [order] * len(df)
+
+    def _tree_orderings(
+        self,
+        df: pd.DataFrame,
+        ser: Dict[object, List[str]],
+        global_scores: Dict[object, int],
+        row_stop,
+        col_stop,
+    ) -> List[List[object]]:
+        n = len(df)
+        cols = list(df.columns)
+        if n == 0:
+            return []
+        # integer factorization per column (on serialized strings, matching scoring)
+        codes = {}
+        code_len = {}
+        for c in cols:
+            arr = np.array(ser[c], dtype=object)
+            uniq, code = np.unique(arr, return_inverse=True)
+            codes[c] = code.astype(np.int64)
+            code_len[c] = np.array([len(u) for u in uniq], dtype=np.int64)
+
+        tail_order = self._global_order(df, global_scores)
+        max_depth = len(cols)
+        if col_stop is not None:
+            try:
+                max_depth = min(max_depth, int(col_stop))
+            except Exception:
+                pass
+        max_depth = max(1, min(max_depth, 10))
+        top_k_candidates = 12
+
+        order_map = [None] * n
+
+        def assign_tail(rows: np.ndarray, remaining: List[object]):
+            tail = [c for c in tail_order if c in set(remaining)]
+            for r in rows:
+                order_map[r] = tail
+
+        def rec(rows: np.ndarray, remaining: List[object], depth: int):
+            if len(rows) == 0:
+                return
+            if len(rows) == 1 or not remaining or depth >= max_depth:
+                assign_tail(rows, remaining)
+                return
+            # candidate columns: top-k by global length-weighted repetition
+            cand = sorted(
+                remaining, key=lambda c: (-global_scores.get(c, 0), cols.index(c))
+            )[:top_k_candidates]
+            best_col = None
+            best_gain = 0
+            for c in cand:
+                cl = code_len[c]
+                cnt = np.bincount(codes[c][rows], minlength=len(cl))
+                gain = int((cnt * (cnt - 1) * cl[: len(cnt)]).sum())
+                if gain > best_gain:
+                    best_gain = gain
+                    best_col = c
+            if best_col is None:
+                assign_tail(rows, remaining)
+                return
+            rem = [c for c in remaining if c != best_col]
+            code = codes[best_col][rows]
+            for u in np.unique(code):
+                sub = rows[code == u]
+                if len(sub) == len(rows) and len(sub) > 1 and u == code[0]:
+                    pass
+                rec(sub, rem, depth + 1)
+            # single-row groups get tail too (handled in rec)
+            for r in rows:
+                if order_map[r] is None:
+                    order_map[r] = [c for c in tail_order if c in set(rem)]
+            # prepend chosen column for all rows in this node
+            for r in rows:
+                base = order_map[r] if order_map[r] is not None else []
+                order_map[r] = [best_col] + [
+                    c for c in base if c != best_col
+                ]
+
+        rows0 = np.arange(n)
+        # guard against excessive work
+        if n * len(cols) > 4_000_000:
+            return [tail_order] * n
+        rec(rows0, cols, 0)
+        # safety: ensure every ordering is a valid permutation of df columns
+        colset = set(cols)
+        for i in range(n):
+            o = order_map[i]
+            if o is None or len(o) != len(cols) or set(o) != colset:
+                order_map[i] = tail_order
+        return order_map
+
+    # ------------------------------------------------------------------
+    # build output frame from per-row orderings
+    # ------------------------------------------------------------------
+    def _build_result(self, df: pd.DataFrame, orderings: List[List[object]]):
+        cols = list(df.columns)
+        n = len(df)
+        if n == 0:
+            return df.copy(), []
+        data = df.to_numpy(dtype=object)
+        col_idx = {c: i for i, c in enumerate(cols)}
+        rows_out = []
+        for i in range(n):
+            order = orderings[i]
+            rows_out.append([data[i, col_idx[c]] for c in order])
+        out = pd.DataFrame(rows_out, columns=cols)
+        out = out.astype(object)
+        return out, [list(o) for o in orderings]
+
+    def _rows_from_order(self, df: pd.DataFrame, ser: Dict[object, List[str]], orderings) -> List[str]:
+        idx = {c: i for i, c in enumerate(df.columns)}
+        ser_cols = [ser[c] for c in df.columns]
+        rows = []
+        for o in orderings:
+            rows.append("".join(ser_cols[idx[c]][i] for i, c in enumerate(o)) if False else None)
+        return rows
+
+    def _serialize_rows(self, df: pd.DataFrame, ser: Dict[object, List[str]], orderings) -> List[str]:
+        n = len(df)
+        cols = list(df.columns)
+        pos = {c: ser[c] for c in cols}
+        rows = []
+        for i in range(n):
+            o = orderings[i]
+            rows.append("".join(pos[c][i] for c in o))
+        return rows
+
+    # ------------------------------------------------------------------
+    # public API
+    # ------------------------------------------------------------------
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        initial_df = df.copy()
+
+        # honor column merges via parent semantics when available
+        if col_merge:
+            try:
+                work = df.copy()
+                stats = getattr(self, "calculate_col_stats", None)
+                if stats is not None:
+                    try:
+                        column_stats = stats(work, enable_index=True)
+                        reordered_columns = [c for c, _, _, _ in column_stats]
+                    except Exception:
+                        reordered_columns = list(work.columns)
+                    for col_to_merge in col_merge:
+                        final_col_order = [
+                            c for c in reordered_columns if c in col_to_merge
+                        ]
+                        work = self.merging_columns(work, final_col_order, prepended=False)
+                else:
+                    raise RuntimeError("no merging_columns")
+                df = work
+            except Exception:
+                df = initial_df.copy()
+
+        n = len(df)
+        if n == 0 or df.shape[1] == 0:
+            return df.copy(), [list(df.columns)] * n
+
+        ser = self._serialize_columns(df)
+        global_scores_len = self._col_scores(df, ser, use_len=True)
+        global_scores_cnt = self._col_scores(df, ser, use_len=False)
+
+        order1 = self._global_order(df, global_scores_len)
+        order2 = self._global_order(df, global_scores_cnt)
+
+        candidates = []
+        ord1 = [order1] * n
+        ord2 = [order2] * n
+        candidates.append(ord1)
+        if order2 != order1:
+            candidates.append(ord2)
+        try:
+            ord3 = self._tree_orderings(df, ser, global_scores_len, row_stop, col_stop)
+            if ord3 and any(o != order1 for o in ord3):
+                candidates.append(ord3)
+        except Exception:
+            pass
+
+        # score each candidate with exact serial-Trie objective
+        best_ord = None
+        best_score = -1
+        for cand in candidates:
+            try:
+                rows = self._serialize_rows(df, ser, cand)
+                sc = self._trie_score(rows)
+                if sc > best_score:
+                    best_score = sc
+                    best_ord = cand
+            except Exception:
+                continue
+        if best_ord is None:
+            best_ord = [list(df.columns)] * n
+
+        out, orderings = self._build_result(df, best_ord)
+        assert out.shape == df.shape, "output shape mismatch"
+
+        if col_merge and out.shape != initial_df.shape:
+            # merged layout differs; that is the expected merged semantics
+            pass
+        else:
+            assert out.shape == initial_df.shape, "final shape mismatch"
+
+        return out, orderings
+
+
+# EVOLVE-BLOCK-END

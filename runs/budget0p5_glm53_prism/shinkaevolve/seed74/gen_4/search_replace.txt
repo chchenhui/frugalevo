@@ -1,0 +1,95 @@
+<NAME>
+best_fit_kvpr_and_refinement
+NAME>
+
+<DESCRIPTION>
+Two improvements: (1) when assigning each model, choose the GPU that minimizes the KVPR *after* placing the model (not before), which is the correct greedy criterion; (2) after the greedy pass, run a simple local-search refinement that tries moving a model from the max-KVPR GPU to another GPU when it reduces the max KVPR, without violating memory. This typically lowers the maximum KVPR across GPUs.
+DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 3) Assign each model to the GPU that minimizes current KVPR while fitting in memory
+    for model in sorted_models:
+        best_idx = None
+        best_ratio = float('inf')
+
+        for gpu_id in range(gpu_num):
+            if model.model_size <= shared_kv[gpu_id] and shared_kv[gpu_id] > 0:
+                current_ratio = weighted_req_rate[gpu_id] / shared_kv[gpu_id]
+                if current_ratio < best_ratio:
+                    best_ratio = current_ratio
+                    best_idx = gpu_id
+=======
+    # 3) Assign each model to the GPU that minimizes the resulting KVPR after placement
+    for model in sorted_models:
+        best_idx = None
+        best_ratio = float('inf')
+
+        for gpu_id in range(gpu_num):
+            if model.model_size <= shared_kv[gpu_id] and shared_kv[gpu_id] > 0:
+                new_num = weighted_req_rate[gpu_id] + model.req_rate / model.slo
+                new_den = shared_kv[gpu_id] - model.model_size
+                if new_den <= 0:
+                    continue
+                new_ratio = new_num / new_den
+                if new_ratio < best_ratio:
+                    best_ratio = new_ratio
+                    best_idx = gpu_id
+>>>>>>> REPLACE
+
+<DIFF>
+<<<<<<< SEARCH
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    return placement
+=======
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    # 4) Local-search refinement: move models off the hottest GPU when it helps
+    def gpu_kvpr(gpu_id):
+        den = GPU_MEM_SIZE - sum(m.model_size for m in placement[gpu_id])
+        if den <= 0:
+            return float('inf')
+        return sum(m.req_rate / m.slo for m in placement[gpu_id]) / den
+
+    for _ in range(50):
+        kvs = [gpu_kvpr(g) for g in range(gpu_num)]
+        src = max(range(gpu_num), key=lambda g: kvs[g])
+        cur_max = max(kvs)
+        improved = False
+        # try moving one model from src to any other GPU
+        for model in placement[src]:
+            w = model.req_rate / model.slo
+            for dst in range(gpu_num):
+                if dst == src:
+                    continue
+                if model.model_size > shared_kv[dst]:
+                    continue
+                kvs2 = kvs[:]
+                kvs2[src] = (weighted_req_rate[src] - w) / (shared_kv[src] + model.model_size) if (shared_kv[src] + model.model_size) > 0 else float('inf')
+                dst_den = shared_kv[dst] - model.model_size
+                if dst_den <= 0:
+                    continue
+                kvs2[dst] = (weighted_req_rate[dst] + w) / dst_den
+                others_max = max(kv for i, kv in enumerate(kvs2) if i not in (src, dst))
+                if max(kvs2[src], kvs2[dst], others_max) < cur_max - 1e-12:
+                    placement[src].remove(model)
+                    placement[dst].append(model)
+                    shared_kv[src] += model.model_size
+                    shared_kv[dst] -= model.model_size
+                    weighted_req_rate[src] -= w
+                    weighted_req_rate[dst] += w
+                    improved = True
+                    break
+            if improved:
+                break
+        if not improved:
+            break
+
+    return placement
+>>>>>>> REPLACE
+</DIFF>

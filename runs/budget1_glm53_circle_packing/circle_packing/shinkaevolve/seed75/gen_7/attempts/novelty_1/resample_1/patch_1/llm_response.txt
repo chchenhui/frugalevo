@@ -1,0 +1,179 @@
+<NAME>
+grow_and_relax_refinement</NAME>
+<DESCRIPTION>
+The current uniform-radius hex lattice caps every circle at the same radius (r≈0.0938, sum 2.44). Two improvements: (1) start from a staggered-row layout (rows 5,4,5,4,5,3) with wider spacing so some circles (edges of 4-circle rows, the 3-circle row) have room to grow beyond the uniform cap; (2) replace the uniform radius computation with a per-circle Gauss-Seidel "water-filling" radius growth (each circle grows up to its border distance minus neighbors' current radii), interleaved with a deterministic constraint-relaxation loop that nudges each center away from its active constraints (overlapping neighbors and walls). This mimics the structure of good non-uniform packings — smaller circles at corners/edges, larger circles in roomy spots — while remaining fully deterministic and guaranteeing a valid final configuration via a monotone (radii-only-shrinking) feasibility repair pass.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Hexagonal (staggered-row) lattice packing of 26 equal circles.
+    # Rows (top to bottom) have counts 5, 4, 5, 4, 5, 3 = 26 circles.
+    # Horizontal spacing s, vertical row spacing h = s*sqrt(3)/2.
+    # Width constraint: 5s <= 1 ; Height constraint: s + 5h <= 1.
+    s = 1.0 / (1.0 + 5.0 * np.sqrt(3.0) / 2.0)
+    h = s * np.sqrt(3.0) / 2.0
+    r = s / 2.0
+
+    row_counts = [5, 4, 5, 4, 5, 3]
+    idx = 0
+    for row, count in enumerate(row_counts):
+        y = r + row * h
+        if row % 2 == 0:
+            # Unstaggered rows touch both side walls
+            for j in range(count):
+                centers[idx] = [r + j * s, y]
+                idx += 1
+        else:
+            # Staggered rows are shifted by half a spacing
+            for j in range(count):
+                centers[idx] = [r + s / 2.0 + j * s, y]
+                idx += 1
+
+    # Compute maximum valid radii for this configuration
+    radii = compute_max_radii(centers)
+=======
+    # Staggered-row starting layout: rows of 5, 4, 5, 4, 5, 3 = 26 circles.
+    # Spacing is wider than the uniform-radius optimum so that circles in
+    # the 4- and 3-circle rows (and near walls) have room to grow larger
+    # than the uniform cap once radii are allowed to differ per circle.
+    s = 0.2
+    row_counts = [5, 4, 5, 4, 5, 3]
+    row_spacings = [s, s, s, s, s, 0.3]
+    y0 = 0.1
+    gap = (1.0 - 2.0 * y0) / 5.0
+    idx = 0
+    for row, count in enumerate(row_counts):
+        sp = row_spacings[row]
+        y = y0 + row * gap
+        for j in range(count):
+            centers[idx] = [0.5 + (j - (count - 1) / 2.0) * sp, y]
+            idx += 1
+
+    # Deterministic refinement: grow per-circle radii, then nudge each
+    # center away from its currently active constraints (touching
+    # neighbors and walls), and repeat with a decreasing step size.
+    radii = compute_max_radii(centers)
+    n_iter = 400
+    for it in range(n_iter):
+        step = 0.02 * (1.0 - it / n_iter) + 0.0005
+        for i in range(n):
+            xi, yi = centers[i]
+            ri = radii[i]
+            fx = 0.0
+            fy = 0.0
+            for j in range(n):
+                if j == i:
+                    continue
+                dx = xi - centers[j, 0]
+                dy = yi - centers[j, 1]
+                dist = np.sqrt(dx * dx + dy * dy)
+                overlap = ri + radii[j] - dist
+                if overlap > 0.0 and dist > 1e-12:
+                    fx += overlap * dx / dist
+                    fy += overlap * dy / dist
+            # Wall pushes
+            if xi - ri < 0.0:
+                fx += (ri - xi)
+            if xi + ri > 1.0:
+                fx -= (xi + ri - 1.0)
+            if yi - ri < 0.0:
+                fy += (ri - yi)
+            if yi + ri > 1.0:
+                fy -= (yi + ri - 1.0)
+            norm = np.sqrt(fx * fx + fy * fy)
+            if norm > 1e-12:
+                centers[i, 0] = min(max(xi + step * fx / norm, 1e-9), 1.0 - 1e-9)
+                centers[i, 1] = min(max(yi + step * fy / norm, 1e-9), 1.0 - 1e-9)
+        if it % 20 == 19:
+            radii = compute_max_radii(centers)
+
+    # Final per-circle radii for the refined layout
+    radii = compute_max_radii(centers)
+>>>>>>> REPLACE
+<DIFF>
+<<<<<<< SEARCH
+def compute_max_radii(centers):
+    """
+    Compute the maximum possible radii for each circle position
+    such that they don't overlap and stay within the unit square.
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+
+    Returns:
+        np.array of shape (n) with radius of each circle
+    """
+    n = centers.shape[0]
+
+    # Uniform radius: limited by border distance and half the minimum
+    # pairwise center distance (valid for lattice-based layouts).
+    r = np.inf
+    for i in range(n):
+        x, y = centers[i]
+        r = min(r, x, y, 1.0 - x, 1.0 - y)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            r = min(r, dist / 2.0)
+
+    return np.full(n, r)
+=======
+def compute_max_radii(centers):
+    """
+    Compute per-circle radii via Gauss-Seidel "water filling": each
+    circle grows up to the largest radius allowed by its wall distances
+    and its neighbors' current radii. Iterated to (near) convergence,
+    then a monotone repair pass (which only ever shrinks radii)
+    guarantees the final radii are feasible: inside the square and
+    pairwise non-overlapping.
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+
+    Returns:
+        np.array of shape (n) with radius of each circle
+    """
+    n = centers.shape[0]
+
+    # Precompute pairwise distances and wall-distance caps
+    D = np.zeros((n, n))
+    wall = np.zeros(n)
+    for i in range(n):
+        x, y = centers[i]
+        wall[i] = min(x, y, 1.0 - x, 1.0 - y)
+        for j in range(i + 1, n):
+            d = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            D[i, j] = d
+            D[j, i] = d
+
+    # Gauss-Seidel growth
+    r = np.zeros(n)
+    for _ in range(300):
+        changed = False
+        for i in range(n):
+            cap = wall[i]
+            for j in range(n):
+                if j != i and D[i, j] - r[j] < cap:
+                    cap = D[i, j] - r[j]
+            if cap < 0.0:
+                cap = 0.0
+            if abs(cap - r[i]) > 1e-12:
+                changed = True
+            r[i] = cap
+        if not changed:
+            break
+
+    # Monotone feasibility repair: clamp to walls, then shrink pairs.
+    # Both operations only reduce radii, so the result is guaranteed valid.
+    r = np.minimum(r, wall)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if r[i] + r[j] > D[i, j]:
+                scale = D[i, j] / (r[i] + r[j])
+                r[i] *= scale
+                r[j] *= scale
+    r = np.minimum(r, wall)
+
+    return r
+>>>>>>> REPLACE
+</DIFF>
+>>>>>>> REPLACE

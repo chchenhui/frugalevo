@@ -1,0 +1,167 @@
+<NAME>
+geometric_slsqp_packing
+</NAME>
+
+<DESCRIPTION>
+Replace the clipped concentric-ring layout with a staggered near-hexagonal seed and a deterministic constrained local optimization over all centers and radii. The staggered rows provide substantially better initial density than the previous outer ring, whose clipped centers created many nearly coincident circles.
+
+The optimization directly maximizes the total radius subject to all four wall constraints per circle and every pairwise non-overlap constraint. Several small deterministic perturbations of the geometric seed are used because boundary effects and unequal radii can lead to different local optima. Analytic constraint derivatives keep SLSQP practical. Finally, a global feasibility rescaling is applied from the actual returned geometry; this preserves the optimized relative radii while protecting against floating-point constraint tolerances.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def construct_packing():
+    """
+    Construct a specific arrangement of 26 circles in a unit square
+    that attempts to maximize the sum of their radii.
+
+    Returns:
+        Tuple of (centers, radii, sum_of_radii)
+        centers: np.array of shape (26, 2) with (x, y) coordinates
+        radii: np.array of shape (26) with radius of each circle
+        sum_of_radii: Sum of all radii
+    """
+    # Initialize arrays for 26 circles
+    n = 26
+    centers = np.zeros((n, 2))
+
+    # Place circles in a structured pattern
+    # This is a simple pattern - evolution will improve this
+
+    # First, place a large circle in the center
+    centers[0] = [0.5, 0.5]
+
+    # Place 8 circles around it in a ring
+    for i in range(8):
+        angle = 2 * np.pi * i / 8
+        centers[i + 1] = [0.5 + 0.3 * np.cos(angle), 0.5 + 0.3 * np.sin(angle)]
+
+    # Place 16 more circles in an outer ring
+    for i in range(16):
+        angle = 2 * np.pi * i / 16
+        centers[i + 9] = [0.5 + 0.7 * np.cos(angle), 0.5 + 0.7 * np.sin(angle)]
+
+    # Additional positioning adjustment to make sure all circles
+    # are inside the square and don't overlap
+    # Clip to ensure everything is inside the unit square
+    centers = np.clip(centers, 0.01, 0.99)
+
+    # Compute maximum valid radii for this configuration
+    radii = compute_max_radii(centers)
+
+    # Calculate the sum of radii
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+=======
+def construct_packing():
+    """
+    Construct 26 circles by relaxing a staggered, hexagonal-like layout.
+    The variables are the 52 center coordinates and the 26 radii.
+    """
+    n = 26
+    pairs = np.array([(i, j) for i in range(n) for j in range(i + 1, n)],
+                     dtype=int)
+
+    # Five staggered rows are a good interior seed, while the unequal row
+    # lengths give the optimizer freedom to exploit the square boundary.
+    row_sizes = (5, 6, 5, 6, 4)
+    seed = []
+    for row, count in enumerate(row_sizes):
+        y = 0.12 + 0.19 * row
+        if count == 6:
+            xs = np.linspace(0.075, 0.925, count)
+        elif count == 5:
+            xs = np.linspace(0.14, 0.86, count)
+        else:
+            xs = np.linspace(0.16, 0.84, count)
+        seed.extend((x, y) for x in xs)
+    seed = np.asarray(seed, dtype=float)
+
+    def constraints(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        walls = np.column_stack((c[:, 0] - r, c[:, 1] - r,
+                                 1.0 - c[:, 0] - r, 1.0 - c[:, 1] - r))
+        d = c[pairs[:, 0]] - c[pairs[:, 1]]
+        pair_gaps = np.einsum("ij,ij->i", d, d) - (r[pairs[:, 0]] +
+                                                   r[pairs[:, 1]]) ** 2
+        return np.concatenate((walls.ravel(), pair_gaps))
+
+    def constraint_jacobian(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        jac = np.zeros((4 * n + len(pairs), 3 * n))
+        for i in range(n):
+            q = 4 * i
+            jac[q, 2 * i] = 1.0
+            jac[q, 2 * n + i] = -1.0
+            jac[q + 1, 2 * i + 1] = 1.0
+            jac[q + 1, 2 * n + i] = -1.0
+            jac[q + 2, 2 * i] = -1.0
+            jac[q + 2, 2 * n + i] = -1.0
+            jac[q + 3, 2 * i + 1] = -1.0
+            jac[q + 3, 2 * n + i] = -1.0
+        offset = 4 * n
+        for k, (i, j) in enumerate(pairs):
+            dx, dy = c[i] - c[j]
+            s = r[i] + r[j]
+            jac[offset + k, 2 * i:2 * i + 2] = (2.0 * dx, 2.0 * dy)
+            jac[offset + k, 2 * j:2 * j + 2] = (-2.0 * dx, -2.0 * dy)
+            jac[offset + k, 2 * n + i] = -2.0 * s
+            jac[offset + k, 2 * n + j] = -2.0 * s
+        return jac
+
+    # If scipy is unavailable, the seed is still a valid conservative packing.
+    try:
+        from scipy.optimize import minimize
+    except ImportError:
+        radii = np.full(n, 0.06)
+        return seed, radii, float(np.sum(radii))
+
+    best = None
+    # Deterministic perturbations avoid imposing unnecessary reflection symmetry.
+    for phase in (0.0, 1.7, 3.4, 5.1):
+        c0 = seed.copy()
+        k = np.arange(n)
+        c0[:, 0] += 0.012 * np.sin(1.91 * k + phase)
+        c0[:, 1] += 0.009 * np.cos(1.37 * k + phase)
+        z0 = np.concatenate((c0.ravel(), np.full(n, 0.045)))
+        result = minimize(
+            lambda z: -np.sum(z[2 * n:]), z0,
+            jac=lambda z: np.r_[np.zeros(2 * n), -np.ones(n)],
+            method="SLSQP",
+            bounds=[(1.e-7, 1. - 1.e-7)] * (2 * n) +
+                   [(1.e-8, 0.5)] * n,
+            constraints={"type": "ineq", "fun": constraints,
+                         "jac": constraint_jacobian},
+            options={"maxiter": 700, "ftol": 1.e-11, "disp": False},
+        )
+        if np.all(np.isfinite(result.x)) and np.min(constraints(result.x)) >= -1.e-7:
+            if best is None or np.sum(result.x[2 * n:]) > np.sum(best[2 * n:]):
+                best = result.x
+
+    if best is None:
+        best = np.concatenate((seed.ravel(), np.full(n, 0.06)))
+
+    centers = best[:2 * n].reshape(n, 2)
+    radii = np.maximum(best[2 * n:], 0.0)
+
+    # SLSQP's stopping tolerance can leave a tiny overlap.  Scaling every
+    # radius by one common factor is guaranteed not to alter center validity.
+    scale = 1.0
+    for i in range(n):
+        if radii[i] > 0.0:
+            scale = min(scale, centers[i, 0] / radii[i],
+                        centers[i, 1] / radii[i],
+                        (1.0 - centers[i, 0]) / radii[i],
+                        (1.0 - centers[i, 1]) / radii[i])
+    for i, j in pairs:
+        total = radii[i] + radii[j]
+        if total > 0.0:
+            scale = min(scale, np.linalg.norm(centers[i] - centers[j]) / total)
+    radii *= min(1.0, 0.999999 * scale)
+
+    return centers, radii, float(np.sum(radii))
+>>>>>>> REPLACE
+</DIFF>

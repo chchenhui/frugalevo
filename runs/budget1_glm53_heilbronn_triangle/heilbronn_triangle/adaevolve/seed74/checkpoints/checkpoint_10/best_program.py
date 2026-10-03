@@ -1,0 +1,173 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+_N = 11
+_S3 = np.sqrt(3) / 2.0
+_V = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, _S3]])
+_TRI_IDX = np.array(list(combinations(range(_N), 3)))
+_REGION_AREA = np.sqrt(3) / 4.0
+
+
+def _min_area(P):
+    """Vectorized smallest normalized triangle area over all triplets."""
+    T = P[_TRI_IDX]
+    a2 = np.abs((T[:, 1, 0] - T[:, 0, 0]) * (T[:, 2, 1] - T[:, 0, 1])
+               - (T[:, 2, 0] - T[:, 0, 0]) * (T[:, 1, 1] - T[:, 0, 1]))
+    i = int(a2.argmin())
+    return 0.5 * a2[i] / _REGION_AREA, _TRI_IDX[i]
+
+
+def _clip(P):
+    """Barycentric clamp all points into the triangle."""
+    A, B, C = _V
+    v0, v1 = B - A, C - A
+    d = v0[0] * v1[1] - v0[1] * v1[0]
+    w = np.empty((len(P), 3))
+    w[:, 0] = ((P[:, 0] - A[0]) * v1[1] - (P[:, 1] - A[1]) * v1[0]) / d
+    w[:, 1] = (v0[0] * (P[:, 1] - A[1]) - v0[1] * (P[:, 0] - A[0])) / d
+    w[:, 2] = 1.0 - w[:, 0] - w[:, 1]
+    w = np.maximum(w, 0.0)
+    w /= w.sum(axis=1, keepdims=True)
+    return w[:, :1] * A + w[:, 1:2] * B + w[:, 2:3] * C
+
+
+def _areas(P):
+    """Vectorized double-areas (unnormalized) for all triplets."""
+    T = P[_TRI_IDX]
+    return np.abs((T[:, 1, 0] - T[:, 0, 0]) * (T[:, 2, 1] - T[:, 0, 1])
+                  - (T[:, 2, 0] - T[:, 0, 0]) * (T[:, 1, 1] - T[:, 0, 1]))
+
+
+def _soft(a2, k=6):
+    """Soft-min guidance: mean of the k smallest double-areas."""
+    return float(np.partition(a2, k)[:k].mean())
+
+
+def _greedy_polish(P, step0=0.012, rounds=40):
+    """Deterministic hill-climb: try 8-direction moves per point, accept
+    only strict improvements of the true minimum area; shrink on stall."""
+    P = _clip(P.copy())
+    best = _min_area(P)[0]
+    ang = np.linspace(0.0, 2.0 * np.pi, 9)[:-1]
+    dirs = np.stack([np.cos(ang), np.sin(ang)], axis=1)
+    step = step0
+    for _ in range(rounds):
+        improved = False
+        for j in range(_N):
+            for mag in (1.0, 0.4):
+                for d in dirs:
+                    Q = P.copy()
+                    Q[j] += step * mag * d
+                    Q = _clip(Q)
+                    a = _min_area(Q)[0]
+                    if a > best + 1e-12:
+                        best, P, improved = a, Q, True
+        if not improved:
+            step *= 0.5
+            if step < 1e-5:
+                break
+    return P, _min_area(P)[0]
+
+
+def _optimize(P, rng, iters, step0):
+    """Annealed local search attacking near-worst triangles; acceptance on
+    a soft-min criterion (smoother than the hard minimum, which cycles on
+    a single bottleneck triangle)."""
+    P = _clip(P.copy())
+    a2 = _areas(P)
+    best_a = _min_area(P)[0]
+    best_P = P.copy()
+    step = step0
+    for it in range(iters):
+        Q = P.copy()
+        if it % 4 == 3:
+            j = int(rng.integers(0, _N))
+            Q[j] += rng.normal(0.0, step, size=2)
+        else:
+            # attack one of the 6 currently worst triangles
+            cand = np.argsort(a2)[:6]
+            tri = _TRI_IDX[int(rng.choice(cand))]
+            T = P[tri]
+            cen = T.mean(axis=0)
+            for k in range(3):
+                d = T[k] - cen
+                nrm = np.linalg.norm(d)
+                if nrm > 1e-12:
+                    Q[tri[k]] += (d / nrm) * step * rng.uniform(0.5, 1.5)
+                else:
+                    Q[tri[k]] += rng.normal(0.0, step, size=2)
+        Q = _clip(Q)
+        a2q = _areas(Q)
+        a = _min_area(Q)[0]
+        # accept on soft-min improvement (with rare uphill moves)
+        if _soft(a2q) >= _soft(a2) or rng.random() < 0.01:
+            P, a2 = Q, a2q
+            if a > best_a:
+                best_a, best_P = a, Q.copy()
+        if it % 500 == 499:
+            step *= 0.85
+            P = best_P.copy()
+            a2 = _areas(P)
+    return best_P, _min_area(best_P)[0]
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Arrange 11 points in the unit equilateral triangle to maximize the
+    minimum triangle area over all triplets.
+
+    Approach: deterministic multi-start annealed local search. Several
+    structured seeds (vertices + edge points + interior points, with
+    seeded jitter) are optimized by perturbing the points of the current
+    worst triangle; the best result is returned. Falls back to a fixed
+    structured configuration on any failure.
+    """
+    try:
+        rng = np.random.default_rng(20240607)
+        seeds = []
+        # Seed 1: 3 vertices, 2 per edge, 2 interior
+        p = [v.copy() for v in _V]
+        for t in (1.0 / 3.0, 2.0 / 3.0):
+            p.append(_V[0] + t * (_V[1] - _V[0]))
+            p.append(_V[1] + t * (_V[2] - _V[1]))
+            p.append(_V[2] + t * (_V[0] - _V[2]))
+        p.append(np.array([0.5, _S3 / 3.0]))
+        p.append(np.array([0.5, 2.0 * _S3 / 3.0]))
+        seeds.append(np.array(p))
+        # Seed 2: jittered seed 1
+        seeds.append(_clip(seeds[0] + rng.normal(0.0, 0.02, size=(_N, 2))))
+        # Seed 3: uniform random
+        w = rng.dirichlet(np.ones(3), size=_N)
+        seeds.append(w[:, :1] * _V[0] + w[:, 1:2] * _V[1] + w[:, 2:3] * _V[2])
+        # Seed 4: another jittered variant
+        seeds.append(_clip(seeds[0] + rng.normal(0.0, 0.05, size=(_N, 2))))
+
+        best_P, best_a = None, -1.0
+        for si, S in enumerate(seeds):
+            R = np.random.default_rng(1000 + si)
+            P, a = _optimize(S, R, 6000, 0.04)
+            if a > best_a:
+                best_a, best_P = a, P
+        # Final polish from best: annealed then deterministic greedy
+        R = np.random.default_rng(999)
+        P, a = _optimize(best_P, R, 6000, 0.008)
+        if a > best_a:
+            best_a, best_P = a, P
+        P, a = _greedy_polish(best_P)
+        if a > best_a:
+            best_a, best_P = a, P
+        return np.asarray(best_P, dtype=float)
+    except Exception:
+        # Deterministic fallback: vertices + edge points + interior
+        p = [v.copy() for v in _V]
+        for t in (1.0 / 3.0, 2.0 / 3.0):
+            p.append(_V[0] + t * (_V[1] - _V[0]))
+            p.append(_V[1] + t * (_V[2] - _V[1]))
+            p.append(_V[2] + t * (_V[0] - _V[2]))
+        p.append(np.array([0.5, _S3 / 3.0]))
+        p.append(np.array([0.5, 2.0 * _S3 / 3.0]))
+        return np.array(p)
+
+
+# EVOLVE-BLOCK-END

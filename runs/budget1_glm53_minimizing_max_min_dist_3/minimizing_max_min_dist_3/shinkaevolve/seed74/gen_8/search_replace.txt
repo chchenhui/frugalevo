@@ -1,0 +1,139 @@
+<NAME>
+structured_seeds_gradient_anneal</NAME>
+
+<DESCRIPTION>
+Two key problems in the current code: (1) the "two staggered heptagons" seeds were appended as 7 separate (2,3) arrays, which the shape-check silently discarded — so almost all structured seeds were wasted; (2) the annealer only made random single-point perturbations, which is very slow at climbing the spread (dmin/dmax) landscape. This edit (a) fixes/extends the seed set with expert geometric constructions for the 14-point spread problem in R^3 — a hexagonal antiprism with two poles (analytically ~0.473 ratio), an icosahedron with two antipodal vertices split into point pairs (a perturbation of the optimal 12-point icosahedral configuration, ratio 0.526), a rhombic dodecahedron, a cuboctahedron plus axial points, and heptagon ring variants — and (b) replaces the random-walk local search with a gradient-style annealer: each step it pushes apart all pairs near the current minimum distance, mildly pulls together pairs at the diameter (shrinking dmax), adds decaying random jitter, then renormalizes the diameter to 1. This directly ascends the spread objective and should raise the ratio from ~0.39 toward the ~0.49 reference.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _local_search(points, iters=3000, seed=0):
+    rng = np.random.default_rng(seed)
+    points, d, _ = _normalize(points.copy())
+    best = points.copy()
+    m, dm = _min_dist(points)
+    best_m = m
+    T0 = 0.35
+    for it in range(iters):
+        T = T0 * (1.0 - it / iters) ** 2 + 1e-6
+        cand = points.copy()
+        # targeted move: perturb one endpoint of closest pair strongly
+        if rng.random() < 0.5 and best_m < 1.0:
+            iu = np.triu_indices(points.shape[0], 1)
+            dd = dm[iu]
+            k = iu[0][np.argmin(dd)], iu[1][np.argmin(dd)]
+            idx = k[rng.integers(2)]
+            cand[idx] += rng.normal(0, T, 3) * 2.0
+        else:
+            idx = rng.integers(points.shape[0])
+            cand[idx] += rng.normal(0, T, 3)
+        # occasional pull-together of farthest pair
+        if rng.random() < 0.25:
+            fi, fj = np.unravel_index(np.argmax(dm), dm.shape)
+            cand[fi] += (cand[fj] - cand[fi]) * 0.15 * rng.random()
+        cand, _, _ = _normalize(cand)
+        m, dm2 = _min_dist(cand)
+        if m > best_m or rng.random() < np.exp((m - best_m) / max(T, 1e-9)) * 0.1:
+            points, dm = cand, dm2
+            if m > best_m:
+                best_m = m
+                best = cand.copy()
+    return best, best_m
+=======
+def _local_search(points, iters=3000, seed=0, step0=0.05):
+    """Gradient-style annealing for the spread ratio dmin/dmax.
+
+    Pushes apart pairs near the current minimum distance, mildly pulls
+    together pairs near the diameter, adds decaying jitter, then rescales
+    the configuration so that dmax = 1.
+    """
+    rng = np.random.default_rng(seed)
+    pts, _, _ = _normalize(np.asarray(points, dtype=float).copy())
+    n = pts.shape[0]
+    iu = np.triu_indices(n, 1)
+    best = pts.copy()
+    best_m = _min_dist(pts)[0]
+    for it in range(iters):
+        f = 1.0 - it / iters
+        step = step0 * f + 2e-4
+        T = 0.03 * f
+        diff = pts[:, None, :] - pts[None, :, :]
+        d = np.sqrt((diff ** 2).sum(-1))
+        np.fill_diagonal(d, np.inf)
+        m = d[iu].min()
+        close = (d < m + 0.12 * f + 0.005).astype(float)
+        far = (d > 1.0 - 0.02).astype(float)
+        inv = diff / d[..., None]
+        gc = (inv * close[..., None]).sum(axis=1)
+        gf = (inv * far[..., None]).sum(axis=1)
+        disp = step * gc - 0.6 * step * gf + rng.normal(0, T, pts.shape)
+        nd = np.linalg.norm(disp, axis=1, keepdims=True)
+        cap = 3.0 * step + 0.1
+        disp = np.where(nd > cap, disp / np.maximum(nd, 1e-12) * cap, disp)
+        pts, _, _ = _normalize(pts + disp)
+        mm = _min_dist(pts)[0]
+        if mm > best_m:
+            best_m = mm
+            best = pts.copy()
+    return best, best_m
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    n = 14
+    d = 3
+    seeds = []
+
+    # structured seed: icosahedron vertices + center-ish cluster
+    phi = (1 + 5 ** 0.5) / 2
+    ico = []
+    for a in (-1, 1):
+        for b in (-phi, phi):
+            ico.append((0, a, b))
+            ico.append((a, b, 0))
+            ico.append((b, 0, a))
+    ico = np.array(ico, dtype=float)
+    # two-layer: two staggered heptagons
+    for k in range(7):
+        ang1 = 2 * np.pi * k / 7
+        ang2 = ang1 + np.pi / 7
+        seeds.append(np.vstack([
+            np.array([np.cos(ang1), np.sin(ang1), 0.8]),
+            np.array([np.cos(ang2), np.sin(ang2), -0.8]),
+        ]))
+    seeds.append(ico[:14])
+
+    rng = np.random.default_rng(12345)
+    for _ in range(12):
+        seeds.append(rng.normal(0, 1, (n, dim)))
+=======
+    n = 14
+    d = 3
+    seeds = []
+
+    # --- hexagonal antiprism + two polar points (symmetric family,
+    # analytic spread ~0.473 before relaxation) ---
+    for zm in (1.0, 1.15):
+        h = 0.4276
+        pts = []
+        for k in range(6):
+            a1 = 2 * np.pi * k / 6
+            a2 = a1 + np.pi / 6
+            pts.append([np.cos(a1), np.sin(a1), h])
+            pts.append([np.cos(a2), np.sin(a2), -h])
+        pts.append([0.0, 0.0, zm * h])
+        pts.append([0.0, 0.0, -zm * h])
+        seeds.append(np.array(pts, dtype=float))
+
+    # --- icosahedron with two antipodal vertices split into pairs
+    # (perturbation of the optimal 12-point icosahedral spread) ---
+    phi = (1 + 5 ** 0.5) / 2
+    V = np.array([
+        [0, 1, phi], [0, 1, -phi], [0, -1, phi], [0, -1, -phi],
+        [1, phi, 0], [1, -phi, 0], [-1, phi, 0], [-1, -phi, 0],
+        [phi, 0, 1], [-phi, 0, 1], [phi, 0, -1], [-phi, 0, -1]],
+        dtype=float)
+    pole = np.array([0.0, 1.0, phi])
+    rest = np.array([v for v in V
+                    if min(np.linalg.norm(v - pole),
+                           np.linalg.norm(v + pole)) > 1e-6])
+    u = np.cross(pole, np.array([1.0, 0.0, 0.0]))
+    u /=

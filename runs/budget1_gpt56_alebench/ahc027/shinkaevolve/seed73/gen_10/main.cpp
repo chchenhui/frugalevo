@@ -1,0 +1,329 @@
+# EVOLVE-BLOCK-START
+#pragma GCC optimize("O3,unroll-loops")
+
+#include <bits/stdc++.h>
+using namespace std;
+
+static const int MAXN = 40;
+static const int MAXV = 1600;
+static const int LIMIT = 100000;
+
+int N, V;
+string H[40], W[40];
+int dirt[40][40];
+int valueCell[MAXV];
+
+int dr[4] = {0, 1, 0, -1};
+int dc[4] = {1, 0, -1, 0};
+char dch[4] = {'R', 'D', 'L', 'U'};
+
+vector<int> graphAdj[MAXV];
+vector<char> graphDir[MAXV];
+
+static unsigned short distAll[MAXV][MAXV];
+static unsigned char parMove[MAXV][MAXV]; // move from parent to this node
+
+mt19937 rng((unsigned)chrono::high_resolution_clock::now().time_since_epoch().count());
+
+inline int id(int r, int c) { return r * N + c; }
+inline int row(int x) { return x / N; }
+inline int col(int x) { return x % N; }
+
+bool canMove(int r, int c, int dir) {
+    int nr = r + dr[dir], nc = c + dc[dir];
+    if (nr < 0 || nr >= N || nc < 0 || nc >= N) return false;
+    if (dir == 0) return W[r][c] == '0';
+    if (dir == 2) return W[r][c - 1] == '0';
+    if (dir == 1) return H[r][c] == '0';
+    return H[r - 1][c] == '0';
+}
+
+char opposite(char x) {
+    if (x == 'R') return 'L';
+    if (x == 'L') return 'R';
+    if (x == 'U') return 'D';
+    return 'U';
+}
+
+void buildGraph() {
+    V = N * N;
+    for (int r = 0; r < N; r++) {
+        for (int c = 0; c < N; c++) {
+            int u = id(r, c);
+            valueCell[u] = dirt[r][c];
+            for (int k = 0; k < 4; k++) {
+                if (!canMove(r, c, k)) continue;
+                int v = id(r + dr[k], c + dc[k]);
+                graphAdj[u].push_back(v);
+                graphDir[u].push_back(dch[k]);
+            }
+        }
+    }
+}
+
+void buildAPSP() {
+    static int q[MAXV];
+    for (int s = 0; s < V; s++) {
+        for (int i = 0; i < V; i++) distAll[s][i] = 65535;
+        int head = 0, tail = 0;
+        q[tail++] = s;
+        distAll[s][s] = 0;
+        while (head < tail) {
+            int u = q[head++];
+            for (int ei = 0; ei < (int)graphAdj[u].size(); ei++) {
+                int v = graphAdj[u][ei];
+                if (distAll[s][v] != 65535) continue;
+                distAll[s][v] = distAll[s][u] + 1;
+                parMove[s][v] = (unsigned char)graphDir[u][ei];
+                q[tail++] = v;
+            }
+        }
+    }
+}
+
+vector<char> shortestPath(int s, int t) {
+    vector<char> rev;
+    while (t != s) {
+        char mv = (char)parMove[s][t];
+        rev.push_back(mv);
+        int r = row(t), c = col(t);
+        if (mv == 'R') --c;
+        else if (mv == 'L') ++c;
+        else if (mv == 'D') --r;
+        else ++r;
+        t = id(r, c);
+    }
+    reverse(rev.begin(), rev.end());
+    return rev;
+}
+
+long double evaluate(const vector<char>& moves) {
+    int L = (int)moves.size();
+    if (L == 0 || L > LIMIT) return 1e100L;
+
+    vector<vector<int>> visits(V);
+    int cur = 0;
+    for (int t = 1; t <= L; t++) {
+        char z = moves[t - 1];
+        int r = row(cur), c = col(cur);
+        if (z == 'R') c++;
+        else if (z == 'L') c--;
+        else if (z == 'D') r++;
+        else r--;
+        if (r < 0 || r >= N || c < 0 || c >= N) return 1e100L;
+        cur = id(r, c);
+        visits[cur].push_back(t);
+    }
+    if (cur != 0) return 1e100L;
+
+    long double sum = 0;
+    for (int x = 0; x < V; x++) {
+        if (visits[x].empty()) return 1e100L;
+        long double term = 0;
+        int m = (int)visits[x].size();
+        for (int i = 0; i < m; i++) {
+            int prev = (i == 0 ? visits[x].back() - L : visits[x][i - 1]);
+            long long gap = visits[x][i] - prev;
+            term += (long double)gap * (gap - 1) * 0.5L;
+        }
+        sum += term * valueCell[x];
+    }
+    return sum / L;
+}
+
+vector<char> makeDFSTour(int style) {
+    vector<char> ans;
+    vector<char> used(V, 0);
+
+    function<void(int)> dfs = [&](int u) {
+        used[u] = 1;
+        vector<int> ord(graphAdj[u].size());
+        iota(ord.begin(), ord.end(), 0);
+
+        if (style == 0) {
+            shuffle(ord.begin(), ord.end(), rng);
+        } else if (style == 1) {
+            sort(ord.begin(), ord.end(), [&](int a, int b) {
+                return valueCell[graphAdj[u][a]] > valueCell[graphAdj[u][b]];
+            });
+        } else if (style == 2) {
+            sort(ord.begin(), ord.end(), [&](int a, int b) {
+                return valueCell[graphAdj[u][a]] < valueCell[graphAdj[u][b]];
+            });
+        } else {
+            shuffle(ord.begin(), ord.end(), rng);
+            stable_sort(ord.begin(), ord.end(), [&](int a, int b) {
+                return valueCell[graphAdj[u][a]] > valueCell[graphAdj[u][b]];
+            });
+        }
+
+        for (int ei : ord) {
+            int v = graphAdj[u][ei];
+            if (used[v]) continue;
+            char go = graphDir[u][ei];
+            ans.push_back(go);
+            dfs(v);
+            ans.push_back(opposite(go));
+        }
+    };
+
+    dfs(0);
+    return ans;
+}
+
+struct GapCandidate {
+    long double priority;
+    int cell;
+    int insertPos;
+    bool operator<(const GapCandidate& other) const {
+        return priority > other.priority;
+    }
+};
+
+vector<GapCandidate> findBadGaps(const vector<char>& moves) {
+    int L = (int)moves.size();
+    vector<vector<int>> visits(V);
+    int cur = 0;
+    for (int t = 1; t <= L; t++) {
+        char z = moves[t - 1];
+        int r = row(cur), c = col(cur);
+        if (z == 'R') c++;
+        else if (z == 'L') c--;
+        else if (z == 'D') r++;
+        else r--;
+        cur = id(r, c);
+        visits[cur].push_back(t);
+    }
+
+    vector<GapCandidate> ret;
+    ret.reserve(V);
+    for (int x = 0; x < V; x++) {
+        if (visits[x].empty()) continue;
+        int bestGap = -1, bestPrev = 0;
+        int m = (int)visits[x].size();
+        for (int i = 0; i < m; i++) {
+            int prev = (i == 0 ? visits[x].back() - L : visits[x][i - 1]);
+            int now = visits[x][i];
+            int gap = now - prev;
+            if (gap > bestGap) {
+                bestGap = gap;
+                bestPrev = prev;
+            }
+        }
+        int mid = bestPrev + bestGap / 2;
+        mid %= L;
+        if (mid < 0) mid += L;
+        long double p = (long double)valueCell[x] * bestGap * bestGap;
+        ret.push_back({p, x, mid});
+    }
+    sort(ret.begin(), ret.end());
+    return ret;
+}
+
+vector<int> routePositions(const vector<char>& moves) {
+    vector<int> pos(moves.size() + 1);
+    int cur = 0;
+    pos[0] = 0;
+    for (int i = 0; i < (int)moves.size(); i++) {
+        int r = row(cur), c = col(cur);
+        char z = moves[i];
+        if (z == 'R') c++;
+        else if (z == 'L') c--;
+        else if (z == 'D') r++;
+        else r--;
+        cur = id(r, c);
+        pos[i + 1] = cur;
+    }
+    return pos;
+}
+
+vector<char> insertRoundTrip(const vector<char>& base, int at, int target, const vector<int>& pos) {
+    int from = pos[at];
+    vector<char> out = shortestPath(from, target);
+    if (out.empty() && from != target) return base;
+
+    vector<char> detour;
+    detour.reserve(out.size() * 2);
+    for (char c : out) detour.push_back(c);
+    for (int i = (int)out.size() - 1; i >= 0; i--) detour.push_back(opposite(out[i]));
+
+    vector<char> res;
+    res.reserve(base.size() + detour.size());
+    res.insert(res.end(), base.begin(), base.begin() + at);
+    res.insert(res.end(), detour.begin(), detour.end());
+    res.insert(res.end(), base.begin() + at, base.end());
+    return res;
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    cin >> N;
+    for (int i = 0; i < N - 1; i++) cin >> H[i];
+    for (int i = 0; i < N; i++) cin >> W[i];
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < N; j++)
+            cin >> dirt[i][j];
+
+    auto start = chrono::steady_clock::now();
+    const double TIME_LIMIT = 1.90;
+
+    buildGraph();
+    buildAPSP();
+
+    vector<char> best;
+    long double bestScore = 1e100L;
+
+    for (int rep = 0; rep < 8; rep++) {
+        vector<char> candidate = makeDFSTour(rep % 4);
+        long double score = evaluate(candidate);
+        if (score < bestScore) {
+            bestScore = score;
+            best = move(candidate);
+        }
+    }
+
+    vector<char> current = best;
+    long double currentScore = bestScore;
+
+    while (true) {
+        double elapsed = chrono::duration<double>(chrono::steady_clock::now() - start).count();
+        if (elapsed > TIME_LIMIT) break;
+
+        vector<int> pos = routePositions(current);
+        vector<GapCandidate> bad = findBadGaps(current);
+
+        vector<char> chosen;
+        long double chosenScore = currentScore;
+        int checks = min((int)bad.size(), 20);
+
+        for (int i = 0; i < checks; i++) {
+            const auto& g = bad[i];
+            int from = pos[g.insertPos];
+            int d = distAll[from][g.cell];
+            if (d == 0 || (int)current.size() + 2 * d > LIMIT) continue;
+
+            vector<char> cand = insertRoundTrip(current, g.insertPos, g.cell, pos);
+            long double sc = evaluate(cand);
+            if (sc < chosenScore) {
+                chosenScore = sc;
+                chosen = move(cand);
+            }
+
+            elapsed = chrono::duration<double>(chrono::steady_clock::now() - start).count();
+            if (elapsed > TIME_LIMIT) break;
+        }
+
+        if (chosen.empty()) break;
+        current = move(chosen);
+        currentScore = chosenScore;
+
+        if ((int)current.size() > 18000) break;
+    }
+
+    for (char c : current) cout << c;
+    cout << '\n';
+    return 0;
+}
+# EVOLVE-BLOCK-END

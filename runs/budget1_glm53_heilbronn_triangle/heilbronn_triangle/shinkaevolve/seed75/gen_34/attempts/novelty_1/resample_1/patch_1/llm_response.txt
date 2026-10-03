@@ -1,0 +1,100 @@
+<NAME>
+batched_best_of_k_search
+</NAME>
+<DESCRIPTION>
+The current program is slow (7.12s) because it evaluates candidate perturbations one at a time with a Python-level triple loop. The prior faster programs show that vectorizing candidate evaluation is the key to both speed and quality: with a batched best-of-K move we can afford many more restarts and a finer multi-scale step schedule within the same wall time, which directly improves min_area (the primary objective). Additionally, focusing moves on the points of the K worst triplets (rather than only the single worst) helps escape poor basins. I therefore: (1) add `_areas_all` and a `_min_area_batch` helper, (2) replace the scalar inner loop with a vectorized best-of-24 perturbation over the movers of the 6 worst triplets plus a fallback global sweep, and (3) increase restarts to 25 with early bail-out on hopeless starts so time budget is spent on good basins.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _project(pts):
+=======
+def _areas_all(points, triples):
+    p = points[triples]
+    a = p[:, 1] - p[:, 0]
+    b = p[:, 2] - p[:, 0]
+    return 0.5 * np.abs(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0])
+
+
+def _min_area_batch(batch, triples):
+    """Minimum triangle area for each of K configurations, shape (K, n, 2)."""
+    p = batch[:, triples]  # (K, T, 3, 2)
+    a = p[:, :, 1] - p[:, :, 0]
+    b = p[:, :, 2] - p[:, :, 0]
+    areas = 0.5 * np.abs(a[:, :, 0] * b[:, :, 1] - a[:, :, 1] * b[:, :, 0])
+    return areas.min(axis=1)
+
+
+def _project(pts):
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    for restart in range(12):
+        pts = _init_points(rng, n)
+        step = 0.05
+        cur_val, _ = _min_area(pts, triples)
+        while step > 1e-7:
+            improved = False
+            _, widx = _min_area(pts, triples)
+            worst = triples[widx]
+            for pi in worst:
+                for _ in range(24):
+                    cand = pts.copy()
+                    cand[pi] = cand[pi] + rng.normal(0.0, step, size=2)
+                    cand = _project(cand)
+                    v, _ = _min_area(cand, triples)
+                    if v > cur_val + 1e-12:
+                        pts = cand
+                        cur_val = v
+                        improved = True
+                        break
+            if not improved:
+                step *= 0.6
+        if cur_val > best_val:
+            best_val = cur_val
+            best_pts = pts.copy()
+=======
+    K = 24          # candidates per point move (best-of-K)
+    KWORST = 6      # worst triplets whose points are allowed to move
+
+    for restart in range(25):
+        pts = _init_points(rng, n)
+        step = 0.05
+        cur_val, _ = _min_area(pts, triples)
+        # Early bail-out on hopeless restarts to spend budget on good basins.
+        if best_val > 0 and cur_val < 0.4 * best_val:
+            continue
+        while step > 1e-7:
+            improved = False
+            areas = _areas_all(pts, triples)
+            worst_order = np.argsort(areas)[:KWORST]
+            movers = sorted(set(triples[worst_order].ravel().tolist()))
+            for pi in movers:
+                cands = np.repeat(pts[None], K, axis=0)  # (K, n, 2)
+                cands[:, pi, :] += rng.normal(0.0, step, size=(K, 2))
+                cands = _project(cands)
+                vals = _min_area_batch(cands, triples)
+                j = int(np.argmax(vals))
+                if vals[j] > cur_val + 1e-12:
+                    pts = cands[j]
+                    cur_val = float(vals[j])
+                    improved = True
+            if not improved:
+                # one global sweep: allow any point to move (escape local optima)
+                any_imp = False
+                for pi in range(len(pts)):
+                    cands = np.repeat(pts[None], K, axis=0)
+                    cands[:, pi, :] += rng.normal(0.0, step, size=(K, 2))
+                    cands = _project(cands)
+                    vals = _min_area_batch(cands, triples)
+                    j = int(np.argmax(vals))
+                    if vals[j] > cur_val + 1e-12:
+                        pts = cands[j]
+                        cur_val = float(vals[j])
+                        any_imp = True
+                if not any_imp:
+                    step *= 0.6
+        if cur_val > best_val:
+            best_val = cur_val
+            best_pts = pts.copy()
+>>>>>>> REPLACE
+</DIFF>

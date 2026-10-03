@@ -1,0 +1,352 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List
+
+
+class Evolved(Algorithm):
+    """
+    Character-Trie prefix reuse optimizer.
+
+    Serializes rows ("" for missing), builds a few cheap candidate per-row
+    column orderings, scores each with the exact Trie reuse objective
+    (sum of LCPs of lexicographically adjacent serialized rows), and returns
+    the best candidate applied to the data. All cell values are preserved.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------ #
+    # serialization helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _cell_str(v):
+        if v is None:
+            return ""
+        if isinstance(v, float) and np.isnan(v):
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        if isinstance(v, bool):
+            return str(v)
+        if isinstance(v, float) and v == int(v) and abs(v) < 1e15:
+            # match how str() prints; keep it simple and consistent
+            pass
+        return str(v)
+
+    def _serialize_cells(self, df: pd.DataFrame) -> List[List[str]]:
+        cols = df.columns.tolist()
+        cells = []
+        for c in cols:
+            s = df[c]
+            cells.append([self._cell_str(v) for v in s.tolist()])
+        # cells[col_idx][row_idx]
+        return cells
+
+    # ------------------------------------------------------------------ #
+    # exact objective: sum of LCPs of adjacent sorted strings
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        n = min(len(a), len(b))
+        if n == 0:
+            return 0
+        if a[:n] == b[:n]:
+            return n
+        lo, hi = 0, n - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_score(self, strings: List[str]) -> int:
+        if len(strings) <= 1:
+            return 0
+        ss = sorted(strings)
+        total = 0
+        prev = ss[0]
+        for cur in ss[1:]:
+            if cur == prev:
+                total += len(cur)
+            else:
+                total += self._lcp(prev, cur)
+            prev = cur
+        return total
+
+    # ------------------------------------------------------------------ #
+    # candidate constructions
+    # ------------------------------------------------------------------ #
+    def _global_order_score(self, df: pd.DataFrame) -> List[str]:
+        """Rank columns by sum over values v of len(v)*c*(c-1)."""
+        n = len(df)
+        scores = {}
+        for c in df.columns:
+            s = df[c]
+            try:
+                vc = s.value_counts(dropna=False)
+            except Exception:
+                vc = pd.Series([1] * n)
+            sc = 0.0
+            for v, cnt in vc.items():
+                if cnt > 1:
+                    sc += len(self._cell_str(v)) * cnt * (cnt - 1)
+            scores[c] = sc
+        return sorted(df.columns.tolist(), key=lambda c: (-scores.get(c, 0.0), str(c)))
+
+    def _conditional_orderings(
+        self,
+        df: pd.DataFrame,
+        codes: dict,
+        global_order: List[str],
+        min_group: int = 4,
+        max_depth: int = 12,
+    ) -> List[List[str]]:
+        """Recursive conditional partition tree -> per-row column orderings."""
+        n = len(df)
+        cols = df.columns.tolist()
+        gpos = {c: i for i, c in enumerate(global_order)}
+        orderings = [None] * n
+        col_len = {}  # column -> {code: serialized length}
+        for c in cols:
+            col_len[c] = {}
+
+        def tail_order(remaining):
+            return sorted(remaining, key=lambda c: (gpos.get(c, 10**9), str(c)))
+
+        def recurse(row_idx: List[int], remaining: List[str], depth: int):
+            if not remaining:
+                return
+            if len(row_idx) < min_group or depth >= max_depth or len(remaining) <= 1:
+                tail = tail_order(remaining)
+                for r in row_idx:
+                    orderings[r] = (orderings[r] or []) + tail
+                return
+            # pick best column by length-weighted pair repetition
+            best_col, best_gain = None, -1.0
+            for c in remaining:
+                arr = codes[c]
+                sub = [arr[r] for r in row_idx]
+                cnt = {}
+                for v in sub:
+                    cnt[v] = cnt.get(v, 0) + 1
+                gain = 0.0
+                for v, k in cnt.items():
+                    if k > 1:
+                        gain += col_len[c].get(v, 0) * k * (k - 1)
+                if gain > best_gain:
+                    best_gain, best_col = gain, c
+            if best_col is None or best_gain <= 0:
+                tail = tail_order(remaining)
+                for r in row_idx:
+                    orderings[r] = (orderings[r] or []) + tail
+                return
+            # place best_col next, partition rows on it
+            groups = {}
+            arr = codes[best_col]
+            for r in row_idx:
+                groups.setdefault(arr[r], []).append(r)
+            rest = [c for c in remaining if c != best_col]
+            for r in row_idx:
+                orderings[r] = (orderings[r] or []) + [best_col]
+            # recurse into partitions, largest first for determinism
+            for v in sorted(groups.keys(), key=lambda x: (str(x))):
+                recurse(groups[v], rest, depth + 1)
+
+        recurse(list(range(n)), cols, 0)
+        for i in range(n):
+            if orderings[i] is None:
+                orderings[i] = cols[:]
+        return orderings
+
+    # ------------------------------------------------------------------ #
+    # main API
+    # ------------------------------------------------------------------ #
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        # Work on a copy; never mutate the caller's frame.
+        work = df.copy()
+        n_rows, n_cols = work.shape
+        if n_rows == 0 or n_cols == 0:
+            return work, [[] for _ in range(n_rows)] if n_cols else []
+
+        columns = work.columns.tolist()
+        col_index = {c: i for i, c in enumerate(columns)}
+
+        # ---- constraint units: col_merge groups kept contiguous;
+        # one_way_dep pairs kept adjacent (a immediately before b) ----
+        merge_units = []
+        in_merge = set()
+        for group in (col_merge or []):
+            g = [c for c in group if c in col_index]
+            if len(g) > 1:
+                merge_units.append(g)
+                in_merge.update(g)
+        dep_units = []
+        in_dep = set()
+        for a, b in (one_way_dep or []):
+            ca = [c for c in columns if a in str(c)]
+            cb = [c for c in columns if b in str(c)]
+            if ca and cb and ca[0] in col_index and cb[0] in col_index and ca[0] != cb[0]:
+                dep_units.append([ca[0], cb[0]])
+                in_dep.update([ca[0], cb[0]])
+        # merged columns take priority over dep adjacency if overlapping
+        dep_units = [g for g in dep_units if not (set(g) & in_merge)]
+        in_dep = {c for g in dep_units for c in g}
+        unit_of = {}
+        for g in merge_units + dep_units:
+            for c in g:
+                unit_of[c] = g
+        singles = [c for c in columns if c not in unit_of]
+
+        # ---- serialize cells once; reuse across candidates ----
+        cell_strings = self._serialize_cells(work)  # [col][row] -> str
+
+        # integer codes per column (for conditional construction)
+        codes = {}
+        for c in columns:
+            arr = cell_strings[col_index[c]]
+            uniq = {}
+            code_arr = []
+            for v in arr:
+                if v not in uniq:
+                    uniq[v] = len(uniq)
+                code_arr.append(uniq[v])
+            codes[c] = code_arr
+
+        def apply_units(order: List[str]) -> List[str]:
+            """Expand an order of standalone columns, inserting constraint units."""
+            out = []
+            used = set()
+            seen = set()
+            for c in order:
+                if c in seen:
+                    continue
+                u = unit_of.get(c)
+                if u is None:
+                    out.append(c)
+                    seen.add(c)
+                else:
+                    if c == u[0]:
+                        for x in u:
+                            if x not in seen:
+                                out.append(x)
+                                seen.add(x)
+                    # if c is not the unit head, skip; head will place it
+            # append any columns never placed (safety)
+            for c in columns:
+                if c not in seen:
+                    out.append(c)
+                    seen.add(c)
+            return out
+
+        # ---- candidate 1: global frequency-ranked ordering ----
+        base_global = self._global_order_score(work)
+        # order over standalone columns only, then expand units
+        standalone_order = [c for c in base_global if c not in unit_of] + [
+            c for c in base_global if c in unit_of
+        ]
+        cand1 = apply_units(standalone_order)
+
+        # ---- candidate 2: conditional partition (per-row orderings) ----
+        try:
+            cond_raw = self._conditional_orderings(work, codes, base_global)
+            cand2_rows = [apply_units(o) for o in cond_raw]
+        except Exception:
+            cand2_rows = [cand1[:] for _ in range(n_rows)]
+
+        # ---- candidate 3: original column order ----
+        cand3 = apply_units(columns)
+
+        candidates = [cand1, cand3]
+
+        def score_ordering(order: List[str]) -> int:
+            idxs = [col_index[c] for c in order]
+            strings = []
+            for r in range(n_rows):
+                parts = [cell_strings[ci][r] for ci in idxs]
+                strings.append("".join(parts))
+            return self._trie_score(strings)
+
+        best_order = None
+        best_score = -1
+        for cand in candidates:
+            s = score_ordering(cand)
+            if s > best_score:
+                best_score, best_order = s, cand
+
+        # score candidate 2 only if it differs from best and rows permit
+        if n_rows > 1:
+            try:
+                # build strings per row for cand2
+                strings2 = []
+                # cache per unique ordering to avoid re-serializing rows
+                uniq_orders = {}
+                row_str = [None] * n_rows
+                for r in range(n_rows):
+                    key = tuple(cand2_rows[r])
+                    if key not in uniq_orders:
+                        idxs = [col_index[c] for c in cand2_rows[r]]
+                        uniq_orders[key] = idxs
+                    idxs = uniq_orders[key]
+                    row_str[r] = "".join(cell_strings[ci][r] for ci in idxs)
+                s2 = self._trie_score(row_str)
+                if s2 > best_score:
+                    best_score = s2
+                    best_order = None  # signals per-row orderings win
+                    best_per_row = cand2_rows
+            except Exception:
+                pass
+
+        if best_order is not None:
+            per_row = [best_order[:] for _ in range(n_rows)]
+        else:
+            per_row = best_per_row
+
+        # ---- build output: permute each row's cells per its ordering ----
+        data = np.empty((n_rows, n_cols), dtype=object)
+        col_arrays = {c: work[c].tolist() for c in columns}
+        for r in range(n_rows):
+            order = per_row[r]
+            assert len(order) == n_cols, f"ordering length {len(order)} != {n_cols}"
+            for j, c in enumerate(order):
+                data[r, j] = col_arrays[c][r]
+
+        out = pd.DataFrame(data, columns=columns, index=work.index.copy())
+        # ensure object dtype preserved for mixed types
+        for c in out.columns:
+            if out[c].dtype != object:
+                out[c] = out[c].astype(object)
+
+        # sort rows by serialized string so adjacent rows share prefixes at
+        # output time (trie total is order-independent, but sorting is cheap
+        # and keeps the output deterministic)
+        order_idx = per_row[0] if per_row else columns
+        idxs = [col_index[c] for c in order_idx]
+        keys = [
+            "".join(cell_strings[ci][r] for ci in idxs) for r in range(n_rows)
+        ]
+        sort_perm = sorted(range(n_rows), key=lambda r: keys[r])
+        if sort_perm != list(range(n_rows)):
+            out = out.iloc[sort_perm].reset_index(drop=True)
+            per_row = [per_row[r] for r in sort_perm]
+
+        return out, per_row
+
+# EVOLVE-BLOCK-END

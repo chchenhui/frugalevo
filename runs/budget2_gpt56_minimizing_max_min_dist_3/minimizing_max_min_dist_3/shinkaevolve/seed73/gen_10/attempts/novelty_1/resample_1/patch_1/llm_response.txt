@@ -1,0 +1,164 @@
+<NAME>
+active_set_diameter_packing
+</NAME>
+
+<DESCRIPTION>
+This uses a two-stage constrained diameter-packing strategy rather than directly optimizing a soft min/max ratio. First, several deterministic charged-particle relaxations maximize a sharp smooth approximation of the minimum squared separation while the configuration is repeatedly rescaled to fixed diameter. The best candidates are then polished as an explicit nonlinear feasibility problem: all pairwise distances must be at least one, all pairwise distances must be below a minimized diameter variable, and the centroid is fixed. When SciPy is available, SLSQP uses exact analytic constraint Jacobians to resolve the active contact graph more accurately than a pure soft-force objective. A NumPy-only relaxation fallback remains available.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct fourteen 3D points with a large minimum-distance / diameter ratio.
+
+    The construction first searches on the fixed-diameter manifold and then,
+    when SciPy is available, solves the corresponding explicit constrained
+    diameter minimization problem from the strongest deterministic candidates.
+    """
+    n, dim = 14, 3
+    iu, ju = np.triu_indices(n, 1)
+    rng = np.random.default_rng(734927)
+
+    def distances_squared(p):
+        v = p[iu] - p[ju]
+        return np.einsum("ij,ij->i", v, v)
+
+    def normalize_diameter(p):
+        p = p - p.mean(axis=0, keepdims=True)
+        d2 = distances_squared(p)
+        p = p / np.sqrt(d2.max())
+        return p
+
+    def ratio(p):
+        d2 = distances_squared(p)
+        return float(d2.min() / d2.max())
+
+    candidates = []
+
+    # Fixed-diameter repulsive relaxation.  Unlike a soft min/max objective,
+    # the diameter is imposed after every move and only near-contact pairs
+    # contribute substantially to the force.
+    for restart in range(14):
+        p = normalize_diameter(rng.normal(size=(n, dim)))
+        m = np.zeros_like(p)
+        v = np.zeros_like(p)
+
+        for step in range(6200):
+            dsq = distances_squared(p)
+            # A continuation in the inverse temperature makes this initially
+            # a broad repulsion and finally an almost exact closest-pair force.
+            beta = 14.0 + 430.0 * (step / 6199.0) ** 1.7
+            z = -beta * dsq
+            z -= z.max()
+            w = np.exp(z)
+            w /= w.sum()
+
+            delta = p[iu] - p[ju]
+            pair_force = (2.0 * beta * w)[:, None] * delta
+            grad = np.zeros_like(p)
+            np.add.at(grad, iu, pair_force)
+            np.add.at(grad, ju, -pair_force)
+
+            # Adam is used only as a stable integrator for the contact forces.
+            m = 0.88 * m + 0.12 * grad
+            v = 0.992 * v + 0.008 * grad * grad
+            lr = 0.018 * (0.20 + 0.80 * (1.0 - step / 6200.0))
+            p = p + lr * m / (np.sqrt(v) + 1.0e-9)
+            p = normalize_diameter(p)
+
+        candidates.append((ratio(p), p.copy()))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best_ratio, best = candidates[0]
+
+    # Explicit active-set polishing.  It minimizes D subject to
+    #     ||xi-xj||^2 >= 1,  ||xi-xj||^2 <= D,
+    # which is exactly equivalent to maximizing the requested ratio after
+    # scaling so that the minimum distance is one.
+    try:
+        from scipy.optimize import minimize
+
+        def make_problem(start):
+            d2 = distances_squared(start)
+            start = start / np.sqrt(d2.min())
+            q0 = float(distances_squared(start).max()) * (1.0 + 1.0e-10)
+            x0 = np.concatenate((start.ravel(), [q0]))
+
+            def fun(x):
+                return x[-1]
+
+            def jac_fun(x):
+                g = np.zeros_like(x)
+                g[-1] = 1.0
+                return g
+
+            def constraints(x):
+                p = x[:-1].reshape(n, dim)
+                q = x[-1]
+                s = distances_squared(p)
+                return np.concatenate((s - 1.0, q - s))
+
+            def jac_constraints(x):
+                p = x[:-1].reshape(n, dim)
+                delta = p[iu] - p[ju]
+                rows = len(iu)
+                out = np.zeros((2 * rows, n * dim + 1))
+                for k, (a, b) in enumerate(zip(iu, ju)):
+                    g = 2.0 * delta[k]
+                    out[k, 3 * a:3 * a + 3] = g
+                    out[k, 3 * b:3 * b + 3] = -g
+                    out[rows + k, 3 * a:3 * a + 3] = -g
+                    out[rows + k, 3 * b:3 * b + 3] = g
+                    out[rows + k, -1] = 1.0
+                return out
+
+            def centroid(x):
+                return x[:-1].reshape(n, dim).sum(axis=0)
+
+            def jac_centroid(x):
+                out = np.zeros((dim, n * dim + 1))
+                for k in range(n):
+                    out[:, 3 * k:3 * k + 3] = np.eye(3)
+                return out
+
+            return x0, fun, jac_fun, constraints, jac_constraints, centroid, jac_centroid
+
+        # Polishing more than one basin is useful when two contact graphs have
+        # nearly identical relaxed scores.
+        for _, seed in candidates[:3]:
+            x0, fun, jfun, con, jcon, cen, jcen = make_problem(seed)
+            result = minimize(
+                fun,
+                x0,
+                jac=jfun,
+                method="SLSQP",
+                constraints=(
+                    {"type": "ineq", "fun": con, "jac": jcon},
+                    {"type": "eq", "fun": cen, "jac": jcen},
+                ),
+                options={"maxiter": 900, "ftol": 2.0e-13, "disp": False},
+            )
+
+            if result.x is not None and np.all(np.isfinite(result.x)):
+                p = result.x[:-1].reshape(n, dim)
+                p = normalize_diameter(p)
+                r = ratio(p)
+                if r > best_ratio:
+                    best_ratio, best = r, p
+
+    except Exception:
+        # The deterministic NumPy construction above is already a valid
+        # finite configuration if an optional SciPy installation is absent.
+        pass
+
+    return np.asarray(best, dtype=float)
+
+
+# EVOLVE-BLOCK-END
+``` 
+</CODE>

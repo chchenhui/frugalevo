@@ -1,0 +1,192 @@
+<NAME>
+triangular_batch_maximin
+</NAME>
+
+<DESCRIPTION>
+This crossover keeps the current program’s equilateral convex hull and barycentric feasibility guarantee, while adopting the prior program’s much more efficient batched population evaluation, differential proposals, elite preservation, restart diversity, and sparse final refinement.
+
+All candidate layouts remain inside the fixed triangular hull through normalized nonnegative barycentric weights. The objective evaluates all 286 triangles in vectorized batches, allowing substantially broader deterministic exploration than a single-chain annealer. A final bottleneck-aware sparse polishing phase focuses perturbations on points participating in currently limiting triangles.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Deterministically construct thirteen points in an equilateral convex hull.
+
+    The three hull vertices are fixed.  The remaining ten points are represented
+    by nonnegative barycentric weights, so every generated candidate is inside
+    the hull.  Since hull normalization is constant, maximizing the minimum
+    triangle determinant is equivalent to maximizing normalized triangle area.
+    """
+    rng = np.random.default_rng(seed=1847)
+
+    hull = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [0.5, np.sqrt(3.0) / 2.0]],
+        dtype=float,
+    )
+    triples = np.array(
+        [(i, j, k) for i in range(13) for j in range(i + 1, 13)
+         for k in range(j + 1, 13)],
+        dtype=np.intp,
+    )
+
+    def normalize_weights(w: np.ndarray) -> np.ndarray:
+        """Project batched barycentric weights into the triangle interior."""
+        w = np.maximum(w, 1.0e-6)
+        return w / w.sum(axis=-1, keepdims=True)
+
+    def minimum_determinants(batch_weights: np.ndarray) -> np.ndarray:
+        """Return minimum unsigned doubled triangle areas for a batch."""
+        count = batch_weights.shape[0]
+        layouts = np.empty((count, 13, 2), dtype=float)
+        layouts[:, :3, :] = hull
+        layouts[:, 3:, :] = batch_weights @ hull
+
+        a = layouts[:, triples[:, 0], :]
+        b = layouts[:, triples[:, 1], :]
+        c = layouts[:, triples[:, 2], :]
+        determinants = np.abs(
+            (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
+            - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
+        )
+        return determinants.min(axis=1)
+
+    population_size = 88
+    generations = 520
+    population = rng.dirichlet(np.ones(3), size=(population_size, 10))
+
+    # Seed several qualitatively different distributions in addition to the
+    # deterministic random population.
+    lattice = np.array(
+        [
+            [0.72, 0.14, 0.14], [0.14, 0.72, 0.14], [0.14, 0.14, 0.72],
+            [0.55, 0.33, 0.12], [0.55, 0.12, 0.33], [0.33, 0.55, 0.12],
+            [0.12, 0.55, 0.33], [0.33, 0.12, 0.55], [0.12, 0.33, 0.55],
+            [0.34, 0.33, 0.33],
+        ],
+        dtype=float,
+    )
+    population[0] = normalize_weights(
+        lattice + rng.normal(0.0, 0.035, size=(10, 3))
+    )
+    population[1] = normalize_weights(
+        lattice[::-1] + rng.normal(0.0, 0.055, size=(10, 3))
+    )
+
+    scores = minimum_determinants(population)
+    best_index = int(np.argmax(scores))
+    best = population[best_index].copy()
+    best_score = float(scores[best_index])
+
+    for generation in range(generations):
+        fraction = generation / (generations - 1)
+        step = 0.105 * (0.010 / 0.105) ** fraction
+
+        # Barycentric noise is sum-zero before projection, producing natural
+        # moves parallel to the affine plane of the triangular region.
+        noise = rng.normal(
+            0.0, step, size=(population_size, 2, 10, 3)
+        )
+        noise -= noise.mean(axis=-1, keepdims=True)
+
+        pull_strength = rng.uniform(
+            0.0, 0.18, size=(population_size, 2, 1, 1)
+        )
+        local = normalize_weights(
+            population[:, None, :, :]
+            + noise
+            + pull_strength * (best[None, None, :, :] - population[:, None, :, :])
+        )
+
+        donor_a = rng.integers(0, population_size, size=population_size)
+        donor_b = rng.integers(0, population_size, size=population_size)
+        differential = normalize_weights(
+            population + 0.72 * (population[donor_a] - population[donor_b])
+        )
+
+        candidates = np.concatenate(
+            (
+                population[:, None, :, :],
+                local,
+                differential[:, None, :, :],
+            ),
+            axis=1,
+        )
+        candidate_scores = minimum_determinants(
+            candidates.reshape(-1, 10, 3)
+        ).reshape(population_size, 4)
+
+        chosen = np.argmax(candidate_scores, axis=1)
+        population = candidates[np.arange(population_size), chosen]
+        scores = candidate_scores[np.arange(population_size), chosen]
+
+        current = int(np.argmax(scores))
+        if scores[current] > best_score:
+            best_score = float(scores[current])
+            best = population[current].copy()
+
+        # Reintroduce global diversity while preserving all elite layouts.
+        if generation in (155, 310, 420):
+            worst = np.argsort(scores)[: population_size // 5]
+            population[worst] = rng.dirichlet(
+                np.ones(3), size=(len(worst), 10)
+            )
+            scores[worst] = minimum_determinants(population[worst])
+
+    # Sparse batched polish: most maximin improvements come from moving only a
+    # few points, rather than disturbing every currently satisfactory triangle.
+    for iteration in range(620):
+        fraction = iteration / 619.0
+        step = 0.030 * (0.0007 / 0.030) ** fraction
+        trial_count = 52
+
+        trials = np.repeat(best[None, :, :], trial_count, axis=0)
+        masks = rng.random((trial_count, 10, 1)) < 0.17
+        masks[0, rng.integers(0, 10), 0] = True
+
+        perturbation = rng.normal(0.0, step, size=(trial_count, 10, 3))
+        perturbation -= perturbation.mean(axis=-1, keepdims=True)
+        trials = normalize_weights(trials + masks * perturbation)
+
+        trial_scores = minimum_determinants(trials)
+        winner = int(np.argmax(trial_scores))
+        if trial_scores[winner] > best_score:
+            best_score = float(trial_scores[winner])
+            best = trials[winner].copy()
+
+        # Occasionally target a member of the active limiting triangle.
+        if iteration % 31 == 30:
+            points = np.vstack((hull, best @ hull))
+            a = points[triples[:, 0]]
+            b = points[triples[:, 1]]
+            c = points[triples[:, 2]]
+            det = np.abs(
+                (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+                - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+            )
+            limiting = triples[int(np.argmin(det))]
+            movable = limiting[limiting >= 3] - 3
+            if len(movable):
+                focused = np.repeat(best[None, :, :], 18, axis=0)
+                indices = movable[rng.integers(0, len(movable), size=18)]
+                focused_noise = rng.normal(0.0, step * 1.4, size=(18, 3))
+                focused_noise -= focused_noise.mean(axis=1, keepdims=True)
+                focused[np.arange(18), indices] += focused_noise
+                focused = normalize_weights(focused)
+                focused_scores = minimum_determinants(focused)
+                focused_winner = int(np.argmax(focused_scores))
+                if focused_scores[focused_winner] > best_score:
+                    best_score = float(focused_scores[focused_winner])
+                    best = focused[focused_winner].copy()
+
+    return np.vstack((hull, best @ hull))
+
+
+# EVOLVE-BLOCK-END
+``` 
+</CODE>

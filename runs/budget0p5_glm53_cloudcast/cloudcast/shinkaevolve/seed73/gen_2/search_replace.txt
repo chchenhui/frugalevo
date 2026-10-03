@@ -1,0 +1,102 @@
+<NAME>
+multi_path_partition_broadcast
+
+<DESCRIPTION>
+The current algorithm sends every partition over a single Dijkstra shortest path, causing redundant transfers over the same (possibly expensive) links and ignoring parallel network paths. A better strategy is to (1) enumerate multiple candidate paths per destination (k-shortest simple paths by cost), (2) split the partitions across those parallel paths proportionally to their achievable throughput so load is balanced across networks, and (3) prefer the set of paths that minimizes the weighted sum of per-GB cost. This reduces redundant transfers over the same links, exploits multi-network topologies, and lowers total cost while keeping the BroadCastTopology structure intact (each partition gets exactly one path with its edge list). Edges missing cost data are given a large penalty so they are only used when necessary, and cached edge data is passed directly into the topology to avoid recomputation.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    # Penalize edges without cost info so they are only used when necessary
+    LARGE_COST = 1e6
+    for u, v, data in h.edges(data=True):
+        if data.get("cost") is None:
+            data["cost_weight"] = LARGE_COST
+        else:
+            data["cost_weight"] = data["cost"]
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        try:
+            # Gather up to k candidate simple paths, cheapest first
+            k = min(4, num_partitions)
+            candidates = []
+            for path in nx.shortest_simple_paths(h, src, dst, weight="cost_weight"):
+                candidates.append(path)
+                if len(candidates) >= k:
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            candidates = []
+
+        if not candidates:
+            continue
+
+        def path_cost(path):
+            return sum(h[path[i]][path[i + 1]]["cost_weight"] for i in range(len(path) - 1))
+
+        def path_tput(path):
+            return min(h[path[i]][path[i + 1]].get("throughput", 1) for i in range(len(path) - 1))
+
+        costs = [path_cost(p) for p in candidates]
+        tputs = [path_tput(p) for p in candidates]
+        total_tput = sum(tputs) or 1.0
+
+        # Assign partitions across paths proportionally to throughput,
+        # so faster (and cheaper) links carry more partitions.
+        assignments = [0] * len(candidates)
+        remaining = num_partitions
+        # Sort path indices by cost-efficiency (cost per unit throughput) ascending
+        order = sorted(range(len(candidates)), key=lambda idx: costs[idx] * tputs[idx])
+        for rank, idx in enumerate(order):
+            if remaining <= 0:
+                break
+            if rank == len(order) - 1:
+                take = remaining
+            else:
+                take = max(1, int(round(num_partitions * tputs[idx] / total_tput)))
+                take = min(take, remaining)
+            assignments[idx] = take
+            remaining -= take
+
+        # If any partitions remain unassigned due to rounding, dump on cheapest path
+        if remaining > 0:
+            assignments[order[0]] += remaining
+
+        for idx, path in enumerate(candidates):
+            count = assignments[idx]
+            if count <= 0:
+                continue
+            # Assign specific partition ids: spread partitions across paths
+        part_ids = list(range(num_partitions))
+        pos = 0
+        for idx in range(len(candidates)):
+            count = assignments[idx]
+            for j in range(pos, pos + count):
+                path = candidates[idx]
+                for i in range(0, len(path) - 1):
+                    s, t = path[i], path[i + 1]
+                    bc_topology.append_dst_partition_path(dst, part_ids[j], [s, t, G[s][t]])
+            pos += count
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

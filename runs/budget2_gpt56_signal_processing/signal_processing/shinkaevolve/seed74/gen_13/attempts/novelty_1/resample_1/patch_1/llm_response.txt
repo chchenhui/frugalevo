@@ -1,0 +1,162 @@
+<NAME>
+quadratic_hysteresis_tracker
+</NAME>
+
+<DESCRIPTION>
+Replace the endpoint linear measurement with a regularized, exponentially weighted local quadratic model. The quadratic endpoint estimate captures curvature near genuine peaks and troughs, reducing the lag caused by a linear trend extrapolation. Its derivative provides a less noisy velocity measurement than updating velocity from level innovation alone.
+
+The tracker then uses robust residual-scale estimation, bounded innovations, and explicit two-observation reversal confirmation. This prevents an isolated noisy local fit from reversing the trend, while allowing large, persistent turns to switch quickly. The result targets lower slope-change and false-reversal counts without sacrificing endpoint alignment or responsiveness.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Time zero is the latest sample, so the fitted intercept is a causal
+    # estimate of the current level rather than a delayed window average.
+    time = np.arange(window_size, dtype=float) - (window_size - 1)
+    weights = np.exp(np.linspace(-2.5, 0.0, window_size))
+    weights /= np.sum(weights)
+    weighted_time = np.sum(weights * time)
+    time_variance = np.sum(weights * (time - weighted_time) ** 2)
+
+    position = 0.0
+    velocity = 0.0
+    previous_direction = 0.0
+
+    for i in range(output_length):
+        window = x[i : i + window_size]
+
+        # Weighted least-squares local line, evaluated at the current endpoint.
+        weighted_mean = np.sum(weights * window)
+        local_slope = np.sum(weights * (time - weighted_time) * (window - weighted_mean)) / time_variance
+        measurement = weighted_mean - local_slope * weighted_time
+
+        # Estimate local noise from residuals without allowing spikes to inflate
+        # the scale estimate and make the tracker insensitive.
+        residuals = window - (measurement + local_slope * time)
+        noise_scale = max(1.4826 * np.median(np.abs(residuals)), 1e-8)
+
+        if i == 0:
+            position = measurement
+            velocity = local_slope
+            y[i] = position
+            previous_direction = np.sign(velocity)
+            continue
+
+        prediction = position + velocity
+        innovation = measurement - prediction
+
+        # Significant innovations receive a rapid update; ordinary innovations
+        # use conservative gains to improve smoothness.
+        activity = min(abs(innovation) / (2.5 * noise_scale), 1.0)
+        alpha = 0.18 + 0.52 * activity
+        beta = 0.012 + 0.10 * activity
+
+        candidate_velocity = velocity + beta * innovation
+        candidate_direction = np.sign(candidate_velocity)
+        reversal_threshold = 2.0 * noise_scale
+
+        # Do not flip direction on a small innovation.  Decaying the velocity
+        # still permits a sustained opposite trend to reverse promptly.
+        if (
+            previous_direction != 0.0
+            and candidate_direction != 0.0
+            and candidate_direction != previous_direction
+            and abs(innovation) < reversal_threshold
+        ):
+            candidate_velocity = 0.5 * velocity
+
+        position = prediction + alpha * innovation
+        velocity = candidate_velocity
+        if abs(velocity) > noise_scale / max(window_size, 1):
+            previous_direction = np.sign(velocity)
+        y[i] = position
+
+    return y
+=======
+    if window_size < 3:
+        raise ValueError("window_size must be at least 3")
+
+    # The latest sample is at t=0.  A lightly regularized quadratic fit retains
+    # local curvature at real turning points while still being fully causal.
+    time = np.arange(window_size, dtype=float) - (window_size - 1)
+    weights = np.exp(np.linspace(-2.7, 0.0, window_size))
+    weights /= np.sum(weights)
+    design = np.column_stack((np.ones(window_size), time, time * time))
+    normal_matrix = design.T @ (weights[:, None] * design)
+    normal_matrix += np.diag((1e-10, 1e-10, 2e-4))
+    fit_operator = np.linalg.solve(normal_matrix, design.T * weights)
+
+    position = 0.0
+    velocity = 0.0
+    confirmed_direction = 0.0
+    pending_direction = 0.0
+    pending_count = 0
+
+    for i in range(output_length):
+        window = x[i : i + window_size]
+        coefficients = fit_operator @ window
+        measurement = coefficients[0]
+        local_slope = coefficients[1]
+        residuals = window - design @ coefficients
+        residual_center = np.median(residuals)
+        noise_scale = max(1.4826 * np.median(np.abs(residuals - residual_center)), 1e-8)
+
+        if i == 0:
+            position = measurement
+            velocity = local_slope
+            y[i] = position
+            confirmed_direction = np.sign(velocity)
+            continue
+
+        prediction = position + velocity
+        innovation = measurement - prediction
+        # A bounded innovation gives outliers limited influence on both states.
+        bounded_innovation = np.clip(innovation, -3.5 * noise_scale, 3.5 * noise_scale)
+        activity = min(abs(innovation) / (2.2 * noise_scale), 1.0)
+        alpha = 0.16 + 0.48 * activity
+
+        # Blend a level-derived velocity correction with the independently
+        # estimated local derivative.  This stabilizes slope without adding
+        # a delayed averaging stage.
+        velocity_measurement = 0.65 * local_slope + 0.35 * (velocity + 0.10 * bounded_innovation)
+        velocity_gain = 0.10 + 0.20 * activity
+        candidate_velocity = velocity + velocity_gain * (velocity_measurement - velocity)
+
+        velocity_deadband = 0.12 * noise_scale
+        candidate_direction = np.sign(candidate_velocity) if abs(candidate_velocity) > velocity_deadband else 0.0
+        significant_turn = abs(innovation) > 1.15 * noise_scale
+
+        if (
+            confirmed_direction != 0.0
+            and candidate_direction != 0.0
+            and candidate_direction != confirmed_direction
+        ):
+            if significant_turn and candidate_direction == pending_direction:
+                pending_count += 1
+            elif significant_turn:
+                pending_direction = candidate_direction
+                pending_count = 1
+            else:
+                pending_direction = 0.0
+                pending_count = 0
+
+            if pending_count < 2:
+                # Preserve the established direction until a turn persists.
+                candidate_velocity = 0.82 * velocity
+            else:
+                confirmed_direction = candidate_direction
+                pending_direction = 0.0
+                pending_count = 0
+        else:
+            pending_direction = 0.0
+            pending_count = 0
+            if candidate_direction != 0.0:
+                confirmed_direction = candidate_direction
+
+        position = prediction + alpha * bounded_innovation
+        velocity = candidate_velocity
+        y[i] = position
+
+    return y
+>>>>>>> REPLACE
+</DIFF>

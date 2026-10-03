@@ -1,0 +1,295 @@
+<NAME>
+analytic_multistart_hex26
+</NAME>
+
+<DESCRIPTION>
+This version keeps the layered 26-circle construction but adds an analytic Jacobian for all wall and pairwise separation constraints. This makes SLSQP substantially more efficient and permits a broader deterministic multistart search within the time budget. It explores rectangular, staggered, and triangular-like layered seeds with small asymmetric perturbations, then applies a final global radius scaling certificate to guarantee containment and non-overlap despite optimizer tolerances.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles"""
+import numpy as np
+
+
+def construct_packing():
+    """
+    Construct a high-sum unequal-radius packing of 26 disks in the unit square.
+
+    The initial configurations are five-layer near-hexagonal arrangements.
+    SLSQP jointly optimizes all center coordinates and all radii.  Exact
+    derivatives of the wall and disk-contact inequalities make a reasonably
+    broad deterministic multistart search inexpensive.
+    """
+    from scipy.optimize import minimize
+
+    n = 26
+    nc = 2 * n
+    nr_vars = 3 * n
+    pair_i, pair_j = np.triu_indices(n, 1)
+    pair_count = len(pair_i)
+    constraint_count = 4 * n + pair_count
+
+    row_counts = (5, 5, 6, 5, 5)
+    row_ids = np.repeat(np.arange(5), row_counts)
+
+    rectangular = []
+    staggered = []
+    triangular = []
+
+    for row, count in enumerate(row_counts):
+        y = 0.11 + 0.195 * row
+
+        if count == 6:
+            x_rect = np.linspace(0.10, 0.90, 6)
+            x_stag = np.linspace(0.09, 0.91, 6)
+            x_tri = np.linspace(0.085, 0.915, 6)
+        else:
+            x_rect = np.linspace(0.13, 0.87, 5)
+            shift = 0.040 if row % 2 else -0.040
+            x_stag = np.linspace(0.13 + shift, 0.87 + shift, 5)
+            tri_shift = 0.052 if row in (1, 3) else -0.032
+            x_tri = np.linspace(0.125 + tri_shift, 0.875 + tri_shift, 5)
+
+        rectangular.extend((x, y) for x in x_rect)
+        staggered.extend((x, y) for x in x_stag)
+        triangular.extend((x, y) for x in x_tri)
+
+    rectangular = np.asarray(rectangular, dtype=float)
+    staggered = np.asarray(staggered, dtype=float)
+    triangular = np.asarray(triangular, dtype=float)
+    seed_patterns = (rectangular, staggered, triangular)
+
+    def inequalities(z):
+        centers = z[:nc].reshape(n, 2)
+        radii = z[nc:]
+
+        walls = np.column_stack((
+            centers[:, 0] - radii,
+            centers[:, 1] - radii,
+            1.0 - centers[:, 0] - radii,
+            1.0 - centers[:, 1] - radii,
+        )).ravel()
+
+        delta = centers[pair_i] - centers[pair_j]
+        pair_clearance = np.einsum("ij,ij->i", delta, delta)
+        pair_clearance -= (radii[pair_i] + radii[pair_j]) ** 2
+
+        return np.concatenate((walls, pair_clearance))
+
+    def inequality_jacobian(z):
+        """Jacobian in the exact ordering returned by inequalities()."""
+        centers = z[:nc].reshape(n, 2)
+        radii = z[nc:]
+        jac = np.zeros((constraint_count, nr_vars), dtype=float)
+
+        circle = np.arange(n)
+        wall_rows = 4 * circle
+
+        jac[wall_rows, 2 * circle] = 1.0
+        jac[wall_rows, nc + circle] = -1.0
+
+        jac[wall_rows + 1, 2 * circle + 1] = 1.0
+        jac[wall_rows + 1, nc + circle] = -1.0
+
+        jac[wall_rows + 2, 2 * circle] = -1.0
+        jac[wall_rows + 2, nc + circle] = -1.0
+
+        jac[wall_rows + 3, 2 * circle + 1] = -1.0
+        jac[wall_rows + 3, nc + circle] = -1.0
+
+        delta = centers[pair_i] - centers[pair_j]
+        radius_sums = radii[pair_i] + radii[pair_j]
+        rows = 4 * n + np.arange(pair_count)
+
+        jac[rows, 2 * pair_i] = 2.0 * delta[:, 0]
+        jac[rows, 2 * pair_i + 1] = 2.0 * delta[:, 1]
+        jac[rows, 2 * pair_j] = -2.0 * delta[:, 0]
+        jac[rows, 2 * pair_j + 1] = -2.0 * delta[:, 1]
+        jac[rows, nc + pair_i] = -2.0 * radius_sums
+        jac[rows, nc + pair_j] = -2.0 * radius_sums
+
+        return jac
+
+    def objective(z):
+        return -float(np.sum(z[nc:]))
+
+    def objective_jacobian(z):
+        grad = np.zeros(nr_vars, dtype=float)
+        grad[nc:] = -1.0
+        return grad
+
+    bounds = [(0.00001, 0.99999)] * nc + [(0.000001, 0.5)] * n
+    constraint = {
+        "type": "ineq",
+        "fun": inequalities,
+        "jac": inequality_jacobian,
+    }
+
+    rng = np.random.default_rng(26031991)
+    best = None
+    best_value = -np.inf
+
+    # The first three starts retain clean layer topologies.  Later starts
+    # perturb these topologies asymmetrically, which is useful because the
+    # best unequal-radius square packing need not have reflection symmetry.
+    for trial in range(24):
+        centers0 = seed_patterns[trial % len(seed_patterns)].copy()
+
+        if trial >= 3:
+            amplitude = 0.006 + 0.003 * ((trial // 3) % 4)
+            centers0 += rng.normal(0.0, amplitude, centers0.shape)
+
+            phase = trial % 6
+            if phase == 0:
+                centers0[row_ids == 2, 0] += 0.012
+            elif phase == 1:
+                centers0[row_ids == 2, 0] -= 0.012
+            elif phase == 2:
+                centers0[row_ids <= 1, 0] -= 0.007
+                centers0[row_ids >= 3, 0] += 0.007
+            elif phase == 3:
+                centers0[row_ids <= 1, 1] -= 0.006
+                centers0[row_ids >= 3, 1] += 0.006
+            elif phase == 4:
+                centers0[row_ids == 1, 0] += 0.010
+                centers0[row_ids == 3, 0] -= 0.010
+
+            centers0 = np.clip(centers0, 0.045, 0.955)
+
+        z0 = np.concatenate((centers0.ravel(), np.full(n, 0.0245)))
+
+        result = minimize(
+            objective,
+            z0,
+            method="SLSQP",
+            jac=objective_jacobian,
+            bounds=bounds,
+            constraints=constraint,
+            options={
+                "maxiter": 1400,
+                "ftol": 1e-12,
+                "disp": False,
+            },
+        )
+
+        if np.all(np.isfinite(result.x)):
+            clearance = float(np.min(inequalities(result.x)))
+            value = float(np.sum(result.x[nc:]))
+            if clearance >= -3e-7 and value > best_value:
+                best = result.x.copy()
+                best_value = value
+
+    if best is None:
+        best = np.concatenate((rectangular.ravel(), np.full(n, 0.024)))
+
+    centers = best[:nc].reshape(n, 2).copy()
+    radii = best[nc:].copy()
+
+    # Certify strict feasibility.  A common radius multiplier preserves every
+    # pairwise constraint and every containment constraint simultaneously.
+    wall_limit = np.minimum.reduce((
+        centers[:, 0],
+        centers[:, 1],
+        1.0 - centers[:, 0],
+        1.0 - centers[:, 1],
+    ))
+    wall_scale = float(np.min(wall_limit / radii))
+
+    distances = np.sqrt(np.sum(
+        (centers[pair_i] - centers[pair_j]) ** 2,
+        axis=1,
+    ))
+    pair_scale = float(np.min(
+        distances / (radii[pair_i] + radii[pair_j])
+    ))
+
+    radii *= min(1.0, 0.9999995 * wall_scale, 0.9999995 * pair_scale)
+
+    return centers, radii, float(np.sum(radii))
+
+
+def compute_max_radii(centers):
+    """
+    Compute the maximum possible radii for each circle position
+    such that they don't overlap and stay within the unit square.
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+
+    Returns:
+        np.array of shape (n) with radius of each circle
+    """
+    n = centers.shape[0]
+    radii = np.ones(n)
+
+    # First, limit by distance to square borders
+    for i in range(n):
+        x, y = centers[i]
+        # Distance to borders
+        radii[i] = min(x, y, 1 - x, 1 - y)
+
+    # Then, limit by distance to other circles
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+
+            # If current radii would cause overlap
+            if radii[i] + radii[j] > dist:
+                # Scale both radii proportionally
+                scale = dist / (radii[i] + radii[j])
+                radii[i] *= scale
+                radii[j] *= scale
+
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)
+``` 
+</CODE>

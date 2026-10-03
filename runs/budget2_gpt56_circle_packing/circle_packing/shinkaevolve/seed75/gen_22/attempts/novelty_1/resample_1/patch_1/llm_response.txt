@@ -1,0 +1,295 @@
+<NAME>
+analytic_multistart_packing
+</NAME>
+
+<DESCRIPTION>
+The current approach uses 10 perturbed square-grid starts, tiny initial radii, numerical finite-difference derivatives, 900 SLSQP iterations, and a uniform feasibility shrink. This version retains the successful 5x5-plus-interstice scaffold but adds analytic Jacobians for all 325 pair constraints and 104 wall constraints, allowing more accurate SLSQP steps at lower derivative cost. It uses a mixture of grid and staggered layered starts, slightly larger feasible initial radii, 1200 iterations, and a final continuation polish from the best candidate. The explicit certification pass keeps the returned packing valid despite optimizer tolerances.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""Analytic multistart constructor for 26 circles in a unit square."""
+import numpy as np
+
+
+def construct_packing():
+    """
+    Construct a high-quality non-overlapping packing of 26 variable-radius
+    circles in the unit square.
+
+    The optimization variables are all center coordinates and radii.  Dense
+    grid and staggered-lattice seeds are refined by SLSQP using exact
+    derivatives of every geometric inequality.
+    """
+    n = 26
+    ii, jj = np.triu_indices(n, 1)
+    pair_count = len(ii)
+    variable_count = 3 * n
+
+    def certify(centers, radii):
+        """Apply one global scale factor to guarantee strict feasibility."""
+        centers = np.clip(np.asarray(centers, dtype=float), 0.0, 1.0)
+        radii = np.maximum(np.asarray(radii, dtype=float), 0.0)
+
+        factor = 1.0
+        positive = radii > 0.0
+        if np.any(positive):
+            factor = min(
+                factor,
+                float(np.min(centers[positive, 0] / radii[positive])),
+                float(np.min((1.0 - centers[positive, 0]) / radii[positive])),
+                float(np.min(centers[positive, 1] / radii[positive])),
+                float(np.min((1.0 - centers[positive, 1]) / radii[positive])),
+            )
+
+        delta = centers[ii] - centers[jj]
+        distance = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+        radius_sum = radii[ii] + radii[jj]
+        mask = radius_sum > 0.0
+        if np.any(mask):
+            factor = min(factor, float(np.min(distance[mask] / radius_sum[mask])))
+
+        radii = radii * max(0.0, min(1.0, factor * (1.0 - 2.0e-10)))
+        return centers, radii
+
+    def grid_seed():
+        grid = np.array(
+            [[x, y] for y in np.linspace(0.10, 0.90, 5)
+             for x in np.linspace(0.10, 0.90, 5)],
+            dtype=float,
+        )
+        # The extra disk starts within a grid face, not on a grid point.
+        return np.vstack((grid, [0.40, 0.40]))
+
+    def layered_seed(row_sizes, phase):
+        centers = []
+        rows = len(row_sizes)
+        for row, count in enumerate(row_sizes):
+            y = 0.09 + 0.82 * row / (rows - 1)
+            inset = 0.075 if row % 2 == 0 else 0.105
+            xs = np.linspace(inset, 1.0 - inset, count)
+            for col, x in enumerate(xs):
+                dx = 0.007 * np.sin(1.91 * (row + 1) * (col + 1) + phase)
+                dy = 0.006 * np.cos(1.37 * (row + 2) * (col + 1) + phase)
+                centers.append((np.clip(x + dx, 0.04, 0.96),
+                                np.clip(y + dy, 0.04, 0.96)))
+        return np.asarray(centers, dtype=float)
+
+    def inequalities(z):
+        centers = z[:2 * n].reshape(n, 2)
+        radii = z[2 * n:]
+
+        delta = centers[ii] - centers[jj]
+        pair_clearance = (
+            np.einsum("ij,ij->i", delta, delta)
+            - (radii[ii] + radii[jj]) ** 2
+        )
+        wall_clearance = np.concatenate((
+            centers[:, 0] - radii,
+            1.0 - centers[:, 0] - radii,
+            centers[:, 1] - radii,
+            1.0 - centers[:, 1] - radii,
+        ))
+        return np.concatenate((wall_clearance, pair_clearance))
+
+    def inequalities_jacobian(z):
+        centers = z[:2 * n].reshape(n, 2)
+        radii = z[2 * n:]
+        jac = np.zeros((4 * n + pair_count, variable_count), dtype=float)
+
+        k = np.arange(n)
+        xcol = 2 * k
+        ycol = 2 * k + 1
+        rcol = 2 * n + k
+
+        jac[k, xcol] = 1.0
+        jac[k, rcol] = -1.0
+
+        jac[n + k, xcol] = -1.0
+        jac[n + k, rcol] = -1.0
+
+        jac[2 * n + k, ycol] = 1.0
+        jac[2 * n + k, rcol] = -1.0
+
+        jac[3 * n + k, ycol] = -1.0
+        jac[3 * n + k, rcol] = -1.0
+
+        rows = 4 * n + np.arange(pair_count)
+        delta = centers[ii] - centers[jj]
+        summed_radii = radii[ii] + radii[jj]
+
+        jac[rows, 2 * ii] = 2.0 * delta[:, 0]
+        jac[rows, 2 * ii + 1] = 2.0 * delta[:, 1]
+        jac[rows, 2 * jj] = -2.0 * delta[:, 0]
+        jac[rows, 2 * jj + 1] = -2.0 * delta[:, 1]
+        jac[rows, 2 * n + ii] = -2.0 * summed_radii
+        jac[rows, 2 * n + jj] = -2.0 * summed_radii
+
+        return jac
+
+    objective_gradient = np.zeros(variable_count, dtype=float)
+    objective_gradient[2 * n:] = -1.0
+
+    def objective(z):
+        return -float(np.sum(z[2 * n:]))
+
+    base = grid_seed()
+    best_centers, best_radii = certify(base, np.full(n, 0.002))
+    best_value = float(np.sum(best_radii))
+
+    rng = np.random.default_rng(260319)
+
+    # EVOLVE-BLOCK-START
+    starts = [(base, 0.018)]
+    for _ in range(6):
+        perturbed = np.clip(
+            base + rng.normal(0.0, 0.026, size=base.shape),
+            0.035,
+            0.965,
+        )
+        starts.append((perturbed, 0.012))
+
+    starts.extend([
+        (layered_seed((5, 6, 5, 5, 5), 0.31), 0.025),
+        (layered_seed((5, 5, 6, 5, 5), 1.17), 0.025),
+        (layered_seed((4, 6, 5, 6, 5), 2.23), 0.020),
+    ])
+    # EVOLVE-BLOCK-END
+
+    try:
+        from scipy.optimize import minimize
+
+        bounds = (
+            [(0.00001, 0.99999)] * (2 * n)
+            + [(1.0e-8, 0.5)] * n
+        )
+        constraint = {
+            "type": "ineq",
+            "fun": inequalities,
+            "jac": inequalities_jacobian,
+        }
+
+        for centers0, radius0 in starts:
+            z0 = np.concatenate((
+                centers0.ravel(),
+                np.full(n, radius0, dtype=float),
+            ))
+            result = minimize(
+                objective,
+                z0,
+                method="SLSQP",
+                jac=lambda z: objective_gradient,
+                bounds=bounds,
+                constraints=constraint,
+                options={
+                    "maxiter": 1200,
+                    "ftol": 2.0e-11,
+                    "disp": False,
+                },
+            )
+
+            candidate = result.x if result.x is not None else z0
+            centers = candidate[:2 * n].reshape(n, 2)
+            radii = candidate[2 * n:]
+            centers, radii = certify(centers, radii)
+            value = float(np.sum(radii))
+
+            if value > best_value:
+                best_centers, best_radii, best_value = centers, radii, value
+
+        # One continuation optimization from the strongest discovered contact
+        # graph often improves the final few active constraints.
+        z_best = np.concatenate((best_centers.ravel(), best_radii))
+        result = minimize(
+            objective,
+            z_best,
+            method="SLSQP",
+            jac=lambda z: objective_gradient,
+            bounds=bounds,
+            constraints=constraint,
+            options={
+                "maxiter": 1600,
+                "ftol": 5.0e-12,
+                "disp": False,
+            },
+        )
+        if result.x is not None:
+            centers = result.x[:2 * n].reshape(n, 2)
+            radii = result.x[2 * n:]
+            centers, radii = certify(centers, radii)
+            value = float(np.sum(radii))
+            if value > best_value:
+                best_centers, best_radii, best_value = centers, radii, value
+
+    except Exception:
+        # The certified grid construction remains a portable valid fallback.
+        pass
+
+    return best_centers, best_radii, float(best_value)
+
+
+def compute_max_radii(centers):
+    """
+    Compute conservative valid radii for supplied centers.
+
+    Args:
+        centers: np.array of shape (n, 2)
+
+    Returns:
+        np.array of shape (n)
+    """
+    centers = np.asarray(centers, dtype=float)
+    n = len(centers)
+    radii = np.minimum.reduce((
+        centers[:, 0],
+        centers[:, 1],
+        1.0 - centers[:, 0],
+        1.0 - centers[:, 1],
+    )).copy()
+
+    for _ in range(3):
+        scale = 1.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                distance = np.linalg.norm(centers[i] - centers[j])
+                total = radii[i] + radii[j]
+                if total > distance and total > 0.0:
+                    scale = min(scale, distance / total)
+        radii *= scale
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+def run_packing():
+    """Run the circle packing constructor for n=26."""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """Visualize a packing."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        ax.add_patch(Circle(center, radius, alpha=0.5))
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+```
+</CODE>

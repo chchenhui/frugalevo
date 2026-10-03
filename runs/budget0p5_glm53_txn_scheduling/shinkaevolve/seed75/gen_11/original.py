@@ -1,0 +1,104 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using multi-start greedy + pairwise-swap local search.
+    """
+    n = workload.num_txns
+
+    # ---- Phase 1: candidate scoring via actual incremental makespan ----
+    def greedy_construct(sample_rate=1.0, seed=None):
+        rng = random.Random(seed)
+        # pick start txn that alone has lowest cost
+        best_start = 0
+        best_cost = None
+        for t in range(n):
+            c = workload.get_opt_seq_cost([t])
+            if best_cost is None or c < best_cost:
+                best_cost = c
+                best_start = t
+        seq = [best_start]
+        remaining = [t for t in range(n) if t != best_start]
+        while remaining:
+            if random.random() > sample_rate:
+                # occasional random move for diversification
+                idx = random.randint(0, len(remaining) - 1)
+                seq.append(remaining.pop(idx))
+                continue
+            best_t = None
+            best_c = None
+            for t in remaining:
+                c = workload.get_opt_seq_cost(seq + [t])
+                if best_c is None or c < best_c:
+                    best_c = c
+                    best_t = t
+            seq.append(best_t)
+            remaining.remove(best_t)
+        return seq
+
+    # ---- Phase 2: local search via adjacent/pairwise swaps ----
+    def swap_local_search(seq, max_rounds=3):
+        seq = list(seq)
+        best_cost = workload.get_opt_seq_cost(seq)
+        improved = True
+        rounds = 0
+        while improved and rounds < max_rounds:
+            improved = False
+            rounds += 1
+            for i in range(n - 1):
+                for j in range(i + 1, min(n, i + 5)):  # limited window swaps
+                    seq[i], seq[j] = seq[j], seq[i]
+                    c = workload.get_opt_seq_cost(seq)
+                    if c < best_cost:
+                        best_cost = c
+                        improved = True
+                    else:
+                        seq[i], seq[j] = seq[j], seq[i]
+        return best_cost, seq
+
+    # ---- Phase 3: multi-restart wrapper keeping best schedule ----
+    best_cost = None
+    best_seq = None
+    restarts = max(3, num_seqs)
+    for k in range(restarts):
+        if k == 0:
+            seq = greedy_construct(1.0, seed=0)
+        elif k == 1:
+            seq = list(range(n))
+            random.shuffle(seq)
+        else:
+            seq = greedy_construct(0.8, seed=k)
+        c, seq = swap_local_search(seq)
+        if best_cost is None or c < best_cost:
+            best_cost = c
+            best_seq = seq
+    return best_cost, best_seq
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

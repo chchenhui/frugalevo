@@ -1,0 +1,144 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get schedule using Large Neighborhood Search (ruin-and-recreate)
+    followed by simulated annealing polish.
+    Returns: (lowest makespan, corresponding schedule)
+    """
+    import math
+    import time
+
+    n = workload.num_txns
+    cost_fn = workload.get_opt_seq_cost
+    start_time = time.time()
+    time_limit = 30.0
+    deadline = start_time + time_limit
+
+    def greedy_construct():
+        """Randomized greedy construction: iteratively append the txn
+        that yields lowest partial makespan (with sampling)."""
+        seq = [random.randint(0, n - 1)]
+        remaining = [x for x in range(n) if x != seq[0]]
+        while remaining:
+            best_t = None
+            best_c = float('inf')
+            k = min(10, len(remaining))
+            for t in random.sample(remaining, k):
+                c = cost_fn(seq + [t])
+                if c < best_c:
+                    best_c = c
+                    best_t = t
+            seq.append(best_t)
+            remaining.remove(best_t)
+        return seq
+
+    def best_insertion(seq, t):
+        """Insert txn t at the position minimizing makespan."""
+        best_c = float('inf')
+        best_j = 0
+        for j in range(len(seq) + 1):
+            cand = seq[:j] + [t] + seq[j:]
+            c = cost_fn(cand)
+            if c < best_c:
+                best_c = c
+                best_j = j
+        return seq[:best_j] + [t] + seq[best_j:], best_c
+
+    def ruin_recreate(seq, cost):
+        """Remove a random subset of txns, greedily reinsert each."""
+        m = max(3, min(12, int(n * random.uniform(0.05, 0.12))))
+        removed = random.sample(range(len(seq)), m)
+        removed_txns = [seq[i] for i in removed]
+        kept = [seq[i] for i in range(len(seq)) if i not in set(removed)]
+        random.shuffle(removed_txns)
+        for t in removed_txns:
+            kept, _ = best_insertion(kept, t)
+        return kept, cost_fn(kept)
+
+    # --- Phase 1: build initial pool ---
+    pool = []
+    while time.time() < start_time + time_limit * 0.2 and len(pool) < 5:
+        s = greedy_construct()
+        c = cost_fn(s)
+        pool.append((c, s))
+        if time.time() >= start_time + time_limit * 0.2:
+            break
+    if not pool:
+        pool.append((cost_fn(list(range(n))), list(range(n))))
+    pool.sort(key=lambda x: x[0])
+    best_cost, best_seq = pool[0]
+
+    # --- Phase 2: LNS ruin-and-recreate on top candidates ---
+    lns_deadline = start_time + time_limit * 0.75
+    for c0, s0 in pool[:3]:
+        cur_seq, cur_cost = s0, c0
+        stall = 0
+        while time.time() < lns_deadline:
+            cand, c = ruin_recreate(cur_seq, cur_cost)
+            if c < cur_cost:
+                cur_seq, cur_cost = cand, c
+                stall = 0
+                if c < best_cost:
+                    best_cost, best_seq = c, list(cand)
+            else:
+                stall += 1
+                if stall > 30:
+                    # restart from best known
+                    cur_seq, cur_cost = list(best_seq), best_cost
+                    stall = 0
+
+    # --- Phase 3: SA polish with insertion + adjacent swaps ---
+    cur_seq, cur_cost = list(best_seq), best_cost
+    T = max(1.0, best_cost * 0.02)
+    alpha = 0.999
+    while time.time() < deadline:
+        T *= alpha
+        if T < 0.05:
+            T = 0.05
+        i = random.randint(0, len(cur_seq) - 1)
+        cand = cur_seq.copy()
+        t = cand.pop(i)
+        if random.random() < 0.5:
+            j = random.randint(0, len(cand))
+            cand.insert(j, t)
+        else:
+            j = min(len(cand) - 1, i)
+            cand.insert(j, t)
+        c = cost_fn(cand)
+        delta = c - cur_cost
+        if delta <= 0 or random.random() < math.exp(-delta / T):
+            cur_seq, cur_cost = cand, c
+            if c < best_cost:
+                best_cost, best_seq = c, list(cand)
+
+    return best_cost, best_seq
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

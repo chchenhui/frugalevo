@@ -1,0 +1,180 @@
+<NAME>
+multi_start_and_or_opt_moves
+</NAME>
+<DESCRIPTION>
+Reasoning:
+1. The current algorithm uses a single greedy construction + local search + ruin-and-recreate. A known weakness of single-seed iterated local search is premature convergence to one basin. Keeping a small pool of diverse seeds (from multiple randomized greedy constructions) and running ruin-and-recreate + local search on each spreads the search across basins, which is standard practice in ILS/beam-style scheduling optimizers.
+2. The local search only uses single-txn relocation and swaps. Adding Or-opt moves (relocating short contiguous segments of 2–3 transactions) is a classic improvement for sequencing problems because good schedules often require moving small blocks of dependent transactions together.
+3. The ruin operator currently only removes one contiguous segment. Removing multiple random scattered transactions ("random ruin") diversifies differently than contiguous "radial ruin" and is known (Schneider et al., ruin-and-recreate literature) to escape different local optima.
+
+Changes:
+- Build a pool of 3 seeds via greedy+local-search, each with a time slice, then continue ILS from the best, periodically re-seeding perturbations from the second-best to explore a different basin.
+- Add Or-opt segment relocation moves to the local search.
+- Perturbation randomly chooses between contiguous ruin and scattered random ruin.
+
+This should lower makespan by exploring more of the search space within the same time budget.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    def local_search(seq, cost, deadline, max_moves_per_pass=200):
+        # Relocation + swap local search on the full-sequence cost.
+        n = workload.num_txns
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            moves = []
+            for _ in range(min(max_moves_per_pass, n * 2)):
+                i = random.randint(0, n - 1)
+                j = random.randint(0, n - 1)
+                if i != j:
+                    moves.append((i, j))
+            for i, j in moves:
+                if time.time() >= deadline:
+                    break
+                cand = seq[:]
+                if random.random() < 0.5:
+                    # relocation: move txn at i to position j
+                    t = cand.pop(i)
+                    cand.insert(j, t)
+                else:
+                    # swap positions i and j
+                    cand[i], cand[j] = cand[j], cand[i]
+                c = workload.get_opt_seq_cost(cand)
+                if c < cost:
+                    seq = cand
+                    cost = c
+                    improved = True
+        return cost, seq
+=======
+    def local_search(seq, cost, deadline, max_moves_per_pass=200):
+        # Relocation + swap + Or-opt segment local search on the
+        # full-sequence cost. Or-opt moves relocate short contiguous
+        # blocks of 2-3 transactions, which helps move groups of
+        # mutually-dependent transactions together.
+        n = workload.num_txns
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            moves = []
+            for _ in range(min(max_moves_per_pass, n * 2)):
+                i = random.randint(0, n - 1)
+                j = random.randint(0, n - 1)
+                if i != j:
+                    moves.append((i, j))
+            for i, j in moves:
+                if time.time() >= deadline:
+                    break
+                cand = seq[:]
+                r = random.random()
+                if r < 0.35:
+                    # relocation: move txn at i to position j
+                    t = cand.pop(i)
+                    cand.insert(j, t)
+                elif r < 0.7:
+                    # swap positions i and j
+                    cand[i], cand[j] = cand[j], cand[i]
+                else:
+                    # Or-opt: relocate a contiguous segment of length 2-3
+                    seg_len = random.randint(2, 3)
+                    i2 = min(i, n - seg_len)
+                    seg = cand[i2:i2 + seg_len]
+                    rest = cand[:i2] + cand[i2 + seg_len:]
+                    j2 = max(0, min(j, len(rest)))
+                    cand = rest[:j2] + seg + rest[j2:]
+                c = workload.get_opt_seq_cost(cand)
+                if c < cost:
+                    seq = cand
+                    cost = c
+                    improved = True
+        return cost, seq
+>>>>>>> REPLACE
+
+<DIFF>
+<<<<<<< SEARCH
+    def perturb_best(seq):
+        # Ruin-and-recreate: remove a random contiguous segment of
+        # transactions from the incumbent and greedily reinsert each
+        # at the position that minimizes the true makespan. This keeps
+        # the candidate close to the best solution while providing
+        # enough diversification for the local search to escape optima.
+        n = workload.num_txns
+        k = random.randint(3, min(8, n - 1))
+        start = random.randint(0, n - k)
+        removed = seq[start:start + k]
+        cand = seq[:start] + seq[start + k:]
+=======
+    def perturb_best(seq):
+        # Ruin-and-recreate: remove transactions from the incumbent and
+        # greedily reinsert each at the position that minimizes the true
+        # makespan. Randomly choose between contiguous "radial" ruin and
+        # scattered "random" ruin for diversification.
+        n = workload.num_txns
+        k = random.randint(3, min(8, n - 1))
+        if random.random() < 0.5:
+            start = random.randint(0, n - k)
+            removed = seq[start:start + k]
+            cand = seq[:start] + seq[start + k:]
+        else:
+            idxs = random.sample(range(n), k)
+            removed = [seq[i] for i in sorted(idxs)]
+            cand = [seq[i] for i in range(n) if i not in set(idxs)]
+>>>>>>> REPLACE
+
+<DIFF>
+<<<<<<< SEARCH
+    time_budget = 20.0  # seconds per workload
+    deadline = time.time() + time_budget
+    # Initial construction: greedy + local search.
+    best_cost, best_seq = get_full_greedy(0.05)
+    best_cost, best_seq = local_search(best_seq, best_cost, deadline)
+    # Iterated local search: perturb the incumbent and re-polish,
+    # accepting only improvements, under the time budget.
+    while time.time() < deadline:
+        cand = perturb_best(best_seq)
+        cost = workload.get_opt_seq_cost(cand)
+        # give each candidate a bounded slice of the remaining budget
+        slice_deadline = min(deadline, time.time() + 2.0)
+        cost, cand = local_search(cand, cost, slice_deadline)
+        if cost < best_cost:
+            best_cost = cost
+            best_seq = cand
+    return best_cost, best_seq
+=======
+    time_budget = 20.0  # seconds per workload
+    deadline = time.time() + time_budget
+    # Multi-start construction: build a small pool of diverse seeds
+    # (greedy + short local search each), keep the top-3, and polish
+    # each further. Working from several basins reduces the chance of
+    # premature convergence to a single local optimum.
+    pool = []
+    while time.time() < min(deadline, time.time() + time_budget * 0.3) and len(pool) < 3:
+        cost, seq = get_full_greedy(0.05)
+        slice_deadline = min(deadline, time.time() + 2.0)
+        cost, seq = local_search(seq, cost, slice_deadline)
+        pool.append((cost, seq))
+        pool.sort(key=lambda x: x[0])
+    if pool:
+        best_cost, best_seq = pool[0]
+    else:
+        best_cost, best_seq = get_full_greedy(0.05)
+    # Iterated local search: perturb the incumbent (and occasionally
+    # the second-best seed to explore a different basin) and re-polish,
+    # accepting only improvements, under the time budget.
+    while time.time() < deadline:
+        if len(pool) > 1 and random.random() < 0.15:
+            cand = perturb_best(pool[1][1])
+        else:
+            cand = perturb_best(best_seq)
+        cost = workload.get_opt_seq_cost(cand)
+        # give each candidate a bounded slice of the remaining budget
+        slice_deadline = min(deadline, time.time() + 2.0)
+        cost, cand = local_search(cand, cost, slice_deadline)
+        if cost < best_cost:
+            best_cost = cost
+            best_seq = cand
+            pool.append((cost, cand))
+            pool.sort(key=lambda x: x[0])
+            pool = pool[:3]
+    return best_cost, best_seq
+>>>>>>> REPLACE
+</DIFF>

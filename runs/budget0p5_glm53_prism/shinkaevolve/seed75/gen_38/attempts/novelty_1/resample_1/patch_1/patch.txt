@@ -1,0 +1,359 @@
+--- a/original.py
++++ b/original.py
+@@ -1,219 +1,270 @@
+ GPU_MEM_SIZE = 80 # GB
+ 
+ # EVOLVE-BLOCK-START
+ 
+ def compute_model_placement(gpu_num, models):
+     """
+     Compute a model placement that minimizes the maximum KVPR across all GPUs.
++
++    Args:
++        gpu_num: Number of GPUs
++        models: List of models to place
++
++    Returns:
++        A placement of models to GPUs
+     """
+ 
+     def kvpr_of(load, used_mem):
+         denom = GPU_MEM_SIZE - used_mem
+         if denom <= 0:
+             return float('inf') if load > 0 else 0.0
+         return load / denom
+ 
+-    def run_pipeline(order_key):
+-        sorted_models = sorted(models, key=order_key, reverse=True)
+-
++    def construct(order):
++        """Greedy construction from a given model order. Returns state or None."""
+         placement = {g: [] for g in range(gpu_num)}
+         free_mem = [GPU_MEM_SIZE] * gpu_num
+         load = [0.0] * gpu_num
+-
+-        for model in sorted_models:
++        for model in order:
+             w = model.req_rate / model.slo
+             best_idx, best_kvpr = None, float('inf')
+             for g in range(gpu_num):
+                 if model.model_size <= free_mem[g]:
+                     k = kvpr_of(load[g] + w,
+                                 GPU_MEM_SIZE - free_mem[g] + model.model_size)
+                     if k < best_kvpr:
+                         best_kvpr, best_idx = k, g
+             if best_idx is None:
+-                return None, float('inf')
++                return None
+             placement[best_idx].append(model)
+             load[best_idx] += w
+             free_mem[best_idx] -= model.model_size
++        return placement, free_mem, load
++
++    def local_search(placement, free_mem, load, max_iters=60):
++        """Atomic best-op local search: moves, 1-for-1, 2-for-1, 2-for-2 swaps."""
+ 
+         def state_kvprs():
+             return [kvpr_of(load[g], GPU_MEM_SIZE - free_mem[g])
+                     for g in range(gpu_num)]
+ 
+-        for _ in range(60):
++        for _ in range(max_iters):
+             kvprs = state_kvprs()
+             hot = max(range(gpu_num), key=lambda g: kvprs[g])
+             hot_kvpr = kvprs[hot]
+             others = [kvprs[g] for g in range(gpu_num) if g != hot]
+             base_others = max(others) if others else 0.0
+             cur_max = hot_kvpr
+ 
+             best_gain, best_op = 0.0, None
+             hot_used = GPU_MEM_SIZE - free_mem[hot]
+ 
+             # --- moves: one model from hot to g ---
+             for model in placement[hot]:
+                 w = model.req_rate / model.slo
+                 new_used = hot_used - model.model_size
+                 src_kvpr = kvpr_of(load[hot] - w, new_used) if new_used > 0 else 0.0
+                 for g in range(gpu_num):
+                     if g == hot or model.model_size > free_mem[g]:
+                         continue
+                     dst_kvpr = kvpr_of(load[g] + w,
+                                        GPU_MEM_SIZE - free_mem[g] + model.model_size)
+                     new_max = max(base_others, src_kvpr, dst_kvpr)
+                     gain = cur_max - new_max
+                     if gain > best_gain + 1e-12:
+                         best_gain = gain
+                         best_op = ('move', (model,), g, ())
+ 
+-            # --- 1-for-1 swaps ---
+-            for model in placement[hot]:
+-                w1 = model.req_rate / model.slo
+-                s1 = model.model_size
++            # --- swaps of 1, 2 models from hot vs 1, 2 models from g ---
++            hotlist = placement[hot]
++            src_groups = []
++            for i in range(len(hotlist)):
++                src_groups.append((hotlist[i],))
++                for j in range(i + 1, len(hotlist)):
++                    src_groups.append((hotlist[i], hotlist[j]))
++            for src_models in src_groups:
++                w1 = sum(m.req_rate / m.slo for m in src_models)
++                s1 = sum(m.model_size for m in src_models)
+                 for g in range(gpu_num):
+                     if g == hot:
+                         continue
+-                    for m2 in placement[g]:
+-                        w2 = m2.req_rate / m2.slo
+-                        s2 = m2.model_size
++                    glist = placement[g]
++                    dst_groups = []
++                    for a in range(len(glist)):
++                        dst_groups.append((glist[a],))
++                        for b in range(a + 1, len(glist)):
++                            dst_groups.append((glist[a], glist[b]))
++                    for dst_models in dst_groups:
++                        w2 = sum(m.req_rate / m.slo for m in dst_models)
++                        s2 = sum(m.model_size for m in dst_models)
+                         if s2 > free_mem[hot] + s1 or s1 > free_mem[g] + s2:
+                             continue
+                         src_used = hot_used - s1 + s2
+                         dst_used = (GPU_MEM_SIZE - free_mem[g]) - s2 + s1
+                         if src_used <= 0 or dst_used <= 0:
+                             continue
+                         src_kvpr = kvpr_of(load[hot] - w1 + w2, src_used)
+                         dst_kvpr = kvpr_of(load[g] - w2 + w1, dst_used)
+                         new_max = max(base_others, src_kvpr, dst_kvpr)
+                         gain = cur_max - new_max
+                         if gain > best_gain + 1e-12:
+                             best_gain = gain
+-                            best_op = ('swap', (model,), g, (m2,))
+-
+-            # --- 2-for-1: one model on hot <-> two models on g ---
+-            for model in placement[hot]:
+-                w1 = model.req_rate / model.slo
+-                s1 = model.model_size
+-                for g in range(gpu_num):
+-                    if g == hot:
+-                        continue
+-                    glist = placement[g]
+-                    for i in range(len(glist)):
+-                        for j in range(i + 1, len(glist)):
+-                            m2, m3 = glist[i], glist[j]
+-                            s2 = m2.model_size + m3.model_size
+-                            w2 = m2.req_rate / m2.slo + m3.req_rate / m3.slo
+-                            if s2 > free_mem[hot] + s1 or s1 > free_mem[g] + s2:
+-                                continue
+-                            src_used = hot_used - s1 + s2
+-                            dst_used = (GPU_MEM_SIZE - free_mem[g]) - s2 + s1
+-                            if src_used <= 0 or dst_used <= 0:
+-                                continue
+-                            src_kvpr = kvpr_of(load[hot] - w1 + w2, src_used)
+-                            dst_kvpr = kvpr_of(load[g] - w2 + w1, dst_used)
+-                            new_max = max(base_others, src_kvpr, dst_kvpr)
+-                            gain = cur_max - new_max
+-                            if gain > best_gain + 1e-12:
+-                                best_gain = gain
+-                                best_op = ('swap', (model,), g, (m2, m3))
+-
+-            # --- 2-for-2: two models on hot <-> two models on g ---
+-            hotlist = placement[hot]
+-            for i in range(len(hotlist)):
+-                for j in range(i + 1, len(hotlist)):
+-                    m1, m1b = hotlist[i], hotlist[j]
+-                    s1 = m1.model_size + m1b.model_size
+-                    w1 = m1.req_rate / m1.slo + m1b.req_rate / m1b.slo
+-                    for g in range(gpu_num):
+-                        if g == hot:
+-                            continue
+-                        glist = placement[g]
+-                        for a in range(len(glist)):
+-                            for b in range(a + 1, len(glist)):
+-                                m2, m2b = glist[a], glist[b]
+-                                s2 = m2.model_size + m2b.model_size
+-                                w2 = m2.req_rate / m2.slo + m2b.req_rate / m2b.slo
+-                                if s2 > free_mem[hot] + s1 or s1 > free_mem[g] + s2:
+-                                    continue
+-                                src_used = hot_used - s1 + s2
+-                                dst_used = (GPU_MEM_SIZE - free_mem[g]) - s2 + s1
+-                                if src_used <= 0 or dst_used <= 0:
+-                                    continue
+-                                src_kvpr = kvpr_of(load[hot] - w1 + w2, src_used)
+-                                dst_kvpr = kvpr_of(load[g] - w2 + w1, dst_used)
+-                                new_max = max(base_others, src_kvpr, dst_kvpr)
+-                                gain = cur_max - new_max
+-                                if gain > best_gain + 1e-12:
+-                                    best_gain = gain
+-                                    best_op = ('swap', (m1, m1b), g, (m2, m2b))
++                            best_op = ('swap', src_models, g, dst_models)
+ 
+             if best_op is None:
+                 break
+ 
+             kind, src_models, g, dst_models = best_op
+             w_src = sum(m.req_rate / m.slo for m in src_models)
+             s_src = sum(m.model_size for m in src_models)
+             w_dst = sum(m.req_rate / m.slo for m in dst_models)
+             s_dst = sum(m.model_size for m in dst_models)
+             for m in src_models:
+-                placement[hot].remove(m)
+-            for m in dst_models:
+-                placement[g].remove(m)
++                idx = placement[hot].index(m)
++                placement[hot].pop(idx)
++            for m in dst_models:
++                idx = placement[g].index(m)
++                placement[g].pop(idx)
+             for m in dst_models:
+                 placement[hot].append(m)
+             for m in src_models:
+                 placement[g].append(m)
+             load[hot] += w_dst - w_src
+             free_mem[hot] += s_src - s_dst
+             load[g] += w_src - w_dst
+             free_mem[g] += s_dst - s_src
+ 
+-        kvprs = state_kvprs()
+-        return placement, max(kvprs)
++        return placement, free_mem, load
++
++    def pair_polish(placement, free_mem, load, max_iters=20):
++        """Final polish: pairwise swaps across non-hot GPUs lowering max, then 2nd max."""
++        def state_kvprs():
++            return [kvpr_of(load[g], GPU_MEM_SIZE - free_mem[g])
++                    for g in range(gpu_num)]
++
++        for _ in range(max_iters):
++            kvprs = state_kvprs()
++            ranked = sorted(kvprs, reverse=True)
++            cur_key = (ranked[0], ranked[1] if len(ranked) > 1 else 0.0)
++            best_key, best_op = cur_key, None
++            for g1 in range(gpu_num):
++                for g2 in range(g1 + 1, gpu_num):
++                    used1 = GPU_MEM_SIZE - free_mem[g1]
++                    used2 = GPU_MEM_SIZE - free_mem[g2]
++                    src_groups = [(m,) for m in placement[g1]]
++                    dst_groups = [(m,) for m in placement[g2]]
++                    for src_models in src_groups:
++                        for dst_models in dst_groups:
++                            w1 = sum(m.req_rate / m.slo for m in src_models)
++                            s1 = sum(m.model_size for m in src_models)
++                            w2 = sum(m.req_rate / m.slo for m in dst_models)
++                            s2 = sum(m.model_size for m in dst_models)
++                            if s2 > free_mem[g1] + s1 or s1 > free_mem[g2] + s2:
++                                continue
++                            u1 = used1 - s1 + s2
++                            u2 = used2 - s2 + s1
++                            if u1 <= 0 or u2 <= 0:
++                                continue
++                            k1 = kvpr_of(load[g1] - w1 + w2, u1)
++                            k2 = kvpr_of(load[g2] - w2 + w1, u2)
++                            others = [kvprs[k] for k in range(gpu_num)
++                                      if k != g1 and k != g2]
++                            new_ranked = sorted(others + [k1, k2], reverse=True)
++                            new_key = (new_ranked[0],
++                                       new_ranked[1] if len(new_ranked) > 1 else 0.0)
++                            if new_key < best_key and new_key[0] <= cur_key[0] + 1e-12:
++                                best_key = new_key
++                                best_op = (g1, src_models, g2, dst_models)
++            if best_op is None:
++                break
++            g1, src_models, g2, dst_models = best_op
++            w1 = sum(m.req_rate / m.slo for m in src_models)
++            s1 = sum(m.model_size for m in src_models)
++            w2 = sum(m.req_rate / m.slo for m in dst_models)
++            s2 = sum(m.model_size for m in dst_models)
++            for m in src_models:
++                idx = placement[g1].index(m)
++                placement[g1].pop(idx)
++            for m in dst_models:
++                idx = placement[g2].index(m)
++                placement[g2].pop(idx)
++            for m in dst_models:
++                placement[g1].append(m)
++            for m in src_models:
++                placement[g2].append(m)
++            load[g1] += w2 - w1
++            free_mem[g1] += s1 - s2
++            load[g2] += w1 - w2
++            free_mem[g2] += s2 - s1
++
++        return placement
+ 
+     if gpu_num <= 0:
+         raise ValueError("gpu_num must be positive")
+ 
+-    orderings = [
+-        lambda m: m.req_rate / m.slo,
+-        lambda m: m.model_size,
+-        lambda m: (m.req_rate / m.slo) / max(m.model_size, 1e-9),
+-        lambda m: (m.req_rate / m.slo, m.model_size),
+-    ]
++    import random
++
++    # Candidate orders: 4 deterministic + randomized restarts
++    orders = []
++    orders.append(sorted(models, key=lambda m: m.req_rate / m.slo, reverse=True))
++    orders.append(sorted(models, key=lambda m: m.model_size, reverse=True))
++    orders.append(sorted(models,
++                         key=lambda m: (m.req_rate / m.slo) / max(m.model_size, 1e-9),
++                         reverse=True))
++    orders.append(sorted(models,
++                         key=lambda m: (m.req_rate / m.slo, m.model_size),
++                         reverse=True))
++    rng = random.Random(12345)
++    n = len(models)
++    for _ in range(min(20, max(0, 200 // max(n, 1)))):
++        order = list(models)
++        # noise-perturbed priority ordering
++        order.sort(key=lambda m: (m.req_rate / m.slo) * (1.0 + rng.uniform(-0.5, 0.5)),
++                   reverse=True)
++        orders.append(order)
+ 
+     best_placement, best_max = None, float('inf')
+-    for key in orderings:
+-        placement, mx = run_pipeline(key)
+-        if placement is not None and mx < best_max:
++    for order in orders:
++        built = construct(order)
++        if built is None:
++            continue
++        placement, free_mem, load = built
++        placement, free_mem, load = local_search(placement, free_mem, load)
++        placement = pair_polish(placement, free_mem, load)
++        final_kvprs = [kvpr_of(sum(m.req_rate / m.slo for m in placement[g]),
++                               sum(m.model_size for m in placement[g]))
++                      for g in range(gpu_num)]
++        mx = max(final_kvprs)
++        if mx < best_max:
+             best_max, best_placement = mx, placement
+ 
+     if best_placement is None:
+         raise ValueError("Unable to place all models on the given GPUs.")
+ 
+     return best_placement
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ if __name__ == "__main__":
+     # Test the algorithm
+ 
+     from evaluator import generate_test_gpu_models
+     from evaluator import calculate_kvcache_pressure
+     from evaluator import safe_float
+     import numpy as np
+ 
+     test_cases = generate_test_gpu_models()
+     all_kvpr = []
+     for i, (gpu_num, gpu_models) in enumerate(test_cases):
+ 
+         results = compute_model_placement(gpu_num, gpu_models)
+         max_kvpr = calculate_kvcache_pressure(results)
+         all_kvpr.append(safe_float(max_kvpr))
+ 
+     avg_kvpr = np.mean(all_kvpr)
+     if avg_kvpr != 0:
+         avg_kvpr = 1.0 / avg_kvpr
+ 
+ 
+     print(f"Max KVPR: {avg_kvpr:.3f}")

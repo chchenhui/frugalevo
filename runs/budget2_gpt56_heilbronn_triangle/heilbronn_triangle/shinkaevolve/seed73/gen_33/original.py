@@ -1,0 +1,279 @@
+# EVOLVE-BLOCK-START
+import itertools
+
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Deterministically construct eleven points in the reference equilateral
+    triangle.  Search coordinates are barycentric pairs (u, v), with
+    u >= 0, v >= 0, u + v <= 1.
+
+    In these coordinates, a triangle determinant is its area normalized by
+    the area of the enclosing equilateral triangle.
+    """
+    n = 11
+    free_start = 3
+    free_count = n - free_start
+    population_size = 128
+    elite_count = 16
+    generations = 6200
+    rng = np.random.default_rng(11031957)
+
+    triples = np.asarray(
+        list(itertools.combinations(range(n), 3)), dtype=np.intp
+    )
+    triple_a = triples[:, 0]
+    triple_b = triples[:, 1]
+    triple_c = triples[:, 2]
+
+    corners = np.array(
+        ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)), dtype=float
+    )
+
+    def project_simplex(points: np.ndarray) -> np.ndarray:
+        """
+        Map arbitrary barycentric pairs to the closed unit simplex.
+
+        The projection is deliberately robust against rare large differential
+        proposals: negative coordinates are removed and any excess total
+        weight is normalized away.
+        """
+        result = np.maximum(points, 0.0)
+        total = result.sum(axis=-1, keepdims=True)
+        result /= np.maximum(total, 1.0)
+        return result
+
+    def determinant_table(configurations: np.ndarray) -> np.ndarray:
+        """Return normalized absolute determinants for every point triple."""
+        selected = configurations[:, triples]
+        ab = selected[:, :, 1] - selected[:, :, 0]
+        ac = selected[:, :, 2] - selected[:, :, 0]
+        return np.abs(ab[..., 0] * ac[..., 1] - ab[..., 1] * ac[..., 0])
+
+    def evaluate(configurations: np.ndarray, tail_weight: float):
+        """
+        Produce both true bottleneck values and a smooth low-tail ranking.
+
+        The ranking signal rewards several near-minimum constraints during
+        exploration, while the true minimum remains the only saved objective.
+        """
+        areas = determinant_table(configurations)
+        smallest = np.partition(areas, 9, axis=1)[:, :10]
+        minima = smallest[:, 0]
+        ranking_value = minima + tail_weight * smallest.mean(axis=1)
+        return areas, minima, ranking_value
+
+    def active_point_masks(active_triples: np.ndarray) -> np.ndarray:
+        """
+        Convert per-layout active triple IDs to masks over movable point IDs.
+        """
+        count, constraint_count = active_triples.shape
+        involved = triples[active_triples].reshape(count, 3 * constraint_count)
+        masks = np.zeros((count, n), dtype=bool)
+        masks[
+            np.repeat(np.arange(count), involved.shape[1]),
+            involved.ravel(),
+        ] = True
+        masks[:, :free_start] = False
+        return masks[:, free_start:, None]
+
+    # Initialization mixes broad random samples with a modest structured seed.
+    weights = rng.dirichlet((0.9, 0.9, 0.9), size=(population_size, n))
+    population = weights[..., 1:].copy()
+    population[:, :free_start] = corners
+
+    seed_layout = np.array(
+        (
+            (0.0, 0.0), (1.0, 0.0), (0.0, 1.0),
+            (0.18, 0.11), (0.48, 0.09), (0.77, 0.08),
+            (0.09, 0.39), (0.35, 0.32), (0.62, 0.24),
+            (0.11, 0.68), (0.36, 0.51),
+        ),
+        dtype=float,
+    )
+    for index in range(12):
+        trial = seed_layout.copy()
+        trial[free_start:] += rng.normal(
+            0.0, 0.040 + 0.006 * index, size=(free_count, 2)
+        )
+        trial[free_start:] = project_simplex(trial[free_start:])
+        population[index] = trial
+
+    areas, minima, ranking_values = evaluate(population, 0.055)
+    best_index = int(np.argmax(minima))
+    best = population[best_index].copy()
+    best_value = float(minima[best_index])
+
+    # Evolution is organized as a generational pipeline:
+    # evaluate -> rank -> generate broad/focused offspring -> replace.
+    for generation in range(generations):
+        progress = generation / (generations - 1)
+        tail_weight = 0.055 * max(0.0, 1.0 - progress / 0.78) ** 1.45
+
+        ranking = np.argsort(ranking_values)[::-1]
+        elite_indices = ranking[:elite_count]
+        elites = population[elite_indices]
+        elite_areas = areas[elite_indices]
+        elite_minima = minima[elite_indices]
+
+        elite_best_index = int(np.argmax(elite_minima))
+        if elite_minima[elite_best_index] > best_value:
+            best_value = float(elite_minima[elite_best_index])
+            best = elites[elite_best_index].copy()
+
+        # Precompute active constraints for every elite.  These IDs are reused
+        # by focused offspring rather than repeatedly evaluating parents.
+        active_count = 10 if progress < 0.70 else 7
+        elite_active = np.argpartition(
+            elite_areas, active_count - 1, axis=1
+        )[:, :active_count]
+
+        parent_choices = rng.integers(elite_count, size=population_size)
+        parents = elites[parent_choices]
+        candidates = parents.copy()
+
+        sigma = 0.078 * (1.0 - progress) ** 1.75 + 0.00055
+        changed_probability = 0.38 - 0.24 * progress
+        changed = (
+            rng.random((population_size, free_count, 1))
+            < changed_probability
+        )
+        candidates[:, free_start:] += (
+            rng.normal(0.0, sigma, size=(population_size, free_count, 2))
+            * changed
+        )
+
+        # Broad differential proposals help rearrange multiple constraints
+        # before the population settles into one combinatorial basin.
+        if progress < 0.57:
+            differential_count = population_size // 2
+            target_rows = np.arange(elite_count, elite_count + differential_count)
+            donor_a = rng.integers(population_size, size=differential_count)
+            donor_b = rng.integers(population_size, size=differential_count)
+            donor_c = rng.integers(population_size, size=differential_count)
+
+            factor = 0.80 - 0.25 * progress
+            mutant = (
+                population[donor_a, free_start:]
+                + factor
+                * (
+                    population[donor_b, free_start:]
+                    - population[donor_c, free_start:]
+                )
+            )
+            crossover = (
+                rng.random((differential_count, free_count, 1)) < 0.60
+            )
+            crossover[
+                np.arange(differential_count),
+                rng.integers(free_count, size=differential_count),
+                0,
+            ] = True
+            candidates[target_rows, free_start:] = np.where(
+                crossover,
+                mutant,
+                parents[target_rows, free_start:],
+            )
+
+        # Late search dedicates half the non-elite offspring to the few
+        # points actually occurring in limiting triangles.  This preserves
+        # sparse local moves while avoiding wasted perturbations elsewhere.
+        if progress > 0.30:
+            focused_rows = np.arange(population_size // 2, population_size)
+            focused_parent_ids = parent_choices[focused_rows]
+            focused_constraints = elite_active[focused_parent_ids]
+            focused_masks = active_point_masks(focused_constraints)
+            focused_sigma = sigma * (0.42 if progress < 0.75 else 0.68)
+
+            focused_noise = rng.normal(
+                0.0,
+                focused_sigma,
+                size=(len(focused_rows), free_count, 2),
+            )
+            candidates[focused_rows, free_start:] = (
+                parents[focused_rows, free_start:]
+                + focused_noise * focused_masks
+            )
+
+            # A small fraction receives a coordinated displacement of all
+            # active points, allowing active constraint sets to exchange.
+            coordinated_count = len(focused_rows) // 5
+            if coordinated_count:
+                displacement = rng.normal(
+                    0.0, focused_sigma * 0.55, size=(coordinated_count, 1, 2)
+                )
+                candidates[
+                    focused_rows[:coordinated_count], free_start:
+                ] += displacement * focused_masks[:coordinated_count]
+
+        candidates[:, free_start:] = project_simplex(
+            candidates[:, free_start:]
+        )
+
+        # Exact elites guarantee monotonic retention of strong basins.
+        candidates[:elite_count] = elites
+        areas, minima, ranking_values = evaluate(candidates, tail_weight)
+        population = candidates
+
+    final_index = int(np.argmax(minima))
+    if minima[final_index] > best_value:
+        best = population[final_index].copy()
+        best_value = float(minima[final_index])
+
+    # Final active-set batch polish.  Unlike the evolutionary stage, every
+    # candidate is derived from the globally best feasible configuration and
+    # selection uses the exact objective without a surrogate tail reward.
+    polish_step = 0.0042
+    polish_batch = 88
+    for iteration in range(460):
+        best_areas = determinant_table(best[None, ...])[0]
+        constraint_count = 10 if iteration < 180 else 6
+        active_ids = np.argpartition(
+            best_areas, constraint_count - 1
+        )[:constraint_count]
+
+        involved = triples[active_ids].ravel()
+        active_points = np.unique(involved[involved >= free_start])
+        if len(active_points) == 0:
+            break
+
+        candidates = np.broadcast_to(
+            best, (polish_batch, n, 2)
+        ).copy()
+
+        # Most rows move only active points.  The remaining rows make sparse
+        # one-point changes, useful when a single determinant is blocking.
+        masks = np.zeros((polish_batch, free_count, 1), dtype=bool)
+        masks[:polish_batch * 3 // 4, active_points - free_start, 0] = True
+        sparse_rows = np.arange(polish_batch * 3 // 4, polish_batch)
+        sparse_points = rng.choice(
+            active_points - free_start, size=len(sparse_rows), replace=True
+        )
+        masks[sparse_rows, sparse_points, 0] = True
+
+        noise = rng.normal(
+            0.0, polish_step, size=(polish_batch, free_count, 2)
+        )
+        candidates[:, free_start:] += noise * masks
+        candidates[:, free_start:] = project_simplex(candidates[:, free_start:])
+
+        _, candidate_minima, _ = evaluate(candidates, 0.0)
+        winner = int(np.argmax(candidate_minima))
+        if candidate_minima[winner] > best_value:
+            best = candidates[winner].copy()
+            best_value = float(candidate_minima[winner])
+            polish_step *= 1.012
+        else:
+            polish_step *= 0.991
+
+        polish_step = min(max(polish_step, 0.00028), 0.0060)
+
+    height = np.sqrt(3.0) / 2.0
+    return np.column_stack(
+        (best[:, 0] + 0.5 * best[:, 1], height * best[:, 1])
+    )
+
+
+# EVOLVE-BLOCK-END

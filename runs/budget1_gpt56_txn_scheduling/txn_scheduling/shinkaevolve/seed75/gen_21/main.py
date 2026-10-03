@@ -1,0 +1,381 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Find a low-makespan transaction ordering using simulator-scored beam search,
+    randomized greedy construction, and variable-neighborhood descent.
+    """
+    n = workload.num_txns
+    if n == 0:
+        return 0, []
+    if n == 1:
+        return workload.get_opt_seq_cost([0]), [0]
+
+    cost_cache = {}
+
+    def sequence_cost(sequence):
+        key = tuple(sequence)
+        if key not in cost_cache:
+            cost_cache[key] = workload.get_opt_seq_cost(sequence)
+        return cost_cache[key]
+
+    # Exhaustive evaluation is safest for small transaction sets.
+    if n <= 8:
+        best_cost = None
+        best_schedule = None
+
+        def enumerate_orders(prefix, remaining):
+            nonlocal best_cost, best_schedule
+            if not remaining:
+                value = sequence_cost(prefix)
+                if best_cost is None or value < best_cost:
+                    best_cost = value
+                    best_schedule = prefix[:]
+                return
+
+            choices = list(remaining)
+            random.shuffle(choices)
+            for txn in choices:
+                prefix.append(txn)
+                remaining.remove(txn)
+                enumerate_orders(prefix, remaining)
+                remaining.add(txn)
+                prefix.pop()
+
+        enumerate_orders([], set(range(n)))
+        return best_cost, best_schedule
+
+    requested = max(1, num_seqs)
+    if n <= 20:
+        beam_width = min(36, max(16, requested * 4))
+    elif n <= 35:
+        beam_width = min(24, max(12, requested * 3))
+    else:
+        beam_width = min(14, max(7, requested))
+
+    def build_beam():
+        """
+        Build several promising partial orderings. Prefixes are scored directly
+        by the simulator, thereby accounting for actual conflict dependencies.
+        """
+        beam = [(0, tuple())]
+
+        for depth in range(n):
+            candidates = {}
+
+            for _, prefix in beam:
+                used = set(prefix)
+                remaining = [txn for txn in range(n) if txn not in used]
+
+                if n <= 42 or len(remaining) <= 24:
+                    extensions = remaining
+                else:
+                    sample_count = min(len(remaining), 24)
+                    extensions = random.sample(remaining, sample_count)
+
+                random.shuffle(extensions)
+                for txn in extensions:
+                    candidate = prefix + (txn,)
+                    value = sequence_cost(candidate)
+                    old = candidates.get(candidate)
+                    if old is None or value < old:
+                        candidates[candidate] = value
+
+            ranked = [(value, seq) for seq, value in candidates.items()]
+            random.shuffle(ranked)
+            ranked.sort(key=lambda item: item[0])
+
+            # Retain paths ending in different transactions before filling the
+            # remaining beam slots. This keeps more distinct conflict patterns.
+            next_beam = []
+            represented_last = set()
+            for value, seq in ranked:
+                if seq[-1] not in represented_last:
+                    next_beam.append((value, seq))
+                    represented_last.add(seq[-1])
+                    if len(next_beam) >= beam_width:
+                        break
+
+            if len(next_beam) < beam_width:
+                selected = {seq for _, seq in next_beam}
+                for value, seq in ranked:
+                    if seq not in selected:
+                        next_beam.append((value, seq))
+                        selected.add(seq)
+                        if len(next_beam) >= beam_width:
+                            break
+
+            beam = next_beam
+
+        return beam
+
+    def greedy_schedule(start, randomized=False):
+        """
+        Crossover of the original sampled-greedy strategy with full simulator
+        scoring. At each step, candidate next transactions are evaluated by
+        their actual partial schedule makespan.
+        """
+        sequence = [start]
+        remaining = set(range(n))
+        remaining.remove(start)
+
+        while remaining:
+            choices = list(remaining)
+
+            # For very large inputs, use a changing sample but always retain a
+            # deterministic candidate to avoid purely random construction.
+            if n > 45 and len(choices) > 26:
+                sampled = random.sample(choices, 26)
+                if choices[0] not in sampled:
+                    sampled[0] = choices[0]
+                choices = sampled
+
+            scored = []
+            for txn in choices:
+                candidate = sequence + [txn]
+                scored.append((sequence_cost(candidate), txn))
+
+            scored.sort(key=lambda item: item[0])
+
+            if randomized and len(scored) > 1:
+                # Select from a restricted candidate list. This supplies
+                # alternate high-quality seeds instead of merely random orders.
+                rcl_size = min(3, len(scored))
+                best_value = scored[0][0]
+                threshold = best_value + max(1, int(best_value * 0.02))
+                rcl = [item for item in scored[:rcl_size]
+                       if item[0] <= threshold]
+                _, chosen = random.choice(rcl if rcl else scored[:rcl_size])
+            else:
+                _, chosen = scored[0]
+
+            sequence.append(chosen)
+            remaining.remove(chosen)
+
+        return sequence_cost(sequence), sequence
+
+    def relocated(sequence, source, destination):
+        candidate = sequence[:]
+        txn = candidate.pop(source)
+        candidate.insert(destination, txn)
+        return candidate
+
+    def block_relocated(sequence, start, length, destination):
+        block = sequence[start:start + length]
+        rest = sequence[:start] + sequence[start + length:]
+        return rest[:destination] + block + rest[destination:]
+
+    def best_neighbor(current, current_cost):
+        """
+        Evaluate several complementary local neighborhoods. Every accepted move
+        is a strict simulator-verified makespan improvement.
+        """
+        best_cost = current_cost
+        best_sequence = None
+
+        if n <= 34:
+            relocation_moves = (
+                (source, destination)
+                for source in range(n)
+                for destination in range(n)
+                if source != destination
+            )
+        else:
+            relocation_moves = (
+                (random.randrange(n), random.randrange(n))
+                for _ in range(700)
+            )
+
+        for source, destination in relocation_moves:
+            if source == destination:
+                continue
+            candidate = relocated(current, source, destination)
+            value = sequence_cost(candidate)
+            if value < best_cost:
+                best_cost, best_sequence = value, candidate
+
+        if n <= 34:
+            swap_moves = (
+                (left, right)
+                for left in range(n - 1)
+                for right in range(left + 1, n)
+            )
+        else:
+            swap_moves = (
+                tuple(sorted(random.sample(range(n), 2)))
+                for _ in range(450)
+            )
+
+        for left, right in swap_moves:
+            candidate = current[:]
+            candidate[left], candidate[right] = candidate[right], candidate[left]
+            value = sequence_cost(candidate)
+            if value < best_cost:
+                best_cost, best_sequence = value, candidate
+
+        if n <= 28:
+            reversal_moves = (
+                (left, right)
+                for left in range(n - 1)
+                for right in range(left + 2, min(n, left + 9))
+            )
+        else:
+            reversal_moves = (
+                (random.randrange(n - 2), random.randrange(3, min(9, n)))
+                for _ in range(220)
+            )
+
+        for move in reversal_moves:
+            if n <= 28:
+                left, right = move
+            else:
+                left, length = move
+                right = min(n - 1, left + length)
+
+            candidate = (
+                current[:left] +
+                list(reversed(current[left:right + 1])) +
+                current[right + 1:]
+            )
+            value = sequence_cost(candidate)
+            if value < best_cost:
+                best_cost, best_sequence = value, candidate
+
+        block_lengths = [2]
+        if n <= 24:
+            block_lengths.append(3)
+
+        for length in block_lengths:
+            if length >= n:
+                continue
+
+            if n <= 30:
+                block_moves = (
+                    (start, destination)
+                    for start in range(n - length + 1)
+                    for destination in range(n - length + 1)
+                    if start != destination
+                )
+            else:
+                samples = 280 if length == 2 else 150
+                block_moves = (
+                    (
+                        random.randrange(n - length + 1),
+                        random.randrange(n - length + 1)
+                    )
+                    for _ in range(samples)
+                )
+
+            for start, destination in block_moves:
+                if start == destination:
+                    continue
+                candidate = block_relocated(current, start, length, destination)
+                value = sequence_cost(candidate)
+                if value < best_cost:
+                    best_cost, best_sequence = value, candidate
+
+        return best_cost, best_sequence
+
+    def descend(seed, seed_cost):
+        current = list(seed)
+        current_cost = seed_cost
+        max_passes = 10 if n <= 28 else 5
+
+        for _ in range(max_passes):
+            value, candidate = best_neighbor(current, current_cost)
+            if candidate is None:
+                break
+            current_cost, current = value, candidate
+
+        return current_cost, current
+
+    beam = build_beam()
+
+    # Add greedy multistart schedules. These provide good complete schedules
+    # from paths that a prefix beam may prune early.
+    seeds = [(value, list(seq)) for value, seq in beam]
+    start_count = min(n, 14 if n <= 30 else 8)
+    starts = list(range(n))
+    random.shuffle(starts)
+
+    for index, start in enumerate(starts[:start_count]):
+        value, schedule = greedy_schedule(start, randomized=(index > 0))
+        seeds.append((value, schedule))
+
+    seeds.sort(key=lambda item: item[0])
+
+    # Deduplicate schedules before expensive local optimization.
+    unique_seeds = []
+    seen = set()
+    for value, schedule in seeds:
+        key = tuple(schedule)
+        if key not in seen:
+            unique_seeds.append((value, schedule))
+            seen.add(key)
+
+    refine_count = min(
+        len(unique_seeds),
+        12 if n <= 24 else (7 if n <= 35 else 4)
+    )
+
+    best_cost = unique_seeds[0][0]
+    best_schedule = unique_seeds[0][1][:]
+    refined = []
+
+    for seed_cost, seed in unique_seeds[:refine_count]:
+        value, schedule = descend(seed, seed_cost)
+        refined.append((value, schedule))
+        if value < best_cost:
+            best_cost, best_schedule = value, schedule
+
+    # Basin-changing perturbations are especially useful when conflict groups
+    # require multiple transactions to move together.
+    if n <= 32 and refined:
+        refined.sort(key=lambda item: item[0])
+        for _, schedule in refined[:min(3, len(refined))]:
+            for _ in range(2):
+                perturbed = schedule[:]
+
+                for _ in range(2):
+                    source = random.randrange(n)
+                    destination = random.randrange(n)
+                    if source != destination:
+                        perturbed = relocated(perturbed, source, destination)
+
+                value, candidate = descend(
+                    perturbed,
+                    sequence_cost(perturbed)
+                )
+                if value < best_cost:
+                    best_cost, best_schedule = value, candidate
+
+    return best_cost, best_schedule
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

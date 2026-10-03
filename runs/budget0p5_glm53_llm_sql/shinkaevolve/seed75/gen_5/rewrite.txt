@@ -1,0 +1,254 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List, Dict, Optional
+from collections import Counter
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-caching optimized reordering: produces per-row column orderings
+    chosen among a few cheap candidate constructions, scored by exact
+    serial character-Trie reuse (sum of adjacent LCPs of sorted strings).
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------ utils
+
+    @staticmethod
+    def _ser(v) -> str:
+        """Scoring-style serialization of a single cell (missing -> '')."""
+        if v is None:
+            return ""
+        if isinstance(v, float) and np.isnan(v):
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        if isinstance(v, str):
+            return v
+        return str(v)
+
+    def _lcp(self, a: str, b: str) -> int:
+        """Longest common prefix length via binary search (C-speed slices)."""
+        if a == b:
+            return len(a)
+        n = min(len(a), len(b))
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_score(self, strings: List[str]) -> int:
+        """Exact ideal Trie reuse: sum of adjacent LCPs of sorted strings."""
+        if not strings:
+            return 0
+        s = sorted(strings)
+        total = len(s[0])
+        for i in range(1, len(s)):
+            total += len(s[i]) - self._lcp(s[i - 1], s[i])
+        # reuse = total chars - new edges = sum len - (total - sum lcp) = sum lcp
+        reuse = 0
+        prev = s[0]
+        for i in range(1, len(s)):
+            cur = s[i]
+            reuse += self._lcp(prev, cur)
+            prev = cur
+        return reuse
+
+    # ------------------------------------------------- candidate constructions
+
+    def _order_by_freq(self, cols, ser_cols, n):
+        """Rank columns by sum len(v)*count(v)*(count(v)-1), deterministic."""
+        stats = []
+        for c in cols:
+            vals = ser_cols[c]
+            cnt = Counter(vals)
+            score = sum(len(v) * k * (k - 1) for v, k in cnt.items())
+            stats.append((-score, c))
+        stats.sort()
+        return [c for _, c in stats]
+
+    def _order_by_len_freq(self, cols, ser_cols, n):
+        """Different tradeoff: count*(count-1)/ (1+len) weight."""
+        stats = []
+        for c in cols:
+            vals = ser_cols[c]
+            cnt = Counter(vals)
+            score = sum(k * (k - 1) / (1.0 + len(v)) for v, k in cnt.items())
+            stats.append((-score, c))
+        stats.sort()
+        return [c for _, c in stats]
+
+    def _cond_partition_orders(self, cols, ser_cols, ser_rows, max_depth=4):
+        """Conditional prefix partition tree -> per-row orders."""
+        n = len(ser_rows)
+        orders = [[list(cols) for _ in range(n)]]  # base: single global order
+        remaining = list(cols)
+
+        groups = [(list(range(n)), list(remaining))]
+
+        for _ in range(max_depth):
+            new_groups = []
+            progress = False
+            for idxs, rem in groups:
+                if len(idxs) < 2 or not rem:
+                    new_groups.append((idxs, rem))
+                    continue
+                # pick field with best length-weighted repetition inside group
+                best_col, best_score = None, 0
+                for c in rem:
+                    cnt = Counter(ser_rows[i][self._col_pos[rem.index(c)] if False else 0] for i in [])  # placeholder
+                    break
+                # proper computation
+                best_col, best_score = None, 0
+                pos = {c: j for j, c in enumerate(cols)}
+                for c in rem:
+                    cnt = Counter(self._row_ser[i][pos[c]] for i in idxs)
+                    sc = sum(len(v) * k * (k - 1) for v, k in cnt.items())
+                    if sc > best_score:
+                        best_score, best_col = sc, c
+                if best_col is None or best_score <= 0:
+                    new_groups.append((idxs, rem))
+                    continue
+                # split
+                by_val = {}
+                for i in idxs:
+                    by_val.setdefault(self._row_ser[i][pos[best_col]], []).append(i)
+                if len(by_val) <= 1:
+                    new_groups.append((idxs, rem))
+                    continue
+                # order remaining cols inside this group: best col first,
+                # then rest ranked by repetition within group
+                rest = [c for c in rem if c != best_col]
+                gcnt = {c: Counter(self._row_ser[i][pos[c]] for i in idxs) for c in rest}
+                rest.sort(key=lambda c: (
+                    -sum(len(v) * k * (k - 1) for v, k in gcnt[c].items()), c))
+                prefix = [best_col] + rest
+                orders.append((idxs, prefix))
+                progress = True
+                for v, sub in sorted(by_val.items()):
+                    new_groups.append((sub, [c for c in rem if c != best_col]))
+            if not progress:
+                break
+            groups = new_groups
+        # build final per-row orders from group prefixes
+        final = [list(cols) for _ in range(n)]
+        for idxs, pref in orders:
+            if isinstance(pref, list) and pref is not cols:
+                for i in idxs:
+                    final[i] = list(pref)
+        # ensure suffix is deterministic: append any missing cols
+        for i in range(n):
+            seen = set(final[i])
+            for c in cols:
+                if c not in seen:
+                    final[i].append(c)
+        return final
+
+    # ------------------------------------------------------------------ main
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        original_df = df.copy()
+        n, p = original_df.shape
+        cols = list(original_df.columns)
+
+        if p == 0 or n == 0:
+            return original_df.astype(object) if p else original_df, [
+                [] for _ in range(n)]
+
+        # honor col_merge: merged columns must be adjacent in that order
+        merged_flat = []
+        for group in col_merge:
+            merged_flat.extend([c for c in group if c in cols])
+        merge_first = merged_flat + [c for c in cols if c not in merged_flat]
+
+        df = original_df[merge_first]
+        cols = merge_first
+
+        # serialize all cells once
+        cell_ser = df.applymap(self._ser) if hasattr(df, "applymap") else df.map(self._ser)
+        cell_ser = cell_ser.astype(object)
+        cell_vals = df.values  # original values
+        ser_mat = [[cell_ser.iat[i, j] for j in range(p)] for i in range(n)]
+
+        self._row_ser = ser_mat
+        self._col_pos = {c: j for j, c in enumerate(cols)}
+
+        # candidate 1 & 2: global orders
+        cands = []
+        o1 = self._order_by_freq(cols, {c: [ser_mat[i][j] for i in range(n)]
+                                         for j, c in enumerate(cols)}, n)
+        cands.append(("global_freq", [o1] * n))
+        o2 = self._order_by_len_freq(cols, {c: [ser_mat[i][j] for i in range(n)]
+                                            for j, c in enumerate(cols)}, n)
+        cands.append(("global_lenfreq", [o2] * n))
+
+        # candidate 3: conditional partition per-row orders (bounded)
+        if p > 1 and n > 1 and p <= 64 and n <= 50000:
+            cands.append(("cond", self._cond_partition_orders(cols, None, None)))
+
+        # col_merge constraint check: ensure merged groups stay adjacent
+        merge_groups = [[c for c in g if c in cols] for g in col_merge]
+        merge_groups = [g for g in merge_groups if len(g) > 1]
+        merge_set = set(c for g in merge_groups for c in g)
+
+        def valid(order):
+            for g in merge_groups:
+                pos = [order.index(c) for c in g if c in order]
+                if len(pos) > 1 and pos != list(range(min(pos), min(pos) + len(pos))):
+                    return False
+            return True
+
+        best_orders, best_score = cands[0][1], -1
+        for name, orders in cands:
+            if not valid(orders[0]):
+                # try fixing by keeping merged cols at front per row
+                orders = [merge_first_order(o) for o in orders]
+            strs = ["".join(ser_mat[i][j] for j in
+                            (cols.index(c) for c in orders[i])) for i in range(n)]
+            sc = self._trie_score(strs)
+            if sc > best_score:
+                best_score, best_orders = sc, orders
+
+        # build output
+        data = []
+        for i in range(n):
+            order = best_orders[i]
+            idxs = [cols.index(c) for c in order]
+            data.append([cell_vals[i][j] for j in idxs])
+
+        out = pd.DataFrame(data, columns=cols, dtype=object)
+        assert out.shape == original_df.shape
+
+        def merge_first_order(order):
+            seen = []
+            for c in merged_flat:
+                if c in order and c not in seen:
+                    seen.append(c)
+            rest = [c for c in order if c not in seen]
+            return seen + rest
+
+        # map orders back to original df column names (same names, reordered rows keep identity)
+        return out, [list(o) for o in best_orders]
+
+# EVOLVE-BLOCK-END

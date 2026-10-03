@@ -1,0 +1,286 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+from solver import Algorithm
+from typing import Tuple, List, Dict
+from collections import Counter
+import math
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-cache-oriented column reordering.
+
+    The returned frame always has the original shape, index, and displayed
+    column labels.  For each row, column_orderings[row] records which original
+    source column was placed at each output position.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    @staticmethod
+    def _score_value(value) -> str:
+        """Match evaluator normalization without changing stored values."""
+        if value is None:
+            return ""
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, bool) and missing:
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(value)
+
+    @staticmethod
+    def _lcp(left: str, right: str) -> int:
+        if left == right:
+            return len(left)
+        high = min(len(left), len(right))
+        low = 0
+        # Slice comparisons run in C and avoid a Python character loop.
+        while low < high:
+            mid = (low + high + 1) // 2
+            if left[:mid] == right[:mid]:
+                low = mid
+            else:
+                high = mid - 1
+        return low
+
+    def _trie_reuse_score(self, rows, orders, values) -> int:
+        strings = []
+        for row, order in zip(rows, orders):
+            strings.append("".join(values[row][col] for col in order))
+        if len(strings) < 2:
+            return 0
+        strings.sort()
+        return sum(self._lcp(strings[i - 1], strings[i]) for i in range(1, len(strings)))
+
+    @staticmethod
+    def _find_column(columns, requested):
+        """Support the historical exact-or-unambiguous-substring dependency API."""
+        if requested in columns:
+            return columns.index(requested)
+        matches = [i for i, col in enumerate(columns) if requested in str(col)]
+        return matches[0] if len(matches) == 1 else None
+
+    def _make_blocks(self, columns, col_merge):
+        used = set()
+        blocks = []
+        for group in col_merge or []:
+            members = []
+            for requested in group:
+                for pos, col in enumerate(columns):
+                    if pos not in used and col == requested:
+                        members.append(pos)
+                        used.add(pos)
+                        break
+            if members:
+                blocks.append(members)
+        for pos in range(len(columns)):
+            if pos not in used:
+                blocks.append([pos])
+        return blocks
+
+    def _dependency_edges(self, columns, blocks, one_way_dep):
+        position_to_block = {}
+        for block_id, block in enumerate(blocks):
+            for pos in block:
+                position_to_block[pos] = block_id
+
+        predecessors = {i: set() for i in range(len(blocks))}
+        for pair in one_way_dep or []:
+            if len(pair) != 2:
+                continue
+            source = self._find_column(columns, pair[0])
+            target = self._find_column(columns, pair[1])
+            if source is None or target is None:
+                continue
+            source_block = position_to_block[source]
+            target_block = position_to_block[target]
+            if source_block != target_block:
+                predecessors[target_block].add(source_block)
+        return predecessors
+
+    @staticmethod
+    def _topological_rank(block_ids, scores, predecessors):
+        """Stable score-prioritized topological ordering."""
+        remaining = set(block_ids)
+        result = []
+        while remaining:
+            ready = [
+                block for block in remaining
+                if not (predecessors.get(block, set()) & remaining)
+            ]
+            # Cyclic dependency input is handled deterministically rather than
+            # dropping a field.
+            if not ready:
+                ready = list(remaining)
+            chosen = min(ready, key=lambda block: (-scores[block], block))
+            result.append(chosen)
+            remaining.remove(chosen)
+        return result
+
+    @staticmethod
+    def _flatten(block_order, blocks):
+        return [column for block in block_order for column in blocks[block]]
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        # Never add helper columns to the caller's data.  Object storage keeps
+        # mixed scalar values exactly as supplied.
+        n_rows, n_cols = df.shape
+        columns = list(df.columns)
+        if n_rows == 0 or n_cols == 0:
+            return df.copy(), [[] for _ in range(n_rows)]
+
+        raw_values = [[df.iat[row, col] for col in range(n_cols)] for row in range(n_rows)]
+        text_values = [
+            [self._score_value(raw_values[row][col]) for col in range(n_cols)]
+            for row in range(n_rows)
+        ]
+
+        blocks = self._make_blocks(columns, col_merge)
+        predecessors = self._dependency_edges(columns, blocks, one_way_dep)
+        block_count = len(blocks)
+
+        # Precompute column frequency statistics once.  The first score is the
+        # requested length-weighted pair-repetition heuristic.
+        pair_scores = [0] * n_cols
+        simple_scores = [0] * n_cols
+        for col in range(n_cols):
+            counts = Counter(text_values[row][col] for row in range(n_rows))
+            pair_scores[col] = sum(
+                len(value) * count * (count - 1)
+                for value, count in counts.items()
+            )
+            simple_scores[col] = sum(
+                len(value) * max(0, count - 1)
+                for value, count in counts.items()
+            )
+
+        block_pair = [sum(pair_scores[col] for col in block) for block in blocks]
+        block_simple = [sum(simple_scores[col] for col in block) for block in blocks]
+
+        global_pair_blocks = self._topological_rank(
+            list(range(block_count)), block_pair, predecessors
+        )
+        global_simple_blocks = self._topological_rank(
+            list(range(block_count)), block_simple, predecessors
+        )
+        global_pair_order = self._flatten(global_pair_blocks, blocks)
+        global_simple_order = self._flatten(global_simple_blocks, blocks)
+
+        # Conditional candidate.  It selects a leading block independently in
+        # useful partitions, then applies the reliable global tail.  Work is
+        # bounded by node, depth, and candidate-column limits.
+        conditional_orders = [list(global_pair_order) for _ in range(n_rows)]
+        ranked_blocks = sorted(
+            range(block_count), key=lambda block: (-block_pair[block], block)
+        )[:min(24, block_count)]
+        max_depth = min(8, col_stop) if col_stop is not None else 8
+        max_depth = max(0, max_depth)
+        max_nodes = 256
+        nodes_used = 0
+
+        def visit(row_ids, selected, depth):
+            nonlocal nodes_used
+            if (
+                len(row_ids) < 2
+                or depth >= max_depth
+                or nodes_used >= max_nodes
+            ):
+                return
+            nodes_used += 1
+            selected_set = set(selected)
+            eligible = [
+                block for block in ranked_blocks
+                if block not in selected_set
+                and predecessors.get(block, set()).issubset(selected_set)
+            ]
+            if not eligible:
+                return
+
+            best_block = None
+            best_score = 0
+            for block in eligible:
+                score = 0
+                for col in blocks[block]:
+                    counts = Counter(text_values[row][col] for row in row_ids)
+                    score += sum(
+                        len(value) * count * (count - 1)
+                        for value, count in counts.items()
+                    )
+                if score > best_score or (
+                    score == best_score and best_block is not None and block < best_block
+                ):
+                    best_score = score
+                    best_block = block
+
+            if best_block is None or best_score <= 0 or (
+                early_stop and best_score < early_stop
+            ):
+                return
+
+            new_selected = selected + [best_block]
+            selected_columns = self._flatten(new_selected, blocks)
+            tail_blocks = [
+                block for block in global_pair_blocks if block not in set(new_selected)
+            ]
+            order = selected_columns + self._flatten(tail_blocks, blocks)
+            for row in row_ids:
+                conditional_orders[row] = order
+
+            groups = {}
+            for row in row_ids:
+                key = tuple(text_values[row][col] for col in blocks[best_block])
+                groups.setdefault(key, []).append(row)
+            # Branching only helps when actual values distinguish rows.
+            if len(groups) <= 1:
+                return
+            for group_rows in groups.values():
+                visit(group_rows, new_selected, depth + 1)
+
+        visit(list(range(n_rows)), [], 0)
+
+        candidates = [
+            [list(global_pair_order) for _ in range(n_rows)],
+            [list(global_simple_order) for _ in range(n_rows)],
+            conditional_orders,
+        ]
+
+        row_ids = list(range(n_rows))
+        best_orders = candidates[0]
+        best_score = self._trie_reuse_score(row_ids, best_orders, text_values)
+        for candidate in candidates[1:]:
+            score = self._trie_reuse_score(row_ids, candidate, text_values)
+            if score > best_score:
+                best_score = score
+                best_orders = candidate
+
+        output_values = [
+            [raw_values[row][source_col] for source_col in best_orders[row]]
+            for row in range(n_rows)
+        ]
+        reordered = pd.DataFrame(
+            output_values,
+            index=df.index.copy(),
+            columns=df.columns.copy(),
+            dtype=object,
+        )
+        column_orderings = [
+            [columns[source_col] for source_col in order]
+            for order in best_orders
+        ]
+        return reordered, column_orderings
+
+
+# EVOLVE-BLOCK-END

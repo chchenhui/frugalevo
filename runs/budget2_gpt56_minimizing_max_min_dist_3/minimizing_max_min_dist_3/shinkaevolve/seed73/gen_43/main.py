@@ -1,0 +1,241 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.optimize import minimize
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct exactly fourteen reproducible points in R^3 maximizing the
+    squared minimum-distance / diameter ratio.
+    """
+    n, d = 14, 3
+    population_size = 36
+    rng = np.random.default_rng(20240517014)
+    iu, ju = np.triu_indices(n, 1)
+    pair_count = iu.size
+
+    incidence = np.zeros((n, pair_count), dtype=np.float64)
+    columns = np.arange(pair_count)
+    incidence[iu, columns] = 1.0
+    incidence[ju, columns] = -1.0
+
+    def normalize_batch(x: np.ndarray) -> np.ndarray:
+        x = x - x.mean(axis=1, keepdims=True)
+        scale = np.sqrt(np.mean(x * x, axis=(1, 2)))
+        return x / np.maximum(scale[:, None, None], 1.0e-15)
+
+    def normalize(x: np.ndarray) -> np.ndarray:
+        x = x - x.mean(axis=0, keepdims=True)
+        scale = np.sqrt(np.mean(x * x))
+        return x / max(scale, 1.0e-15)
+
+    def batch_scores(x: np.ndarray) -> np.ndarray:
+        delta = x[:, iu] - x[:, ju]
+        q = np.einsum("bpd,bpd->bp", delta, delta)
+        return q.min(axis=1) / q.max(axis=1)
+
+    def score(x: np.ndarray) -> float:
+        delta = x[iu] - x[ju]
+        q = np.einsum("pd,pd->p", delta, delta)
+        return float(q.min() / q.max())
+
+    def icosahedral_seed() -> np.ndarray:
+        phi = 0.5 * (1.0 + np.sqrt(5.0))
+        vertices = np.array(
+            [
+                (-1, phi, 0), (1, phi, 0), (-1, -phi, 0), (1, -phi, 0),
+                (0, -1, phi), (0, 1, phi), (0, -1, -phi), (0, 1, -phi),
+                (phi, 0, -1), (phi, 0, 1), (-phi, 0, -1), (-phi, 0, 1),
+            ],
+            dtype=np.float64,
+        )
+        vertices /= np.linalg.norm(vertices[0])
+
+        # Independent extra points intentionally avoid a forced antipodal pair.
+        extra = rng.normal(size=(2, 3))
+        extra /= np.linalg.norm(extra, axis=1, keepdims=True)
+        extra *= rng.uniform(0.65, 1.20, size=(2, 1))
+        seed = np.vstack((vertices, extra))
+        seed += 0.045 * rng.normal(size=seed.shape)
+        return normalize(seed)
+
+    def staggered_ring_seed() -> np.ndarray:
+        counts = (5, 5, 4)
+        heights = (-0.72, 0.04, 0.76)
+        radii = (0.76, 1.00, 0.70)
+        points = []
+        phase = rng.uniform(0.0, 2.0 * np.pi)
+        for ring, (count, z, radius) in enumerate(zip(counts, heights, radii)):
+            offset = phase + ring * np.pi / count + rng.uniform(-0.16, 0.16)
+            angles = offset + 2.0 * np.pi * np.arange(count) / count
+            points.extend(
+                np.column_stack(
+                    (
+                        radius * np.cos(angles),
+                        radius * np.sin(angles),
+                        np.full(count, z),
+                    )
+                )
+            )
+        seed = np.asarray(points, dtype=np.float64)
+        seed += 0.055 * rng.normal(size=seed.shape)
+        return normalize(seed)
+
+    def optimize_population(
+        population: np.ndarray,
+        steps: int,
+        beta0: float,
+        beta1: float,
+        lr0: float,
+        lr1: float,
+    ) -> np.ndarray:
+        """Batched Adam ascent on softmin(log d)-softmax(log d)."""
+        first = np.zeros_like(population)
+        second = np.zeros_like(population)
+        age = 0
+        decay2 = 0.996
+
+        for step in range(steps):
+            fraction = step / max(steps - 1, 1)
+            beta = beta0 + (beta1 - beta0) * fraction
+            learning = lr0 + (lr1 - lr0) * fraction
+
+            if step in (steps // 2, (3 * steps) // 4):
+                first.fill(0.0)
+                second.fill(0.0)
+                age = 0
+
+            delta = population[:, iu] - population[:, ju]
+            q = np.einsum("bpd,bpd->bp", delta, delta) + 1.0e-15
+            log_dist = 0.5 * np.log(q)
+
+            lo = -beta * log_dist
+            lo -= lo.max(axis=1, keepdims=True)
+            wlo = np.exp(lo)
+            wlo /= wlo.sum(axis=1, keepdims=True)
+
+            hi = beta * log_dist
+            hi -= hi.max(axis=1, keepdims=True)
+            whi = np.exp(hi)
+            whi /= whi.sum(axis=1, keepdims=True)
+
+            pair_force = (
+                (wlo - whi)[:, :, None] * delta / q[:, :, None]
+            )
+            gradient = np.einsum("np,bpd->bnd", incidence, pair_force)
+
+            first = 0.90 * first + 0.10 * gradient
+            second = decay2 * second + (1.0 - decay2) * gradient * gradient
+            age += 1
+
+            mhat = first / (1.0 - 0.90 ** age)
+            vhat = second / (1.0 - decay2 ** age)
+            population += learning * mhat / (np.sqrt(vhat) + 1.0e-8)
+            population = normalize_batch(population)
+
+        return population
+
+    seeds = []
+    for _ in range(16):
+        seeds.append(normalize(rng.normal(size=(n, d))))
+    for _ in range(10):
+        seeds.append(staggered_ring_seed())
+    for _ in range(10):
+        seeds.append(icosahedral_seed())
+
+    population = np.asarray(seeds, dtype=np.float64)
+    population = optimize_population(
+        population, 3900, 5.0, 105.0, 0.032, 0.009
+    )
+
+    first_scores = batch_scores(population)
+    elite = population[np.argsort(first_scores)[-9:]]
+
+    descendants = np.empty((population_size, n, d), dtype=np.float64)
+    for k, parent in enumerate(elite):
+        descendants[4 * k] = parent
+        descendants[4 * k + 1] = parent + 0.012 * rng.normal(size=(n, d))
+        descendants[4 * k + 2] = parent + 0.027 * rng.normal(size=(n, d))
+        descendants[4 * k + 3] = parent + 0.050 * rng.normal(size=(n, d))
+
+    population = normalize_batch(descendants)
+    population = optimize_population(
+        population, 5600, 72.0, 330.0, 0.014, 0.0020
+    )
+
+    final_scores = batch_scores(population)
+    ranking = np.argsort(final_scores)[::-1]
+    best_points = population[ranking[0]].copy()
+    best_score = score(best_points)
+
+    # Exact hard-constraint epigraph refinement of several distinct elites.
+    axes = np.arange(d)[None, :]
+    rows = np.arange(pair_count)[:, None]
+
+    def constraints(state: np.ndarray) -> np.ndarray:
+        x = state[:-1].reshape(n, d)
+        delta = x[iu] - x[ju]
+        q = np.einsum("pd,pd->p", delta, delta)
+        return np.concatenate((q - 1.0, state[-1] - q))
+
+    def constraint_jacobian(state: np.ndarray) -> np.ndarray:
+        x = state[:-1].reshape(n, d)
+        delta = x[iu] - x[ju]
+        jac = np.zeros((2 * pair_count, n * d + 1), dtype=np.float64)
+        left = d * iu[:, None] + axes
+        right = d * ju[:, None] + axes
+        deriv = 2.0 * delta
+
+        jac[rows, left] = deriv
+        jac[rows, right] = -deriv
+        jac[pair_count + rows, left] = -deriv
+        jac[pair_count + rows, right] = deriv
+        jac[pair_count:, -1] = 1.0
+        return jac
+
+    objective_gradient = np.zeros(n * d + 1, dtype=np.float64)
+    objective_gradient[-1] = 1.0
+
+    # Top candidates can have different active graphs; retain exact winner.
+    for candidate_index in ranking[:4]:
+        candidate = population[candidate_index].copy()
+        delta = candidate[iu] - candidate[ju]
+        q = np.einsum("pd,pd->p", delta, delta)
+        candidate /= np.sqrt(q.min())
+
+        delta = candidate[iu] - candidate[ju]
+        q = np.einsum("pd,pd->p", delta, delta)
+        state0 = np.concatenate((candidate.ravel(), [float(q.max())]))
+
+        result = minimize(
+            fun=lambda z: z[-1],
+            x0=state0,
+            jac=lambda z: objective_gradient,
+            method="SLSQP",
+            constraints={
+                "type": "ineq",
+                "fun": constraints,
+                "jac": constraint_jacobian,
+            },
+            options={"maxiter": 700, "ftol": 2.0e-12, "disp": False},
+        )
+
+        if not np.all(np.isfinite(result.x)):
+            continue
+
+        refined = result.x[:-1].reshape(n, d)
+        delta = refined[iu] - refined[ju]
+        q = np.einsum("pd,pd->p", delta, delta)
+        if q.max() <= 0.0 or q.min() < 1.0 - 2.0e-7:
+            continue
+
+        refined /= np.sqrt(q.min())
+        refined_score = score(refined)
+        if refined_score > best_score:
+            best_points = refined
+            best_score = refined_score
+
+    return np.asarray(best_points, dtype=np.float64)
+
+
+# EVOLVE-BLOCK-END

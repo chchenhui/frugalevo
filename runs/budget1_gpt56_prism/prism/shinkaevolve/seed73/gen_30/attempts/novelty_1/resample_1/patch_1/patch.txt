@@ -1,0 +1,558 @@
+--- a/original.py
++++ b/original.py
+@@ -1,467 +1,554 @@
+ GPU_MEM_SIZE = 80 # GB
+ 
+ # EVOLVE-BLOCK-START
+ 
+ def compute_model_placement(gpu_num, models):
+     """
+     Compute a memory-feasible model placement minimizing the maximum KV pressure.
+ 
+     KV pressure on a GPU is:
+         sum(req_rate / slo) / remaining_memory
+     """
+ 
+     EPS = 1e-12
+ 
+     def demand(model):
+         return model.req_rate / model.slo
+ 
+     def pressure(load, remaining):
+         if remaining > EPS:
+             return load / remaining
+         return float("inf") if load > EPS else 0.0
+ 
+     def profile(scores):
+         return tuple(sorted(scores, reverse=True))
+ 
+     def better(candidate, current):
+         """Strict lexicographic improvement with numerical tolerance."""
+         for a, b in zip(candidate, current):
+             if a < b - EPS:
+                 return True
+             if a > b + EPS:
+                 return False
+         return False
+ 
+     def make_result(placement, loads, remaining):
+         scores = [
+             pressure(loads[gpu], remaining[gpu])
+             for gpu in range(gpu_num)
+         ]
+         return placement, loads, remaining, scores
+ 
+     def pressure_greedy(order):
+         placement = {gpu: [] for gpu in range(gpu_num)}
+         loads = [0.0] * gpu_num
+         remaining = [GPU_MEM_SIZE] * gpu_num
+         scores = [0.0] * gpu_num
+ 
+         for model in order:
+             d = demand(model)
+             best_gpu = None
+             best_key = None
+ 
+             for gpu in range(gpu_num):
+                 if model.model_size > remaining[gpu] + EPS:
+                     continue
+ 
+                 new_remaining = remaining[gpu] - model.model_size
+                 new_score = pressure(loads[gpu] + d, new_remaining)
+ 
+                 candidate_scores = scores[:]
+                 candidate_scores[gpu] = new_score
+ 
+                 # Primary goal: best global pressure profile.
+                 # Secondary goal: retain a compact bin when pressure is tied.
+                 key = (
+                     profile(candidate_scores),
+                     new_score,
+                     new_remaining,
+                 )
+ 
+                 if best_key is None or key < best_key:
+                     best_key = key
+                     best_gpu = gpu
+ 
+             if best_gpu is None:
+                 return None
+ 
+             placement[best_gpu].append(model)
+             loads[best_gpu] += d
+             remaining[best_gpu] -= model.model_size
+             scores[best_gpu] = pressure(loads[best_gpu], remaining[best_gpu])
+ 
+         return placement, loads, remaining, scores
+ 
+     def best_fit(order):
+         """Memory-oriented fallback useful for heavily fragmented instances."""
+         placement = {gpu: [] for gpu in range(gpu_num)}
+         loads = [0.0] * gpu_num
+         remaining = [GPU_MEM_SIZE] * gpu_num
+ 
+         for model in order:
+             feasible = [
+                 gpu for gpu in range(gpu_num)
+                 if model.model_size <= remaining[gpu] + EPS
+             ]
+             if not feasible:
+                 return None
+ 
+             gpu = min(
+                 feasible,
+                 key=lambda i: (
+                     remaining[i] - model.model_size,
+                     loads[i],
+                 ),
+             )
+             placement[gpu].append(model)
+             loads[gpu] += demand(model)
+             remaining[gpu] -= model.model_size
+ 
+         return make_result(placement, loads, remaining)
+ 
+     if not models:
+         return {gpu: [] for gpu in range(gpu_num)}
+ 
+     by_pressure = sorted(models, key=demand, reverse=True)
+     by_size = sorted(models, key=lambda m: m.model_size, reverse=True)
+     by_density = sorted(
+         models,
+         key=lambda m: demand(m) / max(m.model_size, EPS),
+         reverse=True,
+     )
+     by_single_pressure = sorted(
+         models,
+         key=lambda m: demand(m) / max(GPU_MEM_SIZE - m.model_size, EPS),
+         reverse=True,
+     )
+     by_pressure_then_size = sorted(
+         models,
+         key=lambda m: (demand(m), m.model_size),
+         reverse=True,
+     )
+     by_size_then_pressure = sorted(
+         models,
+         key=lambda m: (m.model_size, demand(m)),
+         reverse=True,
+     )
+     by_balanced_weight = sorted(
+         models,
+         key=lambda m: (
+             0.65 * demand(m) / max(GPU_MEM_SIZE - m.model_size, EPS)
+             + 0.35 * m.model_size / GPU_MEM_SIZE
+         ),
+         reverse=True,
+     )
+ 
+     orders = (
+         by_pressure,
+         by_size,
+         by_density,
+         by_single_pressure,
+         by_pressure_then_size,
+         by_size_then_pressure,
+         by_balanced_weight,
+     )
+ 
+     candidates = []
+     for order in orders:
+         result = pressure_greedy(order)
+         if result is not None:
+             candidates.append(result)
+ 
+     for order in (by_size, by_size_then_pressure, by_single_pressure):
+         result = best_fit(order)
+         if result is not None:
+             candidates.append(result)
+ 
+     if not candidates:
+         raise ValueError(
+             f"Unable to place all models on {gpu_num} GPUs "
+             f"with {GPU_MEM_SIZE} GB each."
+         )
+ 
+     placement, loads, remaining, scores = min(
+         candidates,
+         key=lambda state: profile(state[3]),
+     )
+ 
+     def scores_after(changes):
+         new_scores = scores[:]
+         for gpu, load, rem in changes:
+             new_scores[gpu] = pressure(load, rem)
+         return new_scores
+ 
+     # Bounded exchange candidates preserve speed on instances with many models.
+     EXCHANGE_MODEL_LIMIT = 14
+ 
+     while True:
+         current_profile = profile(scores)
+         best_profile = current_profile
+         best_action = None
+ 
+         # Explore bottleneck GPUs first. Restricting multi-item exchange sources
+         # to these GPUs keeps the expensive neighborhoods focused on KVPR relief.
+         gpu_order = sorted(range(gpu_num), key=lambda g: scores[g], reverse=True)
+ 
+         # Single-model relocation.
+         for source in gpu_order:
+             for model in placement[source]:
+                 d = demand(model)
+ 
+                 for target in range(gpu_num):
+                     if target == source:
+                         continue
+                     if model.model_size > remaining[target] + EPS:
+                         continue
+ 
+                     source_load = loads[source] - d
+                     source_rem = remaining[source] + model.model_size
+                     target_load = loads[target] + d
+                     target_rem = remaining[target] - model.model_size
+ 
+                     new_scores = scores_after((
+                         (source, source_load, source_rem),
+                         (target, target_load, target_rem),
+                     ))
+                     new_profile = profile(new_scores)
+ 
+                     if better(new_profile, best_profile):
+                         best_profile = new_profile
+                         best_action = (
+                             "move", source, target, model,
+                             source_load, source_rem,
+                             target_load, target_rem,
+                         )
+ 
+         # One-for-one swaps.
+         for first in range(gpu_num):
+             for second in range(first + 1, gpu_num):
+                 for model_a in placement[first]:
+                     d_a = demand(model_a)
+ 
+                     for model_b in placement[second]:
+                         if model_b.model_size > remaining[first] + model_a.model_size + EPS:
+                             continue
+                         if model_a.model_size > remaining[second] + model_b.model_size + EPS:
+                             continue
+ 
+                         d_b = demand(model_b)
+                         first_load = loads[first] - d_a + d_b
+                         second_load = loads[second] - d_b + d_a
+                         first_rem = remaining[first] + model_a.model_size - model_b.model_size
+                         second_rem = remaining[second] + model_b.model_size - model_a.model_size
+ 
+                         new_scores = scores_after((
+                             (first, first_load, first_rem),
+                             (second, second_load, second_rem),
+                         ))
+                         new_profile = profile(new_scores)
+ 
+                         if better(new_profile, best_profile):
+                             best_profile = new_profile
+                             best_action = (
+                                 "swap", first, second, model_a, model_b,
+                                 first_load, first_rem,
+                                 second_load, second_rem,
+                             )
+ 
+         # Bounded two-for-one exchanges:
+         # replace two source models with one target model.
+         for source in gpu_order:
+             source_models = sorted(
+                 placement[source],
+                 key=lambda m: (demand(m), m.model_size),
+                 reverse=True,
+             )[:EXCHANGE_MODEL_LIMIT]
+ 
+             if len(source_models) < 2:
+                 continue
+ 
+             for target in range(gpu_num):
+                 if target == source:
+                     continue
+ 
+                 target_models = sorted(
+                     placement[target],
+                     key=lambda m: (demand(m), m.model_size),
+                     reverse=True,
+                 )[:EXCHANGE_MODEL_LIMIT]
+ 
+                 for i in range(len(source_models)):
+                     model_a = source_models[i]
+                     for j in range(i + 1, len(source_models)):
+                         model_b = source_models[j]
+ 
+                         outgoing_size = model_a.model_size + model_b.model_size
+                         outgoing_demand = demand(model_a) + demand(model_b)
+ 
+                         for incoming in target_models:
+                             if incoming.model_size > remaining[source] + outgoing_size + EPS:
+                                 continue
+                             if outgoing_size > remaining[target] + incoming.model_size + EPS:
+                                 continue
+ 
+                             incoming_demand = demand(incoming)
+                             source_load = loads[source] - outgoing_demand + incoming_demand
+                             target_load = loads[target] - incoming_demand + outgoing_demand
+                             source_rem = remaining[source] + outgoing_size - incoming.model_size
+                             target_rem = remaining[target] + incoming.model_size - outgoing_size
+ 
+                             new_scores = scores_after((
+                                 (source, source_load, source_rem),
+                                 (target, target_load, target_rem),
+                             ))
+                             new_profile = profile(new_scores)
+ 
+                             if better(new_profile, best_profile):
+                                 best_profile = new_profile
+                                 best_action = (
+                                     "two_for_one",
+                                     source, target, model_a, model_b, incoming,
+                                     source_load, source_rem,
+                                     target_load, target_rem,
+                                 )
+ 
+         # Bounded one-for-two exchanges, complementary to two-for-one:
+         # replace one bottleneck model with two models from another GPU.
+         for source in gpu_order:
+             source_models = sorted(
+                 placement[source],
+                 key=lambda m: (demand(m), m.model_size),
+                 reverse=True,
+             )[:EXCHANGE_MODEL_LIMIT]
+ 
+             for outgoing in source_models:
+                 outgoing_demand = demand(outgoing)
+ 
+                 for target in range(gpu_num):
+                     if target == source:
+                         continue
+ 
+                     target_models = sorted(
+                         placement[target],
+                         key=lambda m: (demand(m), m.model_size),
+                         reverse=True,
+                     )[:EXCHANGE_MODEL_LIMIT]
+ 
+                     for i in range(len(target_models)):
+                         incoming_a = target_models[i]
+                         for j in range(i + 1, len(target_models)):
+                             incoming_b = target_models[j]
+                             incoming_size = (
+                                 incoming_a.model_size + incoming_b.model_size
+                             )
+                             incoming_demand = (
+                                 demand(incoming_a) + demand(incoming_b)
+                             )
+ 
+                             if incoming_size > remaining[source] + outgoing.model_size + EPS:
+                                 continue
+                             if outgoing.model_size > remaining[target] + incoming_size + EPS:
+                                 continue
+ 
+                             source_load = loads[source] - outgoing_demand + incoming_demand
+                             target_load = loads[target] - incoming_demand + outgoing_demand
+                             source_rem = remaining[source] + outgoing.model_size - incoming_size
+                             target_rem = remaining[target] + incoming_size - outgoing.model_size
+ 
+                             new_scores = scores_after((
+                                 (source, source_load, source_rem),
+                                 (target, target_load, target_rem),
+                             ))
+                             new_profile = profile(new_scores)
+ 
+                             if better(new_profile, best_profile):
+                                 best_profile = new_profile
+                                 best_action = (
+                                     "one_for_two",
+                                     source, target, outgoing, incoming_a, incoming_b,
+                                     source_load, source_rem,
+                                     target_load, target_rem,
+                                 )
+ 
++        # Bounded ejection chains repair blocked moves caused by fragmentation.
++        # Move one model from target to a third GPU, then move a bottleneck
++        # model from source into the freed target capacity.
++        EJECTION_MODEL_LIMIT = 10
++        EJECTION_TARGET_LIMIT = 3
++
++        low_pressure_gpus = sorted(range(gpu_num), key=lambda g: scores[g])
++
++        for source in gpu_order:
++            source_models = sorted(
++                placement[source],
++                key=lambda m: (demand(m), m.model_size),
++                reverse=True,
++            )[:EJECTION_MODEL_LIMIT]
++
++            for outgoing in source_models:
++                outgoing_demand = demand(outgoing)
++
++                for target in range(gpu_num):
++                    if target == source:
++                        continue
++
++                    target_models = sorted(
++                        placement[target],
++                        key=lambda m: (demand(m), m.model_size),
++                    )[:EJECTION_MODEL_LIMIT]
++
++                    for ejected in target_models:
++                        ejected_demand = demand(ejected)
++
++                        # The target must gain enough room after its ejection.
++                        if outgoing.model_size > (
++                            remaining[target] + ejected.model_size + EPS
++                        ):
++                            continue
++
++                        for third in low_pressure_gpus[:EJECTION_TARGET_LIMIT]:
++                            if third == source or third == target:
++                                continue
++                            if ejected.model_size > remaining[third] + EPS:
++                                continue
++
++                            source_load = loads[source] - outgoing_demand
++                            source_rem = remaining[source] + outgoing.model_size
++                            target_load = (
++                                loads[target] - ejected_demand + outgoing_demand
++                            )
++                            target_rem = (
++                                remaining[target] + ejected.model_size
++                                - outgoing.model_size
++                            )
++                            third_load = loads[third] + ejected_demand
++                            third_rem = remaining[third] - ejected.model_size
++
++                            new_scores = scores_after((
++                                (source, source_load, source_rem),
++                                (target, target_load, target_rem),
++                                (third, third_load, third_rem),
++                            ))
++                            new_profile = profile(new_scores)
++
++                            if better(new_profile, best_profile):
++                                best_profile = new_profile
++                                best_action = (
++                                    "eject",
++                                    source, target, third, outgoing, ejected,
++                                    source_load, source_rem,
++                                    target_load, target_rem,
++                                    third_load, third_rem,
++                                )
++
+         if best_action is None:
+             break
+ 
+         kind = best_action[0]
+ 
+         if kind == "move":
+             (
+                 _, source, target, model,
+                 source_load, source_rem,
+                 target_load, target_rem,
+             ) = best_action
+ 
+             placement[source].remove(model)
+             placement[target].append(model)
+             loads[source], remaining[source] = source_load, source_rem
+             loads[target], remaining[target] = target_load, target_rem
+ 
+         elif kind == "swap":
+             (
+                 _, first, second, model_a, model_b,
+                 first_load, first_rem,
+                 second_load, second_rem,
+             ) = best_action
+ 
+             placement[first].remove(model_a)
+             placement[second].remove(model_b)
+             placement[first].append(model_b)
+             placement[second].append(model_a)
+             loads[first], remaining[first] = first_load, first_rem
+             loads[second], remaining[second] = second_load, second_rem
+ 
+         elif kind == "two_for_one":
+             (
+                 _, source, target, model_a, model_b, incoming,
+                 source_load, source_rem,
+                 target_load, target_rem,
+             ) = best_action
+ 
+             placement[source].remove(model_a)
+             placement[source].remove(model_b)
+             placement[target].remove(incoming)
+             placement[source].append(incoming)
+             placement[target].append(model_a)
+             placement[target].append(model_b)
+             loads[source], remaining[source] = source_load, source_rem
+             loads[target], remaining[target] = target_load, target_rem
+ 
+-        else:
++        elif kind == "one_for_two":
+             (
+                 _, source, target, outgoing, incoming_a, incoming_b,
+                 source_load, source_rem,
+                 target_load, target_rem,
+             ) = best_action
+ 
+             placement[source].remove(outgoing)
+             placement[target].remove(incoming_a)
+             placement[target].remove(incoming_b)
+             placement[source].append(incoming_a)
+             placement[source].append(incoming_b)
+             placement[target].append(outgoing)
+             loads[source], remaining[source] = source_load, source_rem
+             loads[target], remaining[target] = target_load, target_rem
+ 
++        else:
++            (
++                _, source, target, third, outgoing, ejected,
++                source_load, source_rem,
++                target_load, target_rem,
++                third_load, third_rem,
++            ) = best_action
++
++            placement[source].remove(outgoing)
++            placement[target].remove(ejected)
++            placement[target].append(outgoing)
++            placement[third].append(ejected)
++            loads[source], remaining[source] = source_load, source_rem
++            loads[target], remaining[target] = target_load, target_rem
++            loads[third], remaining[third] = third_load, third_rem
++
+         scores = [
+             pressure(loads[gpu], remaining[gpu])
+             for gpu in range(gpu_num)
+         ]
+ 
+     return placement
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ if __name__ == "__main__":
+     # Test the algorithm
+ 
+     from evaluator import generate_test_gpu_models
+     from evaluator import calculate_kvcache_pressure
+     from evaluator import safe_float
+     import numpy as np
+ 
+     test_cases = generate_test_gpu_models()
+     all_kvpr = []
+     for i, (gpu_num, gpu_models) in enumerate(test_cases):
+ 
+         results = compute_model_placement(gpu_num, gpu_models)
+         max_kvpr = calculate_kvcache_pressure(results)
+         all_kvpr.append(safe_float(max_kvpr))
+ 
+     avg_kvpr = np.mean(all_kvpr)
+     if avg_kvpr != 0:
+         avg_kvpr = 1.0 / avg_kvpr
+ 
+ 
+     print(f"Max KVPR: {avg_kvpr:.3f}")

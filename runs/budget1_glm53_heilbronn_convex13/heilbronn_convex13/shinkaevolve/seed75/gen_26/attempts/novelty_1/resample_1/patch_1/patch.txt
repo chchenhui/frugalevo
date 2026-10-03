@@ -1,0 +1,197 @@
+--- a/original.py
++++ b/original.py
+@@ -1,154 +1,157 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ import time
+ from itertools import combinations
+ 
+ TRI_IDX = np.array(list(combinations(range(13), 3)))
++N = 13
+ 
+ 
+ def _convex_hull_area(pts):
+-    """Monotone chain convex hull area (vectorized-ish, fast path)."""
+     P = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+-    # dedupe
+-    keep = np.ones(len(P), dtype=bool)
+     if len(P) > 1:
++        keep = np.ones(len(P), dtype=bool)
+         keep[1:] = np.any(P[1:] != P[:-1], axis=1)
+-    P = P[keep]
++        P = P[keep]
+     if len(P) < 3:
+         return 0.0
+     def cross(o, a, b):
+         return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+     lo = []
+     for p in P:
+         while len(lo) >= 2 and cross(lo[-2], lo[-1], p) <= 0:
+             lo.pop()
+         lo.append(p)
+     up = []
+     for p in reversed(P):
+         while len(up) >= 2 and cross(up[-2], up[-1], p) <= 0:
+             up.pop()
+         up.append(p)
+     hull = lo[:-1] + up[:-1]
+     if len(hull) < 3:
+         return 0.0
+-    H = np.array(hull)
++    H = np.asarray(hull)
+     x, y = H[:, 0], H[:, 1]
+     return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+ 
+ 
+ def _cross_all(pts):
+     p = pts[TRI_IDX]
+     a = p[:, 0]
+     v1 = p[:, 1] - a
+     v2 = p[:, 2] - a
+     return np.abs(v1[:, 0]*v2[:, 1] - v1[:, 1]*v2[:, 0])
+ 
+ 
+ def _score(pts):
+     ha = _convex_hull_area(pts)
+     if ha <= 1e-12:
+         return 0.0
+     return 0.5 * _cross_all(pts).min() / ha
+ 
+ 
+-def _bottleneck_pool(pts, k=5):
+-    """Vertices of the k smallest triangles -> candidate move set."""
++def _bottleneck_pool(pts, k=6):
+     cr = _cross_all(pts)
+     idx = np.argpartition(cr, min(k, len(cr)-1))[:k]
+     return np.unique(TRI_IDX[idx])
+ 
+ 
+ def _seeds(rng):
+-    n = 13
+-    t = np.linspace(0, 2*np.pi, n, endpoint=False)
+-    seeds = []
+-    seeds.append(np.column_stack([np.cos(t), np.sin(t)]))
+-    seeds.append(np.column_stack([1.3*np.cos(t), 0.75*np.sin(t)]))
+-    # 12-ring + center
++    t = np.linspace(0, 2*np.pi, N, endpoint=False)
++    seeds = [np.column_stack([np.cos(t), np.sin(t)]),
++             np.column_stack([1.3*np.cos(t), 0.75*np.sin(t)])]
+     t12 = np.linspace(0, 2*np.pi, 12, endpoint=False)
+     seeds.append(np.vstack([np.column_stack([np.cos(t12), np.sin(t12)]), [[0.0, 0.0]]]))
+-    # 7 outer + 6 inner rings
+     t7 = np.linspace(0, 2*np.pi, 7, endpoint=False)
+     t6 = np.linspace(0, 2*np.pi, 6, endpoint=False) + np.pi/6
+     seeds.append(np.vstack([np.column_stack([np.cos(t7), np.sin(t7)]),
+-                            0.5*np.column_stack([np.cos(t6), np.sin(t6)])]))
+-    # superellipse
+-    u = np.linspace(0, 2*np.pi, n, endpoint=False)
++                            0.55*np.column_stack([np.cos(t6), np.sin(t6)])]))
++    u = np.linspace(0, 2*np.pi, N, endpoint=False)
+     seeds.append(np.column_stack([np.sign(np.cos(u))*np.abs(np.cos(u))**0.5,
+                                   np.sign(np.sin(u))*np.abs(np.sin(u))**0.5]))
+-    # perturbed 13-gon
+-    s = np.column_stack([np.cos(t), np.sin(t)])
+-    s += rng.normal(0, 0.08, s.shape)
++    # 3-fold symmetric ring config (good Heilbronn prior)
++    t4 = np.linspace(0, 2*np.pi, 4, endpoint=False)
++    t9 = np.linspace(0, 2*np.pi, 9, endpoint=False)
++    seeds.append(np.vstack([np.column_stack([np.cos(t4), np.sin(t4)]),
++                            0.5*np.column_stack([np.cos(t9+0.3), np.sin(t9+0.3)])]))
++    s = np.column_stack([np.cos(t), np.sin(t)]) + rng.normal(0, 0.08, (N, 2))
+     seeds.append(s)
+-    # random
+-    seeds.append(rng.random((n, 2)))
++    seeds.append(rng.random((N, 2)))
+     return seeds
+ 
+ 
+ def _hillclimb(pts, rng, deadline, sigma0=0.12):
+     pts = pts.copy()
+     sc = _score(pts)
+     sigma = sigma0
+     while time.time() < deadline:
+         improved = False
+-        pool = None
+         for _ in range(150):
++            r = rng.random()
+             cand = pts.copy()
+-            if rng.random() < 0.6:
+-                if pool is None:
+-                    pool = _bottleneck_pool(pts, k=5)
+-                i = int(rng.choice(pool))
++            if r < 0.55:
++                # targeted push: move a bottleneck-triangle vertex away
++                pool = _bottleneck_pool(pts, k=3)
++                tri = TRI_IDX[pool[rng.integers(len(pool))]]
++                # pick the vertex of this triangle that lies in most bottleneck tris
++                i = int(tri[rng.integers(3)])
++                others = pts[[j for j in tri if j != i]]
++                mid = others.mean(axis=0)
++                d = pts[i] - mid
++                nrm = np.linalg.norm(d)
++                if nrm < 1e-12:
++                    d = rng.normal(size=2)
++                    nrm = np.linalg.norm(d)
++                cand[i] = pts[i] + (d / nrm) * sigma * rng.uniform(0.5, 1.5)
+             else:
+-                i = int(rng.integers(13))
+-            cand[i] += rng.normal(0, sigma, 2)
++                i = int(rng.integers(N))
++                cand[i] += rng.normal(0, sigma, 2)
+             csc = _score(cand)
+             if csc > sc + 1e-12:
+                 pts, sc = cand, csc
+-                pool = None  # recompute bottleneck pool
+                 improved = True
+         if improved:
+-            sigma = min(sigma * 1.3, 0.3)
++            sigma = min(sigma * 1.25, 0.3)
+         else:
+-            sigma *= 0.55
++            sigma *= 0.5
+         if sigma < 1e-5:
+             break
+     return pts, sc
+ 
+ 
+ def heilbronn_convex13() -> np.ndarray:
+     rng = np.random.default_rng(seed=42)
+     t_start = time.time()
+     time_limit = 3.0
+-    n = 13
+ 
+     seeds = _seeds(rng)
+     best_pts, best_sc = seeds[0].copy(), _score(seeds[0])
+ 
+-    # Phase 1: seed sweep (~55% of budget)
++    # Phase 1: sweep seeds (~55% budget)
+     phase1 = t_start + time_limit * 0.55
+     per = (phase1 - t_start) / len(seeds)
+     for k, s in enumerate(seeds):
+         dl = min(t_start + (k + 1) * per, t_start + time_limit)
+         if time.time() >= dl:
+             continue
+         pts, sc = _hillclimb(s, rng, dl)
+         if sc > best_sc:
+             best_sc, best_pts = sc, pts.copy()
+ 
+-    # Phase 2: restarts around best (~45% of budget)
++    # Phase 2: restarts around best
+     while time.time() - t_start < time_limit - 0.05:
+         remaining = time_limit - (time.time() - t_start)
+         dl = time.time() + min(0.6, remaining)
+         kick = best_pts + rng.normal(0, 0.05, best_pts.shape)
+         pts, sc = _hillclimb(kick, rng, dl, sigma0=0.06)
+         if sc > best_sc:
+             best_sc, best_pts = sc, pts.copy()
+ 
+     best_pts = np.asarray(best_pts, dtype=float)
+-    if not np.all(np.isfinite(best_pts)) or best_pts.shape != (n, 2):
+-        t = np.linspace(0, 2*np.pi, n, endpoint=False)
++    if not np.all(np.isfinite(best_pts)) or best_pts.shape != (N, 2):
++        t = np.linspace(0, 2*np.pi, N, endpoint=False)
+         best_pts = np.column_stack([np.cos(t), np.sin(t)])
+     return best_pts
+ 
+ 
+ # EVOLVE-BLOCK-END

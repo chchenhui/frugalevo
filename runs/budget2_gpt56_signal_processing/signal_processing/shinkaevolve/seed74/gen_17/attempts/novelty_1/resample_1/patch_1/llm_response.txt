@@ -1,0 +1,125 @@
+<NAME>
+trend_consistency_gain_gate
+</NAME>
+
+<DESCRIPTION>
+Add a short-horizon versus full-window slope-consistency gate to the adaptive tracker. The current Kalman correction can respond strongly to a locally noisy innovation even when the recent direction disagrees with the broader trend, contributing to its relatively high slope-change and false-reversal counts. The new statistic computes inexpensive least-squares slopes over the retained measurement window and its newest 6–10 samples. Process noise and measurement gain are restricted when the slopes disagree or have substantially incompatible magnitudes. Coherent sustained motion still retains the normal high-gain response, while isolated turns are smoothed until they gain multi-sample support. This directly trades a small amount of impulsive responsiveness for improved smoothness and reversal reliability without adding phase delay or changing the public API.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        self.previous_measurement = float(initial_value)
+        self.diff_scale = _RobustScaleEstimator(window_size)
+        self.innovation_scale = _RobustScaleEstimator(window_size)
+
+    def _measurement_noise(self):
+=======
+        self.previous_measurement = float(initial_value)
+        self.diff_scale = _RobustScaleEstimator(window_size)
+        self.innovation_scale = _RobustScaleEstimator(window_size)
+        self.trend_measurements = deque(maxlen=max(4, window_size))
+
+    def _trend_is_coherent(self, measurement, noise_scale):
+        """
+        Compare full-window and recent-window regression slopes.
+
+        A genuine maneuver normally has compatible slopes at both scales.
+        A disagreement is a useful causal indication that a large innovation is
+        an excursion rather than a trend that should receive high Kalman gain.
+        """
+        self.trend_measurements.append(float(measurement))
+        values = np.asarray(self.trend_measurements, dtype=float)
+        count = len(values)
+
+        if count < 6:
+            return True
+
+        recent_count = min(count, max(6, min(10, self.trend_measurements.maxlen // 2)))
+        full_time = np.arange(count, dtype=float)
+        recent_time = np.arange(recent_count, dtype=float)
+
+        def fitted_slope(samples, time):
+            centered_time = time - np.mean(time)
+            denominator = np.dot(centered_time, centered_time)
+            return np.dot(centered_time, samples - np.mean(samples)) / max(denominator, 1e-12)
+
+        full_slope = fitted_slope(values, full_time)
+        recent_slope = fitted_slope(values[-recent_count:], recent_time)
+        slope_floor = 0.06 * max(noise_scale, 1e-8)
+
+        if abs(full_slope) < slope_floor:
+            # In a flat broad trend, only permit high gain after the recent
+            # movement itself rises clearly above the local noise floor.
+            return abs(recent_slope) < 2.5 * slope_floor
+
+        same_direction = full_slope * recent_slope > 0.0
+        magnitude_ratio = abs(recent_slope) / max(abs(full_slope), slope_floor)
+        return same_direction and 0.30 <= magnitude_ratio <= 3.25
+
+    def _measurement_noise(self):
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        measurement_variance = self._measurement_noise()
+
+        # ---- Predict: constant velocity state model ----
+=======
+        measurement_variance = self._measurement_noise()
+        noise_scale = np.sqrt(measurement_variance)
+        trend_coherent = self._trend_is_coherent(measurement, noise_scale)
+
+        # ---- Predict: constant velocity state model ----
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        motion = abs(self.velocity)
+        q_level = measurement_variance * (0.035 + 0.08 * min(1.0, motion / (np.sqrt(measurement_variance) + 1e-8)))
+        q_velocity = measurement_variance * 0.006
+=======
+        motion = abs(self.velocity)
+        motion_ratio = min(1.0, motion / (noise_scale + 1e-8))
+        coherence_factor = 1.0 if trend_coherent else 0.42
+        q_level = measurement_variance * (
+            0.020 + coherence_factor * 0.095 * motion_ratio
+        )
+        q_velocity = measurement_variance * (0.003 + 0.005 * coherence_factor)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        effective_r = measurement_variance * (1.0 + max(0.0, outlier_ratio - 1.0) * 5.0)
+
+        # ---- Correct ----
+        innovation_variance = max(pp00 + effective_r, 1e-10)
+        k_level = pp00 / innovation_variance
+        k_velocity = pp10 / innovation_variance
+
+        self.level = predicted_level + k_level * clipped_innovation
+        raw_velocity = predicted_velocity + k_velocity * clipped_innovation
+=======
+        effective_r = measurement_variance * (
+            1.0 + max(0.0, outlier_ratio - 1.0) * 5.0
+        )
+        if not trend_coherent:
+            # Conflicting multi-scale slopes cap reaction to a single local
+            # excursion without suppressing coherent sustained movement.
+            effective_r *= 2.4
+
+        # ---- Correct ----
+        innovation_variance = max(pp00 + effective_r, 1e-10)
+        k_level = pp00 / innovation_variance
+        k_velocity = pp10 / innovation_variance
+
+        if not trend_coherent:
+            k_level = min(k_level, 0.46)
+            k_velocity = min(k_velocity, 0.18) if k_velocity >= 0.0 else max(k_velocity, -0.18)
+
+        self.level = predicted_level + k_level * clipped_innovation
+        raw_velocity = predicted_velocity + k_velocity * clipped_innovation
+>>>>>>> REPLACE
+</DIFF>

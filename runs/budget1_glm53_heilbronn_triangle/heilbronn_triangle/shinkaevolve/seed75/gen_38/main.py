@@ -1,0 +1,238 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+SQRT3 = np.sqrt(3.0)
+TRI_AREA = SQRT3 / 4.0
+N = 11
+
+V0 = np.array([0.0, 0.0])
+V1 = np.array([1.0, 0.0])
+V2 = np.array([0.5, SQRT3 / 2.0])
+VERTS = np.stack([V0, V1, V2])  # (3,2)
+
+
+def _all_triples(n):
+    idxs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            for k in range(j + 1, n):
+                idxs.append((i, j, k))
+    return np.array(idxs)
+
+
+TRIPLES = _all_triples(N)
+I_, J_, K_ = TRIPLES[:, 0], TRIPLES[:, 1], TRIPLES[:, 2]
+
+
+def _areas(pts):
+    a = pts[I_]
+    b = pts[J_]
+    c = pts[K_]
+    cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    return 0.5 * np.abs(cross)
+
+
+def _min_area_pts(pts):
+    return _areas(pts).min() / TRI_AREA
+
+
+def _decode(Z):
+    """Decode (n,2) raw logits to points strictly inside the triangle via
+    softmax over 3 barycentric coordinates."""
+    Z = Z.reshape(N, 2)
+    Z3 = np.concatenate([Z, np.zeros((N, 1))], axis=1)  # (n,3)
+    m = Z3.max(axis=1, keepdims=True)
+    E = np.exp(Z3 - m)
+    W = E / E.sum(axis=1, keepdims=True)  # barycentric weights, >0, sum 1
+    return W @ VERTS
+
+
+def _softmin_val(pts, p=60.0):
+    ar = _areas(pts) / TRI_AREA
+    m = ar.min()
+    return -((np.log(np.sum(np.exp(-p * (ar - m)))) - p * m) / (-p))  # negative softmin (maximize)
+
+
+def _cma_es(Z0, sigma0, iters, pop, rng):
+    """Compact CMA-ES (rank-mu-free, rank-one) in logit space."""
+    d = Z0.size
+    mean = Z0.flatten().copy()
+    sigma = sigma0
+    C = np.eye(d)
+    # CMA parameters
+    lam = pop
+    mu = lam // 2
+    w = np.log(mu + 0.5) - np.log(np.arange(1, mu + 1))
+    w /= w.sum()
+    mu_eff = 1.0 / (w ** 2).sum()
+    cs = (mu_eff + 2) / (d + mu_eff + 5)
+    ds = 1 + 2 * max(0, np.sqrt((mu_eff - 1) / (d + 1)) - 1) + cs
+    c1 = 2 / ((d + 1.3) ** 2 + mu_eff)
+    cmu = min(1 - c1, 2 * (mu_eff - 2 + 1 / mu_eff) / ((d + 2) ** 2 + mu_eff))
+    pc = np.zeros(d)
+    ps = np.zeros(d)
+    chiN = np.sqrt(d) * (1 - 1 / (4 * d) + 1 / (21 * d * d))
+
+    best_z, best_v = mean.copy(), _softmin_val(_decode(mean))
+    try:
+        for it in range(iters):
+            # sample
+            try:
+                L = np.linalg.cholesky(C)
+            except np.linalg.LinAlgError:
+                C = np.eye(d)
+                L = np.eye(d)
+            Zs = rng.normal(size=(lam, d)) @ L.T
+            Cand = mean + sigma * Zs
+            vals = np.array([_softmin_val(_decode(z)) for z in Cand])
+            order = np.argsort(vals)[::-1]  # descending
+            elite = Cand[order[:mu]]
+            # update mean
+            dm = (elite - mean).T @ w
+            mean = mean + dm
+            v = _softmin_val(_decode(mean))
+            if v > best_v:
+                best_v = v
+                best_z = mean.copy()
+            # evolution paths
+            y = dm / sigma
+            ps = (1 - cs) * ps + np.sqrt(cs * (2 - cs) * mu_eff) * np.linalg.solve(L, y)
+            hsig = float(np.linalg.norm(ps) / np.sqrt(1 - (1 - cs) ** (2 * (it + 1))) / chiN < 1.4 + 2 / (d + 1))
+            pc = (1 - c1) * pc + hsig * np.sqrt(c1 * (2 - c1) * mu_eff) * y
+            # rank-one update with elites
+            Ye = (Cand[order[:mu]] - (mean - dm)) / sigma  # before mean shift
+            C = (1 - c1 - cmu) * C + c1 * (np.outer(pc, pc) + (1 - hsig) * 2 * c1 * C) \
+                + cmu * (Ye.T * w) @ Ye
+            C = (C + C.T) / 2
+            # step-size adaptation via cumulative control
+            cn, cc = 4.0 / (d + 4.0), 10.0 / (d + 10.0)
+            invL = np.linalg.inv(L)
+            z_avg = (Zs[order[:mu]].T * w).sum(axis=1)
+            expectation = np.sqrt(d) * (1 - 1.0 / (4 * d) + 1.0 / (21 * d * d))
+            sigma *= np.exp(min(1.0, cs * (np.linalg.norm(invL @ ps) / expectation - 1)))
+            # degenerate guard
+            eigs = np.linalg.eigvalsh(C)
+            if eigs[-1] > 1e8 * max(eigs[0], 1e-12):
+                C = np.eye(d)
+            if not np.isfinite(C).all() or not np.isfinite(mean).all():
+                break
+    except Exception:
+        pass
+    return best_z, best_v
+
+
+def _targeted_powell(pts, rounds=8):
+    """Interleave discrete worst-triplet refinement: run Powell on the 6
+    coordinates of the worst triplet's 3 points, fixing the rest."""
+    from scipy.optimize import minimize
+
+    def clip_pt(p):
+        x = np.clip(p[0], 0.0, 1.0)
+        yhi = SQRT3 * x if x <= 0.5 else SQRT3 * (1.0 - x)
+        return np.array([x, np.clip(p[1], 0.0, yhi)])
+
+    best_pts = pts.copy()
+    best_val = _min_area_pts(pts)
+    for _ in range(rounds):
+        areas = _areas(best_pts) / TRI_AREA
+        t = int(np.argmin(areas))
+        ti, tj, tk = TRIPLES[t]
+        sel = [ti, tj, tk]
+        base = best_pts.copy()
+
+        def obj(q):
+            P = base.copy()
+            P[sel] = np.array(q).reshape(3, 2)
+            # feasibility via soft projection penalty
+            X = P[:, 0]
+            pen = np.sum(np.maximum(0, -P[:, 1]) ** 2)
+            pen += np.sum(np.maximum(0, P[:, 1] - np.minimum(SQRT3 * X, SQRT3 * (1 - X))) ** 2)
+            pen += np.sum(np.maximum(0, -X) ** 2 + np.maximum(0, X - 1) ** 2)
+            return -_softmin_val(P, p=200.0) + 1e4 * pen
+
+        try:
+            res = minimize(obj, base[sel].flatten(), method='Powell',
+                          options={'maxiter': 40, 'xtol': 1e-6, 'ftol': 1e-9})
+            if np.isfinite(res.x).all():
+                P = base.copy()
+                P[sel] = np.array([clip_pt(p) for p in res.x.reshape(3, 2)])
+                v = _min_area_pts(P)
+                if v > best_val + 1e-16:
+                    best_val, best_pts = v, P
+        except Exception:
+            break
+    return best_pts, best_val
+
+
+def _lattice_start():
+    lat = []
+    for r in range(5):
+        y = r * (SQRT3 / 2) / 4
+        for c in range(r + 1):
+            x = 0.5 * (1 - r / 4) + c * (1.0 / 4)
+            lat.append((x, y))
+    lat = np.array(lat)
+    keep = [0, 1, 2, 3, 4, 5, 6, 8, 9, 12, 14]
+    return lat[keep]
+
+
+def _encode(pts):
+    """Inverse-ish of decode: rough logits from barycentric coords with smoothing."""
+    P = np.asarray(pts, dtype=float).reshape(N, 2)
+    # barycentric via areas
+    a0 = 0.5 * np.abs((V1 - P)[:, 0] * (V2 - P)[:, 1] - (V1 - P)[:, 1] * (V2 - P)[:, 0]) / TRI_AREA
+    a1 = 0.5 * np.abs((V2 - P)[:, 0] * (V0 - P)[:, 1] - (V2 - P)[:, 1] * (V0 - P)[:, 0]) / TRI_AREA
+    a2 = np.clip(1.0 - a0 - a1, 1e-3, 1.0)
+    a0 = np.clip(a0, 1e-3, 1.0)
+    a1 = np.clip(a1, 1e-3, 1.0)
+    S = np.stack([a0, a1, a2], axis=1)
+    S = S / S.sum(axis=1, keepdims=True)
+    L3 = np.log(S)
+    L3 = L3 - L3[:, 2:3]  # reference third coord to 0
+    return L3[:, :2]
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    rng = np.random.default_rng(2024)
+
+    starts = [_lattice_start()]
+    # boundary-heavy and random starts
+    t = np.linspace(0, 1, 12)
+    ring = [(f, 0.0) for f in t]
+    ring += [(0.5 * (1 - f) + f, SQRT3 / 2 * f) for f in t[1:-1]]
+    ring += [(0.5 * (1 - f), SQRT3 / 2 * f) for f in t[1:-1]]
+    ring = np.array(ring)
+    starts.append(ring[np.linspace(0, len(ring) - 1, N).astype(int)])
+    for _ in range(2):
+        p = rng.random((N, 2))
+        p[:, 1] *= np.minimum(SQRT3 * p[:, 0], SQRT3 * (1 - p[:, 0])) * 0.9
+        starts.append(p)
+
+    best_pts, best_val = None, -1.0
+    for s in starts:
+        try:
+            Z0 = _encode(s)
+            # CMA-ES in unconstrained logit space
+            Z, v = _cma_es(Z0, sigma0=0.8, iters=120, pop=20, rng=rng)
+            pts = _decode(Z)
+            val = _min_area_pts(pts)
+            if val > best_val:
+                best_val, best_pts = val, pts.copy()
+            # targeted worst-triplet Powell refinement
+            pts2, val2 = _targeted_powell(pts, rounds=8)
+            if val2 > best_val:
+                best_val, best_pts = val2, pts2
+        except Exception:
+            continue
+
+    if best_pts is None:
+        best_pts = _lattice_start()
+
+    # hard projection to guarantee feasibility
+    X = np.clip(best_pts[:, 0], 0.0, 1.0)
+    yhi = np.minimum(SQRT3 * X, SQRT3 * (1 - X))
+    Y = np.clip(best_pts[:, 1], 0.0, yhi)
+    return np.stack([X, Y], axis=1)
+
+
+# EVOLVE-BLOCK-END

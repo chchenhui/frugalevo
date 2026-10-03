@@ -1,0 +1,128 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Adaptive-width beam search with time budget and insertion-move polish.
+    """
+    n = workload.num_txns
+    if n == 0:
+        return 0, []
+
+    start_time = time.time()
+    budget = 25.0
+
+    best_cost = float('inf')
+    best_seq = None
+
+    def beam_run(width_cap):
+        beam = []
+        # diversified seeds: deterministic + random
+        seeds = {0}
+        if n > 1:
+            seeds.add(n - 1)
+        seeds.add(random.randrange(n))
+        if n > 3:
+            seeds.add(random.randrange(n))
+        for s in seeds:
+            seq = [s]
+            rem = [x for x in range(n) if x != s]
+            beam.append((workload.get_opt_seq_cost(seq), seq, rem))
+        beam.sort(key=lambda x: x[0])
+        beam = beam[:max(2, width_cap)]
+
+        while beam and len(beam[0][1]) < n:
+            placed = len(beam[0][1])
+            # adaptive width: wide early, narrow late
+            w = max(2, min(width_cap, max(3, (width_cap * (n - placed)) // max(1, n // 2))))
+            candidates = []
+            for c, seq, rem in beam:
+                for t in rem:
+                    new_seq = seq + [t]
+                    new_rem = [x for x in rem if x != t]
+                    candidates.append((workload.get_opt_seq_cost(new_seq), new_seq, new_rem))
+            if not candidates:
+                break
+            candidates.sort(key=lambda x: x[0])
+            beam = candidates[:w]
+        if not beam:
+            return None
+        seq = beam[0][1]
+        return workload.get_opt_seq_cost(seq), seq
+
+    def polish(seq, cost, deadline):
+        seq = list(seq)
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            for i in range(len(seq)):
+                txn = seq[i]
+                rest = seq[:i] + seq[i+1:]
+                best_c = cost
+                best_j = -1
+                for j in range(len(seq)):
+                    if j == i:
+                        continue
+                    cand = rest[:j] + [txn] + rest[j:]
+                    c = workload.get_opt_seq_cost(cand)
+                    if c < best_c:
+                        best_c = c
+                        best_j = j
+                if best_j >= 0:
+                    seq = rest[:best_j] + [txn] + rest[best_j:]
+                    cost = best_c
+                    improved = True
+            # random double move occasionally
+        return seq, cost
+
+    # multiple beam restarts until budget nearly exhausted
+    while time.time() - start_time < budget - 4:
+        res = beam_run(width_cap=6)
+        if res:
+            c, seq = res
+            if c < best_cost:
+                best_cost = c
+                best_seq = seq
+        if best_seq is None and res:
+            best_cost, best_seq = res
+
+    # final polish with remaining budget
+    if best_seq is not None:
+        best_seq, best_cost = polish(best_seq, best_cost, start_time + budget)
+        # verify
+        best_cost = workload.get_opt_seq_cost(best_seq)
+
+    if best_seq is None:
+        best_seq = list(range(n))
+        best_cost = workload.get_opt_seq_cost(best_seq)
+
+    assert len(set(best_seq)) == n
+    return best_cost, best_seq
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

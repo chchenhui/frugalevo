@@ -1,0 +1,94 @@
+<NAME>
+swap_refined_packing
+</NAME>
+
+<DESCRIPTION>
+Add a bounded best-improving pair-swap refinement after the batched cardinality-constrained LPT placement.
+
+LPT is fast and usually produces good placements, but it can leave two packs with complementary mistakes: a relatively heavy item in a heavily loaded pack and a lighter item in a lightly loaded pack. Swapping those items preserves the exact per-pack item quota while reducing the sum of squared pack loads, which directly reduces residual GPU/node imbalance.
+
+The refinement evaluates all cross-pack item pairs in parallel and applies at most two best swaps per layer. It is intentionally restricted to moderately sized packing problems so that the quadratic candidate matrix cannot dominate planner runtime for unusually large expert configurations. The main EPLB packing stages normally operate on groups or physical experts per node, where this inexpensive local search has high value.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        pack_count.scatter_add_(
+            1,
+            chosen_pack.unsqueeze(1),
+            torch.ones((num_layers, 1), dtype=torch.int64,
+                       device=weight.device),
+        )
+
+    return pack_index, rank_in_pack
+=======
+        pack_count.scatter_add_(
+            1,
+            chosen_pack.unsqueeze(1),
+            torch.ones((num_layers, 1), dtype=torch.int64,
+                       device=weight.device),
+        )
+
+    # LPT can leave beneficial exchanges between a heavy pack and a light
+    # pack.  A swap preserves cardinality exactly.  For items i and j, with
+    # d = weight[j] - weight[i], its change in squared pack load is
+    # 2 * d * (load(pack(i)) - load(pack(j))) + 2 * d**2.
+    #
+    # Packing stages in EPLB are normally small (groups or experts per node);
+    # retain the linear-time path for larger inputs where an all-pairs search
+    # would be disproportionately expensive.
+    if num_packs > 1 and num_items <= 128:
+        upper_pairs = torch.triu(
+            torch.ones((num_items, num_items),
+                       dtype=torch.bool,
+                       device=weight.device),
+            diagonal=1,
+        )
+        rows = torch.arange(num_layers, device=weight.device)
+
+        # Two exchanges recover most LPT residual imbalance without making
+        # rebalancing latency sensitive to the number of layers.
+        for _ in range(2):
+            item_load = pack_load.gather(1, pack_index)
+            transfer = (weight.float().unsqueeze(1) -
+                        weight.float().unsqueeze(2))
+            load_gap = item_load.unsqueeze(2) - item_load.unsqueeze(1)
+            delta = 2 * transfer * load_gap + 2 * transfer.square()
+
+            different_packs = (pack_index.unsqueeze(1) !=
+                               pack_index.unsqueeze(2))
+            delta.masked_fill_(~(upper_pairs.unsqueeze(0) & different_packs),
+                               float("inf"))
+            best_delta, best_pair = delta.flatten(1).min(dim=1)
+            active = best_delta < 0
+            if not bool(active.any()):
+                break
+
+            first = best_pair // num_items
+            second = best_pair % num_items
+            first_pack = pack_index[rows, first]
+            second_pack = pack_index[rows, second]
+            first_rank = rank_in_pack[rows, first]
+            second_rank = rank_in_pack[rows, second]
+
+            pack_index[rows, first] = torch.where(
+                active, second_pack, first_pack)
+            pack_index[rows, second] = torch.where(
+                active, first_pack, second_pack)
+            rank_in_pack[rows, first] = torch.where(
+                active, second_rank, first_rank)
+            rank_in_pack[rows, second] = torch.where(
+                active, first_rank, second_rank)
+
+            applied_transfer = torch.where(
+                active,
+                weight.float()[rows, second] - weight.float()[rows, first],
+                torch.zeros_like(best_delta),
+            )
+            pack_load.scatter_add_(1, first_pack.unsqueeze(1),
+                                   applied_transfer.unsqueeze(1))
+            pack_load.scatter_add_(1, second_pack.unsqueeze(1),
+                                   (-applied_transfer).unsqueeze(1))
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

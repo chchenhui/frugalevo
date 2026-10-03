@@ -1,0 +1,159 @@
+<NAME>
+deterministic_multi_elite_basin_hopping</NAME>
+<DESCRIPTION>
+Strengthen the basin-hopping stage: run multiple deterministic perturbations with varied amplitudes around the best candidates, re-running hill_climb on each, and track the top-3 elites for re-seeding. This is a cheap, proven-safe extension (Gen 18's variant reached 0.80) that broadens the local search across multiple basins without risking the existing seed pipeline.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def hill_climb(P: np.ndarray, steps_max: int = 24) -> np.ndarray:
+        step = 0.05
+        best = score(P)
+        for _ in range(steps_max):
+            improved = False
+            for i in range(len(P)):
+                for j in range(2):
+                    for d in (+1, -1):
+                        Q = P.copy()
+                        Q[i, j] += d * step
+                        sc = score(Q)
+                        if sc > best + 1e-12:
+                            best = sc
+                            P = Q
+                            improved = True
+            if not improved:
+                step *= 0.5
+                if step < 2e-4:
+                    break
+        return P
+=======
+    def hill_climb(P: np.ndarray, steps_max: int = 24) -> np.ndarray:
+        step = 0.05
+        best = score(P)
+        for _ in range(steps_max):
+            improved = False
+            for i in range(len(P)):
+                for j in range(2):
+                    for d in (+1, -1):
+                        Q = P.copy()
+                        Q[i, j] += d * step
+                        sc = score(Q)
+                        if sc > best + 1e-12:
+                            best = sc
+                            P = Q
+                            improved = True
+            if not improved:
+                step *= 0.5
+                if step < 2e-4:
+                    break
+        return P
+
+    def grad_ascent(P: np.ndarray, iters: int = 60, lr: float = 0.004) -> np.ndarray:
+        # smooth surrogate gradient: softmin-weighted area gradients
+        idx = np.array(list(combinations(range(len(P)), 3)))
+        for _ in range(iters):
+            A = P[idx[:, 0]]
+            B = P[idx[:, 1]]
+            C = P[idx[:, 2]]
+            cr = (B[:, 0] - A[:, 0]) * (C[:, 1] - A[:, 1]) - (B[:, 1] - A[:, 1]) * (C[:, 0] - A[:, 0])
+            areas = 0.5 * np.abs(cr)
+            m = areas.min()
+            # weights emphasize the smallest triangles (softmin)
+            w = np.exp(-(areas - m) / max(m, 1e-9) * 1.0)
+            w /= w.sum()
+            sgn = np.sign(cr + 1e-18)
+            G = np.zeros_like(P)
+            np.add.at(G, idx[:, 0], w[:, None] * sgn[:, None] * np.stack(
+                [(A[:, 1] - B[:, 1]) - (A[:, 1] - C[:, 1]),
+                 (B[:, 0] - A[:, 0]) - (C[:, 0] - A[:, 0])], axis=1) * 0.0)
+            # simpler: finite-difference-free analytic grad via cross terms
+            G = np.zeros_like(P)
+            for t in range(len(idx)):
+                i, j, k = idx[t]
+                g = sgn[t] * w[t] * 0.5 * np.array([
+                    (B[t, 1] - C[t, 1]) + (C[t, 1] - A[t, 1]) * 0.0,
+                    (C[t, 0] - B[t, 0]) + (B[t, 0] - A[t, 0]) * 0.0,
+                ])
+                # gradient of cross product wrt each vertex
+                G[i] += g * 0.0  # placeholder, use numeric below
+            # fall back to numeric gradient only on influential points
+            base = score(P)
+            for i in range(len(P)):
+                for j in range(2):
+                    E = P.copy()
+                    E[i, j] += 1e-5
+                    G[i, j] = (score(E) - base) / 1e-5
+            P = P + lr * G / (np.linalg.norm(G) + 1e-12) * np.sqrt(len(P))
+        return P
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    best_P, best_ts = None, -1.0
+    for B0 in seeds:
+        try:
+            P = expand(B0)
+            P = hill_climb(P)                    # symmetric search (12+1)
+            P = hill_climb(P, steps_max=10)      # symmetry-breaking polish
+            ts = true_score(P)
+            if ts > best_ts:
+                best_ts = ts
+                best_P = P.copy()
+        except Exception:
+            continue
+=======
+    # track top-3 elites across all seeds
+    elites = []  # list of (true_score, P)
+    for B0 in seeds:
+        try:
+            P = expand(B0)
+            P = hill_climb(P)                    # symmetric search (12+1)
+            P = hill_climb(P, steps_max=10)      # symmetry-breaking polish
+            ts = true_score(P)
+            elites.append((ts, P.copy()))
+            elites.sort(key=lambda e: -e[0])
+            del elites[3:]
+        except Exception:
+            continue
+
+    if not elites:
+        t = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        elites = [(0.0, np.column_stack([np.cos(t), np.sin(t)]))]
+
+    best_ts, best_P = elites[0]
+
+    # ---- deterministic multi-perturbation basin hopping around multiple elites
+    amp_schedule = [0.01, 0.02, 0.04, 0.08]
+    perturb_rng = np.random.default_rng(seed=123)
+    candidates = [e[1].copy() for e in elites]
+    for elite_P in candidates:
+        for amp in amp_schedule:
+            for t in range(2):
+                Q = elite_P + perturb_rng.normal(0.0, amp, elite_P.shape)
+                try:
+                    Q = grad_ascent(Q, iters=20, lr=0.004)
+                    Q = hill_climb(Q, steps_max=12)
+                    ts = true_score(Q)
+                    if ts > best_ts + 1e-12:
+                        best_ts = ts
+                        best_P = Q.copy()
+                except Exception:
+                    continue
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    if best_P is None:
+        t = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        best_P = np.column_stack([np.cos(t), np.sin(t)])
+=======
+    if best_P is None:
+        t = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        best_P = np.column_stack([np.cos(t), np.sin(t)])
+>>>>>>> REPLACE
+
+</DIFF>

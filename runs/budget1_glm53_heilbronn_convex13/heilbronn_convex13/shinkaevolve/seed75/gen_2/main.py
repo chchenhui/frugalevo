@@ -1,0 +1,171 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct an arrangement of n points on or inside a convex region in order to maximize the area of the
+    smallest triangle formed by these points. Here n = 13.
+
+    Returns:
+        points: np.ndarray of shape (13,2) with the x,y coordinates of the points.
+    """
+    n = 13
+    from itertools import combinations
+    import math
+
+    tri_idx = np.array(list(combinations(range(n), 3)), dtype=int)
+    ia, ib, ic = tri_idx[:, 0], tri_idx[:, 1], tri_idx[:, 2]
+
+    def tri_areas(P):
+        A, B, C = P[ia], P[ib], P[ic]
+        return 0.5 * np.abs((B[:, 0] - A[:, 0]) * (C[:, 1] - A[:, 1]) -
+                            (C[:, 0] - A[:, 0]) * (B[:, 1] - A[:, 1]))
+
+    def hull_area(P):
+        pts = sorted(set(map(tuple, np.round(P, 12))))
+        if len(pts) < 3:
+            return 1e-12
+
+        def cross(o, a, b):
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+        lower = []
+        for p in pts:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+        upper = []
+        for p in reversed(pts):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+        hull = lower[:-1] + upper[:-1]
+        s = 0.0
+        m = len(hull)
+        for i in range(m):
+            x1, y1 = hull[i]
+            x2, y2 = hull[(i + 1) % m]
+            s += x1 * y2 - x2 * y1
+        return max(abs(s) / 2.0, 1e-12)
+
+    def score(P):
+        return tri_areas(P).min() / hull_area(P)
+
+    def tri_grad(P, t):
+        i, j, k = tri_idx[t]
+        A, B, C = P[i], P[j], P[k]
+        cr = (B[0] - A[0]) * (C[1] - A[1]) - (C[0] - A[0]) * (B[1] - A[1])
+        sg = 1.0 if cr >= 0 else -1.0
+        g = np.zeros((3, 2))
+        g[0] = sg * 0.5 * np.array([B[1] - C[1], C[0] - B[0]])
+        g[1] = sg * 0.5 * np.array([C[1] - A[1], A[0] - C[0]])
+        g[2] = sg * 0.5 * np.array([A[1] - B[1], B[0] - A[0]])
+        return g, (i, j, k)
+
+    def targeted_search(P, max_iters=400):
+        P = np.clip(P.copy(), 0.0, 1.0)
+        cur_min = tri_areas(P).min()
+        t = int(np.argmin(tri_areas(P)))
+        step = 0.02
+        stalls = 0
+        for _ in range(max_iters):
+            gv, verts = tri_grad(P, t)
+            norm = np.linalg.norm(gv)
+            improved = False
+            if norm > 1e-15 and np.isfinite(norm):
+                trial = P.copy()
+                vs = list(verts)
+                trial[vs] = np.clip(trial[vs] + step * gv / norm, 0.0, 1.0)
+                new_min = tri_areas(trial).min()
+                if new_min > cur_min + 1e-14:
+                    P, cur_min = trial, new_min
+                    step = min(step * 1.3, 0.05)
+                    improved = True
+                    t = int(np.argmin(tri_areas(P)))
+            if not improved:
+                step *= 0.5
+                if step < 1e-6:
+                    a = tri_areas(P)
+                    t = int(np.argsort(a)[stalls % 5])
+                    step = 0.01
+                    stalls += 1
+                    if stalls > 30:
+                        break
+        return P
+
+    def softmin_polish(P, iters=200):
+        P = np.clip(P.copy(), 0.0, 1.0)
+        cur_min = tri_areas(P).min()
+        a0 = tri_areas(P)
+        spread = max(a0.max() - a0.min(), 1e-9)
+        p = 10.0 / spread
+        lr = 0.002
+        fails = 0
+        for _ in range(iters):
+            A, B, C = P[ia], P[ib], P[ic]
+            cr = (B[:, 0] - A[:, 0]) * (C[:, 1] - A[:, 1]) - \
+                 (C[:, 0] - A[:, 0]) * (B[:, 1] - A[:, 1])
+            sgn = np.where(cr >= 0, 1.0, -1.0)
+            areas = 0.5 * np.abs(cr)
+            w = np.exp(-p * (areas - areas.min()))
+            w /= w.sum()
+            ga = 0.5 * sgn[:, None] * np.stack([B[:, 1] - C[:, 1],
+                                                C[:, 0] - B[:, 0]], axis=1)
+            gb = 0.5 * sgn[:, None] * np.stack([C[:, 1] - A[:, 1],
+                                                A[:, 0] - C[:, 0]], axis=1)
+            gc = 0.5 * sgn[:, None] * np.stack([A[:, 1] - B[:, 1],
+                                                B[:, 0] - A[:, 0]], axis=1)
+            G = np.zeros_like(P)
+            np.add.at(G, ia, w[:, None] * ga)
+            np.add.at(G, ib, w[:, None] * gb)
+            np.add.at(G, ic, w[:, None] * gc)
+            gn = np.linalg.norm(G, axis=1, keepdims=True)
+            gn[gn < 1e-15] = 1.0
+            trial = np.clip(P + lr * G / gn, 0.0, 1.0)
+            new_min = tri_areas(trial).min()
+            if new_min > cur_min + 1e-14:
+                P, cur_min = trial, new_min
+                lr = min(lr * 1.2, 0.02)
+                fails = 0
+            else:
+                lr *= 0.5
+                fails += 1
+                if lr < 1e-7 or fails > 25:
+                    break
+        return P
+
+    rng = np.random.default_rng(12345)
+
+    def symmetric_init():
+        P = [np.array([0.5, 0.5])]
+        radii = sorted(rng.uniform(0.12, 0.48, size=4))
+        phase = rng.uniform(0, 2 * math.pi / 3)
+        for r in radii:
+            for q in range(3):
+                th = phase + q * 2 * math.pi / 3 + rng.uniform(-0.06, 0.06)
+                rr = r * rng.uniform(0.97, 1.03)
+                P.append(np.array([0.5 + rr * math.cos(th),
+                                   0.5 + rr * math.sin(th)]))
+        return np.clip(np.array(P), 0.02, 0.98)
+
+    inits = [symmetric_init() for _ in range(10)]
+    inits += [rng.uniform(0.02, 0.98, size=(n, 2)) for _ in range(15)]
+
+    best_P, best_s = None, -1.0
+    for P0 in inits:
+        P = softmin_polish(targeted_search(P0))
+        s = score(P)
+        if s > best_s:
+            best_s, best_P = s, P
+
+    best_P = np.clip(best_P, 0.0, 1.0)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if np.allclose(best_P[i], best_P[j], atol=1e-9):
+                best_P[j] = np.clip(best_P[j] + 1e-6, 0.0, 1.0)
+
+    return [(float(x), float(y)) for x, y in best_P]
+
+
+# EVOLVE-BLOCK-END

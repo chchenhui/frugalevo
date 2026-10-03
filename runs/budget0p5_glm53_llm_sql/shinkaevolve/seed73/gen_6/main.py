@@ -1,0 +1,159 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-cache friendly column reordering.
+
+    Builds a small set of candidate global column orderings, scores each by
+    the exact serial character-Trie reuse objective (sum of adjacent LCPs of
+    the sorted serialized rows), and returns the best. Data, shape and row
+    order are preserved exactly.
+    """
+
+    def _serialize(self, df: pd.DataFrame) -> np.ndarray:
+        """Serialize exactly like the evaluator: fillna('') then astype(str)."""
+        obj = df.astype(object)
+        mask = pd.notna(obj)
+        filled = obj.where(mask, "")
+        return filled.astype(str).values
+
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        """Longest common prefix length using binary search with C slice compares."""
+        n = min(len(a), len(b))
+        if a[:32] != b[:32]:
+            # quick reject only if first 32 chars differ is wrong; do real binary search
+            pass
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_score(self, strings: List[str]) -> int:
+        """Ideal trie reuse: sum of adjacent LCPs after sorting."""
+        if len(strings) <= 1:
+            return 0
+        arr = sorted(strings)
+        total = 0
+        prev = arr[0]
+        for cur in arr[1:]:
+            if cur == prev:
+                total += len(cur)
+            else:
+                total += self._lcp(prev, cur)
+            prev = cur
+        return total
+
+    def _candidate_orders(self, df: pd.DataFrame) -> List[List[str]]:
+        cols = list(df.columns)
+        if len(cols) <= 1:
+            return [list(cols)]
+
+        # Serialize once for candidate scoring heuristics.
+        ser = self._serialize(df)  # ndarray (n_rows, n_cols)
+        n = len(df)
+
+        # Candidate 1: length-weighted pair repetition: sum len(v)*c*(c-1)
+        score1 = []
+        for j, col in enumerate(cols):
+            colvals = ser[:, j]
+            uniq, counts = np.unique(colvals, return_counts=True)
+            s = 0
+            for v, c in zip(uniq.tolist(), counts.tolist()):
+                if c > 1:
+                    s += len(v) * c * (c - 1)
+            score1.append((-s, cols.index(col), col))
+        order1 = [t[2] for t in sorted(score1)]
+
+        # Candidate 2: fewest distinct values first (grouping heuristic)
+        score2 = []
+        for j, col in enumerate(cols):
+            colvals = ser[:, j]
+            nu = len(np.unique(colvals))
+            score2.append((nu, -int(np.char.str_len(colvals).sum()) if colvals.size else 0, cols.index(col), col))
+        order2 = [t[3] for t in sorted(score2)]
+
+        # Candidate 3: original order (reliable baseline)
+        order3 = list(cols)
+
+        # Deduplicate while preserving candidates
+        seen = set()
+        out = []
+        for o in (order1, order2, order3):
+            key = tuple(o)
+            if key not in seen:
+                seen.add(key)
+                out.append(o)
+        return out
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        work = df.copy()
+
+        # Honor col_merge: concatenate merged columns into the first one.
+        if col_merge:
+            for group in col_merge:
+                cols = [c for c in work.columns if c in group]
+                if len(cols) > 1:
+                    ser = work[cols].astype(object).where(pd.notna(work[cols]), "")
+                    merged = ser.apply(lambda r: "".join(str(x) for x in r), axis=1)
+                    rest = [c for c in work.columns if c not in cols]
+                    work = pd.concat([work[rest], merged], axis=1)
+                    work.columns = rest + [cols[0]]
+                    work = work[rest[: rest.index(cols[0])]] if False else work
+                    # reorder columns back to original positions
+                    new_order = [c for c in df.columns if c not in cols] if False else list(work.columns)
+                    work = work[new_order]
+
+        n_rows, n_cols = work.shape
+        if n_rows == 0 or n_cols == 0:
+            return df.copy(), [[] for _ in range(n_rows)] if n_cols == 0 else [[] for _ in range(n_rows)]
+
+        # Guard: on extremely wide/long tables limit scoring cost by capping
+        # candidate count (already <= 3) — scoring is O(total chars * log) per candidate.
+        candidates = self._candidate_orders(work)
+
+        best_order = candidates[-1]
+        best_score = -1
+        total_chars = None
+        for order in candidates:
+            sub = work[order]
+            ser = self._serialize(sub)
+            rows = ["".join(ser[i].tolist()) for i in range(n_rows)]
+            if total_chars is None:
+                total_chars = sum(len(r) for r in rows)
+            score = self._trie_score(rows)
+            if score > best_score:
+                best_score = score
+                best_order = order
+
+        reordered = work[best_order].copy()
+        # preserve dtypes where possible
+        for c in reordered.columns:
+            try:
+                reordered[c] = df[c] if c in df.columns else reordered[c]
+            except Exception:
+                pass
+
+        column_orderings = [list(best_order) for _ in range(n_rows)]
+        return reordered, column_orderings
+
+# EVOLVE-BLOCK-END

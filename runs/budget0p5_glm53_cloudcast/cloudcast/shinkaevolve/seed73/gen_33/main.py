@@ -1,0 +1,201 @@
+# EVOLVE-BLOCK-START
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+
+DEFAULT_FALLBACK_COST = 1e9
+
+
+class GraphBuilder:
+    """Builds the routing graph and provides cost-aware shortest paths."""
+
+    def __init__(self, G):
+        self.G = G
+        # routing graph: exclude reverse edges into src and self loops,
+        # but keep all edges with explicit weight via fallback
+        self.h = G.copy()
+        self.h.remove_edges_from(list(self.h.in_edges(G, None)) if False else [])
+        # remove self loops
+        self.h.remove_edges_from(list(nx.selfloop_edges(self.h)))
+
+    def prepare_routing_graph(self, src):
+        h = self.h.copy()
+        h.remove_edges_from(list(h.in_edges(src)))
+        return h
+
+    def _weight(self, u, v, data):
+        c = data.get("cost")
+        if c is None:
+            return DEFAULT_FALLBACK_COST
+        return c
+
+    def shortest_path(self, h, src, dst):
+        return nx.dijkstra_path(h, src, dst, weight=self._weight)
+
+
+class Router:
+    """Computes routes for all destinations once, reusing preprocessing."""
+
+    def __init__(self, G, src, dsts):
+        self.builder = GraphBuilder(G)
+        self.h = self.builder.prepare_routing_graph(src)
+        self.paths = {}
+        for dst in dsts:
+            if dst == src:
+                self.paths[dst] = [src]
+            else:
+                self.paths[dst] = self.builder.shortest_path(self.h, src, dst)
+
+    def path_edges(self, dst):
+        path = self.paths[dst]
+        return [(path[i], path[i + 1]) for i in range(len(path) - 1)]
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    router = Router(G, src, dsts)
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    def true_cost(path):
+        total = 0.0
+        for i in range(len(path) - 1):
+            c = G[path[i]][path[i + 1]].get("cost")
+            if c is None:
+                c = DEFAULT_FALLBACK_COST
+            total += c
+        return total
+
+    used_edges = set()
+    alpha = 0.3
+
+    # Pre-compute baselines, then process destinations in descending order of
+    # baseline cost: expensive routes build shared trunks first so cheaper
+    # destinations can latch onto them at a reuse discount.
+    baselines = {}
+    for dst in dsts:
+        try:
+            baseline_path = router.builder.shortest_path(router.h, src, dst)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+        baselines[dst] = (baseline_path, true_cost(baseline_path))
+
+    ordered_dsts = sorted(
+        baselines.keys(),
+        key=lambda d: baselines[d][1],
+        reverse=True,
+    )
+
+    for dst in ordered_dsts:
+        baseline_path, baseline_cost = baselines[dst]
+
+        # gather up to 6 bounded candidate simple paths
+        candidates = []
+        try:
+            gen = nx.shortest_simple_paths(router.h, src, dst,
+                                           weight=router.builder._weight)
+            for i, p in enumerate(gen):
+                candidates.append(p)
+                if i + 1 >= 6:
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            candidates = []
+        if baseline_path not in candidates:
+            candidates.append(baseline_path)
+
+        # score with trunk-reuse discount; pick cheapest discounted score
+        best_path = None
+        best_score = None
+        for p in candidates:
+            score = true_cost(p)
+            for i in range(len(p) - 1):
+                if (p[i], p[i + 1]) in used_edges:
+                    score -= alpha * (G[p[i]][p[i + 1]].get("cost") or 0.0)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_path = p
+
+        # adopt only if true cost is never worse than baseline
+        if best_path is not None and true_cost(best_path) <= baseline_cost:
+            chosen = best_path
+        else:
+            chosen = baseline_path
+
+        for i in range(len(chosen) - 1):
+            used_edges.add((chosen[i], chosen[i + 1]))
+
+        for i in range(len(chosen) - 1):
+            s, t = chosen[i], chosen[i + 1]
+            edge_data = G[s][t]
+            for j in range(num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, edge_data])
+
+    return bc_topology
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]  # [[src, dst, edge data]]
+
+
+class BroadCastTopology:
+    def __init__(self, src: str, dsts: List[str], num_partitions: int = 4, paths: Dict[str, SingleDstPath] = None):
+        self.src = src
+        self.dsts = dsts
+        self.num_partitions = num_partitions
+
+        if paths is not None:
+            self.paths = paths
+        else:
+            self.paths = {dst: {str(i): None for i in range(num_partitions)} for dst in dsts}
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        partition = str(partition)
+        self.paths[dst][partition] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    cost = pd.read_csv(cost_path or os.path.join(current_dir, "profiles/cost.csv"))
+    throughput = pd.read_csv(throughput_path or os.path.join(current_dir, "profiles/throughput.csv"))
+
+    G = nx.DiGraph()
+    for _, row in throughput.iterrows():
+        if row["src_region"] == row["dst_region"]:
+            continue
+        G.add_edge(row["src_region"], row["dst_region"], cost=None,
+                   throughput=num_vms * row["throughput_sent"] / 1e9)
+
+    for _, row in cost.iterrows():
+        if row["src"] in G and row["dest"] in G[row["src"]]:
+            G[row["src"]][row["dest"]]["cost"] = row["cost"]
+
+    no_cost_pairs = [(u, v) for u, v, d in G.edges(data=True) if d["cost"] is None]
+    print("Unable to get costs for: ", no_cost_pairs)
+
+    return G
+
+# EVOLVE-BLOCK-END
+
+# Helper functions that won't be evolved
+def create_broadcast_topology(src: str, dsts: List[str], num_partitions: int = 4):
+    """Create a broadcast topology instance"""
+    return BroadCastTopology(src, dsts, num_partitions)
+
+def run_search_algorithm(src: str, dsts: List[str], G, num_partitions: int):
+    """Run the search algorithm and return the topology"""
+    return search_algorithm(src, dsts, G, num_partitions)

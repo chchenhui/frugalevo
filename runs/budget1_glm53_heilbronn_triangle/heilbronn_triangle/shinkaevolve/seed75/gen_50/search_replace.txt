@@ -1,0 +1,81 @@
+<NAME>
+worst_triplet_refine_between_temps</NAME>
+
+<DESCRIPTION>
+Following the recommendation, I interleave discrete worst-triplet refinement between the Powell annealing stages inside `_softmin_refine`. After each temperature stage, the argmin triplet is identified via a vectorized cross-product scan, and a cheap Powell pass optimizes only that triplet's 9 logits against a small softmin objective. This focuses effort exactly on the binding constraint (the triplet that actually determines the score) while the global softmax keeps all points inside the triangle. Since only 9 variables are perturbed and the objective only evaluates ~few triples plus the runner-up check, each refine costs far less than a global stage but can directly raise the minimum area, breaking the 0.03 plateau. The refined result is accepted only if the true global min area improves, so it can never hurt.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    cur_val, _ = _min_area(pts)
+    for temp in n_temps:
+        try:
+            res = _scipy_minimize(obj, theta, args=(temp,), method="Powell",
+                                  options={"maxiter": 300, "xtol": 1e-6, "ftol": 1e-9})
+            if np.all(np.isfinite(res.x)):
+                theta = res.x
+        except Exception:
+            break
+    cand = unpack(theta)
+=======
+    def _worst_triplet_idx(p):
+        pi, pj, pk = p[ii], p[jj], p[kk]
+        cross = ((pj[:, 0] - pi[:, 0]) * (pk[:, 1] - pi[:, 1])
+                 - (pj[:, 1] - pi[:, 1]) * (pk[:, 0] - pi[:, 0]))
+        a = 0.5 * np.abs(cross)
+        return int(np.argmin(a))
+
+    def _refine_worst_triplet(th):
+        """Powell on only the current argmin triplet's 9 logits."""
+        if not _HAVE_SCIPY:
+            return th
+        p = unpack(th)
+        t = _worst_triplet_idx(p)
+        i0, j0, k0 = ii[t], jj[t], kk[t]
+
+        def obj_trip(th9, temp=2e-4):
+            th = th.copy()
+            th.reshape(n, 3)[[i0, j0, k0]] = th9.reshape(3, 3)
+            p = unpack(th)
+            pi, pj, pk = p[ii], p[jj], p[kk]
+            cross = ((pj[:, 0] - pi[:, 0]) * (pk[:, 1] - pi[:, 1])
+                     - (pj[:, 1] - pi[:, 1]) * (pk[:, 0] - pi[:, 0]))
+            a = 0.5 * np.abs(cross)
+            part = np.partition(a, 10)[:11]
+            m = part.min()
+            return -(m - temp * np.log(np.sum(np.exp(-(part - m) / temp))))
+
+        cur = _min_area(unpack(th))[0]
+        for _round in range(2):
+            p = unpack(th)
+            t = _worst_triplet_idx(p)
+            i0, j0, k0 = ii[t], jj[t], kk[t]
+            th9 = th.reshape(n, 3)[[i0, j0, k0]].copy().ravel()
+            try:
+                res = _scipy_minimize(obj_trip, th9, method="Powell",
+                                      options={"maxiter": 60, "xtol": 1e-6, "ftol": 1e-10})
+                if np.all(np.isfinite(res.x)):
+                    cand_th = th.copy()
+                    cand_th.reshape(n, 3)[[i0, j0, k0]] = res.x.reshape(3, 3)
+                    if _min_area(unpack(cand_th))[0] > _min_area(unpack(th))[0] + 1e-14:
+                        th = cand_th
+            except Exception:
+                break
+        del cur
+        return th
+
+    cur_val, _ = _min_area(pts)
+    for temp in n_temps:
+        try:
+            res = _scipy_minimize(obj, theta, args=(temp,), method="Powell",
+                                  options={"maxiter": 300, "xtol": 1e-6, "ftol": 1e-9})
+            if np.all(np.isfinite(res.x)):
+                theta = res.x
+            theta = _refine_worst_triplet(theta)
+        except Exception:
+            break
+    cand = unpack(theta)
+>>>>>>> REPLACE
+</DIFF>
+
+</DIFF>

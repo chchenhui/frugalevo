@@ -1,0 +1,74 @@
+<NAME>
+vectorized_serpentine_packing_and_marginal_replication
+</NAME>
+<DESCRIPTION>
+Two changes:
+
+1. **`balanced_packing` speed + quality**: The old implementation was a pure-Python double loop over `num_layers × num_groups` items, calling `min(...)` per item — this dominated the algorithm's runtime (speed_score 0.00, times_algorithm 0.55). Replace it with a fully vectorized serpentine (snake) assignment: sort each layer's weights descending, then deal items to packs in alternating forward/backward order. Serpentine LPT is a classic near-optimal heuristic for balanced cardinality-constrained partitioning, and the whole computation is a single `argsort` plus two `scatter_` calls, giving a massive speedup while improving (or matching) pack balance.
+
+2. **`replicate_experts` quality**: The old greedy picks the expert with the largest `weight/count` for each extra replica. The correct marginal-load-reduction criterion is `weight/(cnt*(cnt+1))` (the load drop from going from `cnt` to `cnt+1` replicas), which yields a lower maximum replica load and thus better expert balancedness (currently the weakest metric at 0.25).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    # Sort weights descending (longest-processing-time-first heuristic).
+    indices = weight.float().argsort(-1, descending=True)
+    # Serpentine (snake) deal: the r-th heaviest item goes to the pack given
+    # by dealing packs in forward order on even rounds and backward order on
+    # odd rounds. This is fully vectorizable and yields near-optimal
+    # cardinality-constrained balance.
+    pos = torch.arange(num_groups, dtype=torch.int64)
+    round_id = pos // num_packs
+    base = pos % num_packs
+    pack_seq = torch.where((round_id & 1) == 0, base,
+                           num_packs - 1 - base)
+    pack_seq = pack_seq.expand(num_layers, -1)
+    rank_seq = round_id.expand(num_layers, -1)
+    pack_index = torch.empty(num_layers,
+                             num_groups,
+                             dtype=torch.int64,
+                             device=weight.device)
+    pack_index.scatter_(-1, indices, pack_seq)
+    rank_in_pack = torch.empty_like(pack_index)
+    rank_in_pack.scatter_(-1, indices, rank_seq)
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+=======
+    for i in range(num_log, num_phy):
+        # Duplicating an expert with cnt replicas and load w reduces its
+        # per-replica load by w/(cnt*(cnt+1)); greedily pick the expert with
+        # the largest marginal gain.
+        redundant_indices = (weight / (logcnt * (logcnt + 1))).max(
+            dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+>>>>>>> REPLACE
+</DIFF>

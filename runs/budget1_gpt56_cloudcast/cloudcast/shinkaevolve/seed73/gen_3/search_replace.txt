@@ -1,0 +1,103 @@
+<NAME>
+shared_multicast_tree
+</NAME>
+
+<DESCRIPTION>
+Replace independent source-to-destination unicast routing with a greedy shared multicast-tree construction. The previous implementation sends every partition for every destination over a separate shortest path, charging common source/relay links repeatedly in the broadcast topology.
+
+The new approach grows a low-cost directed tree from the source. At each step it finds the cheapest route from any already-reached relay to any unreached destination, adds that route once to the shared tree, and treats any additional requested destinations encountered along that route as reached as well. Each destination then receives its source-to-destination route extracted from the common tree for every partition. This preserves partition delivery while maximizing overlapping transfers and allowing low-cost intermediate cloud relays to fan out data.
+
+Edges with missing or invalid costs are excluded before routing so Dijkstra does not fail on incomplete cost profiles. Unreachable destinations retain empty paths rather than causing the entire search to fail.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Build a shared multicast tree instead of independent unicast paths.
+
+    A link that has already received the input can act as a relay for another
+    destination, so the greedy tree expansion charges shared prefix links only
+    once in the resulting broadcast topology.
+    """
+    h = G.copy()
+    if src not in h:
+        return BroadCastTopology(src, dsts, num_partitions)
+
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    # Dijkstra cannot safely route over profile entries without a usable cost.
+    invalid_edges = []
+    for u, v, data in h.edges(data=True):
+        try:
+            cost = float(data.get("cost"))
+            if cost < 0 or cost != cost:  # reject negative values and NaN
+                invalid_edges.append((u, v))
+        except (TypeError, ValueError):
+            invalid_edges.append((u, v))
+    h.remove_edges_from(invalid_edges)
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    requested = set(dsts)
+    pending = requested - {src}
+    tree = nx.DiGraph()
+    tree.add_node(src)
+
+    # Prim-like expansion over directed shortest paths.  Multi-source routing
+    # selects the least expensive already-populated relay for each expansion.
+    while pending:
+        lengths, paths = nx.multi_source_dijkstra(
+            h, list(tree.nodes), weight="cost"
+        )
+        candidates = [
+            (lengths[dst], dst, paths[dst])
+            for dst in pending
+            if dst in lengths
+        ]
+        if not candidates:
+            break
+
+        _, _, path = min(candidates, key=lambda item: item[0])
+        for u, v in zip(path, path[1:]):
+            tree.add_edge(u, v, **G[u][v])
+
+        # A route may pass through other requested destinations; they have
+        # received the broadcast without requiring another transfer.
+        pending.difference_update(set(path))
+
+    for dst in dsts:
+        if dst == src:
+            edge_path = []
+        elif dst in tree and nx.has_path(tree, src, dst):
+            nodes = nx.shortest_path(tree, src, dst, weight="cost")
+            edge_path = [
+                [u, v, G[u][v]]
+                for u, v in zip(nodes, nodes[1:])
+            ]
+        else:
+            edge_path = []
+
+        for partition in range(bc_topology.num_partitions):
+            # Use a fresh list per partition so later topology edits do not
+            # accidentally mutate another partition's route.
+            bc_topology.set_dst_partition_paths(
+                dst, partition, list(edge_path)
+            )
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

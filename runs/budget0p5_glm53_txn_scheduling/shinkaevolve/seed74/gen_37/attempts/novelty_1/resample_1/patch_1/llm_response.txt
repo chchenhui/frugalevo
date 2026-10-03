@@ -1,0 +1,229 @@
+<NAME>
+lns_destroy_repair_sa</NAME>
+<DESCRIPTION>
+Restructure the solver around an Iterated Local Search / Large Neighborhood Search architecture with three clean phases: (1) randomized greedy construction, (2) destroy-and-repair perturbation starting from the incumbent best (every few trials, remove 4–6 transactions and greedily reinsert them at their cheapest positions), and (3) simulated annealing with mixed move neighborhoods and stagnation kicks. The destroy-repair moves operate near a proven-good basin instead of rebuilding from scratch, giving cost-guided diversity that pure random restarts lack, while the modular phase structure keeps construction cheap so more improvement iterations fit in the time budget.</DESCRIPTION>
+<CODE>
+```python
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Find a low-makespan schedule using:
+      Phase 1: randomized greedy construction restarts
+      Phase 2: destroy-and-repair (LNS) restarts seeded from incumbent best
+      Phase 3: simulated annealing with mixed neighborhoods + stagnation kicks
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    import math
+    import time
+
+    n = workload.num_txns
+    opt_cost = workload.get_opt_seq_cost
+
+    # ------------------------------------------------------------------
+    # Phase helpers
+    # ------------------------------------------------------------------
+    def greedy_construct(sample_rate=1.0, candidate_cap=None):
+        """Full greedy build with randomized diversification."""
+        start = random.randint(0, n - 1)
+        seq = [start]
+        remaining = [x for x in range(n) if x != start]
+        while remaining:
+            if random.random() > sample_rate:
+                idx = random.randint(0, len(remaining) - 1)
+                t = remaining.pop(idx)
+            else:
+                cands = remaining
+                if candidate_cap is not None and len(cands) > candidate_cap:
+                    cands = random.sample(cands, candidate_cap)
+                best_t, best_c = None, float('inf')
+                for t in cands:
+                    c = opt_cost(seq + [t])
+                    if c < best_c:
+                        best_c, best_t = c, t
+                t = best_t
+                remaining.remove(t)
+            seq.append(t)
+        return opt_cost(seq), seq
+
+    def destroy_repair(base_seq, k):
+        """LNS move: remove k random txns, greedily reinsert each at its
+        cheapest position in the partial sequence."""
+        seq = base_seq[:]
+        removed = []
+        for _ in range(min(k, len(seq))):
+            idx = random.randint(0, len(seq) - 1)
+            removed.append(seq.pop(idx))
+        random.shuffle(removed)
+        for t in removed:
+            best_pos, best_c = 0, float('inf')
+            for pos in range(len(seq) + 1):
+                cand = seq[:pos] + [t] + seq[pos:]
+                c = opt_cost(cand)
+                if c < best_c:
+                    best_c, best_pos = c, pos
+            seq.insert(best_pos, t)
+        return opt_cost(seq), seq
+
+    def local_search(seq, cost, deadline):
+        """First-improvement adjacent swaps."""
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            for i in range(len(seq) - 1):
+                if time.time() > deadline:
+                    return seq, cost
+                cand = seq[:]
+                cand[i], cand[i + 1] = cand[i + 1], cand[i]
+                c = opt_cost(cand)
+                if c < cost:
+                    seq, cost = cand, c
+                    improved = True
+        return seq, cost
+
+    def perturb(seq, k):
+        s = seq[:]
+        for _ in range(k):
+            i = random.randint(0, len(s) - 1)
+            j = random.randint(0, len(s) - 1)
+            if i != j:
+                t = s.pop(i)
+                s.insert(j, t)
+        return s
+
+    # ------------------------------------------------------------------
+    # Main search
+    # ------------------------------------------------------------------
+    start_time = time.time()
+    time_limit = 30.0
+    end_time = start_time + time_limit + 10.0
+
+    best_cost, best_seq = float('inf'), None
+
+    # --- Phase 1: greedy construction restarts (60% of construction slice) ---
+    construct_deadline = min(start_time + time_limit * 0.30, end_time)
+    trial = 0
+    while time.time() < construct_deadline:
+        trial += 1
+        if trial % 3 == 0:
+            cost, seq = greedy_construct(sample_rate=1.0)
+        else:
+            cost, seq = greedy_construct(
+                sample_rate=random.uniform(0.7, 0.95),
+                candidate_cap=random.choice([None, 12, 20]))
+        if cost < best_cost:
+            best_cost, best_seq = cost, seq
+
+    if best_seq is None:
+        best_cost, best_seq = greedy_construct(1.0)
+
+    # --- Phase 2: destroy-and-repair restarts from incumbent ---
+    lns_deadline = min(start_time + time_limit * 0.45, end_time)
+    lns_trial = 0
+    while time.time() < lns_deadline:
+        lns_trial += 1
+        k = random.randint(3, 6)
+        cost, seq = destroy_repair(best_seq, k)
+        # occasionally accept a slightly worse LNS result to diversify basin
+        if cost < best_cost or (lns_trial % 5 == 0 and cost < best_cost * 1.10):
+            if cost < best_cost:
+                best_cost, best_seq = cost, seq
+            else:
+                # use as a working incumbent for the next LNS restart
+                best_seq_lns = seq
+                c2, s2 = destroy_repair(best_seq_lns, random.randint(2, 4))
+                if c2 < best_cost:
+                    best_cost, best_seq = c2, s2
+
+    # --- Phase 3: quick polish ---
+    best_seq, best_cost = local_search(best_seq, best_cost,
+                                        min(start_time + time_limit * 0.55, end_time))
+
+    # --- Phase 4: long SA with mixed neighborhoods + stagnation kicks ---
+    cur_seq, cur_cost = best_seq[:], best_cost
+    T0 = max(1.0, best_cost * 0.02)
+    T = T0
+    alpha = 0.99995
+    T_min = 0.05
+    since_best = 0
+    kick_thresh = 3000
+    while time.time() < end_time:
+        T *= alpha
+        if T < T_min:
+            T = T_min
+        r = random.random()
+        cand = cur_seq[:]
+        if r < 0.50 or n < 3:
+            i = random.randint(0, n - 1)
+            j = random.randint(0, n - 1)
+            if i == j:
+                continue
+            t = cand.pop(i)
+            cand.insert(j, t)
+        elif r < 0.75:
+            i = random.randint(0, n - 2)
+            cand[i], cand[i + 1] = cand[i + 1], cand[i]
+        elif r < 0.90:
+            # Or-opt segment move
+            seg_len = random.randint(1, min(3, n - 1))
+            i = random.randint(0, n - seg_len)
+            seg = cand[i:i + seg_len]
+            rest = cand[:i] + cand[i + seg_len:]
+            if not rest:
+                continue
+            j = random.randint(0, len(rest))
+            cand = rest[:j] + seg + rest[j:]
+        else:
+            # destroy-repair as a large SA move
+            c2, cand = destroy_repair(cur_seq, random.randint(2, 4))
+        c = opt_cost(cand)
+        delta = c - cur_cost
+        if delta <= 0 or random.random() < math.exp(-delta / max(T, 1e-9)):
+            cur_seq, cur_cost = cand, c
+            since_best += 1
+            if c < best_cost:
+                best_cost, best_seq = c, cand[:]
+                since_best = 0
+        if since_best >= kick_thresh:
+            cur_seq = perturb(best_seq, 3)
+            cur_cost = opt_cost(cur_seq)
+            T = max(T, T0 * 0.3)
+            since_best = 0
+
+    # --- Final polish ---
+    best_seq, best_cost = local_search(best_seq, best_cost, end_time + 3.0)
+
+    return best_cost, best_seq
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")
+```
+</CODE>

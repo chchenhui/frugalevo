@@ -1,0 +1,85 @@
+<NAME>
+shared_multicast_tree
+</NAME>
+
+<DESCRIPTION>
+Replace independent per-destination shortest paths with a greedy directed multicast-tree construction. The previous implementation optimizes each destination in isolation, repeatedly paying for identical source-side links. This edit grows one low-cost broadcast tree: at each step it attaches the destination that can be reached most cheaply from any node already in the tree. Routes are then derived from the shared tree for every destination and reused by every partition.
+
+This is a practical directed-Steiner-tree heuristic. It preserves valid source-to-destination paths while reducing duplicate inter-cloud transfers, especially when multiple destinations share regional transit links. Invalid or unpriced links are excluded, preventing routes from being selected through edges that cannot contribute to a meaningful transfer-cost calculation.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Build a shared directed broadcast tree instead of independently copying data
+    along a shortest path for every destination.  The tree is grown by repeatedly
+    attaching the cheapest remaining destination to any node already reachable
+    from the source, which lets later destinations reuse paid-for transit links.
+    """
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Edges without a price cannot be safely compared by the cost optimizer.
+    h = nx.DiGraph()
+    for u, v, data in G.edges(data=True):
+        cost = data.get("cost")
+        if u != v and cost is not None:
+            h.add_edge(u, v, **dict(data))
+    h.remove_edges_from(list(h.in_edges(src)))
+
+    tree = nx.DiGraph()
+    tree.add_node(src)
+    remaining = set(dsts)
+
+    # Greedy directed-Steiner approximation: choose the least expensive new
+    # branch from the current broadcast tree, rather than paying source->dst
+    # independently for each destination.
+    while remaining:
+        best = None
+        for anchor in tree.nodes:
+            for dst in remaining:
+                try:
+                    path = nx.dijkstra_path(h, anchor, dst, weight="cost")
+                    cost = nx.path_weight(h, path, weight="cost")
+                except nx.NetworkXNoPath:
+                    continue
+                if best is None or cost < best[0]:
+                    best = (cost, dst, path)
+
+        if best is None:
+            break
+
+        _, dst, path = best
+        for u, v in zip(path, path[1:]):
+            tree.add_edge(u, v, **dict(h[u][v]))
+        remaining.remove(dst)
+
+    # Every partition follows the same shared tree.  Partition data can overlap
+    # on each tree edge, allowing the transfer scheduler to broadcast it once.
+    for dst in dsts:
+        if dst not in tree or not nx.has_path(tree, src, dst):
+            continue
+        path = nx.dijkstra_path(tree, src, dst, weight="cost")
+        for u, v in zip(path, path[1:]):
+            for partition in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(
+                    dst, partition, [u, v, dict(G[u][v])]
+                )
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

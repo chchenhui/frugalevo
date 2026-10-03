@@ -1,0 +1,124 @@
+<NAME>
+multi_start_direct_ratio_optimization</NAME>
+<DESCRIPTION>
+The current program optimizes a spherical code (all points on the unit sphere), but the actual objective is dmin/dmax, which is not necessarily maximized by a spherical configuration — the best known 14-point configurations achieve ratio ≈ 0.49, while spherical codes only reach ≈ 0.446. Instead, optimize the ratio directly: at each step compute pairwise distances, rescale the configuration so its diameter (dmax) equals 1, and apply strong short-range repulsion (power-law weights emphasizing the closest pairs, which drives dmin up). Track the configuration with the best actual dmin/dmax ratio. Add multiple random restarts with fixed seeds (plus the icosahedron-based init) to escape bad local optima. Scaling by dmax each iteration keeps the objective equivalent to the true ratio, and evaluating the ratio on the rescaled points is scale-invariant, so we directly maximize the score. This should lift the ratio from ~0.46 toward ~0.49 (score > 0.95).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    n = 14
+    d = 3
+
+    # Start from icosahedron vertices (12) + 2 polar points on the unit sphere,
+    # then refine with a repulsion-based spherical code optimization (Tammes-style).
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    ico = np.array([
+        [-1,  phi, 0], [ 1,  phi, 0], [-1, -phi, 0], [ 1, -phi, 0],
+        [ 0, -1, phi], [ 0,  1, phi], [ 0, -1, -phi], [ 0,  1, -phi],
+        [ phi, 0, -1], [ phi, 0,  1], [-phi, 0, -1], [-phi, 0,  1],
+    ], dtype=float)
+    ico /= np.linalg.norm(ico, axis=1, keepdims=True)
+    extra = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]])
+    # Perturb the polar points slightly to break symmetry and allow better packing
+    np.random.seed(0)
+    extra[0] += 0.05 * np.random.randn(3)
+    extra[1] += 0.05 * np.random.randn(3)
+    extra /= np.linalg.norm(extra, axis=1, keepdims=True)
+
+    pts = np.vstack([ico, extra])
+    idx_i, idx_j = np.triu_indices(n, k=1)
+
+    # Repulsion optimization: gradient ascent on sum of inverse-power distances,
+    # with renormalization to the unit sphere each step (spherical code heuristic).
+    best_pts = pts.copy()
+    best_dmin = 0.0
+    step = 0.02
+    for it in range(600):
+        diff = pts[idx_i] - pts[idx_j]
+        dist = np.linalg.norm(diff, axis=1)
+        dmin = dist.min()
+        if dmin > best_dmin:
+            best_dmin = dmin
+            best_pts = pts.copy()
+        # Strong repulsion for close pairs (power -8), gentle for the rest (-2)
+        w = 1.0 / dist ** 9 + 1e-4 / dist ** 3
+        forces = np.zeros_like(diff)
+        forces = (w[:, None] * diff) / dist[:, None]
+        grad = np.zeros_like(pts)
+        np.add.at(grad, idx_i, forces)
+        np.add.at(grad, idx_j, -forces)
+        # Remove radial component to stay on the sphere
+        grad -= (grad * pts).sum(axis=1, keepdims=True) * pts
+        norm = np.linalg.norm(grad, axis=1, keepdims=True)
+        norm[norm == 0] = 1.0
+        pts = pts + step * grad / norm
+        pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+        # Slowly decay the step for convergence
+        step *= 0.995
+
+    points = best_pts
+    return points
+=======
+    n = 14
+    d = 3
+    idx_i, idx_j = np.triu_indices(n, k=1)
+
+    def optimize(pts, iters=1500, step=0.02):
+        """Repulsion optimization that directly maximizes dmin/dmax:
+        each iteration rescales so the diameter equals 1, then applies
+        strong short-range repulsion to push the closest pairs apart."""
+        pts = pts.copy()
+        for it in range(iters):
+            diff = pts[idx_i] - pts[idx_j]
+            dist = np.linalg.norm(diff, axis=1)
+            dmax = dist.max()
+            if dmax <= 0:
+                break
+            pts /= dmax
+            diff = pts[idx_i] - pts[idx_j]
+            dist = np.linalg.norm(diff, axis=1)
+            ratio = dist.min()  # dmax == 1 here
+            # Strongly repel only the near pairs (drives dmin up)
+            w = 1.0 / dist ** 12
+            forces = (w[:, None] * diff) / dist[:, None]
+            grad = np.zeros_like(pts)
+            np.add.at(grad, idx_i, forces)
+            np.add.at(grad, idx_j, -forces)
+            norm = np.linalg.norm(grad, axis=1, keepdims=True)
+            norm[norm == 0] = 1.0
+            pts = pts + step * grad / norm
+            step *= 0.998
+        diff = pts[idx_i] - pts[idx_j]
+        dist = np.linalg.norm(diff, axis=1)
+        return pts, dist.min() / dist.max()
+
+    # Structured init: icosahedron + 2 perturbed polar points
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    ico = np.array([
+        [-1,  phi, 0], [ 1,  phi, 0], [-1, -phi, 0], [ 1, -phi, 0],
+        [ 0, -1, phi], [ 0,  1, phi], [ 0, -1, -phi], [ 0,  1, -phi],
+        [ phi, 0, -1], [ phi, 0,  1], [-phi, 0, -1], [-phi, 0,  1],
+    ], dtype=float)
+    ico /= np.linalg.norm(ico, axis=1, keepdims=True)
+
+    best_pts = None
+    best_ratio = -1.0
+    for seed in range(10):
+        np.random.seed(seed)
+        if seed == 0:
+            extra = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]])
+            extra[0] += 0.05 * np.random.randn(3)
+            extra[1] += 0.05 * np.random.randn(3)
+            extra /= np.linalg.norm(extra, axis=1, keepdims=True)
+            init = np.vstack([ico, extra])
+        else:
+            init = np.random.randn(n, d)
+            init /= np.linalg.norm(init, axis=1, keepdims=True)
+        pts, ratio = optimize(init)
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_pts = pts
+
+    points = best_pts
+    return points
+>>>>>>> REPLACE
+</DIFF>

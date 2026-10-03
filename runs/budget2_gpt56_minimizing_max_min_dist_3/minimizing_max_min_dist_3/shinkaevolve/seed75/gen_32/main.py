@@ -1,0 +1,194 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """Construct a deterministic antipodal 14-point Euclidean 3D code."""
+
+    m = 7
+    rng = np.random.default_rng(9182741)
+
+    def unit_rows(v: np.ndarray) -> np.ndarray:
+        return v / np.maximum(
+            np.sqrt(np.sum(v * v, axis=1, keepdims=True)), 1e-15
+        )
+
+    def coherence(v: np.ndarray) -> float:
+        gram = np.abs(v @ v.T)
+        np.fill_diagonal(gram, 0.0)
+        return float(np.max(gram))
+
+    def power_energy(v: np.ndarray, power: float) -> float:
+        gram = np.abs(v @ v.T)
+        np.fill_diagonal(gram, 0.0)
+        return float(np.sum(gram ** power) / (m * (m - 1)))
+
+    def power_descent(v: np.ndarray) -> np.ndarray:
+        """Continuation descent for the maximum absolute line correlation."""
+        best_v = v.copy()
+        best_c = coherence(v)
+
+        for power, iterations, step in (
+            (4.0, 110, 0.100),
+            (8.0, 140, 0.074),
+            (16.0, 170, 0.052),
+            (32.0, 190, 0.035),
+            (64.0, 210, 0.023),
+            (112.0, 190, 0.014),
+        ):
+            energy = power_energy(v, power)
+
+            for _ in range(iterations):
+                dot = v @ v.T
+                absolute = np.abs(dot)
+
+                # The off-diagonal coefficient is proportional to the
+                # derivative of |v_i . v_j|**power with respect to v_i.
+                coeff = np.sign(dot) * np.maximum(
+                    absolute, 1e-14
+                ) ** (power - 1.0)
+                np.fill_diagonal(coeff, 0.0)
+                gradient = coeff @ v
+
+                # Restrict each update to its sphere tangent plane.
+                gradient -= np.sum(gradient * v, axis=1, keepdims=True) * v
+                scale = np.sqrt(np.mean(np.sum(gradient * gradient, axis=1)))
+                if scale < 1e-15:
+                    break
+
+                accepted = False
+                for multiplier in (1.0, 0.5, 0.24, 0.11):
+                    trial = unit_rows(v - step * multiplier * gradient / scale)
+                    trial_energy = power_energy(trial, power)
+                    if trial_energy < energy - 1e-16:
+                        v = trial
+                        energy = trial_energy
+                        accepted = True
+                        c = coherence(v)
+                        if c < best_c:
+                            best_c = c
+                            best_v = v.copy()
+                        break
+                if not accepted:
+                    break
+
+        return best_v
+
+    def active_polish(v: np.ndarray) -> np.ndarray:
+        """Accept-only minimax polishing over nearly limiting line contacts."""
+        best_v = v.copy()
+        best_c = coherence(v)
+
+        for tolerance, step, iterations in (
+            (0.070, 0.050, 210),
+            (0.030, 0.028, 260),
+            (0.012, 0.014, 310),
+            (0.004, 0.006, 260),
+        ):
+            for _ in range(iterations):
+                dot = v @ v.T
+                absolute = np.abs(dot)
+                np.fill_diagonal(absolute, 0.0)
+                c = float(np.max(absolute))
+
+                # Average the gradients of all correlations sufficiently close
+                # to the current worst one.  This is a projected active-set
+                # descent for the exact nonsmooth objective.
+                mask = absolute >= c * (1.0 - tolerance)
+                weights = np.zeros_like(dot)
+                weights[mask] = np.sign(dot[mask])
+                np.fill_diagonal(weights, 0.0)
+                count = np.count_nonzero(mask)
+                if count == 0:
+                    break
+
+                force = (weights @ v) / float(count)
+                force -= np.sum(force * v, axis=1, keepdims=True) * v
+                scale = np.sqrt(np.mean(np.sum(force * force, axis=1)))
+                if scale < 1e-15:
+                    break
+
+                accepted = False
+                for multiplier in (1.0, 0.5, 0.25, 0.12, 0.06):
+                    trial = unit_rows(v - step * multiplier * force / scale)
+                    trial_c = coherence(trial)
+                    if trial_c < best_c - 2e-14:
+                        v = trial
+                        best_v = trial.copy()
+                        best_c = trial_c
+                        accepted = True
+                        break
+                if not accepted:
+                    break
+
+        return best_v
+
+    # Cube body diagonals and coordinate axes form the natural seven-line
+    # cube--octahedron starting configuration.  Perturbed copies and random
+    # starts explore nearby asymmetric line-packings deterministically.
+    structured = np.array(
+        [
+            [1.0, 1.0, 1.0],
+            [1.0, 1.0, -1.0],
+            [1.0, -1.0, 1.0],
+            [-1.0, 1.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+    structured = unit_rows(structured)
+
+    best = None
+    best_c = np.inf
+
+    starts = [structured]
+    for noise in (0.025, 0.060, 0.110, 0.180, 0.270, 0.380):
+        starts.append(unit_rows(structured + rng.normal(scale=noise, size=(m, 3))))
+    for _ in range(18):
+        starts.append(unit_rows(rng.normal(size=(m, 3))))
+
+    for start in starts:
+        candidate = power_descent(start.copy())
+        candidate = active_polish(candidate)
+        c = coherence(candidate)
+        if c < best_c:
+            best_c = c
+            best = candidate.copy()
+
+    # A final small collection of deterministic tangent perturbations can
+    # escape a contact-switch stall without ever accepting a worse exact code.
+    v = best.copy()
+    c = best_c
+    sigma = 0.035
+    for k in range(1800):
+        i = int(rng.integers(m))
+        direction = rng.normal(size=3)
+        direction -= np.dot(direction, v[i]) * v[i]
+        norm = np.linalg.norm(direction)
+        if norm < 1e-15:
+            continue
+        trial = v.copy()
+        trial[i] = trial[i] + sigma * direction / norm
+        trial = unit_rows(trial)
+        trial_c = coherence(trial)
+        if trial_c < c - 1e-14:
+            v = trial
+            c = trial_c
+
+        if (k + 1) % 150 == 0:
+            sigma *= 0.72
+
+    v = active_polish(v)
+    if coherence(v) < best_c:
+        best = v
+
+    # Every line supplies two antipodal points.  Their pairwise diameter is
+    # exactly 2, and the complete configuration is centered without requiring
+    # a postprocessing translation.
+    points = np.vstack((best, -best))
+    return np.asarray(points, dtype=float)
+
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,144 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+N = 14
+D = 3
+IJ = np.array(list(combinations(range(N), 2)), dtype=int)
+
+
+def d2_all(X):
+    diff = X[IJ[:, 0]] - X[IJ[:, 1]]
+    return np.sum(diff * diff, axis=1)
+
+
+def true_ratio(X):
+    d2 = d2_all(X)
+    return np.sqrt(d2.min() / d2.max())
+
+
+def normalize_dmax1(X):
+    X = X - X.mean(axis=0)
+    dm = np.sqrt(d2_all(X).max())
+    return X / dm
+
+
+# ---------- structured inits ----------
+def make_inits():
+    inits = []
+    # two parallel twisted regular heptagons
+    for twist in np.linspace(0, np.pi, 8, endpoint=False):
+        t = 2 * np.pi * np.arange(7) / 7
+        r1 = np.stack([np.cos(t), np.sin(t), np.full(7, -0.5)], axis=1)
+        r2 = np.stack([np.cos(t + twist), np.sin(t + twist), np.full(7, 0.5)], axis=1)
+        inits.append(np.vstack([r1, r2]))
+    # staggered hexagonal rings + poles
+    for off in (0.0, np.pi / 6):
+        for h in (0.45, 0.6, 0.75, 0.9):
+            t = 2 * np.pi * np.arange(6) / 6
+            r1 = np.stack([np.cos(t), np.sin(t), np.full(6, h)], axis=1)
+            r2 = np.stack([np.cos(t + off), np.sin(t + off), np.full(6, -h)], axis=1)
+            inits.append(np.vstack([r1, r2, [[0, 0, 1.0], [0, 0, -1.0]]]))
+    # icosahedron + axis pair
+    phi = (1 + np.sqrt(5)) / 2
+    ico = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1]], dtype=float)
+    ico /= np.linalg.norm(ico, axis=1, keepdims=True)
+    for a in (1.0, np.sqrt(3), 1.3):
+        inits.append(np.vstack([ico, [[0, 0, a], [0, 0, -a]]]))
+    # single ring of 13 + pole
+    t = 2 * np.pi * np.arange(13) / 13
+    inits.append(np.vstack([np.stack([np.cos(t), np.sin(t), np.zeros(13)], axis=1),
+                             [[0, 0, 1.0]]]))
+    # random
+    rng = np.random.default_rng(7)
+    for _ in range(10):
+        inits.append(rng.normal(size=(N, D)))
+    return inits
+
+
+# ---------- phase 1: fast soft-min projected gradient on sphere ----------
+def softmin_ascent(X0, iters=350):
+    P = X0 / np.linalg.norm(X0, axis=1, keepdims=True)
+    iu = np.triu_indices(N, 1)
+    lr = 0.08
+    for it in range(iters):
+        Diff = P[:, None] - P[None, :]
+        Dm = np.linalg.norm(Diff, axis=-1) + 1e-12
+        Dp = Dm[iu]
+        tau = max(0.02, 0.15 * (0.99 ** it))
+        w = np.exp(-(Dp - Dp.min()) / tau); w /= w.sum()
+        wM = np.exp((Dp - Dp.max()) / tau); wM /= wM.sum()
+        Wm = np.zeros((N, N)); WM = np.zeros((N, N))
+        Wm[iu] = w; Wm.T[iu] = w
+        WM[iu] = wM; WM.T[iu] = wM
+        U = Diff / Dm[:, :, None]
+        G = (Wm[:, :, None] * U).sum(axis=1) - 0.5 * (WM[:, :, None] * U).sum(axis=1)
+        gn = np.linalg.norm(G)
+        if gn > 1e-12:
+            P = P + lr * np.sqrt(N) * G / gn
+        P /= np.linalg.norm(P, axis=1, keepdims=True)
+        if it % 50 == 49:
+            lr *= 0.7
+    return P
+
+
+# ---------- phase 2: exact epigraph SLSQP ----------
+def exact_solve(X0, maxiter=250):
+    from scipy.optimize import minimize
+    X0 = normalize_dmax1(X0)
+    t0 = np.sqrt(d2_all(X0).min())
+    z0 = np.concatenate([X0.ravel(), [t0]])
+
+    def obj(z):
+        return -z[-1]
+
+    def cons(z):
+        X = z[:N * D].reshape(N, D)
+        t2 = z[-1] ** 2
+        d2 = d2_all(X)
+        return np.concatenate([d2 - t2, 1.0 - d2])
+
+    bounds = [(None, None)] * (N * D) + [(1e-9, 1.0)]
+    res = minimize(obj, z0, method="SLSQP",
+                   constraints=[{"type": "ineq", "fun": cons}],
+                   bounds=bounds, options={"maxiter": maxiter, "ftol": 1e-14})
+    X = res.x[:N * D].reshape(N, D)
+    if not np.isfinite(X).all():
+        return X0, true_ratio(X0)
+    return X, true_ratio(X)
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    rng = np.random.default_rng(12345)
+    # phase 1 across all inits, keep the best few
+    scored = []
+    for init in make_inits():
+        P = softmin_ascent(np.asarray(init, dtype=float))
+        scored.append((true_ratio(P), P))
+    scored.sort(key=lambda s: -s[0])
+    candidates = [p for _, p in scored[:6]]
+
+    best, best_r = None, -1.0
+    for P in candidates:
+        X, r = exact_solve(P)
+        if r > best_r:
+            best_r, best = r, X
+    # phase 3: perturb-and-reoptimize on exact program
+    for rnd in range(14):
+        mag = 0.10 * (0.8 ** rnd)
+        Q = best + mag * rng.normal(size=best.shape)
+        Q = normalize_dmax1(Q)
+        Q = softmin_ascent(Q, iters=80)
+        X, r = exact_solve(Q, maxiter=150)
+        if r > best_r:
+            best_r, best = r, X
+
+    best = normalize_dmax1(best)
+    if not np.isfinite(best).all() or best.shape != (N, D) or d2_all(best).max() <= 0:
+        np.random.seed(42)
+        best = np.random.randn(N, D)
+    return best
+# EVOLVE-BLOCK-END

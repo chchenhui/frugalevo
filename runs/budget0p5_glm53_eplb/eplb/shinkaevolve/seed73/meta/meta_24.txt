@@ -1,0 +1,202 @@
+# INDIVIDUAL PROGRAM SUMMARIES
+
+The following are summaries of individual programs evaluated since the last meta update:
+
+**Program Name: DeepSeek-style EPLB Hierarchical Expert Load Balancer**
+- **Implementation**: Ports the DeepSeek EPLB algorithm using three stages—`balanced_packing` (greedy sorted bin-packing on CPU), `replicate_experts` (greedy replication by weight/logcnt), and a hierarchical variant that packs groups to nodes, replicates within nodes, then packs physical experts to GPUs; falls back to a flat global policy when `num_groups % num_nodes != 0`.
+- **Performance**: Combined score 0.13, with good GPU balancedness (0.66) and inference-time balance (0.98), but weak expert-level balancedness (0.25), mediocre algorithm-time balance (0.56), and a speed score of 0.00.
+- **Feedback**: Correctness passes all validation tests, but the CPU-Python greedy loops in `balanced_packing` and per-step replication loops make it extremely slow (speed score 0), and the greedy replication heuristic leaves expert loads unevenly distributed; vectorizing the packing and improving the replication criterion are the main improvement opportunities.
+**Program Identifier:** Generation 0 - Patch Name initial_program - Correct Program: True
+
+**Program Name: Vectorized Snake LPT Expert Load Balancer for vLLM EPLB**
+- **Implementation**: Fully vectorized PyTorch rewrite of DeepSeek's EPLB algorithm using a serpentine LPT packing (sort descending, snake round-robin across packs), greedy max weight/logcnt replication for redundant experts, and hierarchical three-step balancing (groups→nodes, replicate within nodes, pack to GPUs) with scatter-based index remapping.
+- **Performance**: Combined score 0.13 — balancedness_score_gpu 0.66, balancedness_score_expert 0.25, speed_score 0.01, times_algorithm 0.00, times_inference 0.23; passes all validation tests.
+- **Feedback**: The vectorized snake packing achieves reasonable GPU-level balance but poor expert-level balance (0.25), suggesting the greedy replication scheme (repeatedly replicating the max weight/logcnt expert) underperforms the reference on per-expert load distribution. Fast algorithm runtime (0.00) but slow inference times indicate correctness without runtime advantage; improving expert-level balance (e.g., better replication heuristics) is the main opportunity.
+**Program Identifier:** Generation 1 - Patch Name vectorize_balanced_packing_snake - Correct Program: True
+
+**Program Name: vLLM Expert Parallelism Load Balancer (EPLB)**
+- **Implementation**: Adapts DeepSeek's EPLB with a vectorized snake-order (boustrophedon) `balanced_packing` using sort/scatter for equal-cardinality packing, a greedy per-layer replication loop (`replicate_experts`) that replicates the max load/logcnt expert, and a 3-stage hierarchical rebalance (groups→nodes, replication within nodes, physical experts→GPUs).
+- **Performance**: Combined score 0.13 — balancedness_score_gpu 0.66, balancedness_score_expert 0.25, times_algorithm 0.00, times_inference 0.24, speed_score 0.01; passes all validation tests.
+- **Feedback**: GPU-level balance is decent, but expert-level balancedness (0.25) is weak, suggesting the greedy replication and packing choices leave redundant-expert placement poorly balanced. The vectorized snake packing trades quality for speed, yet times_algorithm 0.00 and speed_score 0.01 indicate the algorithm timing dimension was not competitive, so both balance quality and speed need improvement.
+**Program Identifier:** Generation 2 - Patch Name vectorized_snake_packing - Correct Program: True
+
+**Program Name: EPLB Hierarchical Expert Replication and Packing Load Balancer**
+
+- **Implementation**: Implements a Python heapq-based greedy `balanced_packing` (sorting weights descending, always assigning the next item to the least-loaded pack via min-heap), a `replicate_experts` routine that iteratively replicates the highest load-per-replica logical experts, and a hierarchical `rebalance_experts_hierarchical` that packs groups to nodes, replicates experts within nodes, then packs physical experts to GPUs, with a global-policy fallback when `num_groups % num_nodes != 0`. Heavy use of tensor list conversion and per-layer Python loops in packing, and CPU-based float tensor operations throughout.
+
+- **Performance**: All reported metrics (balancedness_score_gpu, balancedness_score_expert, times_algorithm, times_inference, speed_score, combined_score) are 0.00, though the program is correct and passes all validation tests.
+
+- **Feedback**: The algorithm is functionally correct but the Python/heapq-based packing loop with `.tolist()` conversions is likely a major performance bottleneck versus vectorized torch alternatives; the zeroed metrics suggest evaluation scoring may not have captured this run or the implementation needs optimization to compete. Correctness of the DeepSeek-adapted hierarchical strategy (group→node packing, per-node replication, GPU packing) is validated, leaving runtime efficiency as the main improvement area.
+**Program Identifier:** Generation 3 - Patch Name heap_based_balanced_packing - Correct Program: True
+
+**Program Name: Hierarchical EPLB Expert Load Balancer for vLLM**
+- **Implementation**: Implements DeepSeek-style EPLB via three stages—balanced_packing (greedy LPT with a Python min-heap assigning sorted groups to least-loaded packs with capacity constraints), replicate_experts (iteratively duplicating highest load/logcnt experts), and a hierarchical rebalance (groups→nodes, replication within nodes, physical experts→GPUs), with an inverse-permutation helper and scatter-based log2phy construction.
+- **Performance**: Combined score 0.13, with good GPU balancedness (0.66) but weak expert balancedness (0.25) and very slow speed (0.01 algorithm time, 0.24 inference).
+- **Feedback**: The heap-based greedy packing on CPU with per-layer Python loops severely hurts runtime speed, while expert-level balance suffers from the simplistic max-load replication heuristic; the algorithm is correct, so the main improvement levers are vectorizing the packing loop (e.g., fully tensorized assignment) and refining replica-count selection for better per-expert balance.
+**Program Identifier:** Generation 4 - Patch Name heap_based_balanced_packing_speedup - Correct Program: True
+
+**Program Name: GPU-Vectorized EPLB with Greedy Packing and Local Search**
+- **Implementation**: Fully vectorized `balanced_packing` using per-layer greedy best-fit via masked `argmin`/`scatter_add_`, plus an 8-iteration local-search swap between heaviest/lightest packs, then rank recomputation via stable `argsort` on pack index; builds on DeepSeek-style `replicate_experts` and hierarchical `rebalance_experts` (groups→nodes→GPUs).
+- **Performance**: Combined score 0.00 — the program crashes immediately with `TypeError: argsort() received an invalid combination of arguments ... stable` and fails all validation tests.
+- **Feedback**: The stable-sort call `pack_index.argsort(-1, stable=True)` is incompatible with the evaluation environment's PyTorch version (older API signature); it must be replaced with a compatibility workaround (e.g., `torch.sort(..., stable=True)` or key-composed argsort like `pack_index * n + arange(n)`), which would otherwise make the vectorized approach viable.
+**Program Identifier:** Generation 5 - Patch Name vectorized_packing_with_local_search_refinement - Correct Program: False
+
+**Program Name: EPLB Hierarchical Load Balancer with Swap Refinement**
+- **Implementation**: Implements DeepSeek-style expert parallelism load balancing in three stages — balanced packing via a greedy LPT min-heap with an added local pairwise-swap refinement pass between heavy/light packs, greedy expert replication, and hierarchical node/GPU packing — all done in Python lists (converting tensors to `.tolist()`) rather than vectorized PyTorch ops.
+- **Performance**: All metrics are 0.00 (combined score, balancedness, speed); the program fails validation with `index 256 is out of bounds for dimension 1 with size 256`.
+- **Feedback**: The custom swap-refinement step corrupts rank/pack bookkeeping — swapping `rank_in_pack` values between items of different packs can produce out-of-range rank+1 indices, causing the downstream scatter (`phy2log * maxlogcnt + phyrank`) in `rebalance_experts` to overflow, crashing the whole pipeline. The added refinement violates the algorithm's pack-capacity and rank invariants; removing it or fixing rank reassignment after swaps is necessary for correctness.
+**Program Identifier:** Generation 6 - Patch Name fast_heap_packing_with_swap_refinement - Correct Program: False
+
+**Program Name: EPLB Expert Parallelism Load Balancer for vLLM**
+- **Implementation**: Port of DeepSeek's EPLB algorithm with three core functions: `balanced_packing` (heap-based greedy multi-way weighted packing with descending sort and index tie-breaking), `replicate_experts` (greedy replica assignment minimizing max load via weight/logcnt argmax), and `rebalance_experts_hierarchical` (three-step pipeline: pack groups to nodes, replicate experts within nodes, pack physical experts to GPUs, using permutation inverses via scatter).
+- **Performance**: Combined score and all sub-metrics (balancedness_score_gpu, balancedness_score_expert, speed, times) registered as 0.00, though the program is correct and passes all validation tests.
+- **Feedback**: The heap-based packing with tie-breaking by pack index ensures even pack filling, and the hierarchical node-aware design accounts for faster intra-node networks (NVLink), producing valid expert placement maps; the zero metrics suggest either benchmark infrastructure not being applied or the score not being computed for this run rather than any algorithmic deficiency.
+**Program Identifier:** Generation 7 - Patch Name greedy_heap_vectorized_eplb - Correct Program: True
+
+**Program Name: EPLB Expert Load Balancer with Heap-Based Packing and Local Search**
+- **Implementation**: Adapted from DeepSeek EPLB, uses a greedy min-heap balanced packing of weighted items into equal-size packs, hierarchical three-step rebalancing (group→node, replication, GPU packing), plus a local search swap refinement between most/least-loaded GPUs (8 iterations, capacity-preserving swaps).
+- **Performance**: Combined score 0.13 — balancedness_score_gpu 0.66, balancedness_score_expert 0.25, times_algorithm 0.04, times_inference 0.46, speed_score 0.00; passes all validation tests.
+- **Feedback**: GPU-level balance is decent thanks to the heap packing and swap refinement, but expert-level balancedness (0.25) is weak, suggesting the replication step (weight/logcnt greedy max selection) leaves expert replica counts poorly distributed. Long algorithm runtime (0.04) and slow inference (0.46) with zero speed score indicate Python loops over layers and CPU-heavy list operations are a major bottleneck; vectorizing the heap packing and local search would improve both speed and scalability.
+**Program Identifier:** Generation 8 - Patch Name gpu_pack_local_search_refinement - Correct Program: True
+
+**Program Name: vLLM EPLB Hierarchical Expert Load Balancer**
+- **Implementation**: Adapted from DeepSeek EPLB with a hierarchical rebalance (groups→nodes→GPUs) using a fully vectorized greedy LPT `balanced_packing` with cardinality constraints (masked-argmin over full packs), a vectorized water-filling `replicate_experts` that replicates the highest per-replica-load expert, and index-permutation inverses via scatter to build the final maps.
+- **Performance**: Combined score 0.13 (balancedness_score_gpu 0.66, balancedness_score_expert 0.25, times_algorithm 0.01, times_inference 0.43, speed_score 0.00).
+- **Feedback**: The program is correct and passes all validation tests, but the greedy vectorized approach yields moderate GPU-level balance (0.66) while expert-level balancedness is weak (0.25), suggesting replication counts are poorly spread across logical experts despite good per-GPU packing.
+**Program Identifier:** Generation 10 - Patch Name vectorized_lpt_balancer - Correct Program: True
+
+**Program Name: PyTorch EPLB Expert Rebalancer with LPT Packing and Greedy Replication**
+- **Implementation**: Three-stage pipeline—LPT heap-based packing of expert groups onto nodes, greedy per-replica-load replication of logical experts, then LPT packing of physical experts onto GPUs—done mostly on CPU with Python loops, with vectorized permutation-inversion and final map assembly via scatter ops.
+- **Performance**: Combined score 0.13; GPU balancedness 0.66, expert balancedness 0.25, times_algorithm 0.13, times_inference 0.55, speed score 0.00.
+- **Feedback**: Correctness is validated, but the slow Python-loop LPT packer and greedy replicator yield poor runtime (speed 0.00) and weak expert-level balancedness (0.25), indicating the replication heuristic doesn't equalize per-replica loads well despite decent GPU-level balance.
+**Program Identifier:** Generation 9 - Patch Name modular_lpt_pipeline - Correct Program: True
+
+**Program Name: Hierarchical EPLB with Proportional Replication and Heap-Based Packing**
+- **Implementation**: Extends DeepSeek-style EPLB with a min-heap variant of balanced_packing (LPT-style with per-pack capacity limits), and replaces the original redundant-expert allocation with proportional largest-remainder quota distribution in `replicate_experts`, plus replica emission ordered by descending per-replica load. Falls back to a global policy (num_groups=1) when `num_groups % num_nodes != 0`.
+- **Performance**: Combined score 0.00 across all metrics (balancedness GPU/expert, algorithm/inference times, speed) — the program crashes during validation with a tensor shape mismatch ("expanded size (72) must match existing size (66)").
+- **Feedback**: The rewritten replication logic is broken: the floor/remainder quota computation does not guarantee the total emitted replica count equals `num_phy` (the per-row `base` clamp and `rem` handling can overflow/underflow), producing a 66-vs-72 size inconsistency that propagates into the scatter operations. The innovations (proportional replication, load-ordered emission) never got evaluated because the code fails before producing valid maps; the parent DeepSeek algorithm's replication scheme should be restored or the remainder allocation fixed so emitted replicas exactly match `num_phy`.
+**Program Identifier:** Generation 11 - Patch Name proportional_replication_with_sorted_placement - Correct Program: False
+
+**Program Name: Vectorized EPLB with Snake Packing and Local Search**
+- **Implementation**: Implements an expert-parallelism load balancer using a fully vectorized "snake" (boustrophedon) round-robin packing for equal-cardinality bin packing, plus a vectorized local-search swap refinement (up to 64 iterations), combined with hierarchical group→node→GPU rearrangement via `replicate_experts` and `rebalance_experts_hierarchical`.
+- **Performance**: Combined score 0.13 (maximize 0.13 target met), with expert balancedness 0.66, expert-level balancedness 0.25, GPU-time score 0.00, inference-time 0.46, and speed score 0.00; passes all validation tests.
+- **Feedback**: The snake packing plus swap refinement achieves good expert-level balance but the refinement loop (64 rounds of scatter/gather ops) hurts both GPU-time and speed scores; the weak expert balancedness (0.25) suggests the greedy per-layer replication and hierarchical grouping leaves residual load imbalance across physical experts.
+**Program Identifier:** Generation 12 - Patch Name snake_packing_swap_refinement - Correct Program: True
+
+**Program Name: EPLB Expert Load Balancer with Heap-Based LPT Packing and Local Search Refinement**
+- **Implementation**: Uses greedy LPT (Longest Processing Time) assignment via a min-heap for balanced packing, replacing the linear O(m) `min()` scan, plus an 8-pass local search (`_refine_packing`) that swaps items between the most- and least-loaded packs to reduce max load while keeping pack sizes fixed. Hierarchical rebalancing packs groups to nodes, replicates experts within nodes, then packs physical experts to GPUs.
+- **Performance**: Combined score 0.13; balancedness_score_gpu 0.66, balancedness_score_expert 0.25, times_algorithm 0.05, times_inference 0.49, speed_score 0.00.
+- **Feedback**: The heap-based LPT plus local search refinement yields strong GPU-level balance (0.66), but expert-level balance remains weak (0.25) and speed score is 0.00, indicating runtime overhead from Python-level list/loop refinements offsets balance gains. Future work should focus on vectorizing the refinement (currently pure-Python loops) and improving replication heuristics to raise expert balancedness.
+**Program Identifier:** Generation 13 - Patch Name heap_lpt_plus_swap_refinement - Correct Program: True
+
+**Program Name: Vectorized LPT-based Hierarchical Expert Load Balancer**
+- **Implementation**: Implements EPLB rebalancing with a greedy LPT heuristic in `balanced_packing` vectorized across all layers via tensor ops (sorting weights descending, assigning each item to the lightest non-full pack in a Python loop over items), plus greedy replication via `weight/logcnt` argmax and a three-stage hierarchical packing (groups→nodes→GPUs) with permutation inversion helpers.
+- **Performance**: Combined score 0.13 with expert balancedness 0.25, GPU balancedness 0.66, but poor speed (algorithm 0.01s, inference 0.44s, speed_score 0.00).
+- **Feedback**: The per-item Python loop in `balanced_packing` (O(n) iterations of tensor ops) hurts speed despite correctness, and expert-level balance (0.25) is weak because replication greed minimizes max load without optimizing per-expert distribution; the strong GPU-level packing (0.66) shows the hierarchical node/GPU stages work well.
+**Program Identifier:** Generation 14 - Patch Name vectorized_lpt_packing - Correct Program: True
+
+**Program Name: Vectorized Balanced-Pair LPT Expert Load Balancer (EPLB)**
+
+- **Implementation**: Replaces the original DeepSeek-style sorted greedy bin-packing in `balanced_packing` with a fully vectorized balanced-pair scheme: items are sorted descending, matched heaviest-to-lightest into pairs, and pairs are distributed round-robin over packs with alternating snake direction per block, computing pack indices and ranks via tensor ops and `scatter_` (rank = `block*2 + side`).
+
+- **Performance**: The program fails validation entirely — all scores are 0.00 (balancedness GPU/expert, speed, combined), with runtime error "index 629990972 is out of bounds for dimension 1 with size 72".
+
+- **Feedback**: The vectorized pair-matching approach has a correctness bug in index computation (likely rank/pack index bounds in `balanced_packing` when the number of groups per pack is odd or when pair blocks don't divide evenly, corrupting downstream scatter operations), producing out-of-bounds indices. The vectorization strategy is a reasonable speedup idea, but index arithmetic (particularly `rank_sorted = block*2 + side` vs. valid rank range within each pack) must be validated against all shape configurations before it can compete with the baseline.
+**Program Identifier:** Generation 15 - Patch Name balanced_pair_packing - Correct Program: False
+
+**Program Name: Vectorized vLLM Expert Parallelism Load Balancer (EPLB)**
+- **Implementation**: Implements DeepSeek-style hierarchical EPLB (groups→nodes→GPUs) with a two-stage `balanced_packing`: a snake-order greedy initial assignment via `sort`+`scatter_`, followed by vectorized local-search swaps between heaviest/lightest packs across all layers in parallel, plus a global rebalancing pass.
+- **Performance**: Failed validation — combined score 0.00 with all metrics (balancedness GPU/expert, times, speed) at 0.00 due to a runtime crash.
+- **Feedback**: The algorithm crashes with a scatter dimension mismatch ("Expected index [58, 8] to be no larger than self [58, 8]... than src [1, 8]"), indicating the Stage-1 `pack_index.scatter_(-1, indices, pack_sorted.view(1, -1))` uses an incorrectly shaped source tensor that must broadcast to the full `[num_layers, num_groups]` shape. The vectorized swap-based local search is a reasonable design, but correctness of tensor shape handling in scatter operations must be fixed before any performance evaluation is meaningful.
+**Program Identifier:** Generation 16 - Patch Name vectorized_lpt_with_pair_swap_refine - Correct Program: False
+
+**Program Name: Expert Parallelism Load Balancer (EPLB) for vLLM**
+- **Implementation**: Implements DeepSeek-style EPLB with three stages: a heap-based `balanced_packing` greedy algorithm (run on CPU with Python lists for speed), greedy `replicate_experts` for redundant expert allocation minimizing maximum replica load, and a hierarchical `rebalance_experts` combining node-level packing with GPU-level packing via tensor permutation inverses.
+- **Performance**: All metrics report 0.00 (balancedness GPU/expert, algorithm/inference times, speed score, combined score), though the program is correct and passes all validation tests.
+- **Feedback**: The zeroed metrics suggest this is the unmodified reference/baseline implementation rather than an evolved variant; correctness is confirmed but no performance gains or optimization effects are measurable. The heavy use of CPU-side Python loops in `balanced_packing` is a clear candidate for vectorization in future iterations.
+**Program Identifier:** Generation 17 - Patch Name heap_packing_eplb_crossover - Correct Program: True
+
+**Program Name: EPLB Expert Load Balancer with LPT Packing and Local Search**
+
+- **Implementation**: Implements a three-stage pipeline (group-to-node LPT packing with fixed pack capacity, greedy expert replication by highest per-replica load, and physical-expert-to-GPU packing), where the LPT packer adds a deterministic local-search swap refinement (up to 4·num_packs rounds) that swaps items between the most- and least-loaded packs to shrink the load spread, preferring swaps that bisect the spread.
+
+- **Performance**: Correct and passes all validation tests; combined score 0.13 with strong GPU balancedness (0.66) and inference time (0.70), but weak expert balancedness (0.25), algorithm time (0.27), and speed score (0.00).
+
+- **Feedback**: The local-search refinement improves GPU-level load balance but the pure greedy replication leaves expert-level balance poor, and the Python-loop-heavy per-row packing makes the algorithm slow — a vectorized/PyTorch-native approach would substantially improve speed and expert balancedness.
+**Program Identifier:** Generation 18 - Patch Name lpt_swap_refinement - Correct Program: True
+
+**Program Name: EPLB with Snake Packing and Local-Search Refinement**
+- **Implementation**: Uses a vectorized boustrophedon (snake) round-robin over weight-sorted items for equal-cardinality packing, then adds a vectorized local-search loop (up to 64 iterations) swapping the lightest item in the most-loaded pack with the heaviest item in the least-loaded pack; replication is greedy (max weight/count) and the hierarchical node→GPU pipeline follows the DeepSeek EPLB design.
+- **Performance**: Correct on all validation tests, but scores poorly overall — GPU balancedness 0.66, expert balancedness 0.25, speed score 0.00, combined 0.13.
+- **Feedback**: The snake packing plus local search achieves moderate per-GPU balance, but the greedy replication strategy leaves expert-level load very unbalanced (0.25), and heavy per-iteration scatter/argmax work in the refinement loop drives runtime to the point where the speed score is zero; future improvements should focus on smarter replication allocation and reducing per-layer iterative overhead.
+**Program Identifier:** Generation 19 - Patch Name snake_lpt_fast_packing - Correct Program: True
+
+**Program Name: EPLB Hierarchical Expert Load Balancer**
+- **Implementation**: Adapts DeepSeek EPLB with hierarchical 3-step flow (pack groups to nodes via balanced_packing with a Python heap-based greedy, replicate experts within nodes, pack physical experts to GPUs), including a replica-count cap (`maxlogcnt = max(num_redundant//2+1, ceil(num_phy/num_log))` in `replicate_experts` to prevent hot experts from hoarding replicas, and CPU-side loop processing for balanced_packing.
+- **Performance**: Combined score 0.13 — balancedness_score_gpu 0.66, balancedness_score_expert 0.25, times_algorithm 0.02, times_inference 0.45, speed_score 0.00.
+- **Feedback**: Correct and passes all validation; GPU-level balance is decent, but the replica cap trades away expert-level balancedness (0.25) without yielding speed gains (0.00), suggesting the cap is overly restrictive for expert distribution while the Python-loop packing hurts runtime.
+**Program Identifier:** Generation 20 - Patch Name cap_replica_spread - Correct Program: True
+
+**Program Name: EPLB Hierarchical Expert Load Balancer for vLLM**
+- **Implementation**: Adapts DeepSeek's EPLB with a three-stage hierarchical algorithm (group→node packing, per-node expert replication, GPU packing) using greedy LPT with Python heaps/lists rather than vectorized tensor ops to avoid per-item kernel launches; CPU float processing throughout.
+- **Performance**: Combined score 0.13 — GPU balancedness 0.66 (good), expert balancedness 0.25 (weak), algorithm time score 0.03, inference time 0.45, speed score 0.00 (poor runtime).
+- **Feedback**: The move from tensorized vectorized loops to Python-list greedy heuristics reduced kernel-launch overhead but yields very slow absolute runtime and poor expert-level balance; the hierarchical packing constrains expert placement quality, so future work should improve balance heuristics and optimize hot inner loops (e.g., vectorized argmax for replication).
+**Program Identifier:** Generation 21 - Patch Name heap_lpt_fast_packing - Correct Program: True
+
+**Program Name: vLLM Expert Parallelism Load Balancer (EPLB)**
+- **Implementation**: Reimplements DeepSeek-style hierarchical expert rebalancing with a vectorized greedy LPT `balanced_packing` (batched across all rows via scatter ops) and a capped-replica `replicate_experts` (maxcnt = redundant//2 + 1) that spreads replicas across more logical experts.
+- **Performance**: Combined score 0.13 — GPU balancedness 0.66, expert balancedness 0.25, times_algorithm 0.01, times_inference 0.45, speed_score 0.00; passes all correctness tests.
+- **Feedback**: The replica-count cap trades expert-level balance (0.25) for better GPU balance and slightly faster inference; expert balancedness is the main weakness, suggesting the cap spreads load too thinly relative to weight distribution.
+**Program Identifier:** Generation 22 - Patch Name cap_and_spread_replica_counts - Correct Program: True
+
+**Program Name: EPLB Expert Rebalancing with Joint GPU-Load Refinement**
+- **Implementation**: Implements the DeepSeek-style EPLB pipeline (LPT group packing to nodes, greedy expert replication, GPU packing) plus a novel "joint refinement" stage that moves a replica from the hottest GPU's expert to the coldest GPU's expert, then vectorized-rebuilds phy2mlog/ranks from updated counts and re-packs before assembling the final logical-to-physical maps via scatter.
+- **Performance**: Failed validation entirely — all metrics 0.00 with error "The size of tensor a (72) must match the size of tensor b (64) at non-singleton dimension 1", indicating a shape mismatch (72 vs 64 experts) during map assembly.
+- **Feedback**: The added refinement stage breaks dimension invariants: the final `logcnt` assembly does `mlogcnt.view(num_layers, -1).gather(-1, log2mlog)` where `mlogcnt` (per-node rows × num_mlog) cannot be gathered with full-width `log2mlog` indices, causing the 72-vs-64 mismatch. The core three-stage pipeline is sound; the joint refinement's count-rebuild and final assembly logic need index-space fixes (mlogcnt must be expanded/unflattened per node before gathering with logical indices) before any balancedness gains can be measured.
+**Program Identifier:** Generation 23 - Patch Name joint_replication_packing_refinement - Correct Program: False
+
+# GLOBAL INSIGHTS SCRATCHPAD
+
+The following are global insights about optimization approaches and their effectiveness:
+
+# Updated Global Insights
+
+## Successful Algorithmic Patterns
+
+- **The current best program's vectorized snake LPT packing remains the proven backbone**: descending sort → `rank_sorted = pos // num_packs`, snake offset via `torch.where(rank_sorted % 2 == 0, offset, num_packs - 1 - offset)`, then dual `scatter_` — zero Python loops. It achieves times_algorithm 0.00, times_inference 0.23, speed_score 0.01, the strongest speed profile of all evaluations (Gens 12, 14, 19 confirm).
+- **The three-stage hierarchical pipeline (groups→nodes, per-node replication, physical→GPUs) with global fallback when `num_groups % num_nodes != 0` is validated across every passing program** — Gens 20, 21, 22 (all combined 0.13, correct) again implement this structure unchanged, confirming only internals differentiate performance.
+- **Gens 20–22 independently confirm the plateau, not a regression**: all three new correct variants (replica cap, heap LPT, vectorized LPT + spread cap) scored identical combined 0.13, GPU 0.66, expert 0.25 — matching the current best. No replication modification pattern found so far moves expert balancedness.
+
+## Ineffective Approaches
+
+- **Replica-count caps (`redundant//2 + 1`) hurt expert balancedness with no speed payoff**: Gen 20 (`cap_replica_spread`), Gen 21 (`heap_lpt_fast_packing`), and Gen 22 (`cap_and_spread_replica_counts`) all implemented capped `replicate_experts`; all scored expert balancedness 0.25 and speed 0.00 (vs best's 0.01). The cap spreads replicas too thinly relative to weight distribution — same expert balance as uncapped, but slower.
+- **Gen 23's joint refinement stage crashed entirely** (all 0.00, "tensor a (72) must match tensor b (64)"): the refinement's count-rebuild gathers per-node `mlogcnt` (rows × num_mlog) with full-width `log2mlog` indices, violating index-space invariants. Echoes the established crash pattern of Gens 11, 15, 16 — refinements touching `logcnt`/scatter assembly break `phy2log * maxlogcnt + phyrank` invariants.
+- **Python heap/list loops still double inference time**: Gen 21's heap-based greedy LPT on CPU lists produced times_inference 0.45 vs best's 0.23, speed_score 0.00. Confirms Gens 9/13/17's finding — the claimed "avoid kernel-launch overhead" benefit never materializes into better speed_score.
+
+## Implementation Insights
+
+- **The best program's `replicate_experts` is the confirmed score bottleneck and every attempted fix has failed**: the greedy loop `for i in range(num_log, num_phy)` with `(weight / logcnt).max(-1)` caps expert balancedness at 0.25 in all correct programs. Gen 22's vectorized-batched `balanced_packing` attempt succeeded in correctness (vectorizing across all rows via scatter) but still scored expert 0.25 — the greedy argmax heuristic itself, not the loop structure, is the quality limit.
+- **Any post-replication refinement must preserve the mlog→log index space**: Gen 23 shows that rebuilding counts requires `mlogcnt` to be expanded/unflattened per node (`mlogcnt.view(num_layers, -1)` must align with `log2mlog`'s per-node unflattened ordering) before gathering — the 72-vs-64 mismatch came exactly from skipping this step.
+- **Scatter index invariants remain the dominant crash source**: Gens 11, 15, 16, 23 all failed in scatter/gather ops. Any replication change must guarantee emitted replicas exactly equal `num_phy` and that `phy2log * maxlogcnt + phyrank < num_logical_experts * maxlogcnt` across configurations.
+- **CPU-side `weight = weight.float().cpu()` with vectorized tensor ops is the winning runtime recipe** (best: 0.00 algorithm, 0.23 inference) — pure vectorized tensors, no Python-level per-item work.
+
+## Performance Analysis
+
+- **Universal plateau persists across 10+ correct programs**: combined 0.13 (GPU 0.66 / expert 0.25) for the best program plus Gens 9, 12, 13, 14, 18, 19, 20, 21, 22. GPU balancedness is saturated by the packing stage; expert balancedness is fixed by the replication heuristic and has never been moved by any working variant (caps, spreads, vectorized LPT all leave it at 0.25).
+- **Current best dominates all new variants on speed**: 0.00/0.23/0.01 vs Gen 20 (0.02/0.45/0.00), Gen 21 (0.03/0.45/0.00), Gen 22 (0.01/0.45/0.00). The replica caps cost ~2× inference time with zero balance gain — strictly dominated by the best program.
+- **Crash rate vs gain asymmetry sharpens**: Gens 11, 15, 16, 23 all scored 0.00 from index/shape violations, while every successful modification scored exactly the baseline — the only unexplored score dimension remains expert balancedness via a *correct* replication strategy, and four failed attempts show it requires exact-count invariants plus a non-greedy placement heuristic (Gen 23's refinement idea was the right direction but needs the mlog/log index fix).
+- **Correlation reaffirmed**: speed_score > 0 occurs only in the fully loop-free packing (best, 0.01); any Python loop or refinement iteration collapses speed_score to 0.00 regardless of balance outcome.
+
+# META RECOMMENDATIONS
+
+The following are actionable recommendations for the next program generations:
+
+1. **Replace the greedy `replicate_experts` loop with a tensorized proportional largest-remainder allocation**: Compute per-row target counts as `torch.floor(num_phy * weight / weight.sum(-1, keepdim=True)).clamp(min=1)`, then fix the remainder in one tensorized pass: `diff = num_phy - counts.sum(-1)`, and for rows with `diff != 0`, use `topk` on the fractional residuals to increment/decrement the correct entries so each row sums exactly to `num_phy`. Build `phy2log` via `torch.repeat_interleave` on a sorted expert-id tensor and `rank` via `cumsum` within segments — fully loop-free, preserving times_algorithm 0.00. This directly attacks the only remaining Python loop, the confirmed source of the 0.25 expert-balance plateau (the greedy argmax heuristic, not the loop structure, was the quality limiter in Gens 20–22).
+
+2. **Guarantee scatter invariants before returning from any new `replicate_experts`**: After the tensorized allocation, assert `logcnt.sum(-1) == num_phy` and `logcnt.max() <= maxlogcnt` (where `maxlogcnt = num_redundant_experts + 1` at the global level, and correspondingly smaller at node level). Gens 11/15/16/23 all crashed with all-zero scores from exactly these violations (`phy2log * maxlogcnt + phyrank` out of bounds, or 72-vs-64 shape mismatches from misaligned per-node flattening). A cheap shape/index check converts a guaranteed 0.00 into a correct fallback.
+
+3. **If attempting joint replication–packing refinement, mutate `logcnt`/`phy2mlog` inputs *before* Step 3 packing, never post-hoc**: After Step 2, compute hypothetical GPU loads via `scatter_add` of `tokens_per_phy`, and if the hottest pack exceeds the row mean by a threshold, shift one replica count from the highest-load logical expert in the hottest node to the lowest in the coldest node using tensorized top-k — a single loop-free pass. This is the safe form of Gen 23's refinement: it changes the *inputs* to `balanced_packing` rather than rebuilding counts from per-node `mlogcnt` (which caused the 72-vs-64 crash because `mlogcnt.view(num_layers, -1)` must align with `log2mlog`'s per-node unflattened ordering before any gather).
+
+4. **Leave `balanced_packing`, the dual `scatter_`, and all index arithmetic byte-identical**: GPU balancedness is saturated at 0.66 across 10+ correct programs and the snake-LPT + dual-scatter construction delivers the only speed_score > 0 (0.01, times_inference 0.23). Every packing/swap variant (Gens 12, 13, 15, 16, 18, 19) either crashed or bought zero balance at 2–3× inference cost. All future mutation budget should concentrate exclusively on the replication stage.
+
+5. **Preserve evaluation-timing and structure hygiene in every variant**: Keep `weight = weight.float().cpu()` as the first operation, keep the global-fallback branch for `num_groups % num_nodes != 0`, use only `torch.sort(..., descending=True)` (Gen 5's kwargs crash), and never create tensors on other devices mid-algorithm. Gens 3/7/17 show correct programs can score all-zeros from flaky capture — re-run any variant that scores 0.00 without a crash message before treating it as an algorithmic regression. Also verify `tokens_per_phy = (tokens_per_mlog / mlogcnt).gather(-1, phy2mlog)` still yields integers-free float semantics after count changes, since downstream `balanced_packing` only needs ordering.

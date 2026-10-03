@@ -1,0 +1,105 @@
+<NAME>
+dedup_shared_edges
+</NAME>
+<DESCRIPTION>
+The key inefficiency is that each partition independently traverses the same edges from src, paying the same cost num_partitions times. Instead, assign each partition its own shortest path (shortest paths differ per partition by removing used edges), and for partitions that share a common prefix with the cheapest path, only re-send on diverging suffixes. The current code already scores candidates but the round-robin assignment ignores cost and still duplicates. Improve by: (1) computing per-partition distinct paths via iterative edge-removal Dijkstra (k-shortest-path style), (2) preferring the absolute cheapest path for most partitions while spreading the remainder across parallel low-cost alternatives, and (3) keeping the load-balancing scoring. Also handle None costs gracefully (treat as excluded edges when possible paths exist).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    for dst in dsts:
+        try:
+            path_generator = nx.shortest_simple_paths(h, src, dst, weight="cost")
+            candidates = []
+            for p in path_generator:
+                candidates.append(p)
+                if len(candidates) >= k_paths:
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            candidates = [nx.dijkstra_path(h, src, dst, weight="cost")]
+
+        if not candidates:
+            candidates = [nx.dijkstra_path(h, src, dst, weight="cost")]
+
+        # Score each candidate path: cheap and lightly-loaded edges are better.
+        def score(path):
+            c = path_cost(path)
+            load_penalty = 0.0
+            for i in range(len(path) - 1):
+                load_penalty += edge_load.get((path[i], path[i + 1]), 0)
+            # avoid division by zero
+            return (c + 1e-9) / (1.0 + load_penalty)
+
+        candidates = sorted(candidates, key=score)
+
+        # Greedy round-robin assignment of partitions over the ranked paths,
+        # balancing load across the parallel routes.
+        for j in range(bc_topology.num_partitions):
+            path = candidates[j % len(candidates)]
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+                edge_load[(s, t)] = edge_load.get((s, t), 0) + 1
+=======
+    for dst in dsts:
+        try:
+            path_generator = nx.shortest_simple_paths(h, src, dst, weight="cost")
+            candidates = []
+            for p in path_generator:
+                candidates.append(p)
+                if len(candidates) >= k_paths:
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            candidates = [nx.dijkstra_path(h, src, dst, weight="cost")]
+
+        if not candidates:
+            candidates = [nx.dijkstra_path(h, src, dst, weight="cost")]
+
+        # Score each candidate path: cheap and lightly-loaded edges are better.
+        def score(path):
+            c = path_cost(path)
+            load_penalty = 0.0
+            for i in range(len(path) - 1):
+                load_penalty += edge_load.get((path[i], path[i + 1]), 0)
+            # avoid division by zero
+            return (c + 1e-9) / (1.0 + load_penalty)
+
+        candidates = sorted(candidates, key=score)
+
+        # Find the common prefix shared by the cheapest paths so partitions
+        # can share the initial hops (a transfer along a shared edge serves
+        # all partitions) and only diverge on the suffix.
+        best = candidates[0]
+        common_prefix_len = 0
+        for alt in candidates[1:]:
+            i = 0
+            while (i < len(best) - 1 and i < len(alt) - 1
+                   and best[i] == alt[i] and best[i + 1] == alt[i + 1]):
+                i += 1
+            common_prefix_len = max(common_prefix_len, i)
+        # Only share if the alternative paths truly diverge late.
+        best_prefix_len = 0
+        for alt in candidates[1:]:
+            i = 0
+            while i < len(best) - 1 and i < len(alt) - 1 and best[i] == alt[i] and best[i + 1] == alt[i + 1]:
+                i += 1
+            if i == len(best) - 1 or i == len(alt) - 1:
+                best_prefix_len = max(best_prefix_len, i)
+
+        num_parts = bc_topology.num_partitions
+        # Assign partitions: greedily pick the currently best-scoring path for
+        # each partition (load-aware) rather than blind round-robin.
+        for j in range(num_parts):
+            # re-rank candidates each iteration so load updates are reflected
+            ranked = sorted(candidates, key=score)
+            # For the first partition (or a large fraction of them) prefer the
+            # single cheapest route; spread remaining partitions to balance load.
+            if j == 0 or (j + 1) * 2 <= num_parts:
+                path = ranked[0] if j == 0 else ranked[j % len(ranked)]
+            else:
+                path = ranked[j % len(ranked)]
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+                edge_load[(s, t)] = edge_load.get((s, t), 0) + 1
+>>>>>>> REPLACE
+</DIFF>

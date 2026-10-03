@@ -1,0 +1,85 @@
+<NAME>
+edge_reuse_aware_candidate_routing</NAME>
+<DESCRIPTION>
+Replace the plain Dijkstra routing with a read-only, edge-reuse-aware candidate selection. For each destination, generate up to 4 k-shortest candidates via shortest_simple_paths, score each as raw cost minus a discount for edges already used by previously routed destinations (shared trunks get consolidated, reducing redundant transfers), plus a small congestion penalty for edges used many times to balance load across networks. Unlike Gen 4's cost-mutation approach, we never modify G or h — we only re-score candidates — avoiding fragility while exploiting shared trunks and multi-network paths. Falls back to Dijkstra on errors.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def _path_edges(path):
+    return [(path[i], path[i + 1]) for i in range(len(path) - 1)]
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Read-only edge usage counters (never mutate G or h).
+    edge_use = {}  # (u, v) -> number of prior dsts whose route used it
+    REUSE_DISCOUNT = 0.5   # consolidate traffic onto shared trunks
+    CONGESTION_PENALTY = 0.1  # discourage overloading a single link
+
+    from itertools import islice
+
+    def raw_cost(path):
+        return sum(
+            (h[u][v].get("cost") or 0) for u, v in _path_edges(path)
+        )
+
+    def reuse_score(path):
+        """Effective cost: raw cost - reuse discount + congestion penalty."""
+        c = raw_cost(path)
+        for e in _path_edges(path):
+            u = edge_use.get(e, 0)
+            if u > 0:
+                c -= REUSE_DISCOUNT * (h[e[0]][e[1]].get("cost") or 0)
+            c += CONGESTION_PENALTY * u
+        return c
+
+    for dst in dsts:
+        if dst == src:
+            continue
+        path = None
+        try:
+            best_score = None
+            candidates = islice(
+                nx.shortest_simple_paths(h, src, dst, weight="cost"), 4
+            )
+            for cand in candidates:
+                s = reuse_score(cand)
+                if best_score is None or s < best_score:
+                    best_score = s
+                    path = cand
+        except (nx.NetworkXNoPath, nx.NetworkXError, nx.NodeNotFound):
+            path = None
+
+        if path is None:
+            try:
+                path = nx.dijkstra_path(h, src, dst, weight="cost")
+            except (nx.NetworkXNoPath, nx.NetworkXError, nx.NodeNotFound):
+                continue
+
+        for e in _path_edges(path):
+            edge_use[e] = edge_use.get(e, 0) + 1
+
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

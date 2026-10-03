@@ -1,0 +1,83 @@
+<NAME>
+congestion_aware_ksp_broadcast</NAME>
+
+<DESCRIPTION>
+The current algorithm sends every partition of every destination along the single shortest path. This (a) overloads one network path when many partitions/dsts share it and (b) never exploits alternative parallel paths. I propose two targeted improvements:
+
+1. **Congestion-aware weights**: maintain a running count of how many partition-flows have already been placed on each edge. Before routing each destination, create an auxiliary weighted copy of the graph where each edge's effective cost is `cost * (1 + usage)` (scaled). This spreads load across parallel network links, which reduces bottleneck cost in multi-cloud topologies where transferring many partitions simultaneously over one link is more expensive than splitting across several links.
+
+2. **k-shortest-path partition assignment**: instead of putting all partitions of a dst on one path, enumerate up to `num_partitions` simple paths via `nx.shortest_simple_paths` (with congestion-adjusted weights) and assign partitions round-robin across them. This leverages multi-network parallelism and reduces redundant per-link load.
+
+Cost per edge is still summed correctly by downstream evaluation since the topology format is unchanged — we only change which paths are chosen.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    # Track how many partition-flows are already placed on each edge so we can
+    # balance load across parallel networks and avoid bottleneck links.
+    edge_usage = {}
+
+    def effective_cost(u, v, data):
+        base = data.get("cost")
+        if base is None:
+            base = 0.0
+        usage = edge_usage.get((u, v), 0)
+        # Penalize congested edges: cost grows with prior usage.
+        return base * (1.0 + 0.5 * usage)
+
+    # Pre-compute congestion-adjusted edge weights on the routing graph.
+    for u, v, data in h.edges(data=True):
+        data["eff_cost"] = effective_cost(u, v, data)
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        # Enumerate up to num_partitions simple paths under the
+        # congestion-adjusted weights, then assign partitions round-robin so
+        # transfers overlap across multiple networks.
+        try:
+            path_iter = nx.shortest_simple_paths(h, src, dst, weight="eff_cost")
+            candidate_paths = []
+            for p in path_iter:
+                candidate_paths.append(p)
+                if len(candidate_paths) >= num_partitions:
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            candidate_paths = []
+
+        if not candidate_paths:
+            # Fall back to a direct single shortest path if enumeration fails.
+            try:
+                candidate_paths = [nx.dijkstra_path(h, src, dst, weight="eff_cost")]
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+
+        for j in range(bc_topology.num_partitions):
+            path = candidate_paths[j % len(candidate_paths)]
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                edge_usage[(s, t)] = edge_usage.get((s, t), 0) + 1
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+                # Re-weight this edge for subsequent routing decisions.
+                h[s][t]["eff_cost"] = effective_cost(s, t, G[s][t])
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

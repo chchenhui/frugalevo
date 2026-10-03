@@ -1,0 +1,355 @@
+--- a/original.py
++++ b/original.py
+@@ -1,257 +1,351 @@
+ GPU_MEM_SIZE = 80 # GB
+ 
+ # EVOLVE-BLOCK-START
+ 
+ def compute_model_placement(gpu_num, models):
+     """
+     Compute a memory-feasible model placement minimizing maximum KV cache
+     pressure across GPUs.
+ 
+     Args:
+         gpu_num: Number of GPUs
+         models: List of models to place
+ 
+     Returns:
+         A dictionary mapping GPU ids to lists of assigned models.
+     """
+     if gpu_num <= 0:
+         if models:
+             raise ValueError("Cannot place models without GPUs.")
+         return {}
+ 
+     EPS = 1e-12
+     model_list = list(models)
+     weights = {id(model): model.req_rate / model.slo for model in model_list}
+ 
+     def pressure(load, remaining_memory):
+         if remaining_memory > 0:
+             return load / remaining_memory
+         return 0.0 if load <= EPS else float("inf")
+ 
+     def state_objective(loads, remaining):
+         # Lexicographic objective: first minimize maximum KVPR, then the
+         # second-highest KVPR, etc.
+         return tuple(sorted(
+             (pressure(loads[g], remaining[g]) for g in range(gpu_num)),
+             reverse=True
+         ))
+ 
+     def build_greedy(order):
+         placement = {g: [] for g in range(gpu_num)}
+         loads = [0.0] * gpu_num
+         remaining = [GPU_MEM_SIZE] * gpu_num
+ 
+         for model in order:
+             size = model.model_size
+             weight = weights[id(model)]
+             best_gpu = None
+             best_key = None
+ 
+             for g in range(gpu_num):
+                 if size > remaining[g]:
+                     continue
+ 
+                 trial_loads = loads[:]
+                 trial_remaining = remaining[:]
+                 trial_loads[g] += weight
+                 trial_remaining[g] -= size
+ 
+                 # Tighter packing is used only after pressure-vector ties,
+                 # preserving empty GPUs for later large models.
+                 key = (
+                     state_objective(trial_loads, trial_remaining),
+                     trial_remaining[g],
+                     g,
+                 )
+                 if best_key is None or key < best_key:
+                     best_key = key
+                     best_gpu = g
+ 
+             if best_gpu is None:
+                 raise ValueError(
+                     f"Unable to place model of size {size} GB on any GPU. "
+                     f"Remaining per-GPU memory: {remaining}"
+                 )
+ 
+             placement[best_gpu].append(model)
+             loads[best_gpu] += weight
+             remaining[best_gpu] -= size
+ 
+         return placement, loads, remaining
+ 
+     # Deterministic multi-start orderings.  The original method uses the
+     # first ordering; the additional orderings improve cases dominated by
+     # memory fragmentation or high pressure-per-GB models.
+     orders = [
+         sorted(model_list,
+                key=lambda m: (weights[id(m)], m.model_size),
+                reverse=True),
+         sorted(model_list,
+                key=lambda m: (m.model_size, weights[id(m)]),
+                reverse=True),
+         sorted(model_list,
+                key=lambda m: (
+                    weights[id(m)] / max(m.model_size, 1e-12),
+                    m.model_size
+                ),
+                reverse=True),
+         sorted(model_list,
+                key=lambda m: (
+                    weights[id(m)] * (1.0 + m.model_size / GPU_MEM_SIZE),
+                    m.model_size
+                ),
+                reverse=True),
+     ]
+ 
+     candidates = []
+     for order in orders:
+         candidates.append(build_greedy(order))
+ 
+     # Refine the two strongest starts.  This retains low execution time while
+     # avoiding dependence on a single greedy ordering.
+     candidates.sort(key=lambda state: state_objective(state[1], state[2]))
+     refine_count = min(2, len(candidates))
+     max_iterations = max(4, 2 * max(len(model_list), 1) * gpu_num)
+ 
+     def improve(placement, loads, remaining):
+         placement = {g: list(placement[g]) for g in range(gpu_num)}
+         loads = loads[:]
+         remaining = remaining[:]
+ 
+         for _ in range(max_iterations):
+             current_objective = state_objective(loads, remaining)
+             current_max = current_objective[0]
+             best_objective = current_objective
+             best_change = None
+ 
+             for source in range(gpu_num):
+                 source_pressure = pressure(loads[source], remaining[source])
+ 
+                 # Only a current bottleneck can improve the lexicographic
+                 # objective's leading component.
+                 if source_pressure < current_max - EPS:
+                     continue
+ 
+                 for source_index, model in enumerate(placement[source]):
+                     size = model.model_size
+                     weight = weights[id(model)]
+ 
+                     # Move a bottleneck model.
+                     for target in range(gpu_num):
+                         if target == source or size > remaining[target]:
+                             continue
+ 
+                         trial_loads = loads[:]
+                         trial_remaining = remaining[:]
+                         trial_loads[source] -= weight
+                         trial_remaining[source] += size
+                         trial_loads[target] += weight
+                         trial_remaining[target] -= size
+                         objective = state_objective(
+                             trial_loads, trial_remaining
+                         )
+ 
+                         if objective < best_objective:
+                             best_objective = objective
+                             best_change = (
+                                 "move", source, source_index, target
+                             )
+ 
+                     # Swap a bottleneck model with another GPU's model.
+                     for target in range(gpu_num):
+                         if target == source:
+                             continue
+ 
+                         for target_index, other in enumerate(placement[target]):
+                             other_size = other.model_size
+                             other_weight = weights[id(other)]
+ 
+                             source_remaining = (
+                                 remaining[source] + size - other_size
+                             )
+                             target_remaining = (
+                                 remaining[target] + other_size - size
+                             )
+                             if source_remaining < 0 or target_remaining < 0:
+                                 continue
+ 
+                             trial_loads = loads[:]
+                             trial_remaining = remaining[:]
+                             trial_loads[source] += other_weight - weight
+                             trial_loads[target] += weight - other_weight
+                             trial_remaining[source] = source_remaining
+                             trial_remaining[target] = target_remaining
+                             objective = state_objective(
+                                 trial_loads, trial_remaining
+                             )
+ 
+                             if objective < best_objective:
+                                 best_objective = objective
+                                 best_change = (
+                                     "swap", source, source_index,
+                                     target, target_index
+                                 )
+ 
++            # Single-model changes can be trapped by memory fragmentation:
++            # a bottleneck model may require replacing two smaller models.
++            # Search these more expensive exchanges only after all ordinary
++            # moves and swaps have failed.
++            if best_change is None:
++                for source in range(gpu_num):
++                    if pressure(loads[source], remaining[source]) < (
++                        current_max - EPS
++                    ):
++                        continue
++
++                    for source_index, model in enumerate(placement[source]):
++                        size = model.model_size
++                        weight = weights[id(model)]
++
++                        for target in range(gpu_num):
++                            if target == source:
++                                continue
++
++                            target_models = placement[target]
++                            for first_index in range(len(target_models)):
++                                first = target_models[first_index]
++                                for second_index in range(
++                                    first_index + 1, len(target_models)
++                                ):
++                                    second = target_models[second_index]
++                                    exchanged_size = (
++                                        first.model_size + second.model_size
++                                    )
++                                    source_remaining = (
++                                        remaining[source] + size
++                                        - exchanged_size
++                                    )
++                                    target_remaining = (
++                                        remaining[target] + exchanged_size
++                                        - size
++                                    )
++                                    if (source_remaining < 0 or
++                                            target_remaining < 0):
++                                        continue
++
++                                    trial_loads = loads[:]
++                                    trial_remaining = remaining[:]
++                                    trial_loads[source] += (
++                                        weights[id(first)] +
++                                        weights[id(second)] - weight
++                                    )
++                                    trial_loads[target] += (
++                                        weight - weights[id(first)] -
++                                        weights[id(second)]
++                                    )
++                                    trial_remaining[source] = (
++                                        source_remaining
++                                    )
++                                    trial_remaining[target] = (
++                                        target_remaining
++                                    )
++                                    objective = state_objective(
++                                        trial_loads, trial_remaining
++                                    )
++                                    if objective < best_objective:
++                                        best_objective = objective
++                                        best_change = (
++                                            "pair_swap", source,
++                                            source_index, target,
++                                            first_index, second_index
++                                        )
++
+             if best_change is None:
+                 break
+ 
+             if best_change[0] == "move":
+                 _, source, source_index, target = best_change
+                 model = placement[source].pop(source_index)
+                 size = model.model_size
+                 weight = weights[id(model)]
+                 placement[target].append(model)
+                 loads[source] -= weight
+                 remaining[source] += size
+                 loads[target] += weight
+                 remaining[target] -= size
+-            else:
++            elif best_change[0] == "swap":
+                 _, source, source_index, target, target_index = best_change
+                 model = placement[source][source_index]
+                 other = placement[target][target_index]
+ 
+                 placement[source][source_index] = other
+                 placement[target][target_index] = model
+ 
+                 loads[source] += weights[id(other)] - weights[id(model)]
+                 loads[target] += weights[id(model)] - weights[id(other)]
+                 remaining[source] += model.model_size - other.model_size
+                 remaining[target] += other.model_size - model.model_size
++            else:
++                (_, source, source_index, target,
++                 first_index, second_index) = best_change
++                model = placement[source][source_index]
++                first = placement[target][first_index]
++                second = placement[target][second_index]
++
++                placement[source][source_index] = first
++                placement[source].append(second)
++                placement[target][first_index] = model
++                placement[target].pop(second_index)
++
++                loads[source] += (
++                    weights[id(first)] + weights[id(second)]
++                    - weights[id(model)]
++                )
++                loads[target] += (
++                    weights[id(model)] - weights[id(first)]
++                    - weights[id(second)]
++                )
++                remaining[source] += (
++                    model.model_size - first.model_size - second.model_size
++                )
++                remaining[target] += (
++                    first.model_size + second.model_size - model.model_size
++                )
+ 
+         return placement, loads, remaining
+ 
+     refined = []
+     for i, candidate in enumerate(candidates):
+         if i < refine_count:
+             refined.append(improve(*candidate))
+         else:
+             refined.append(candidate)
+ 
+     best = min(refined, key=lambda state: state_objective(state[1], state[2]))
+     return best[0]
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ if __name__ == "__main__":
+     # Test the algorithm
+ 
+     from evaluator import generate_test_gpu_models
+     from evaluator import calculate_kvcache_pressure
+     from evaluator import safe_float
+     import numpy as np
+ 
+     test_cases = generate_test_gpu_models()
+     all_kvpr = []
+     for i, (gpu_num, gpu_models) in enumerate(test_cases):
+ 
+         results = compute_model_placement(gpu_num, gpu_models)
+         max_kvpr = calculate_kvcache_pressure(results)
+         all_kvpr.append(safe_float(max_kvpr))
+ 
+     avg_kvpr = np.mean(all_kvpr)
+     if avg_kvpr != 0:
+         avg_kvpr = 1.0 / avg_kvpr
+ 
+ 
+     print(f"Max KVPR: {avg_kvpr:.3f}")

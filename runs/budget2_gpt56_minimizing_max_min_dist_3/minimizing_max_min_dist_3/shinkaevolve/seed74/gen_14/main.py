@@ -1,0 +1,136 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct 14 three-dimensional points with a large minimum/maximum
+    pairwise-distance ratio.
+    """
+    n, d = 14, 3
+    rng = np.random.default_rng(814729)
+
+    def normalize_and_score(configs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Center configurations, set their diameter to one, and score them."""
+        configs = configs - configs.mean(axis=1, keepdims=True)
+        differences = configs[:, :, None, :] - configs[:, None, :, :]
+        squared = np.sum(differences * differences, axis=-1)
+
+        # The diagonal must not participate in the nearest-neighbour minimum.
+        diagonal = np.arange(n)
+        squared[:, diagonal, diagonal] = np.inf
+        diameter_squared = np.max(np.where(np.isfinite(squared), squared, 0.0),
+                                  axis=(1, 2))
+        configs = configs / np.sqrt(diameter_squared)[:, None, None]
+
+        differences = configs[:, :, None, :] - configs[:, None, :, :]
+        squared = np.sum(differences * differences, axis=-1)
+        squared[:, diagonal, diagonal] = np.inf
+        # Diameter is one after normalization, so this is precisely
+        # (minimum distance / maximum distance)^2.
+        return configs, np.min(squared, axis=(1, 2))
+
+    best_score = -np.inf
+    best_points = None
+    batch_size = 28
+    iterations = 1200
+
+    for _ in range(10):
+        # A uniform-in-volume ball start includes both boundary and interior
+        # points, which is important for finite diameter packings.
+        directions = rng.normal(size=(n, d))
+        directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+        radii = rng.random(n) ** (1.0 / d)
+        current, current_score = normalize_and_score(
+            (directions * radii[:, None])[None, :, :]
+        )
+        current = current[0]
+        current_score = current_score[0]
+
+        for step in range(iterations):
+            # Geometric cooling permits large rearrangements early and precise
+            # contact adjustment near the final packing.
+            fraction = step / (iterations - 1)
+            scale = 0.18 * (0.012 / 0.18) ** fraction
+
+            candidates = np.repeat(current[None, :, :], batch_size, axis=0)
+            moved = rng.integers(0, n, size=batch_size)
+            candidates[np.arange(batch_size), moved] += (
+                rng.normal(size=(batch_size, d)) * scale
+            )
+
+            # Occasionally move a second point to escape one-point local traps.
+            second_mask = rng.random(batch_size) < 0.18
+            second = rng.integers(0, n, size=batch_size)
+            candidates[np.arange(batch_size)[second_mask], second[second_mask]] += (
+                rng.normal(size=(np.count_nonzero(second_mask), d)) * scale
+            )
+
+            candidates, scores = normalize_and_score(candidates)
+            choice = int(np.argmax(scores))
+            if scores[choice] > current_score:
+                current = candidates[choice]
+                current_score = scores[choice]
+
+        if current_score > best_score:
+            best_score = current_score
+            best_points = current
+
+    # The greedy random search is effective at finding the correct packing
+    # basin, but its final moves alter only one or two points.  Polish the
+    # complete configuration using gradients from the short-distance and
+    # diameter contact classes.  Exact scores, rather than the surrogate,
+    # decide every accepted line-search step.
+    upper_i, upper_j = np.triu_indices(n, k=1)
+    polished = best_points.copy()
+    polished_score = best_score
+
+    for polish_step in range(260):
+        fraction = polish_step / 259.0
+        sharpness = 80.0 * (5.0 ** fraction)
+
+        delta = polished[upper_i] - polished[upper_j]
+        q = np.sum(delta * delta, axis=1)
+        qmin = float(np.min(q))
+        qmax = float(np.max(q))
+
+        # Shifted exponentials are stable even in the final high-sharpness
+        # iterations.  They average all nearly active constraints instead of
+        # reacting to an arbitrary single tied pair.
+        low_weight = np.exp(-sharpness * (q - qmin))
+        low_weight /= np.sum(low_weight)
+        high_weight = np.exp(sharpness * (q - qmax))
+        high_weight /= np.sum(high_weight)
+
+        grad_low = np.zeros_like(polished)
+        grad_high = np.zeros_like(polished)
+        low_pair_grad = 2.0 * low_weight[:, None] * delta
+        high_pair_grad = 2.0 * high_weight[:, None] * delta
+        np.add.at(grad_low, upper_i, low_pair_grad)
+        np.add.at(grad_low, upper_j, -low_pair_grad)
+        np.add.at(grad_high, upper_i, high_pair_grad)
+        np.add.at(grad_high, upper_j, -high_pair_grad)
+
+        # Gradient of a logarithmic min/diameter ratio approximation.
+        direction = grad_low / qmin - grad_high / qmax
+        direction -= direction.mean(axis=0, keepdims=True)
+        direction_norm = np.linalg.norm(direction)
+        if direction_norm < 1e-14:
+            continue
+        direction /= direction_norm
+
+        base_step = 0.020 * (0.0008 / 0.020) ** fraction
+        multipliers = np.array([1.0, 0.5, 0.25, 0.1])
+        trials = polished[None, :, :] + (
+            base_step * multipliers[:, None, None] * direction[None, :, :]
+        )
+        trials, trial_scores = normalize_and_score(trials)
+        choice = int(np.argmax(trial_scores))
+        if trial_scores[choice] > polished_score + 1e-14:
+            polished = trials[choice]
+            polished_score = trial_scores[choice]
+
+    return np.asarray(polished, dtype=float)
+
+
+# EVOLVE-BLOCK-END

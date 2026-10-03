@@ -1,0 +1,80 @@
+<NAME>
+rts_smoother_zero_phase</NAME>
+<DESCRIPTION>
+The metrics show the main weakness is smoothness: slope_changes (307) and false_reversals (245.4) are very high, while lag/accuracy are already good. The current causal Kalman filter is noisy because the adaptive measurement noise (r = r_base + 0.5*innov²) makes the filter over-trust large innovations (which are often noise spikes), producing spurious directional reversals. Two targeted fixes:
+
+1. Soften the adaptive R using a smoothed innovation estimate (EMA of squared innovations) instead of the instantaneous innovation — this prevents single noise outliers from collapsing the measurement noise and yanking the state, which directly reduces slope changes and false reversals without adding lag.
+
+2. Add a forward-backward (Rauch-Tung-Striebel style two-pass) smoothing pass over the Kalman estimates. Since this is offline sliding-window processing (we already return a windowed output), running the same constant-velocity filter backwards and averaging with the forward pass makes the filter effectively zero-phase, eliminating the phase delay of the causal filter while suppressing high-frequency jitter — this improves smoothness AND reduces lag error simultaneously, without hurting tracking accuracy since both passes use the same dynamics model.
+
+These changes attack the weakest metrics (smoothness_score 0.06, slope_changes, false_reversals) while preserving the strong ones (correlation 0.93, avg_error 0.23).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # ---- Stage 1: Adaptive Kalman filter (constant-velocity model) ----
+    q = 0.05   # process noise (signal dynamics)
+    r_base = 0.5  # base measurement noise
+    delta = 1.0
+=======
+    # ---- Stage 1: Adaptive Kalman filter (constant-velocity model) ----
+    q = 0.05   # process noise (signal dynamics)
+    r_base = 0.5  # base measurement noise
+    delta = 1.0
+    # EMA of squared innovations for robust (outlier-resistant) adaptive R
+    innov_ema = 0.0
+    ema_alpha = 0.08
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # Adaptive measurement noise from innovation magnitude
+        innov = x[i] - level
+        r = r_base + 0.5 * innov * innov
+        r_hist[i] = r
+=======
+        # Adaptive measurement noise from innovation magnitude
+        innov = x[i] - level
+        # Use smoothed (EMA) innovation power instead of instantaneous value
+        # so that isolated noise spikes do not collapse r and yank the state
+        innov_ema = (1.0 - ema_alpha) * innov_ema + ema_alpha * innov * innov
+        r = r_base + 0.25 * innov_ema
+        r_hist[i] = r
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        kf_out[i] = level
+
+    # ---- Stage 2: Savitzky-Golay trend-preserving smoothing ----
+=======
+        kf_out[i] = level
+
+    # ---- Stage 1b: Backward pass (RTS-style two-pass smoothing) ----
+    # Running the same constant-velocity filter in reverse and blending the
+    # two passes yields an effectively zero-phase estimate: it removes the
+    # causal filter's phase lag while further suppressing jitter.
+    level = kf_out[-1]
+    vel = 0.0
+    P = np.array([[1.0, 0.0], [0.0, 1.0]])
+    bw_out = np.empty(n)
+    innov_ema = 0.0
+    for i in range(n - 1, -1, -1):
+        # Predict
+        level = level + delta * vel
+        P = F @ P @ F.T + Q
+
+        innov = kf_out[i] - level
+        innov_ema = (1.0 - ema_alpha) * innov_ema + ema_alpha * innov * innov
+        r = r_base + 0.25 * innov_ema
+
+        S = P[0, 0] + r
+        K = np.array([P[0, 0] / S, P[1, 0] / S])
+        level = level + K[0] * innov
+        vel = vel + K[1] * innov
+        P = (np.eye(2) - np.outer(K, H)) @ P
+        P = 0.5 * (P + P.T)
+
+        bw_out[i] = level
+
+    # Blend forward and backward (zero-phase) estimates
+    kf_out = 0.5 * (kf_out + bw_out)
+
+    # ---- Stage 2: Savitzky-Golay trend-preserving smoothing ----
+>>>>>>> REPLACE
+</DIFF>

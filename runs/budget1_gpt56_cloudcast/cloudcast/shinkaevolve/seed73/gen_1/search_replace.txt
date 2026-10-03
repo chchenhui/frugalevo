@@ -1,0 +1,95 @@
+<NAME>
+shared_multicast_tree
+</NAME>
+
+<DESCRIPTION>
+Replace independent per-destination shortest paths with a greedy multicast-tree construction. The previous implementation sends every destination along its own source path, which can pay repeatedly for common prefixes. This edit grows a shared directed broadcast tree: at each step it finds the cheapest remaining destination reachable from any node that already receives the data, adds only that incremental branch, and records the resulting source-to-node routes.
+
+All partitions use the same shared tree, allowing transfers over common links to be broadcast once before branching near destinations. Edges without a usable cost are excluded so routing remains valid even when the profile has incomplete cost entries. The resulting topology preserves the existing `BroadCastTopology` interface while reducing redundant cross-cloud transfer cost.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    """Build a low-cost shared multicast tree rooted at ``src``.
+
+    A branch is paid for only when it extends the already-reachable portion of
+    the broadcast tree.  This favors relaying through clouds that have already
+    received the input instead of independently copying the same data over
+    common source-side links for every destination.
+    """
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    unique_dsts = list(dict.fromkeys(dst for dst in dsts if dst != src))
+
+    # Dijkstra cannot reliably compare missing costs.  Such links cannot be
+    # priced, so do not select them as part of a cost-minimizing transfer plan.
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    h.remove_edges_from([
+        (u, v) for u, v, data in h.edges(data=True)
+        if data.get("cost") is None
+    ])
+
+    tree_nodes = {src}
+    node_routes = {src: [src]}
+    remaining = set(unique_dsts)
+
+    while remaining:
+        try:
+            distances, paths = nx.multi_source_dijkstra(
+                h, list(tree_nodes), weight="cost"
+            )
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            break
+
+        reachable = [dst for dst in remaining if dst in distances]
+        if not reachable:
+            break
+
+        # Adding the nearest destination gives the lowest incremental branch
+        # cost and lets later destinations reuse every node on that branch.
+        dst = min(reachable, key=lambda node: (distances[node], str(node)))
+        branch = paths[dst]
+        start = branch[0]
+        prefix = node_routes[start]
+
+        for index, node in enumerate(branch[1:], start=1):
+            tree_nodes.add(node)
+            node_routes.setdefault(node, prefix + branch[1:index + 1])
+
+        # A branch can pass through other requested destinations; they have
+        # already received the broadcast and need no separate transfer.
+        remaining.difference_update(set(branch) & remaining)
+
+    for dst in dsts:
+        route = node_routes.get(dst)
+        if route is None:
+            # Preserve the original failure behavior for unreachable requests.
+            route = nx.dijkstra_path(h, src, dst, weight="cost")
+
+        edges = [
+            [u, v, G[u][v]]
+            for u, v in zip(route, route[1:])
+        ]
+        for partition in range(bc_topology.num_partitions):
+            bc_topology.set_dst_partition_paths(
+                dst, partition, list(edges)
+            )
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

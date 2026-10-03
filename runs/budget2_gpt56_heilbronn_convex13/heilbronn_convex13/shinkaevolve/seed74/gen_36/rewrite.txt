@@ -1,0 +1,205 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Deterministically construct thirteen points in a convex equilateral
+    triangle scaled to unit area.  The hull vertices are fixed, so the raw
+    triangle-area objective is identical to normalized area after scaling.
+    """
+    rng = np.random.default_rng(1301957)
+    root3 = np.sqrt(3.0)
+    angle120 = 2.0 * np.pi / 3.0
+
+    vertices = np.array(
+        [[0.0, root3 / 3.0], [-0.5, -root3 / 6.0], [0.5, -root3 / 6.0]],
+        dtype=float,
+    )
+    orbit_angles = angle120 * np.arange(3, dtype=float)
+    circumradius = root3 / 3.0
+
+    ia, ib, ic = [], [], []
+    for i in range(11):
+        for j in range(i + 1, 12):
+            for k in range(j + 1, 13):
+                ia.append(i)
+                ib.append(j)
+                ic.append(k)
+    ia = np.asarray(ia, dtype=np.intp)
+    ib = np.asarray(ib, dtype=np.intp)
+    ic = np.asarray(ic, dtype=np.intp)
+
+    def radial_limit(theta: np.ndarray) -> np.ndarray:
+        # The three supporting-line inequalities of the centered triangle.
+        result = np.full(theta.shape, 1.0e9, dtype=float)
+        for alpha in (np.pi / 2.0, 7.0 * np.pi / 6.0, 11.0 * np.pi / 6.0):
+            cosine = np.cos(theta - alpha)
+            result = np.minimum(
+                result,
+                np.where(cosine < -1.0e-12,
+                         circumradius / (-2.0 * cosine), 1.0e9),
+            )
+        return result
+
+    def layouts(parameters: np.ndarray) -> np.ndarray:
+        count = parameters.shape[0]
+        result = np.empty((count, 13, 2), dtype=float)
+        result[:, :3] = vertices
+        result[:, 3] = 0.0
+        for ring in range(3):
+            frac = np.clip(parameters[:, 2 * ring], 0.015, 0.992)
+            phase = np.mod(parameters[:, 2 * ring + 1], angle120)
+            theta = phase[:, None] + orbit_angles[None, :]
+            radius = frac[:, None] * radial_limit(theta)
+            lo = 4 + 3 * ring
+            result[:, lo:lo + 3, 0] = radius * np.cos(theta)
+            result[:, lo:lo + 3, 1] = radius * np.sin(theta)
+        return result
+
+    def area_values(configs: np.ndarray) -> np.ndarray:
+        a = configs[:, ia]
+        b = configs[:, ib]
+        c = configs[:, ic]
+        return 0.5 * np.abs(
+            (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
+            - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
+        )
+
+    def signatures(configs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        values = area_values(configs)
+        lower = np.partition(values, 11, axis=1)[:, :12]
+        return lower[:, 0], np.mean(lower, axis=1)
+
+    def search_score(configs: np.ndarray) -> np.ndarray:
+        minimum, tail = signatures(configs)
+        # The maximin criterion dominates; the tail term provides a stable
+        # preference between almost equal active-constraint arrangements.
+        return minimum + 0.045 * tail
+
+    population_size = 112
+    dimensions = 6
+    population = np.empty((population_size, dimensions), dtype=float)
+    population[:, 0::2] = rng.uniform(0.05, 0.96, (population_size, 3))
+    population[:, 1::2] = rng.uniform(0.0, angle120, (population_size, 3))
+
+    # Structured seeds complement random orbit arrangements.
+    population[:6] = np.array(
+        [
+            [0.22, 0.08, 0.49, 0.44, 0.80, 1.02],
+            [0.31, 0.59, 0.61, 0.11, 0.90, 0.89],
+            [0.18, 0.27, 0.48, 0.94, 0.78, 0.53],
+            [0.15, 0.00, 0.43, 0.35, 0.73, 0.70],
+            [0.27, 0.20, 0.56, 0.80, 0.87, 0.42],
+            [0.36, 0.51, 0.66, 0.16, 0.93, 0.95],
+        ],
+        dtype=float,
+    )
+    scores = search_score(layouts(population))
+
+    elite_count = 8
+    generations = 680
+    for generation in range(generations):
+        order = np.argsort(scores)
+        elites = population[order[-elite_count:]].copy()
+        elite_scores = scores[order[-elite_count:]].copy()
+
+        r1 = rng.integers(population_size, size=population_size)
+        r2 = rng.integers(population_size, size=population_size)
+        r3 = rng.integers(population_size, size=population_size)
+        r2 = (r2 + (r2 == r1)) % population_size
+        r3 = (r3 + (r3 == r1) + (r3 == r2)) % population_size
+
+        best = population[order[-1]]
+        progress = generation / (generations - 1)
+        scale = 0.79 - 0.24 * progress
+        donor = population[r1] + scale * (population[r2] - population[r3])
+        donor += 0.13 * (1.0 - progress) * (best - population[r1])
+
+        mask = rng.random((population_size, dimensions)) < 0.80
+        mask[np.arange(population_size),
+             rng.integers(dimensions, size=population_size)] = True
+        trial = np.where(mask, donor, population)
+        trial[:, 0::2] = np.clip(trial[:, 0::2], 0.015, 0.992)
+        trial[:, 1::2] = np.mod(trial[:, 1::2], angle120)
+
+        trial_scores = search_score(layouts(trial))
+        accepted = trial_scores > scores
+        population[accepted] = trial[accepted]
+        scores[accepted] = trial_scores[accepted]
+
+        # Preserve rare high-quality orbit patterns exactly.
+        worst = np.argsort(scores)[:elite_count]
+        population[worst] = elites
+        scores[worst] = elite_scores
+
+        if generation in (220, 440):
+            worst = np.argsort(scores)[:14]
+            population[worst, 0::2] = rng.uniform(0.04, 0.97, (14, 3))
+            population[worst, 1::2] = rng.uniform(0.0, angle120, (14, 3))
+            scores[worst] = search_score(layouts(population[worst]))
+
+    candidates = layouts(population[np.argsort(scores)[-12:]])
+    candidate_min, candidate_tail = signatures(candidates)
+    ranking = np.lexsort((candidate_tail, candidate_min))
+    starts = candidates[ranking[-4:]]
+
+    inverse_basis = np.linalg.inv(
+        np.column_stack((vertices[0] - vertices[2], vertices[1] - vertices[2]))
+    )
+
+    def project_inside(points: np.ndarray) -> np.ndarray:
+        flat = points.reshape(-1, 2)
+        uv = (flat - vertices[2]) @ inverse_basis.T
+        weights = np.column_stack((uv[:, 0], uv[:, 1], 1.0 - uv[:, 0] - uv[:, 1]))
+        weights = np.maximum(weights, 1.0e-8)
+        weights /= weights.sum(axis=1, keepdims=True)
+        return (weights @ vertices).reshape(points.shape)
+
+    best = starts[-1].copy()
+    best_min, best_tail = signatures(best[None, :])
+    best_min, best_tail = float(best_min[0]), float(best_tail[0])
+
+    # Independent sparse refinements retain the best symmetric basins while
+    # allowing beneficial breaking of orbit symmetry.
+    for start in starts:
+        current = start.copy()
+        current_min, current_tail = signatures(current[None, :])
+        current_min, current_tail = float(current_min[0]), float(current_tail[0])
+
+        for iteration in range(430):
+            fraction = iteration / 429.0
+            step = 0.045 * (0.0010 / 0.045) ** fraction
+            trial_count = 48
+            trials = np.repeat(current[None, :, :], trial_count, axis=0)
+
+            move_probability = 0.27 - 0.16 * fraction
+            moving = rng.random((trial_count, 10, 1)) < move_probability
+            moving[0, rng.integers(10), 0] = True
+            trials[:, 3:] += moving * rng.normal(
+                0.0, step, size=(trial_count, 10, 2)
+            )
+            trials[:, 3:] = project_inside(trials[:, 3:])
+
+            minima, tails = signatures(trials)
+            winner = int(np.lexsort((tails, minima))[-1])
+            trial_min = float(minima[winner])
+            trial_tail = float(tails[winner])
+
+            if (trial_min > current_min + 1.0e-13 or
+                    (abs(trial_min - current_min) <= 1.0e-13 and
+                     trial_tail > current_tail)):
+                current = trials[winner]
+                current_min, current_tail = trial_min, trial_tail
+
+        if (current_min > best_min + 1.0e-13 or
+                (abs(current_min - best_min) <= 1.0e-13 and
+                 current_tail > best_tail)):
+            best = current.copy()
+            best_min, best_tail = current_min, current_tail
+
+    # Equilateral side-one hull has area sqrt(3)/4.
+    return np.asarray(best * np.sqrt(4.0 / root3), dtype=float)
+
+
+# EVOLVE-BLOCK-END

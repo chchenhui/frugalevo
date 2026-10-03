@@ -1,0 +1,344 @@
+<NAME>
+multiscale_endpoint_trend
+</NAME>
+
+<DESCRIPTION>
+This replaces the recursive Kalman design with a causal multi-scale endpoint-regression filter. Three precomputed weighted local-linear regressions estimate the current endpoint using gentle, medium, and strongly recent weighting. Their outputs are blended according to slope agreement and local noise: stable long-scale regression dominates uncertain/noisy periods, while recent endpoint fits dominate coherent trends to reduce lag. A direction-aware hysteresis stage then rejects isolated opposite moves without delaying sustained reversals. The implementation uses vectorized convolutions for low latency and preserves the original output alignment and API.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""
+Causal multi-scale endpoint-regression signal filter.
+
+The enhanced filter combines several causal weighted local-linear endpoint
+estimators.  It adaptively prefers stable long-context fits in noisy/ambiguous
+regions and recent fits during coherent trends, followed by a small
+direction-aware reversal controller.
+"""
+import numpy as np
+
+
+def adaptive_filter(x, window_size=20):
+    """
+    Efficient sliding-window moving-average baseline.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window.
+
+    Returns:
+        Moving-average output aligned to x[window_size - 1:].
+    """
+    x = np.asarray(x, dtype=float)
+    if x.ndim != 1:
+        raise ValueError("Input signal must be a one-dimensional array")
+    if window_size < 1:
+        raise ValueError("window_size must be at least 1")
+    if len(x) < window_size:
+        raise ValueError(
+            f"Input signal length ({len(x)}) must be >= window_size ({window_size})"
+        )
+
+    sums = np.concatenate(([0.0], np.cumsum(x, dtype=float)))
+    return (sums[window_size:] - sums[:-window_size]) / float(window_size)
+
+
+def _endpoint_regression_coefficients(window_size, decay):
+    """
+    Return FIR coefficients for the endpoint and slope of a weighted local line.
+
+    Samples are ordered oldest-to-newest.  The endpoint is evaluated at the
+    newest sample, therefore it has no additional phase delay.
+    """
+    time = np.arange(window_size, dtype=float) - float(window_size - 1)
+    weights = np.exp(decay * time / max(window_size - 1, 1))
+
+    s0 = np.sum(weights)
+    s1 = np.sum(weights * time)
+    s2 = np.sum(weights * time * time)
+    determinant = s0 * s2 - s1 * s1
+
+    endpoint_coeff = weights * (s2 - s1 * time) / determinant
+    slope_coeff = weights * (s0 * time - s1) / determinant
+    return endpoint_coeff, slope_coeff
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Causal adaptive multi-scale endpoint-regression filter.
+
+    Three weighted endpoint regressions use the same trailing window but
+    different temporal decays.  The broad fit suppresses noise, while the
+    recent fit removes endpoint lag when all scales agree on a meaningful
+    direction.  A compact hysteretic output controller rejects one-sample
+    false reversals while releasing persistent turns quickly.
+
+    Args:
+        x: Input one-dimensional real-valued signal.
+        window_size: Trailing context used by every endpoint regression.
+
+    Returns:
+        Filtered signal of length len(x) - window_size + 1, aligned with
+        x[window_size - 1:].
+    """
+    x = np.asarray(x, dtype=float)
+    if x.ndim != 1:
+        raise ValueError("Input signal must be a one-dimensional array")
+    if window_size < 1:
+        raise ValueError("window_size must be at least 1")
+    if len(x) < window_size:
+        raise ValueError(
+            f"Input signal length ({len(x)}) must be >= window_size ({window_size})"
+        )
+
+    if window_size == 1:
+        return x.copy()
+
+    n_out = len(x) - window_size + 1
+
+    # Decays span stable, balanced, and strongly endpoint-focused models.
+    # Negative time coordinates make a positive decay increasingly favor the
+    # newest samples.
+    decays = (1.5, 3.0, 5.0)
+    levels = []
+    slopes = []
+    for decay in decays:
+        level_coeff, slope_coeff = _endpoint_regression_coefficients(
+            window_size, decay
+        )
+        levels.append(np.convolve(x, level_coeff[::-1], mode="valid"))
+        slopes.append(np.convolve(x, slope_coeff[::-1], mode="valid"))
+
+    slow_level, medium_level, fast_level = levels
+    slow_slope, medium_slope, fast_slope = slopes
+
+    # A causal local noise proxy based on first differences.  Mean absolute
+    # difference is robust against sign cancellation and inexpensive.
+    abs_difference = np.abs(np.diff(x))
+    noise_kernel = np.ones(window_size - 1, dtype=float) / float(window_size - 1)
+    local_difference = np.convolve(abs_difference, noise_kernel, mode="valid")
+    noise_scale = np.maximum(local_difference / 1.128379167, 1e-8)
+
+    output = np.empty(n_out, dtype=float)
+    emitted = slow_level[0]
+    velocity = 0.0
+    established_direction = 0
+    reversal_votes = 0
+
+    for i in range(n_out):
+        scale = noise_scale[i]
+
+        # Slope coherence distinguishes a real local trend from fits reacting
+        # differently to noise.  The minimum absolute slope is used so all
+        # scales must support the direction before aggressive tracking occurs.
+        slope_signs_agree = (
+            slow_slope[i] * medium_slope[i] > 0.0
+            and medium_slope[i] * fast_slope[i] > 0.0
+        )
+        coherent_slope = min(
+            abs(slow_slope[i]), abs(medium_slope[i]), abs(fast_slope[i])
+        )
+
+        # Endpoint disagreement is another confidence signal: when estimators
+        # disagree, retain the broad regression rather than chase the newest
+        # samples.
+        disagreement = abs(fast_level[i] - slow_level[i])
+        trend_strength = coherent_slope / (scale + 1e-12)
+        coherence = 1.0 / (1.0 + disagreement / (2.2 * scale + 1e-12))
+
+        if slope_signs_agree:
+            recent_weight = (
+                0.12
+                + 0.64 * (trend_strength / (trend_strength + 0.11))
+                * coherence
+            )
+        else:
+            recent_weight = 0.08 * coherence
+
+        recent_weight = float(np.clip(recent_weight, 0.05, 0.74))
+        medium_weight = 0.22 + 0.16 * coherence
+        slow_weight = 1.0 - recent_weight
+        target = (
+            slow_weight * slow_level[i]
+            + medium_weight * medium_level[i]
+            + (recent_weight - medium_weight) * fast_level[i]
+        )
+
+        if i == 0:
+            emitted = target
+            output[i] = emitted
+            continue
+
+        proposed = target - emitted
+        direction = 1 if proposed > 0.0 else (-1 if proposed < 0.0 else 0)
+
+        # Adaptive deadband is deliberately small: it removes movement below
+        # local noise while allowing the endpoint model to retain genuine
+        # oscillatory dynamics.
+        deadband = 0.045 * scale
+        opposing = (
+            established_direction != 0
+            and direction != 0
+            and direction != established_direction
+        )
+
+        accepted = proposed
+        if abs(proposed) <= deadband:
+            accepted = 0.0
+            reversal_votes = 0
+        elif opposing:
+            strong_turn = abs(proposed) > max(0.30 * scale, 1.9 * abs(velocity))
+            reversal_votes += 1
+            if reversal_votes < 2 and not strong_turn:
+                accepted = 0.0
+            else:
+                established_direction = direction
+                reversal_votes = 0
+        else:
+            reversal_votes = 0
+            if direction != 0:
+                established_direction = direction
+
+        # Trend confidence controls output gain.  Predictive endpoint fitting
+        # supplies low lag, so only modest final damping is needed.
+        gain = 0.54 + 0.32 * min(1.0, trend_strength / 0.18)
+        if not slope_signs_agree:
+            gain *= 0.76
+
+        step = gain * accepted
+        emitted += step
+        velocity = 0.72 * velocity + 0.28 * step
+        output[i] = emitted
+
+    return output
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """
+    Apply the selected signal-processing algorithm.
+
+    Args:
+        input_signal: Input time series.
+        window_size: Sliding context length.
+        algorithm_type: "basic" or "enhanced".
+
+    Returns:
+        Filtered signal.
+    """
+    if algorithm_type == "enhanced":
+        return enhanced_filter_with_trend_preservation(input_signal, window_size)
+    return adaptive_filter(input_signal, window_size)
+
+
+# EVOLVE-BLOCK-END
+
+
+def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+    """
+    Generate a synthetic non-stationary noisy signal.
+
+    Returns:
+        Tuple of (noisy_signal, clean_signal).
+    """
+    np.random.seed(seed)
+    t = np.linspace(0, 10, length)
+
+    clean_signal = (
+        2 * np.sin(2 * np.pi * 0.5 * t)
+        + 1.5 * np.sin(2 * np.pi * 2 * t)
+        + 0.5 * np.sin(2 * np.pi * 5 * t)
+        + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)
+    )
+
+    trend = 0.1 * t * np.sin(0.2 * t)
+    clean_signal += trend
+
+    random_walk = np.cumsum(np.random.randn(length) * 0.05)
+    clean_signal += random_walk
+
+    noise = np.random.normal(0, noise_level, length)
+    noisy_signal = clean_signal + noise
+    return noisy_signal, clean_signal
+
+
+def run_signal_processing(
+    noisy_signal=None,
+    signal_length=1000,
+    noise_level=0.3,
+    window_size=20,
+):
+    """
+    Run filtering and return filtered data plus metrics when clean data exists.
+    """
+    if noisy_signal is not None:
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+        clean_signal = None
+    else:
+        noisy_signal, clean_signal = generate_test_signal(
+            signal_length, noise_level
+        )
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+
+    if len(filtered_signal) > 0 and clean_signal is not None:
+        delay = window_size - 1
+        aligned_clean = clean_signal[delay:]
+        aligned_noisy = noisy_signal[delay:]
+
+        min_length = min(len(filtered_signal), len(aligned_clean))
+        filtered_signal = filtered_signal[:min_length]
+        aligned_clean = aligned_clean[:min_length]
+        aligned_noisy = aligned_noisy[:min_length]
+
+        correlation = (
+            np.corrcoef(filtered_signal, aligned_clean)[0, 1]
+            if min_length > 1
+            else 0
+        )
+
+        noise_before = np.var(aligned_noisy - aligned_clean)
+        noise_after = np.var(filtered_signal - aligned_clean)
+        noise_reduction = (
+            (noise_before - noise_after) / noise_before
+            if noise_before > 0
+            else 0
+        )
+
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": aligned_clean,
+            "noisy_signal": aligned_noisy,
+            "correlation": correlation,
+            "noise_reduction": noise_reduction,
+            "signal_length": min_length,
+        }
+
+    if len(filtered_signal) > 0:
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": None,
+            "noisy_signal": None,
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": len(filtered_signal),
+        }
+
+    return {
+        "filtered_signal": [],
+        "clean_signal": [],
+        "noisy_signal": [],
+        "correlation": 0,
+        "noise_reduction": 0,
+        "signal_length": 0,
+    }
+
+
+if __name__ == "__main__":
+    results = run_signal_processing()
+    print("Signal processing completed!")
+    print(f"Correlation with clean signal: {results['correlation']:.3f}")
+    print(f"Noise reduction: {results['noise_reduction']:.3f}")
+    print(f"Processed signal length: {results['signal_length']}")
+```
+</CODE>

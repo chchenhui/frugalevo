@@ -1,0 +1,197 @@
+--- a/original.py
++++ b/original.py
+@@ -1,131 +1,194 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_convex13() -> np.ndarray:
+     """
+     Deterministically search for a high-quality maximin configuration of 13
+     points.  Coordinates are unconstrained because the convex hull of the
+     returned points is itself the containing convex region; the objective is
+     invariant under translation and uniform scaling.
+     """
+     n = 13
+     rng = np.random.default_rng(seed=91723)
+     triangles = np.array(
+         [(i, j, k) for i in range(n - 2) for j in range(i + 1, n - 1)
+          for k in range(j + 1, n)],
+         dtype=np.intp,
+     )
+ 
+     def hull_area(p: np.ndarray) -> float:
+         """Area of the convex hull, using the monotone-chain algorithm."""
+         order = np.lexsort((p[:, 1], p[:, 0]))
+         hull = []
+ 
+         def turn(a: int, b: int, c: int) -> float:
+             return ((p[b, 0] - p[a, 0]) * (p[c, 1] - p[a, 1])
+                     - (p[b, 1] - p[a, 1]) * (p[c, 0] - p[a, 0]))
+ 
+         for q in order:
+             while len(hull) >= 2 and turn(hull[-2], hull[-1], q) <= 0.0:
+                 hull.pop()
+             hull.append(q)
+         lower_size = len(hull)
+         for q in order[-2::-1]:
+             while len(hull) > lower_size and turn(hull[-2], hull[-1], q) <= 0.0:
+                 hull.pop()
+             hull.append(q)
+ 
+         vertices = p[np.asarray(hull[:-1], dtype=np.intp)]
+         return 0.5 * abs(
+             np.dot(vertices[:, 0], np.roll(vertices[:, 1], -1))
+             - np.dot(vertices[:, 1], np.roll(vertices[:, 0], -1))
+         )
+ 
+     def evaluate(p: np.ndarray) -> tuple[float, int]:
+         a = p[triangles[:, 0]]
+         b = p[triangles[:, 1]]
+         c = p[triangles[:, 2]]
+         double_areas = np.abs(
+             (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+             - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+         )
+         worst = int(np.argmin(double_areas))
+         area = hull_area(p)
+         if area <= 1.0e-14:
+             return -np.inf, worst
+         return 0.5 * double_areas[worst] / area, worst
+ 
+     best_points = None
+     best_score = -np.inf
+ 
+     def anneal(points: np.ndarray, score: float, worst: int,
+                iterations: int, initial_step: float,
+                initial_temperature: float) -> tuple[np.ndarray, float, int]:
+         """Metropolis refinement at one exploration or polishing scale."""
+         for iteration in range(iterations):
+             fraction = iteration / max(1, iterations - 1)
+             step = initial_step * (1.0 - fraction) ** 1.7 + 0.0020
+             temperature = (initial_temperature * (1.0 - fraction) ** 2
+                            + 0.000012)
+ 
+             candidate = points.copy()
+             if rng.random() < 0.82:
+                 moved = int(triangles[worst, rng.integers(0, 3)])
+             else:
+                 moved = int(rng.integers(n))
+             candidate[moved] += rng.normal(0.0, step, 2)
+ 
+             candidate_score, candidate_worst = evaluate(candidate)
+             delta = candidate_score - score
+             if delta >= 0.0 or rng.random() < np.exp(delta / temperature):
+                 points, score, worst = candidate, candidate_score, candidate_worst
+         return points, score, worst
+ 
++    def active_polish(points: np.ndarray, score: float,
++                      rounds: int = 5) -> tuple[np.ndarray, float]:
++        """
++        Deterministically polish active maximin constraints using a decreasing
++        coordinate stencil.  The full objective is reevaluated for every probe,
++        and only strict primary-objective improvements are retained.
++        """
++        directions = np.array(
++            [
++                [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
++                [1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0],
++            ],
++            dtype=float,
++        )
++        directions /= np.linalg.norm(directions, axis=1)[:, None]
++        extent = max(float(np.ptp(points[:, 0])),
++                     float(np.ptp(points[:, 1])), 1.0e-10)
++        radius = 0.026 * extent
++
++        for _ in range(rounds):
++            a = points[triangles[:, 0]]
++            b = points[triangles[:, 1]]
++            c = points[triangles[:, 2]]
++            determinants = np.abs(
++                (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
++                - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
++            )
++            active_faces = np.argsort(determinants)[:18]
++            active_vertices = np.unique(triangles[active_faces].ravel())
++            centre = np.mean(points, axis=0)
++
++            for vertex in active_vertices:
++                vertex = int(vertex)
++                radial = points[vertex] - centre
++                length = float(np.linalg.norm(radial))
++                if length > 1.0e-12:
++                    radial /= length
++                    tangent = np.array([-radial[1], radial[0]])
++                    probes = np.vstack(
++                        (directions, radial, -radial, tangent, -tangent)
++                    )
++                else:
++                    probes = directions
++
++                best_candidate = None
++                best_value = score
++                for direction in probes:
++                    candidate = points.copy()
++                    candidate[vertex] += radius * direction
++                    candidate_score, _ = evaluate(candidate)
++                    if candidate_score > best_value + 1.0e-12:
++                        best_candidate = candidate
++                        best_value = candidate_score
++
++                if best_candidate is not None:
++                    points = best_candidate
++                    score = best_value
++
++            radius *= 0.43
++
++        return points, score
++
+     # Four rotated rings plus a centre give a useful non-collinear, threefold
+     # initial geometry.  Each restart relaxes this prior independently.
+     base_radii = np.array([0.31, 0.55, 0.79, 1.00])
+     base_phases = np.array([0.03, 0.29, 0.57, 0.84])
+ 
+     # Initial trials identify good determinant-orientation patterns.  Refining
+     # only survivors avoids spending the full budget in poor maximin basins.
+     survivors = []
+     for restart in range(10):
+         points = np.zeros((n, 2), dtype=float)
+         radii = base_radii + rng.normal(0.0, 0.035, 4)
+         phases = base_phases + rng.normal(0.0, 0.045, 4)
+         points[0] = rng.normal(0.0, 0.018, 2)
+         index = 1
+         for radius, phase in zip(radii, phases):
+             angles = phase + 2.0 * np.pi * np.arange(3) / 3.0
+             points[index:index + 3] = radius * np.column_stack(
+                 (np.cos(angles), np.sin(angles))
+             )
+             index += 3
+         points += rng.normal(0.0, 0.012, points.shape)
+ 
+         score, worst = evaluate(points)
+         points, score, worst = anneal(
+             points, score, worst, 3000, 0.115, 0.0022
+         )
+         survivors.append((score, points.copy(), worst))
+         if score > best_score:
+             best_score = score
+             best_points = points.copy()
+ 
+     survivors.sort(key=lambda item: item[0], reverse=True)
+     for _, points, worst in survivors[:4]:
+         score, worst = evaluate(points)
+         points, score, worst = anneal(
+             points, score, worst, 21000, 0.062, 0.0011
+         )
++        points, score = active_polish(points, score)
+         if score > best_score:
+             best_score = score
+             best_points = points.copy()
+ 
+     if best_points is None or not np.all(np.isfinite(best_points)):
+         raise RuntimeError("deterministic Heilbronn search failed to produce a configuration")
+     return best_points
+ 
+ 
+ # EVOLVE-BLOCK-END

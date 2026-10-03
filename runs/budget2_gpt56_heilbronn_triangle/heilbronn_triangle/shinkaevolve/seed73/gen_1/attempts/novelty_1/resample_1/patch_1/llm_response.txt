@@ -1,0 +1,145 @@
+<NAME>
+deterministic_maximin_search
+</NAME>
+
+<DESCRIPTION>
+Replace the degenerate all-zero construction with a deterministic maximin search in barycentric coordinates. The three vertices are retained as anchors, while the remaining eight points are optimized by a seeded population-based simulated annealing search followed by a small deterministic local refinement.
+
+For the reference equilateral triangle, the absolute determinant in barycentric coordinates is exactly the area of a point triangle normalized by the container triangle area. Optimizing this quantity therefore directly targets `min_area_normalized` without repeatedly converting coordinates during the search. The fixed seed makes the result reproducible, and all generated barycentric coordinates are folded back into the feasible simplex.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of n points on or inside a convex region in order to maximize the area of the
+    smallest triangle formed by these points. Here n = 11.
+
+    Returns:
+        points: np.ndarray of shape (11,2) with the x,y coordinates of the points.
+    """
+    n = 11
+    points = np.zeros((n, 2))
+    return points
+=======
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct eleven points in the reference equilateral triangle.
+
+    The search is performed in coordinates (u, v) such that
+    (x, y) = (u + v/2, sqrt(3)*v/2).  In these coordinates the
+    absolute 3-by-3 determinant is precisely the triangle area
+    normalized by the area of the containing equilateral triangle.
+    """
+    rng = np.random.default_rng(11031987)
+
+    # Triangle indices, shared by every member of the population.
+    triples = np.array(
+        [(i, j, k) for i in range(11) for j in range(i + 1, 11)
+         for k in range(j + 1, 11)],
+        dtype=np.intp,
+    )
+
+    def score(configurations: np.ndarray) -> np.ndarray:
+        """Minimum normalized triangle area for each barycentric layout."""
+        a = configurations[:, triples[:, 0]]
+        b = configurations[:, triples[:, 1]]
+        c = configurations[:, triples[:, 2]]
+        determinants = (
+            (b[:, :, 0] - a[:, :, 0]) * (c[:, :, 1] - a[:, :, 1])
+            - (b[:, :, 1] - a[:, :, 1]) * (c[:, :, 0] - a[:, :, 0])
+        )
+        return np.min(np.abs(determinants), axis=1)
+
+    def fold_into_simplex(p: np.ndarray) -> np.ndarray:
+        """Fold proposed barycentric coordinates into u>=0, v>=0, u+v<=1."""
+        p = np.abs(p)
+        total = p[..., 0] + p[..., 1]
+        outside = total > 1.0
+        p[outside] = 1.0 - p[outside]
+        # The preceding reflection is sufficient for the small search moves;
+        # this final normalization also makes unusually large proposals safe.
+        p = np.maximum(p, 0.0)
+        total = p[..., 0] + p[..., 1]
+        over = total > 1.0
+        p[over] /= total[over, None]
+        return p
+
+    population_size = 160
+    layouts = np.empty((population_size, 11, 2), dtype=float)
+
+    # Anchoring the hull at the container vertices is both geometrically natural
+    # and leaves the search free to optimize all nontrivial point positions.
+    layouts[:, :3] = np.array(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)))
+    raw = rng.exponential(1.0, size=(population_size, 8, 3))
+    raw /= raw.sum(axis=2, keepdims=True)
+    layouts[:, 3:, 0] = raw[:, :, 1]
+    layouts[:, 3:, 1] = raw[:, :, 2]
+
+    values = score(layouts)
+    best_index = int(np.argmax(values))
+    best_layout = layouts[best_index].copy()
+    best_value = float(values[best_index])
+
+    # Population annealing avoids the severe local traps caused by a single
+    # active minimum-area triangle.  Every operation is vectorized over layouts.
+    iterations = 4200
+    for iteration in range(iterations):
+        fraction = iteration / (iterations - 1)
+        step = 0.085 * (1.0 - fraction) + 0.0012 * fraction
+        temperature = 0.006 * (1.0 - fraction) ** 2 + 0.000015
+
+        proposal = layouts.copy()
+        changed = rng.integers(3, 11, size=population_size)
+        proposal[np.arange(population_size), changed] += rng.normal(
+            scale=step, size=(population_size, 2)
+        )
+        proposal[:, 3:] = fold_into_simplex(proposal[:, 3:])
+
+        proposal_values = score(proposal)
+        improvement = proposal_values - values
+        accept = (improvement >= 0.0) | (
+            rng.random(population_size) < np.exp(np.minimum(improvement / temperature, 0.0))
+        )
+        layouts[accept] = proposal[accept]
+        values[accept] = proposal_values[accept]
+
+        current_best = int(np.argmax(values))
+        if values[current_best] > best_value:
+            best_value = float(values[current_best])
+            best_layout = layouts[current_best].copy()
+
+    # A reproducible coordinate stencil gives the saved best layout a final
+    # maximin polish without depending on optional external optimizers.
+    directions = np.array(
+        ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
+         (0.70710678, 0.70710678), (-0.70710678, -0.70710678))
+    )
+    for step in (0.012, 0.006, 0.003, 0.0015):
+        improved = True
+        while improved:
+            improved = False
+            for point_index in range(3, 11):
+                for direction in directions:
+                    candidate = best_layout.copy()
+                    candidate[point_index] += step * direction
+                    candidate[3:] = fold_into_simplex(candidate[3:])
+                    candidate_value = float(score(candidate[None, ...])[0])
+                    if candidate_value > best_value:
+                        best_layout = candidate
+                        best_value = candidate_value
+                        improved = True
+
+    # Convert barycentric coordinates back to Cartesian coordinates.
+    points = np.empty((11, 2), dtype=float)
+    points[:, 0] = best_layout[:, 0] + 0.5 * best_layout[:, 1]
+    points[:, 1] = (np.sqrt(3.0) / 2.0) * best_layout[:, 1]
+    return points
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,287 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct eleven deterministic points in the requested equilateral triangle.
+
+    Internally the first three points are the reference-simplex vertices
+    (0,0), (1,0), (0,1).  For simplex coordinates (u,v), the map
+
+        (u,v) -> (u + v/2, sqrt(3)*v/2)
+
+    maps into the requested equilateral triangle, and every determinant in
+    simplex coordinates is exactly the corresponding normalized triangle area.
+    """
+    n = 11
+    height = np.sqrt(3.0) * 0.5
+    rng = np.random.default_rng(917263401)
+
+    triples = np.array(
+        [(i, j, k)
+         for i in range(n)
+         for j in range(i + 1, n)
+         for k in range(j + 1, n)],
+        dtype=np.intp,
+    )
+
+    anchors = np.array(
+        [[0.0, 0.0],
+         [1.0, 0.0],
+         [0.0, 1.0]],
+        dtype=float,
+    )
+
+    def decode(z: np.ndarray) -> np.ndarray:
+        """
+        Stick-breaking coordinates map each pair in [0,1]^2 to the simplex.
+        u=(1-b)*a, v=b.
+        """
+        q = np.asarray(z, dtype=float).reshape(8, 2)
+        p = np.empty((11, 2), dtype=float)
+        p[:3] = anchors
+        p[3:, 0] = q[:, 0] * (1.0 - q[:, 1])
+        p[3:, 1] = q[:, 1]
+        return p
+
+    def determinants(p: np.ndarray) -> np.ndarray:
+        a = p[triples[:, 0]]
+        b = p[triples[:, 1]]
+        c = p[triples[:, 2]]
+        return ((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+                - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+
+    def minimum_area(p: np.ndarray) -> float:
+        return float(np.min(np.abs(determinants(p))))
+
+    def tail_merit(p: np.ndarray) -> tuple:
+        values = np.abs(determinants(p))
+        low = np.partition(values, 13)[:14]
+        return float(low[0]), float(low[0] + 0.035 * low.mean())
+
+    def simplex_repair(q: np.ndarray) -> np.ndarray:
+        q = np.asarray(q, dtype=float).reshape(8, 2).copy()
+        q = np.maximum(q, 0.0)
+        totals = q.sum(axis=1)
+        outside = totals > 1.0
+        if np.any(outside):
+            q[outside] /= totals[outside, None]
+        return q
+
+    def fallback() -> np.ndarray:
+        """Dependency-free deterministic stochastic fallback."""
+        p = np.empty((11, 2), dtype=float)
+        p[:3] = anchors
+        bary = rng.dirichlet((1.0, 1.0, 1.0), size=8)
+        p[3:] = bary[:, 1:]
+
+        current = p.copy()
+        current_value, current_tail = tail_merit(current)
+        best = current.copy()
+        best_value, best_tail = current_value, current_tail
+
+        for iteration in range(95000):
+            fraction = iteration / 94999.0
+            scale = 0.105 * (1.0 - fraction) ** 1.65 + 0.00045
+            temperature = 0.0032 * (1.0 - fraction) ** 2.1 + 1.0e-7
+
+            trial = current.copy()
+            index = int(rng.integers(3, 11))
+            weights = np.array(
+                [1.0 - trial[index, 0] - trial[index, 1],
+                 trial[index, 0], trial[index, 1]]
+            )
+            weights = np.maximum(weights + rng.normal(0.0, scale, 3), 1.0e-9)
+            weights /= weights.sum()
+            trial[index] = weights[1:]
+
+            value, tail = tail_merit(trial)
+            delta = tail - current_tail
+            if delta >= 0.0 or rng.random() < np.exp(max(-55.0, delta / temperature)):
+                current, current_value, current_tail = trial, value, tail
+
+            if (value > best_value + 1.0e-13 or
+                    (abs(value - best_value) <= 1.0e-13 and tail > best_tail)):
+                best, best_value, best_tail = trial.copy(), value, tail
+
+        return best
+
+    best = None
+    best_value = -1.0
+
+    try:
+        from scipy.optimize import differential_evolution, minimize
+
+        # A population search finds several promising combinatorial cells.
+        # The later epigraph phase deliberately refines a portfolio of them,
+        # rather than trusting only the single nominal DE winner.
+        result = differential_evolution(
+            lambda z: -minimum_area(decode(z)),
+            bounds=[(0.0, 1.0)] * 16,
+            seed=917263401,
+            popsize=20,
+            maxiter=460,
+            tol=2.0e-9,
+            atol=1.0e-11,
+            polish=False,
+            updating="immediate",
+            workers=1,
+        )
+
+        population = getattr(result, "population", None)
+        if population is None or len(population) == 0:
+            population = np.asarray([result.x], dtype=float)
+
+        # Rank population endpoints by true bottleneck first and low-tail
+        # support second.  Enforce separation so refinements cover genuinely
+        # different local oriented-matroid cells.
+        ranked = []
+        for z in population:
+            p = decode(np.clip(z, 0.0, 1.0))
+            ranked.append((tail_merit(p), p))
+
+        ranked.sort(key=lambda item: (item[0][0], item[0][1]), reverse=True)
+
+        elite = []
+        for merit, p in ranked:
+            flat = p[3:].ravel()
+            if all(np.linalg.norm(flat - old[3:].ravel()) > 0.035 for old in elite):
+                elite.append(p)
+            if len(elite) >= 7:
+                break
+
+        winner = decode(np.clip(result.x, 0.0, 1.0))
+        if not elite:
+            elite = [winner]
+        elif all(np.linalg.norm(winner[3:] - p[3:]) > 1.0e-10 for p in elite):
+            elite.insert(0, winner)
+
+        best = max(elite, key=minimum_area).copy()
+        best_value = minimum_area(best)
+
+        def polish_cell(initial: np.ndarray) -> np.ndarray:
+            """
+            Maximize epigraph height after freezing signs of every determinant.
+            The signs identify one smooth absolute-determinant cell.
+            """
+            cell_best = initial.copy()
+            cell_value = minimum_area(cell_best)
+            signs = np.sign(determinants(cell_best))
+            signs[signs == 0.0] = 1.0
+
+            def unpack(w: np.ndarray) -> np.ndarray:
+                return np.vstack((anchors, w[:16].reshape(8, 2)))
+
+            def constraints(w: np.ndarray) -> np.ndarray:
+                return signs * determinants(unpack(w)) - w[-1]
+
+            def constraint_jacobian(w: np.ndarray) -> np.ndarray:
+                p = unpack(w)
+                a = p[triples[:, 0]]
+                b = p[triples[:, 1]]
+                c = p[triples[:, 2]]
+
+                jac = np.zeros((len(triples), 17), dtype=float)
+                derivatives = (
+                    np.column_stack((b[:, 1] - c[:, 1], c[:, 0] - b[:, 0])),
+                    np.column_stack((c[:, 1] - a[:, 1], a[:, 0] - c[:, 0])),
+                    np.column_stack((a[:, 1] - b[:, 1], b[:, 0] - a[:, 0])),
+                )
+
+                for slot in range(3):
+                    point_ids = triples[:, slot]
+                    movable = point_ids >= 3
+                    rows = np.flatnonzero(movable)
+                    columns = 2 * (point_ids[movable] - 3)
+                    gradient = derivatives[slot][movable] * signs[movable, None]
+                    jac[rows, columns] = gradient[:, 0]
+                    jac[rows, columns + 1] = gradient[:, 1]
+
+                jac[:, -1] = -1.0
+                return jac
+
+            def simplex_constraints(w: np.ndarray) -> np.ndarray:
+                q = w[:16].reshape(8, 2)
+                return 1.0 - q[:, 0] - q[:, 1]
+
+            def simplex_jacobian(w: np.ndarray) -> np.ndarray:
+                jac = np.zeros((8, 17), dtype=float)
+                rows = np.arange(8)
+                jac[rows, 2 * rows] = -1.0
+                jac[rows, 2 * rows + 1] = -1.0
+                return jac
+
+            start = np.concatenate((
+                initial[3:].ravel(),
+                [cell_value * (1.0 - 1.0e-8)]
+            ))
+
+            for _ in range(2):
+                solution = minimize(
+                    lambda w: -w[-1],
+                    start,
+                    jac=lambda w: np.r_[np.zeros(16), -1.0],
+                    method="SLSQP",
+                    bounds=[(0.0, 1.0)] * 16 + [(0.0, 1.0)],
+                    constraints=[
+                        {"type": "ineq", "fun": constraints,
+                         "jac": constraint_jacobian},
+                        {"type": "ineq", "fun": simplex_constraints,
+                         "jac": simplex_jacobian},
+                    ],
+                    options={"maxiter": 1800, "ftol": 1.0e-13, "disp": False},
+                )
+
+                if not np.isfinite(solution.x).all():
+                    break
+
+                repaired = simplex_repair(solution.x[:16])
+                candidate = np.vstack((anchors, repaired))
+                candidate_value = minimum_area(candidate)
+
+                if candidate_value > cell_value + 1.0e-13:
+                    cell_best = candidate
+                    cell_value = candidate_value
+                    signs = np.sign(determinants(cell_best))
+                    signs[signs == 0.0] = 1.0
+                    start = np.concatenate((
+                        repaired.ravel(),
+                        [cell_value * (1.0 - 1.0e-9)]
+                    ))
+                else:
+                    break
+
+            return cell_best
+
+        for initial in elite:
+            candidate = polish_cell(initial)
+            candidate_value = minimum_area(candidate)
+            if candidate_value > best_value + 1.0e-13:
+                best = candidate
+                best_value = candidate_value
+
+        # Short deterministic perturb-and-polish attempts around the strongest
+        # cell provide a final active-constraint resolution opportunity.
+        for _ in range(2):
+            perturbed = best.copy()
+            index = int(rng.integers(3, 11))
+            q = perturbed[index] + rng.normal(0.0, 0.004, size=2)
+            q = simplex_repair(q.reshape(1, 2))[0]
+            perturbed[index] = q
+            candidate = polish_cell(perturbed)
+            candidate_value = minimum_area(candidate)
+            if candidate_value > best_value + 1.0e-13:
+                best = candidate
+                best_value = candidate_value
+
+    except Exception:
+        best = fallback()
+
+    result = np.empty((11, 2), dtype=float)
+    result[:, 0] = best[:, 0] + 0.5 * best[:, 1]
+    result[:, 1] = height * best[:, 1]
+    return result
+
+
+# EVOLVE-BLOCK-END

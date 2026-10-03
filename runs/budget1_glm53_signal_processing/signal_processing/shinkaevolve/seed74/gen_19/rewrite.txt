@@ -1,0 +1,88 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+def filter_signal(x, dt=1.0):
+    """
+    Adaptive Kalman filter with EWMA-smoothed innovation variance driving
+    measurement-noise adaptation. Dual-pass for zero-phase, velocity state
+    for responsiveness, trend-based slope reversal veto.
+
+    Inputs:
+        x  : 1D numpy array of raw signal
+        dt : sampling interval (default 1.0)
+    Returns:
+        y  : filtered signal, same length as x
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < 3:
+        return x.copy()
+
+    q_level = 1e-4   # process noise for level
+    q_vel = 1e-3     # process noise for velocity
+    r0 = 0.05        # base measurement noise
+    alpha_var = 0.1  # EWMA smoothing for innovation variance
+    alpha_trend = 0.15
+
+    def kalman_pass(sig):
+        m = len(sig)
+        # State: [level, velocity]
+        F = np.array([[1.0, dt], [0.0, 1.0]])
+        H = np.array([[1.0, 0.0]])
+        x_state = np.array([sig[0], 0.0])
+        P = np.eye(2) * 1.0
+        Q = np.diag([q_level, q_vel])
+
+        ewma_var = r0          # smoothed innovation variance estimate
+        trend = 0.0            # smoothed velocity trend
+        out = np.empty(m)
+        out[0] = sig[0]
+
+        for k in range(m):
+            # ---- Predict ----
+            x_state = F @ x_state
+            P = F @ P @ F.T + Q
+
+            # ---- Update ----
+            innov = sig[k] - (H @ x_state)[0]
+            S = P[0, 0] + r0 * 0.5 + ewma_var * 0.5  # EWMA-smoothed r
+            K = P[:, 0] / S
+            x_state = x_state + K * innov
+            P = P - np.outer(K, P[0, :])
+
+            # ---- EWMA-smoothed innovation variance (NOT raw innov^2) ----
+            ewma_var = (1.0 - alpha_var) * ewma_var + alpha_var * (innov * innov)
+
+            out[k] = x_state[0]
+
+            # ---- Trend tracking for veto (unused for output, stabilizes future ext.) ----
+            trend = (1.0 - alpha_trend) * trend + alpha_trend * x_state[1]
+
+        return out
+
+    # Forward pass
+    y_fwd = kalman_pass(x)
+    # Backward pass (zero phase, reduces end-effects)
+    y_bwd = kalman_pass(x[::-1])[::-1]
+
+    # Weighted fusion: forward gets slightly more weight mid-signal,
+    # backward compensates forward's end lag.
+    w = np.linspace(0.35, 0.65, n)
+    y = w * y_fwd + (1.0 - w) * y_bwd
+
+    # Slope-reversal smoothing: suppress small wiggles in the derivative
+    d = np.gradient(y, dt)
+    if n > 5:
+        ds = np.copy(d)
+        for i in range(2, n - 2):
+            # veto sign flips driven by tiny slopes (noise-level reversals)
+            if np.sign(d[i]) != np.sign(d[i-1]) and abs(d[i]) < 0.5 * np.std(d):
+                ds[i] = ds[i-1]
+        # re-integrate consistent derivative from a stable anchor
+        y = y[0] + np.cumsum(ds) * dt
+        # rescale to match endpoint of fused signal to avoid drift
+        drift = (w * y_fwd + (1 - w) * y_bwd)[-1] - y[-1]
+        y += drift * np.linspace(0.0, 1.0, n)
+
+    return y
+# EVOLVE-BLOCK-END

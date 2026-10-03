@@ -1,0 +1,88 @@
+<NAME>
+post_placement_kvpr_and_local_search</NAME>
+<DESCRIPTION>
+The current greedy picks the GPU with the lowest *current* KVPR (weighted_req_rate / remaining memory), which ignores both the new model's contribution and the fact that denominator should be total used memory (GPU_MEM_SIZE - free), not remaining. This biases placements badly. I fix the selection criterion to the *post-placement* KVPR: (load + r/s) / (GPU_MEM_SIZE - (free - size)), matching the evaluator's KVPR definition. Then I add a lightweight local-search pass that repeatedly moves a model off the hottest GPU (highest KVPR) whenever it strictly lowers the max KVPR across all GPUs, with bounded iterations. This directly minimizes the objective.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # 3) Assign each model to the GPU that minimizes current KVPR while fitting in memory
+    for model in sorted_models:
+        best_idx = None
+        best_ratio = float('inf')
+
+        for gpu_id in range(gpu_num):
+            if model.model_size <= shared_kv[gpu_id] and shared_kv[gpu_id] > 0:
+                current_ratio = weighted_req_rate[gpu_id] / shared_kv[gpu_id]
+                if current_ratio < best_ratio:
+                    best_ratio = current_ratio
+                    best_idx = gpu_id
+=======
+    # 3) Assign each model to the GPU that minimizes post-placement KVPR while fitting in memory
+    for model in sorted_models:
+        best_idx = None
+        best_ratio = float('inf')
+        w = model.req_rate / model.slo
+
+        for gpu_id in range(gpu_num):
+            if model.model_size <= shared_kv[gpu_id] and shared_kv[gpu_id] > 0:
+                used_after = GPU_MEM_SIZE - (shared_kv[gpu_id] - model.model_size)
+                post_kvpr = (weighted_req_rate[gpu_id] + w) / used_after
+                if post_kvpr < best_ratio:
+                    best_ratio = post_kvpr
+                    best_idx = gpu_id
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    return placement
+=======
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    # 4) Local search: move models off the hottest GPU to reduce max KVPR
+    def kvpr(g):
+        denom = GPU_MEM_SIZE - shared_kv[g]
+        return weighted_req_rate[g] / denom if denom > 0 else 0.0
+
+    improved = True
+    iterations = 0
+    while improved and iterations < 30:
+        improved = False
+        iterations += 1
+        kvprs = [kvpr(g) for g in range(gpu_num)]
+        hot = max(range(gpu_num), key=lambda g: kvprs[g])
+        hot_kvpr = kvprs[hot]
+        for model in list(placement[hot]):
+            w = model.req_rate / model.slo
+            rest = [kvprs[g] for g in range(gpu_num) if g != hot]
+            base = max(rest) if rest else 0.0
+            best_gain, best_dst = 0.0, None
+            for g in range(gpu_num):
+                if g == hot or model.model_size > shared_kv[g]:
+                    continue
+                dst_used = GPU_MEM_SIZE - (shared_kv[g] - model.model_size)
+                dst_kvpr = (weighted_req_rate[g] + w) / dst_used
+                src_used = GPU_MEM_SIZE - (shared_kv[hot] + model.model_size)
+                src_kvpr = (weighted_req_rate[hot] - w) / src_used if src_used > 0 else 0.0
+                new_max = max(base, dst_kvpr, src_kvpr)
+                if hot_kvpr - new_max > best_gain:
+                    best_gain = hot_kvpr - new_max
+                    best_dst = g
+            if best_dst is not None:
+                placement[hot].remove(model)
+                placement[best_dst].append(model)
+                weighted_req_rate[hot] -= w
+                shared_kv[hot] += model.model_size
+                weighted_req_rate[best_dst] += w
+                shared_kv[best_dst] -= model.model_size
+                improved = True
+                break
+
+    return placement
+>>>>>>> REPLACE
+</DIFF>

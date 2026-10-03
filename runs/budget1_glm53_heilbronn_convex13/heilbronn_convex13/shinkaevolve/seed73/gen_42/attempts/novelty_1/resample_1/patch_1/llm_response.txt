@@ -1,0 +1,201 @@
+<NAME>
+optimize_true_ratio_objective</NAME>
+<DESCRIPTION>
+The refinement stages currently maximize the raw minimum triangle area while ignoring the convex hull area in the denominator. Since the benchmark score is min_area/hull_area, a configuration can be improved both by increasing the min triangle AND by shrinking the hull (e.g., pulling near-boundary "wasted" points inward so that small triangles with them grow relative to hull area). I make three consistent changes:
+
+1. Refinement (`_refine_base` and `_polish_full`) now directly maximize the true objective `_true_score` (min area / hull area) rather than raw min area. The pattern search remains deterministic; each candidate is scored with the full ratio, so the optimizer can trade hull shrinkage against triangle growth — this is the key geometric insight: many near-optimal Heilbronn configurations sit strictly inside their hull, and fixing the hull (as the hexagon-clipped earlier programs did) is suboptimal.
+
+2. Vectorize `_hull_area` with `scipy.spatial.ConvexHull` (with a pure-numpy fallback) as recommended: pattern search calls the score hundreds of times per sweep, so this multiplies the number of seeds/steps affordable in the same runtime.
+
+3. Increase the deterministic seed pool (more 3-fold symmetric radial seeds plus more random seeds) to exploit the cheaper scoring, and use a slightly finer polish step. All seeds remain fixed/seeded, preserving determinism.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+import numpy as np
+from itertools import combinations
+=======
+import numpy as np
+from itertools import combinations
+
+try:
+    from scipy.spatial import ConvexHull as _ConvexHull
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def _hull_area(P: np.ndarray) -> float:
+    pts = P[np.lexsort((P[:, 1], P[:, 0]))]
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower, upper = [], []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    for p in pts[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = lower[:-1] + upper[:-1]
+    if len(hull) < 3:
+        return 1e-12
+    h = np.array(hull)
+    x, y = h[:, 0], h[:, 1]
+    return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+=======
+def _hull_area(P: np.ndarray) -> float:
+    # Vectorized hull area: scipy when available (much faster in the
+    # pattern-search inner loop), pure-numpy monotone chain fallback.
+    if _HAVE_SCIPY and len(P) >= 3:
+        try:
+            hull = _ConvexHull(P)
+            return float(hull.volume)
+        except Exception:
+            pass
+    pts = P[np.lexsort((P[:, 1], P[:, 0]))]
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower, upper = [], []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    for p in pts[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = lower[:-1] + upper[:-1]
+    if len(hull) < 3:
+        return 1e-12
+    h = np.array(hull)
+    x, y = h[:, 0], h[:, 1]
+    return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def _true_score(P: np.ndarray) -> float:
+    ha = _hull_area(P)
+    if ha <= 1e-12:
+        return 0.0
+    return _min_area(P) / ha
+=======
+def _true_score(P: np.ndarray) -> float:
+    ha = _hull_area(P)
+    if ha <= 1e-12:
+        return 0.0
+    return _min_area(P) / ha
+
+
+def _score(P: np.ndarray) -> float:
+    """Objective used inside refinement: the true benchmark score."""
+    return _true_score(P)
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    best = _min_area(_expand(B))
+    while step > min_step:
+        improved = False
+        for i in range(len(B)):
+            for j in range(2):
+                for sgn in (1.0, -1.0):
+                    cand = B.copy()
+                    cand[i, j] += sgn * step
+                    val = _min_area(_expand(cand))
+                    if val > best + 1e-15:
+                        B = cand
+                        best = val
+                        improved = True
+=======
+    best = _score(_expand(B))
+    while step > min_step:
+        improved = False
+        for i in range(len(B)):
+            for j in range(2):
+                for sgn in (1.0, -1.0):
+                    cand = B.copy()
+                    cand[i, j] += sgn * step
+                    val = _score(_expand(cand))
+                    if val > best + 1e-15:
+                        B = cand
+                        best = val
+                        improved = True
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    best = _min_area(P)
+    while step > min_step:
+        improved = False
+        for i in range(n):
+            base = P.copy()
+            # evaluate all 16 candidate moves for point i at once
+            cand = np.repeat(P[i][None, :], 16, axis=0) + step * _DIRS
+            # find triangles containing i and not containing i
+            mask_has = (_I0 == i) | (_I1 == i) | (_I2 == i)
+            others = _tri_areas(P)[~mask_has].min() if np.any(~mask_has) else np.inf
+            vals = np.empty(16)
+            for d in range(16):
+                base[i] = cand[d]
+                vals[d] = min(others, _tri_areas(base)[mask_has].min())
+            d = int(np.argmax(vals))
+            if vals[d] > best + 1e-15:
+                P[i] = cand[d]
+                best = vals[d]
+                improved = True
+=======
+    best = _score(P)
+    while step > min_step:
+        improved = False
+        for i in range(n):
+            base = P.copy()
+            # evaluate all 16 candidate moves for point i at once
+            cand = np.repeat(P[i][None, :], 16, axis=0) + step * _DIRS
+            # find triangles containing i and not containing i
+            mask_has = (_I0 == i) | (_I1 == i) | (_I2 == i)
+            others = _tri_areas(P)[~mask_has].min() if np.any(~mask_has) else np.inf
+            vals = np.empty(16)
+            for d in range(16):
+                base[i] = cand[d]
+                tri_min = min(others, _tri_areas(base)[mask_has].min())
+                ha = _hull_area(base)
+                vals[d] = tri_min / ha if ha > 1e-12 else 0.0
+            d = int(np.argmax(vals))
+            if vals[d] > best + 1e-15:
+                P[i] = cand[d]
+                best = vals[d]
+                improved = True
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    for spread in (0.9, 0.6, 0.3):
+        seeds.append(np.array([[spread, 0.0],
+                               [spread * 0.5, spread * 0.85],
+                               [0.0, spread],
+                               [spread * 0.4, spread * 0.3]]))
+    for _ in range(10):
+=======
+    for spread in (0.95, 0.9, 0.75, 0.6, 0.45, 0.3):
+        seeds.append(np.array([[spread, 0.0],
+                               [spread * 0.5, spread * 0.85],
+                               [0.0, spread],
+                               [spread * 0.4, spread * 0.3]]))
+    # extra radial 3-fold seeds with varied angular offsets
+    for off in (0.0, np.pi / 12, np.pi / 6):
+        for r4 in ([1.0, 0.78, 0.5, 0.15], [0.95, 0.7, 0.42, 0.1]):
+            B = [[r * np.cos(ang - off - k * np.pi / 7.0),
+                  r * np.sin(ang - off - k * np.pi / 7.0)] for k, r in enumerate(r4)]
+            seeds.append(np.array(B))
+    for _ in range(24):
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

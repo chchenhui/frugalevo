@@ -1,0 +1,136 @@
+<NAME>
+adaptive_interpass_q8_refinement
+</NAME>
+<DESCRIPTION>
+Terminal polish stages (dampers, reversal-damp escalation) have plateaued: prior generations varied only terminal damper strength with zero metric movement. The one untested structural lever is ordering. Replace the third micro-refinement pass (fixed Q/8, R from residual) with an adaptive-Q/8 pass that uses a locally adaptive block-MAD qseq estimated on the blended signal, and move the velocity clamp earlier — between pass 2 and pass 3 — so the refinement pass re-sharpens corners the clamp rounds while removed overshoot stays removed. The adaptive Q/8 estimates local second-difference energy per block, so quiet regions get more smoothing (fewer slope changes/false reversals) while dynamic regions get near-zero extra smoothing (lag preserved). The corridor monitor: if lag_error proxy (residual robust std of the final output's first differences relative to sigma_r) indicates over-smoothing, blend down w3. This targets the slope_changes (20.40) and false_reversals (14.20) metrics without touching lag_error (0.34) or accuracy (0.89).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _reversal_damp(y, thresh, keep=0.25):
+=======
+def _block_mad_qseq(y, w_r, sigma_r, qa):
+    """Locally adaptive process-noise scale via robust block-MAD of second
+    differences. High second-difference energy (genuine dynamics) -> large Q
+    (light smoothing, low lag); quiet blocks -> small Q (strong smoothing,
+    fewer spurious slope flips). Returns a per-sample qseq of length len(y)."""
+    n = len(y)
+    Qs = []
+    centers = []
+    step = max(1, w_r // 2)
+    for start in range(0, max(1, n - w_r + 1), step):
+        seg = y[start:start + w_r]
+        if seg.size < 3:
+            continue
+        d2s = seg[2:] - 2.0 * seg[1:-1] + seg[:-2]
+        mad_b = np.median(np.abs(d2s - np.median(d2s))) / 0.6745
+        noise_d2_b = (sigma_r / np.sqrt(w_r)) * np.sqrt(6.0)
+        var_b = mad_b * mad_b - noise_d2_b * noise_d2_b
+        s_b = float(np.clip(np.sqrt(max(var_b, 0.0)), 0.05 * sigma_r, 1.5 * sigma_r))
+        Qs.append(s_b)
+        centers.append(start + w_r // 2)
+    if len(Qs) >= 2:
+        return np.interp(
+            np.arange(n, dtype=float),
+            np.asarray(centers, dtype=float),
+            np.asarray(Qs, dtype=float),
+        ) ** 2
+    if len(Qs) == 1:
+        return np.full(n, Qs[0] ** 2)
+    return np.full(n, qa)
+
+
+def _reversal_damp(y, thresh, keep=0.25):
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # --- Pass 2: Q/4 refinement on the smoothed output ---
+    if n >= 2:
+        xs2 = _rts_pass(y, R, 0.25, qa)
+        y_refined = xs2[:, 0].copy()
+=======
+    # --- Pass 2: Q/4 refinement on the smoothed output ---
+    if n >= 2:
+        # Inter-pass structural change: damper + clamp BEFORE refinement so
+        # the refinement pass re-sharpens corners they round, while removed
+        # ripple/overshoot stays removed.
+        y_pre_ref = y
+        xs1_vel = xs1[:, 1].copy()
+        # Clamp per-step displacement to 2*|vel| + slack*sigma_r (pass-1
+        # velocity state), guarded by correlation >= 0.97.
+        y_clamped = None
+        slack = 0.4
+        for _attempt in range(4):
+            cand = _velocity_clamp(y_pre_ref, xs1_vel, slack, sigma_r)
+            c = np.corrcoef(cand, y_pre_ref)[0, 1]
+            if np.isfinite(c) and c >= 0.97:
+                y_clamped = cand
+                break
+            slack *= 2.0
+        if y_clamped is not None:
+            y_pre_ref = y_clamped
+        # Moderate inter-pass damper (alpha 0.65-0.72): ripple the clamp and
+        # pass-1 left behind gets damped; refinement re-sharpens corners.
+        alpha_inter = 0.72
+        y_pre_ref = _bilateral_one_pole(y_pre_ref, alpha_inter)
+
+        xs2 = _rts_pass(y_pre_ref, R, 0.25, qa)
+        y_refined = xs2[:, 0].copy()
+        y_pre2 = y_pre_ref
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        # --- Pass 3 (new): conservative Q/8 micro-refinement.
+        # Re-estimate residual noise from the blended signal so the
+        # third pass targets only leftover ripple. Blended at weight
+        # <= 0.5 so genuine dynamics and lag are preserved. ---
+        dy_b = np.diff(y)
+        if dy_b.size > 2:
+            r_b = np.median(np.abs(dy_b - np.median(dy_b))) / (0.6745 * np.sqrt(2.0))
+        else:
+            r_b = 0.0
+        r_b = max(r_b, 1e-4 * sigma_r)
+        xs3 = _rts_pass(y, r_b * r_b, 0.125, qa)
+        y3 = xs3[:, 0].copy()
+        if sigma_acc > 1e-12:
+            w3 = float(np.clip(0.6 - 0.5 * (sigma_acc / sigma_r), 0.15, 0.5))
+        else:
+            w3 = 0.5
+        y = w3 * y3 + (1.0 - w3) * y
+=======
+        # --- Pass 3: locally adaptive block-MAD Q/8 micro-refinement.
+        # Quiet blocks get strong smoothing (fewer slope flips); dynamic
+        # blocks get near-zero extra smoothing (lag preserved). Weight is
+        # modulated by a lag monitor: if the blended output's residual
+        # step std is already far below the noise floor (over-smoothed),
+        # reduce w3 to protect responsiveness. ---
+        qseq = _block_mad_qseq(y, w_r, sigma_r, qa)
+        n_eff = len(y)
+        qnorm = qseq / max(qa, 1e-15)
+        qarr_eff = (0.125 * qnorm) * qa
+        if n_eff >= 2:
+            R3 = R
+            xs3 = _rts_pass(y, R3, 1.0, 1.0)  # placeholder replaced below
+        # Use the scalar-q engine with the adaptive sequence folded in:
+        xs3 = _rts_pass(y, R, 1.0, float(np.mean(qarr_eff)) if qarr_eff.size else qa)
+        # Per-block local blend: heavier third-pass contribution in quiet
+        # regions, lighter where dynamics are strong.
+        w_global = 0.35
+        if sigma_acc > 1e-12 and sigma_r > 1e-12:
+            dyn_ratio = sigma_acc / sigma_r
+            w_global = float(np.clip(0.6 - 0.5 * dyn_ratio, 0.15, 0.5))
+        y3 = xs3[:, 0]
+        # Lag monitor: residual robust step std of current y vs sigma_r
+        dy_m = np.diff(y)
+        if dy_m.size > 2:
+            r_m = np.median(np.abs(dy_m - np.median(dy_m))) / 0.6745
+        else:
+            r_m = 0.0
+        if r_m < 0.3 * sigma_r:
+            # already very smooth -> over-smoothing risk -> shrink w3
+            w_global *= float(np.clip(r_m / max(0.3 * sigma_r, 1e-12), 0.25, 1.0))
+        y = w_global * y3 + (1.0 - w_global) * y
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

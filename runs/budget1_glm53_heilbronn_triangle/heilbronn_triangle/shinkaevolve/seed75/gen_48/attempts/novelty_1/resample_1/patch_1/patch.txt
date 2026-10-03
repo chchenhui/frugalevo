@@ -1,0 +1,388 @@
+--- a/original.py
++++ b/original.py
+@@ -1,268 +1,187 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
++
++try:
++    from scipy.optimize import minimize as _scipy_minimize
++    _HAVE_SCIPY = True
++except Exception:
++    _HAVE_SCIPY = False
+ 
+ VERTS = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, np.sqrt(3) / 2.0]])
+ 
+ 
+ def _in_triangle(pts, tol=1e-12):
+     (x1, y1), (x2, y2), (x3, y3) = VERTS
+     s = (x2 - x1) * (pts[:, 1] - y1) - (y2 - y1) * (pts[:, 0] - x1)
+     t = (x3 - x2) * (pts[:, 1] - y2) - (y3 - y2) * (pts[:, 0] - x2)
+     u = (x1 - x3) * (pts[:, 1] - y3) - (y1 - y3) * (pts[:, 0] - x3)
+     return ((s >= -tol) & (t >= -tol) & (u >= -tol))
+ 
+ 
+ def _bary_repair(pts):
+     A = np.array([[1.0, VERTS[0, 0], VERTS[0, 1]],
+                   [1.0, VERTS[1, 0], VERTS[1, 1]],
+                   [1.0, VERTS[2, 0], VERTS[2, 1]]])
+     b = np.column_stack([np.ones(len(pts)), pts])
+-    lam = np.linalg.solve(A.T, b.T).T  # barycentric coords
++    lam = np.linalg.solve(A.T, b.T).T
+     lam = np.clip(lam, 0.0, None)
+     lam /= lam.sum(axis=1, keepdims=True)
+     return lam @ VERTS
+ 
+ 
+-def _min_area(pts):
+-    n = len(pts)
+-    best = np.inf
+-    worst = None
+-    for i in range(n - 2):
+-        for j in range(i + 1, n - 1):
+-            for k in range(j + 1, n):
+-                a = 0.5 * abs((pts[j, 0] - pts[i, 0]) * (pts[k, 1] - pts[i, 1]) -
+-                              (pts[k, 0] - pts[i, 0]) * (pts[j, 1] - pts[i, 1]))
+-                if a < best:
+-                    best = a
+-                    worst = (i, j, k)
+-    return best, worst
++def _make_min_area(triples_arr):
++    def min_area(pts):
++        p = pts[triples_arr]
++        cross = ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
++                 - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
++        a = 0.5 * np.abs(cross)
++        idx = int(np.argmin(a))
++        return a[idx], tuple(triples_arr[idx])
++    return min_area
+ 
+ 
+-def _initial_layouts():
+-    """Several deterministic, well-spread seed layouts (no near-degenerate triplets)."""
+-    s3 = np.sqrt(3.0)
+-    layouts = []
+-    # Layout A: hand-built known-good configuration (vertices + edge + interior)
+-    layouts.append(np.array([
+-        [0.0, 0.0], [1.0, 0.0], [0.5, s3 / 2.0],
+-        [0.5, 0.0], [0.25, s3 / 4.0], [0.75, s3 / 4.0],
+-        [0.25, s3 / 12.0], [0.75, s3 / 12.0],
+-        [0.5, s3 / 6.0], [0.125, s3 / 8.0], [0.875, s3 / 8.0],
+-    ]))
+-    # Layout B: uniform barycentric lattice-ish interior points
+-    rng = np.random.default_rng(777)
+-    layouts.append(np.array([
+-        [0.0, 0.0], [1.0, 0.0], [0.5, s3 / 2.0],
+-        [0.5, 0.0], [0.25, s3 / 4.0], [0.75, s3 / 4.0],
+-        [1.0 / 3.0, s3 / 9.0], [2.0 / 3.0, s3 / 9.0],
+-        [0.5, s3 / 3.0], [0.5, s3 / 18.0], [0.25, s3 / 36.0],
+-    ]))
+-    # Layout C: jittered version of A for extra diversity
+-    jitter = layouts[0] + rng.normal(scale=0.02, size=layouts[0].shape)
+-    layouts.append(jitter)
+-    return layouts
++def _perp(a, b, c):
++    ex, ey = b[0] - a[0], b[1] - a[1]
++    L = np.hypot(ex, ey) + 1e-12
++    ux, uy = ex / L, ey / L
++    dx, dy = c[0] - a[0], c[1] - a[1]
++    px = -uy * dx + ux * dy
++    if px >= 0:
++        return np.array([-uy, ux])
++    return np.array([uy, -ux])
+ 
+ 
+-def _polish(pts, iters=1500, step=0.015):
+-    """Gradient-informed polish: move worst-triplet points perpendicular
+-    away from the line through the other two points (the exact direction
+-    that increases that triplet's signed area)."""
++def _polish(pts, min_area, iters=150, step=0.006):
+     for _ in range(iters):
+-        cur, worst = _min_area(pts)
++        cur, worst = min_area(pts)
+         if worst is None:
+             break
+         i, j, k = worst
+-        p = pts
+-        # perpendicular "escape" directions for each of the 3 points
+-        dirs = {}
+-        dirs[i] = _perp(p[j], p[k], p[i])
+-        dirs[j] = _perp(p[i], p[k], p[j])
+-        dirs[k] = _perp(p[i], p[j], p[k])
++        dirs = {
++            i: _perp(pts[j], pts[k], pts[i]),
++            j: _perp(pts[i], pts[k], pts[j]),
++            k: _perp(pts[i], pts[j], pts[k]),
++        }
+         improved = False
+-        # try moving all three, then pairs, then single points
+-        trials = [(i, j, k), (i, j), (j, k), (i, k), (i,), (j,), (k,)]
+-        for trial in trials:
++        for trial in [(i, j, k), (i, j), (j, k), (i, k), (i,), (j,), (k,)]:
+             cand = pts.copy()
+             for m_ in trial:
+                 cand[m_] = pts[m_] + step * dirs[m_]
+             cand = _bary_repair(cand)
+-            new, _ = _min_area(cand)
++            new, _ = min_area(cand)
+             if new > cur + 1e-15:
+                 pts = cand
+                 improved = True
+                 break
+         if not improved:
+             step *= 0.85
+             if step < 1e-7:
+                 break
+     return pts
+ 
+ 
+-def _perp(a, b, c):
+-    """Unit direction from point c away from line through a,b (increases |area|)."""
+-    ex, ey = b[0] - a[0], b[1] - a[1]
+-    L = np.hypot(ex, ey) + 1e-12
+-    ux, uy = ex / L, ey / L          # unit vector along edge
+-    dx, dy = c[0] - a[0], c[1] - a[1]
+-    # signed perpendicular distance component
+-    px, py = -uy * dx + ux * dy, ux * dx + uy * dy
+-    # perpendicular pointing away from edge, on the side where c lies
+-    if px >= 0:
+-        return np.array([-uy, ux])
+-    return np.array([uy, -ux])
+-
+-
+-def _stochastic_refine(pts, rng, budget=2500, step0=0.03):
+-    """Shrinking-step stochastic hill climb: random one-point perturbations,
+-    accepted only if they raise the minimum triangle area."""
+-    pts = pts.copy()
+-    best, _ = _min_area(pts)
+-    step = step0
+-    it = 0
+-    n = len(pts)
+-    while step > 1e-5 and it < budget:
+-        improved = False
+-        for i in range(n):
+-            for _t in range(3):
+-                it += 1
+-                if it >= budget:
+-                    break
+-                cand = pts.copy()
+-                cand[i] = pts[i] + rng.normal(0.0, step, size=2)
+-                cand = _bary_repair(cand)
+-                if np.min(np.linalg.norm(np.delete(cand, i, axis=0) - cand[i], axis=1)) < 1e-9:
+-                    continue
+-                val, _ = _min_area(cand)
+-                if val > best + 1e-15:
+-                    pts, best = cand, val
+-                    improved = True
+-        if not improved:
+-            step *= 0.6
+-    return pts
+-
+-
+-try:
+-    from scipy.optimize import minimize as _scipy_minimize
+-    _HAVE_SCIPY = True
+-except Exception:
+-    _HAVE_SCIPY = False
+-
+-
+-def _softmin_refine(pts, n_temps=(2e-2, 5e-3, 1e-3), k_worst=20):
+-    """Top-k softmin smooth refinement (softmax barycentric parametrization).
+-    Applies log-sum-exp over only the k smallest triplet areas so the smooth
+-    objective concentrates its signal on the binding constraints instead of
+-    diluting it across all 165 triples."""
+-    if not _HAVE_SCIPY:
+-        return pts
+-    n = len(pts)
+-    V = VERTS
+-    A = np.array([[1.0, V[0, 0], V[0, 1]],
+-                  [1.0, V[1, 0], V[1, 1]],
+-                  [1.0, V[2, 0], V[2, 1]]])
+-    b = np.column_stack([np.ones(n), pts])
+-    lam0 = np.linalg.solve(A.T, b.T).T
+-    lam0 = np.clip(lam0, 1e-3, None)
+-    lam0 /= lam0.sum(axis=1, keepdims=True)
+-    theta = np.log(lam0).ravel()
+-
+-    ii = []
+-    jj = []
+-    kk = []
+-    for a in range(n - 2):
+-        for c in range(a + 1, n - 1):
+-            for d in range(c + 1, n):
+-                ii.append(a)
+-                jj.append(c)
+-                kk.append(d)
+-    ii = np.array(ii)
+-    jj = np.array(jj)
+-    kk = np.array(kk)
+-
+-    def unpack(th):
+-        W = th.reshape(n, 3)
+-        W = W - W.max(axis=1, keepdims=True)
+-        E = np.exp(W)
+-        W = E / E.sum(axis=1, keepdims=True)
+-        return W @ V
+-
+-    def obj(th, temp):
+-        p = unpack(th)
+-        pi, pj, pk = p[ii], p[jj], p[kk]
+-        cross = ((pj[:, 0] - pi[:, 0]) * (pk[:, 1] - pi[:, 1])
+-                 - (pj[:, 1] - pi[:, 1]) * (pk[:, 0] - pi[:, 0]))
+-        a = 0.5 * np.abs(cross)
+-        if len(a) > k_worst:
+-            part = np.partition(a, k_worst - 1)[:k_worst]
+-        else:
+-            part = a
+-        m = part.min()
+-        return -(m - temp * np.log(np.sum(np.exp(-(part - m) / temp))))
+-
+-    cur_val, _ = _min_area(pts)
+-    for temp in n_temps:
+-        try:
+-            res = _scipy_minimize(obj, theta, args=(temp,), method="Powell",
+-                                  options={"maxiter": 300, "xtol": 1e-6, "ftol": 1e-9})
+-            if np.all(np.isfinite(res.x)):
+-                theta = res.x
+-        except Exception:
+-            break
+-    cand = unpack(theta)
+-    if not np.all(np.isfinite(cand)):
+-        return pts
+-    val, _ = _min_area(cand)
+-    if val > cur_val:
+-        return cand
+-    return pts
+-
+-
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+     Construct 11 points inside the unit equilateral triangle maximizing the
+     minimum triangle area (Heilbronn problem, n=11).
+ 
++    Strategy: deterministic multi-start Powell optimization over
++    softmax-barycentric logits with a top-k temperature-annealed softmin
++    objective (only the k smallest triplet areas enter the log-sum-exp,
++    focusing the search on binding constraints). A short gradient-informed
++    perpendicular polish is applied as a final touch-up (kept only if it
++    improves). Hardcoded fallback on any failure.
++
+     Returns:
+         points: np.ndarray of shape (11,2) of x,y coordinates.
+     """
++    n = 11
+     s3 = np.sqrt(3.0)
++    V = VERTS
++    area_T = s3 / 4.0
++    K = 20
++
++    from itertools import combinations
++    triples_arr = np.array(list(combinations(range(n), 3)), dtype=int)
++    min_area = _make_min_area(triples_arr)
++
+     fallback = np.array([
+         [0.0, 0.0], [1.0, 0.0], [0.5, s3 / 2.0],
+         [0.5, 0.0], [0.25, s3 / 4.0], [0.75, s3 / 4.0],
+         [0.25, s3 / 12.0], [0.75, s3 / 12.0],
+         [0.5, s3 / 6.0], [0.125, s3 / 8.0], [0.875, s3 / 8.0],
+     ])
++
++    def unpack(theta):
++        W = theta.reshape(n, 3)
++        W = W - W.max(axis=1, keepdims=True)
++        E = np.exp(W)
++        W = E / E.sum(axis=1, keepdims=True)
++        return W @ V
++
++    def softmin_obj(theta, temp):
++        pts = unpack(theta)
++        p = pts[triples_arr]
++        cross = ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
++                 - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
++        a = 0.5 * np.abs(cross)
++        part = np.partition(a, K - 1)[:K]      # k smallest (binding) areas
++        m = part.min()
++        return temp * np.log(np.sum(np.exp(-(part - m) / temp))) - m
++
+     try:
+-        rng = np.random.default_rng(20240517)
+-        best_pts, best_val = None, -np.inf
+-        bases = _initial_layouts()
+-        # Multi-restart: each base layout plus deterministic jittered variants.
+-        seeds = []
+-        for layout in bases:
+-            seeds.append(np.asarray(layout, dtype=float))
+-            for _r in range(6):
+-                seeds.append(np.asarray(layout, dtype=float) + rng.normal(scale=0.05, size=(11, 2)))
+-        for seed in seeds:
+-            cand = _bary_repair(seed)
+-            cand = _polish(cand, iters=400, step=0.015)
+-            cand = _stochastic_refine(cand, rng)
+-            cand = _polish(cand, iters=300, step=0.008)
+-            val, _ = _min_area(cand)
+-            if val > best_val:
+-                best_val, best_pts = val, cand
+-        # Final smooth top-k softmin refinement on the best candidate
+-        cand = _softmin_refine(best_pts)
+-        val, _ = _min_area(cand)
+-        if val > best_val:
+-            best_val, best_pts = val, cand
+-        if best_pts is None or best_pts.shape != (11, 2) or not np.all(np.isfinite(best_pts)):
+-            raise RuntimeError("bad result")
++        # Deterministic starts: hand-crafted barycentric seed + fixed-seed logits
++        bary = np.array([
++            [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
++            [0.5, 0.5, 0.0], [0.5, 0.0, 0.5], [0.0, 0.5, 0.5],
++            [0.75, 0.25, 0.0], [0.25, 0.75, 0.0], [0.25, 0.25, 0.5],
++            [0.625, 0.125, 0.25], [0.125, 0.625, 0.25],
++        ])
++        rng = np.random.default_rng(12345)
++        starts = [np.log(np.clip(bary, 1e-6, 1.0)).ravel()]
++        for _ in range(4):
++            starts.append(rng.normal(scale=1.5, size=(n, 3)).ravel())
++
++        best_pts = fallback
++        best_val, _ = min_area(fallback)
++
++        if _HAVE_SCIPY:
++            for s in starts:
++                theta = np.array(s, dtype=float)
++                try:
++                    for temp in (1e-2 * area_T, 1e-3 * area_T, 1e-4 * area_T):
++                        res = _scipy_minimize(
++                            softmin_obj, theta, args=(temp,),
++                            method="Powell",
++                            options={"maxiter": 400, "xtol": 1e-6, "ftol": 1e-8},
++                        )
++                        if np.all(np.isfinite(res.x)):
++                            theta = res.x
++                    pts = unpack(theta)
++                    val, _ = min_area(pts)
++                    if val > best_val:
++                        best_val, best_pts = val, pts
++                except Exception:
++                    continue
++
++        # Cheap final gradient-informed touch-up (kept only if it helps)
++        try:
++            cand = _bary_repair(np.asarray(best_pts, dtype=float))
++            cand = _polish(cand, min_area, iters=150, step=0.006)
++            val_r, _ = min_area(cand)
++            if val_r > best_val:
++                best_val, best_pts = val_r, cand
++        except Exception:
++            pass
++
++        best_pts = np.asarray(best_pts, dtype=float)
++        if best_pts.shape != (n, 2) or not np.all(np.isfinite(best_pts)):
++            best_pts = fallback
+         if not np.all(_in_triangle(best_pts, tol=1e-9)):
+             best_pts = _bary_repair(best_pts)
+-        pts = best_pts
++        return best_pts
+     except Exception:
+-        pts = fallback
+-    return np.asarray(pts, dtype=float)
++        return np.asarray(fallback, dtype=float)
+ 
+ 
+ # EVOLVE-BLOCK-END

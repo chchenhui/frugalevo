@@ -1,0 +1,165 @@
+<NAME>
+lpt_replication_and_vectorized_packing
+</NAME>
+<DESCRIPTION>
+The expert balancedness (0.25) is the weakest metric. The current `replicate_experts` greedily replicates the expert with the highest weight/count ratio, which is a myopic heuristic and under-uses redundancy. Instead, we do a proper LPT over post-replication loads: treat each logical expert's weight as being divided among its replicas; when we must add a replica, we pick the expert whose removal best reduces the maximum per-expert replica load. Concretely, sorting experts by weight descending and assigning each replica (in that order, including the first `num_log` mandatory replicas) to keep replica loads balanced yields a much better LPT-style solution: each logical expert of weight w gets either ceil/floor of total/num_log replicas such that w/c is as uniform as possible. This directly targets the expert balancedness metric (which measures how uniform the per-replica loads w_i/c_i are).
+
+Additionally, `balanced_packing` is currently a slow Python double loop (times_algorithm 0.49). Replace it with the vectorized masked-argmin LPT loop validated in a prior program (which achieved times_algorithm 0.01), processing all rows in lockstep.
+
+The new replication strategy: sort experts descending by weight; compute a target replica load T = total_weight / num_phy; for each expert in descending order, assign c_i = max(1, round(w_i / T)) replicas, then fix up the total to exactly num_phy greedily by adjusting the counts that most reduce the max deviation. This is a one-shot assignment with a small greedy fix-up, much faster than the per-replica loop and better balanced.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    device = weight.device
+    w = weight.float()
+    # Descending item order for each row.
+    order = w.sort(-1, descending=True).indices  # [X, n]
+
+    pack_index = torch.empty(num_layers,
+                             num_groups,
+                             dtype=torch.int64,
+                             device=device)
+    rank_in_pack = torch.empty(num_layers,
+                               num_groups,
+                               dtype=torch.int64,
+                               device=device)
+
+    pack_weight = torch.zeros(num_layers, num_packs, device=device)
+    pack_items = torch.zeros(num_layers,
+                             num_packs,
+                             dtype=torch.int64,
+                             device=device)
+    arange_layers = torch.arange(num_layers, device=device)
+    full_mask = torch.zeros(num_layers,
+                            num_packs,
+                            dtype=torch.bool,
+                            device=device)
+    large = torch.full_like(pack_weight, float("inf"))
+
+    for t in range(num_groups):
+        group = order[:, t]  # [X]
+        gw = w.gather(1, group.unsqueeze(1)).squeeze(1)  # [X]
+        # Lightest pack that still has capacity.
+        cand = torch.where(full_mask, large, pack_weight)
+        pack = cand.argmin(dim=-1)  # [X]
+        pack_index[arange_layers, group] = pack
+        rank_in_pack[arange_layers, group] = pack_items[arange_layers, pack]
+        pack_weight[arange_layers, pack] += gw
+        pack_items[arange_layers, pack] += 1
+        full_mask |= pack_items >= groups_per_pack
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+<DIFF>
+<<<<<<< SEARCH
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+=======
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.empty(n, num_phy, dtype=torch.int64, device=device)
+    rank = torch.empty(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+
+    w = weight.float()
+    total = w.sum(-1, keepdim=True)  # [n, 1]
+    # Target per-replica load so replica loads are as uniform as possible.
+    target = total / num_phy
+    # Ideal replica count per expert (at least 1).
+    ideal = (w / target).round().clamp(min=1).long()  # [n, num_log]
+    # Fix up so each row sums to exactly num_phy, greedily adjusting the
+    # count that most reduces the deviation of the per-replica load.
+    logcnt = ideal.clone()
+    diff = num_phy - logcnt.sum(-1)  # [n]
+    safe_w = w.clamp(min=torch.finfo(w.dtype).tiny)
+    for _ in range(int(diff.abs().max().item()) if n > 0 else 0):
+        active = diff != 0
+        if not active.any():
+            break
+        # Deviation if we add / remove one replica.
+        cur_load = w / logcnt.clamp(min=1)
+        add_load = w / (logcnt + 1).clamp(min=1)
+        dev_add = (add_load - target).abs() - (cur_load - target).abs()
+        dev_sub = ((logcnt > 1) & active.unsqueeze(-1))
+        sub_load = w / (logcnt - 1).clamp(min=1)
+        dev_sub_v = (sub_load - target).abs() - (cur_load - target).abs()
+        rows = torch.nonzero(active, as_tuple=True)[0]
+        d = diff[rows]
+        if (d > 0).any():
+            r = rows[d > 0]
+            cand = torch.where(logcnt[r] > 0, dev_add[r],
+                               torch.full_like(dev_add[r], float("inf")))
+            j = cand.argmin(-1)
+            logcnt[r, j] += 1
+            diff[r] -= 1
+        if (d < 0).any():
+            r = rows[d < 0]
+            cand = torch.where(dev_sub[r], dev_sub_v[r],
+                               torch.full_like(dev_sub_v[r], float("inf")))
+            j = cand.argmin(-1)
+            logcnt[r, j] -= 1
+            diff[r] += 1
+
+    # Fill phy2log / rank from the counts (all rows in lockstep).
+    order = w.sort(-1, descending=True).indices  # [n, num_log]
+    slot = 0
+    for j in range(num_log):
+        e = order[:, j]  # [n]
+        c = logcnt[arangen, e]  # [n]
+        for k in range(int(c.max().item()) if n > 0 else 0):
+            m = k < c
+            if not m.any():
+                break
+            rows = torch.nonzero(m, as_tuple=True)[0]
+            phy2log[rows, slot] = e[rows]
+            rank[rows, slot] = k
+            slot += 1
+            if slot >= num_phy:
+                break
+        if slot >= num_phy:
+            break
+    # Any remaining slots (defensive): fill with lightest experts.
+    while slot < num_phy:
+        phy2log[:, slot] = order[:, -1]
+        rank[:, slot] = 0
+        slot += 1
+    return phy2log, rank, logcnt
+>>>>>>> REPLACE
+</DIFF>

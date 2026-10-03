@@ -1,0 +1,331 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+import time
+from solver import Algorithm
+from typing import Tuple, List, Dict
+
+
+class Evolved(Algorithm):
+    """
+    Serial character-Trie oriented row/column reordering.
+
+    Objective: maximize total shared prefix characters across the collection
+    of serialized rows ("".join of str cells, missing -> ""), measured exactly
+    as the sum of longest-common-prefix lengths of lexicographically adjacent
+    serialized strings. Row order does not change this total, so we only need
+    good per-row field orderings.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------ #
+    # serialization helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _ser(v) -> str:
+        """Scoring serialization of a single cell (does not alter stored data)."""
+        if v is None:
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(v)
+
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        """Longest common prefix via binary search with C-speed slice compares."""
+        n = min(len(a), len(b))
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _score_orders(self, ser, orders, R) -> int:
+        """Exact serial-Trie reuse: sum of LCPs of sorted serialized rows."""
+        strs = ["".join(ser[r][c] for c in orders[r]) for r in range(R)]
+        strs.sort()
+        tot = 0
+        lcp = self._lcp
+        prev = None
+        for s in strs:
+            if prev is not None:
+                tot += lcp(prev, s)
+            prev = s
+        return tot
+
+    def _score_flat(self, ser, order, R) -> int:
+        """Score a single global column order (fast path, one join per row)."""
+        strs = ["".join(ser[r][c] for c in order) for r in range(R)]
+        strs.sort()
+        tot = 0
+        lcp = self._lcp
+        prev = None
+        for s in strs:
+            if prev is not None:
+                tot += lcp(prev, s)
+            prev = s
+        return tot
+
+    # ------------------------------------------------------------------ #
+    # factorization (done once, shared by all constructions)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _factorize(sercols, R, C):
+        """Convert each column's serialized values to integer codes."""
+        codes = [None] * C
+        val_strs = [None] * C
+        val_lens = [None] * C
+        for c in range(C):
+            col = sercols[c]
+            d: Dict[str, int] = {}
+            arr = np.empty(R, dtype=np.int64)
+            vs: List[str] = []
+            vl: List[int] = []
+            for r in range(R):
+                v = col[r]
+                k = d.get(v, -1)
+                if k < 0:
+                    k = len(vs)
+                    d[v] = k
+                    vs.append(v)
+                    vl.append(len(v))
+                arr[r] = k
+            codes[c] = arr
+            val_strs[c] = vs
+            val_lens[c] = np.array(vl, dtype=np.int64)
+        return codes, val_strs, val_lens
+
+    # ------------------------------------------------------------------ #
+    # candidate constructions
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _global_freq_order(codes, val_lens, C, names) -> List[int]:
+        """Order columns by sum(len(v) * count * (count-1))."""
+        scores = []
+        for c in range(C):
+            cnt = np.bincount(codes[c])
+            n = cnt.astype(np.int64)
+            lens = val_lens[c]
+            sc = int(np.sum(lens * n[: len(lens)] * (n[: len(lens)] - 1)))
+            scores.append(sc)
+        return sorted(range(C), key=lambda c: (-scores[c], names[c]))
+
+    @staticmethod
+    def _global_len_order(sercols, C, names) -> List[int]:
+        """Alternative tradeoff: total serialized characters, descending."""
+        scores = [sum(len(v) for v in sercols[c]) for c in range(C)]
+        return sorted(range(C), key=lambda c: (-scores[c], names[c]))
+
+    def _tree_orders(
+        self,
+        codes,
+        val_lens,
+        R,
+        C,
+        base_order,
+        max_depth,
+        max_nodes=4000,
+        max_cand=24,
+    ):
+        """Conditional prefix partition tree on integer codes."""
+        orders = [None] * R
+        base_set = list(base_order)
+        base_pos = {c: i for i, c in enumerate(base_set)}
+        nodes = [0]
+
+        def emit(rows, cols):
+            o = sorted(cols, key=lambda c: base_pos[c])
+            for r in rows:
+                orders[r] = o
+
+        def rec(rows, cols, depth):
+            nodes[0] += 1
+            if (
+                len(rows) <= 1
+                or not cols
+                or depth >= max_depth
+                or nodes[0] > max_nodes
+            ):
+                emit(rows, cols)
+                return
+            cand = sorted(cols, key=lambda c: base_pos[c])[:max_cand]
+            best, best_sc = None, 0
+            for c in cand:
+                arr = codes[c][rows]
+                k = int(arr.max()) + 1
+                cnt = np.bincount(arr, minlength=k)
+                lens = val_lens[c][:k]
+                sc = int(np.sum(lens * cnt * (cnt - 1)))
+                if sc > best_sc:
+                    best_sc, best = sc, c
+            if best is None or best_sc <= 0:
+                emit(rows, cols)
+                return
+            rest = [c for c in cols if c != best]
+            head = [best] + sorted(rest, key=lambda c: base_pos[c])
+            for r in rows:
+                orders[r] = head
+            arr = codes[best][rows]
+            order_idx = np.argsort(arr, kind="stable")
+            sorted_codes = arr[order_idx]
+            bounds = np.nonzero(np.diff(sorted_codes))[0] + 1
+            starts = np.concatenate(([0], bounds))
+            ends = np.concatenate((bounds, [len(rows)]))
+            for s, e in zip(starts, ends):
+                if e - s > 1:
+                    rec(rows[order_idx[s:e]], rest, depth + 1)
+
+        all_rows = np.arange(R, dtype=np.int64)
+        rec(all_rows, list(range(C)), 0)
+        for r in range(R):
+            if orders[r] is None:
+                orders[r] = list(base_set)
+        return orders
+
+    # ------------------------------------------------------------------ #
+    # bounded adjacent-swap hill-climb on a flat global order
+    # ------------------------------------------------------------------ #
+    def _hill_climb(
+        self,
+        ser,
+        order,
+        R,
+        deadline,
+        max_sweeps=20,
+    ):
+        """Try all adjacent column-pair swaps; keep only exact improvements.
+
+        Bounded by wall-clock deadline and a maximum number of sweeps. Each
+        accepted swap must strictly improve the real serial-Trie reuse score.
+        """
+        order = list(order)
+        if len(order) < 2 or R == 0:
+            return order
+        best = self._score_flat(ser, order, R)
+        n = len(order)
+        for _ in range(max_sweeps):
+            improved = False
+            for i in range(n - 1):
+                if time.time() > deadline:
+                    return order
+                order[i], order[i + 1] = order[i + 1], order[i]
+                sc = self._score_flat(ser, order, R)
+                if sc > best:
+                    best = sc
+                    improved = True
+                else:
+                    order[i], order[i + 1] = order[i + 1], order[i]
+            if not improved:
+                break
+        return order
+
+    # ------------------------------------------------------------------ #
+    # public API
+    # ------------------------------------------------------------------ #
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        # honor column merges with the existing API semantics; after this,
+        # each merge group is a single atomic column.
+        work = df.copy()
+        if col_merge:
+            for col_to_merge in col_merge:
+                present = [c for c in work.columns if c in col_to_merge]
+                if len(present) > 1:
+                    work = self.merging_columns(work, present, prepended=False)
+
+        R, C = work.shape
+        if R == 0:
+            return work.copy(), []
+        if C == 0:
+            return work.copy(), [[] for _ in range(R)]
+
+        names = [str(c) for c in work.columns]
+
+        # serialize every cell once, reuse across all candidate constructions
+        sercols = [work.iloc[:, c].map(self._ser).tolist() for c in range(C)]
+        ser = [[sercols[c][r] for c in range(C)] for r in range(R)]
+
+        # factorize columns once (integer codes + per-code string lengths)
+        codes, val_strs, val_lens = self._factorize(sercols, R, C)
+
+        # candidate 1: global frequency-ranked order
+        freq_order = self._global_freq_order(codes, val_lens, C, names)
+        candidates = [("freq", [freq_order] * R)]
+
+        # candidate 2: deterministic length-ranked order (different tradeoff)
+        len_order = None
+        if C > 1:
+            len_order = self._global_len_order(sercols, C, names)
+            if len_order != freq_order:
+                candidates.append(("len", [len_order] * R))
+
+        max_depth = col_stop if col_stop else 10
+        if row_stop is not None:
+            max_depth = min(max_depth, max(1, int(row_stop)))
+        budget = R * C
+
+        # candidate 3 / 4: conditional partition trees (bounded)
+        if C > 1 and R > 1 and budget <= 4_000_000:
+            tree_f = self._tree_orders(codes, val_lens, R, C, freq_order, max_depth)
+            if any(tree_f[r] != freq_order for r in range(R)):
+                candidates.append(("tree_f", tree_f))
+            if len_order is not None and len_order != freq_order:
+                tree_l = self._tree_orders(codes, val_lens, R, C, len_order, max_depth)
+                if any(tree_l[r] != len_order for r in range(R)):
+                    candidates.append(("tree_l", tree_l))
+
+        # select using the real serial-Trie character objective
+        best_orders, best_score = candidates[0][1], -1
+        for _, orders in candidates:
+            sc = self._score_orders(ser, orders, R)
+            if sc > best_score:
+                best_score, best_orders = sc, orders
+
+        # bounded adjacent-swap hill-climb on the best flat global order,
+        # then compare it against the current winner under the exact score.
+        if C > 2 and R > 1:
+            flat_scores = [
+                (self._score_flat(ser, o, R), o)
+                for o in (freq_order, len_order)
+                if o is not None
+            ]
+            flat_scores.sort(key=lambda t: -t[0])
+            seed = flat_scores[0][1]
+            hc_start = time.time()
+            # ~2.0s budget, scaled down for tiny tables where scoring is cheap
+            deadline = hc_start + 2.0
+            hc_order = self._hill_climb(ser, seed, R, deadline)
+            if hc_order != seed:
+                hc_score = self._score_flat(ser, hc_order, R)
+                if hc_score > best_score:
+                    best_score = hc_score
+                    best_orders = [hc_order] * R
+
+        # emit: permute each row's original values per its ordering
+        data = [[work.iat[r, c] for c in best_orders[r]] for r in range(R)]
+        out = pd.DataFrame(data, columns=list(work.columns), index=work.index)
+        out = out.astype(object)
+
+        column_orderings = [
+            [work.columns[c] for c in best_orders[r]] for r in range(R)
+        ]
+        return out, column_orderings
+
+# EVOLVE-BLOCK-END

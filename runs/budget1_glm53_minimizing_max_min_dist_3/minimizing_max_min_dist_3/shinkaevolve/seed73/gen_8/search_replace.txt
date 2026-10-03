@@ -1,0 +1,95 @@
+<NAME>
+softmin_ratio_optimizer</NAME>
+<DESCRIPTION>
+The current force-based relaxation keeps all points on a unit sphere, which caps the achievable ratio: the diameter of the configuration stays 2 while the best packing of 14 points on a sphere only reaches dmin ≈ 0.59, giving ratio² ≈ 0.09 at best, far from the reference 0.24. The true optimum of dmin/dmax is scale/rotation/translation invariant and generally does NOT lie on a sphere (the optimal configuration can have a smaller diameter relative to its minimum separation). So instead of a sphere-constrained relaxation, I directly optimize a smooth approximation of the target ratio (dmin/dmax)² over freely moving points, using L-BFGS with many random restarts. Smooth softmin/softmax over pairwise distances give useful gradients; after each run the exact ratio is computed and the best configuration kept. Random restarts make it robust; fixed seeds keep it deterministic. Points are normalized (centered, max coordinate scaled) at the end only as a convenience — this doesn't affect the score.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    def score(P):
+        D = np.linalg.norm(P[:, None, :] - P[None, :, :], axis=-1)
+        iu = np.triu_indices(n, 1)
+        dmin = D[iu].min()
+        dmax = D[iu].max()
+        if dmax <= 0:
+            return -1.0, P
+        return (dmin / dmax) ** 2, P
+
+    def relax(P, steps=4000, step0=0.05):
+        P = P / np.linalg.norm(P, axis=1, keepdims=True)
+        for t in range(steps):
+            step = step0 * (1.0 - t / steps) + 1e-4
+            diff = P[:, None, :] - P[None, :, :]
+            dist = np.linalg.norm(diff, axis=-1)
+            np.fill_diagonal(dist, 1.0)
+            # repulsive force ~ 1/dist
+            F = -diff / dist[:, :, None] ** 3
+            forces = F.sum(axis=1)
+            # extra force on the closest pair to push the minimum up
+            iu = np.triu_indices(n, 1)
+            dm = dist[iu]
+            k = np.argmin(dm)
+            i, j = iu[0][k], iu[1][k]
+            forces[i] += (P[i] - P[j]) / dm[k] ** 3
+            forces[j] += (P[j] - P[i]) / dm[k] ** 3
+            P = P + step * forces
+            P = P / np.linalg.norm(P, axis=1, keepdims=True)
+        return P
+
+    best_s, best_P = -1.0, None
+    for seed in range(12):
+        rng = np.random.RandomState(seed)
+        P0 = rng.randn(n, d)
+        # start from a reasonable configuration: cube + antipodal pairs hint
+        if seed == 0:
+            cube = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], dtype=float)
+            P0 = np.vstack([cube[:7], -cube[:7]])
+        P = relax(P0)
+        s, P = score(P)
+        if s > best_s:
+            best_s, best_P = s, P
+=======
+    from scipy.optimize import minimize
+
+    iu = np.triu_indices(n, 1)
+
+    def score(P):
+        D = np.linalg.norm(P[:, None, :] - P[None, :, :], axis=-1)
+        dmin = D[iu].min()
+        dmax = D[iu].max()
+        if dmax <= 0:
+            return -1.0
+        return (dmin / dmax) ** 2
+
+    def objective(flat):
+        P = flat.reshape(n, d)
+        diff = P[:, None, :] - P[None, :, :]
+        dist = np.sqrt((diff ** 2).sum(-1) + 1e-12)
+        dm = dist[iu]
+        beta = 20.0
+        # smooth min and max of pairwise distances
+        wmin = np.exp(-beta * dm)
+        dmin_s = (dm * wmin).sum() / wmin.sum()
+        wmax = np.exp(beta * dm)
+        dmax_s = (dm * wmax).sum() / wmax.sum()
+        # objective: maximize dmin/dmax  ->  minimize -ratio (smooth)
+        return -(dmin_s / dmax_s)
+
+    best_s, best_P = -1.0, None
+    for seed in range(60):
+        rng = np.random.RandomState(seed)
+        P0 = rng.randn(n, d)
+        if seed == 0:
+            # hint: cube vertices + antipodal-ish start
+            cube = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], dtype=float)
+            P0 = np.vstack([cube[:7], -cube[:7]])
+        elif seed == 1:
+            # hint: start from random points in a ball (not on a sphere)
+            P0 = rng.randn(n, d) * rng.rand(n, 1)
+        res = minimize(objective, P0.ravel(), method="L-BFGS-B",
+                       options={"maxiter": 500, "maxfun": 2000})
+        P = res.x.reshape(n, d)
+        s = score(P)
+        if s > best_s:
+            best_s, best_P = s, P
+>>>>>>> REPLACE
+</DIFF>

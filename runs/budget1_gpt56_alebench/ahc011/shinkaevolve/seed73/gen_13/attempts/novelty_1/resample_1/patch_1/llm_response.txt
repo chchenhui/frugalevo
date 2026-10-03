@@ -1,0 +1,359 @@
+<NAME>
+forestbeam</NAME>
+
+<DESCRIPTION>
+This version replaces the corner-forcing/A*-preface and component-count-heavy ranking with a direct diversity-preserving forest beam search.
+
+Key ideas:
+- It starts searching immediately from the given position, preserving useful structure instead of spending moves relocating the empty cell.
+- Every board is evaluated as a graph using DSU, measuring the largest acyclic component, compatible edges, cyclic vertices, and component fragmentation.
+- The beam objective strongly prioritizes the actual target metric (largest tree), while compatible edges provide a smoother gradient before large tree merges become available.
+- The next beam is selected through a mixture of strong global elites and “one best state per empty-square position”, preventing all states from collapsing into identical blank trajectories.
+- Zobrist hashing is used for both state deduplication and score memoization.
+- Paths are stored as compact persistent history nodes, allowing many explored states without copying strings.
+
+</DESCRIPTION>
+
+<CODE>
+```cpp
+// EVOLVE-BLOCK-START
+#include <bits/stdc++.h>
+using namespace std;
+
+static const int MAXN = 10;
+static const int MAXC = 100;
+
+int N, Tlim;
+uint64_t zob[MAXC][16];
+
+static inline uint64_t splitmix64(uint64_t &x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    uint64_t z = x;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+static inline int hexval(char c) {
+    return ('0' <= c && c <= '9') ? c - '0' : c - 'a' + 10;
+}
+
+static const int dr[4] = {-1, 1, 0, 0};
+static const int dc[4] = {0, 0, -1, 1};
+static const char mch[4] = {'U', 'D', 'L', 'R'};
+
+struct Eval {
+    int bestTree;
+    int components;
+    int compatibleEdges;
+    int cyclicVertices;
+    long long rank;
+};
+
+struct DSU {
+    int p[MAXC], sz[MAXC], ed[MAXC];
+
+    void init(int cells) {
+        for (int i = 0; i < cells; ++i) {
+            p[i] = i;
+            sz[i] = 0;
+            ed[i] = 0;
+        }
+    }
+    int find(int x) {
+        while (p[x] != x) {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        return x;
+    }
+    void edge(int a, int b) {
+        a = find(a);
+        b = find(b);
+        if (a == b) {
+            ++ed[a];
+            return;
+        }
+        if (sz[a] < sz[b]) swap(a, b);
+        p[b] = a;
+        sz[a] += sz[b];
+        ed[a] += ed[b] + 1;
+    }
+};
+
+struct Board {
+    array<unsigned char, MAXC> a{};
+    int empty = 0;
+    uint64_t hash = 0;
+
+    bool move(int d) {
+        int r = empty / N, c = empty % N;
+        int nr = r + dr[d], nc = c + dc[d];
+        if (nr < 0 || nr >= N || nc < 0 || nc >= N) return false;
+        int q = nr * N + nc;
+        int v = a[q];
+
+        hash ^= zob[empty][0];
+        hash ^= zob[q][v];
+        hash ^= zob[empty][v];
+        hash ^= zob[q][0];
+
+        a[empty] = (unsigned char)v;
+        a[q] = 0;
+        empty = q;
+        return true;
+    }
+};
+
+unordered_map<uint64_t, Eval> evalCache;
+
+Eval evaluate(const Board &b) {
+    auto it = evalCache.find(b.hash);
+    if (it != evalCache.end()) return it->second;
+
+    const int cells = N * N;
+    DSU uf;
+    uf.init(cells);
+
+    for (int i = 0; i < cells; ++i) {
+        if (b.a[i] != 0) uf.sz[i] = 1;
+    }
+
+    int compat = 0;
+    for (int r = 0; r < N; ++r) {
+        for (int c = 0; c < N; ++c) {
+            int x = r * N + c;
+            int v = b.a[x];
+            if (v == 0) continue;
+
+            if (c + 1 < N) {
+                int y = x + 1, w = b.a[y];
+                if (w && (v & 4) && (w & 1)) {
+                    uf.edge(x, y);
+                    ++compat;
+                }
+            }
+            if (r + 1 < N) {
+                int y = x + N, w = b.a[y];
+                if (w && (v & 8) && (w & 2)) {
+                    uf.edge(x, y);
+                    ++compat;
+                }
+            }
+        }
+    }
+
+    int best = 0, comp = 0, cyclicVertices = 0;
+    for (int i = 0; i < cells; ++i) {
+        if (uf.find(i) != i || uf.sz[i] == 0) continue;
+        ++comp;
+        if (uf.ed[i] == uf.sz[i] - 1) best = max(best, uf.sz[i]);
+        if (uf.ed[i] >= uf.sz[i]) cyclicVertices += uf.sz[i];
+    }
+
+    // The official score is governed by bestTree.  The remaining terms
+    // provide a useful local-search gradient while preserving that priority.
+    long long rank = 0;
+    rank += 1000000000LL * best;
+    rank += 18000LL * compat;
+    rank -= 26000LL * max(0, comp - 1);
+    rank -= 9000LL * cyclicVertices;
+
+    Eval e{best, comp, compat, cyclicVertices, rank};
+    if (evalCache.size() < 1800000) evalCache.emplace(b.hash, e);
+    return e;
+}
+
+struct History {
+    int parent;
+    char move;
+};
+
+struct State {
+    Board board;
+    Eval ev;
+    int hist;
+    int depth;
+    int previousDir;
+    long long value;
+};
+
+struct Candidate {
+    State s;
+};
+
+static inline bool betterState(const Candidate &x, const Candidate &y) {
+    if (x.s.value != y.s.value) return x.s.value > y.s.value;
+    if (x.s.ev.bestTree != y.s.ev.bestTree)
+        return x.s.ev.bestTree > y.s.ev.bestTree;
+    return x.s.depth < y.s.depth;
+}
+
+string reconstruct(const vector<History> &hist, int node) {
+    string ans;
+    while (node > 0) {
+        ans.push_back(hist[node].move);
+        node = hist[node].parent;
+    }
+    reverse(ans.begin(), ans.end());
+    return ans;
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    cin >> N >> Tlim;
+    int cells = N * N;
+
+    uint64_t seed = 0x123456789abcdefULL;
+    for (int i = 0; i < MAXC; ++i)
+        for (int v = 0; v < 16; ++v)
+            zob[i][v] = splitmix64(seed);
+
+    Board initial;
+    for (int r = 0; r < N; ++r) {
+        string s;
+        cin >> s;
+        for (int c = 0; c < N; ++c) {
+            int id = r * N + c;
+            initial.a[id] = (unsigned char)hexval(s[c]);
+            if (initial.a[id] == 0) initial.empty = id;
+            initial.hash ^= zob[id][initial.a[id]];
+            seed ^= (uint64_t)(unsigned char)s[c] + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+        }
+    }
+
+    mt19937 rng((uint32_t)(seed ^ (seed >> 32)));
+
+    int width;
+    if (N <= 6) width = 850;
+    else if (N == 7) width = 650;
+    else if (N == 8) width = 470;
+    else if (N == 9) width = 330;
+    else width = 230;
+
+    vector<History> history;
+    history.reserve(2500000);
+    history.push_back({-1, ' '});
+
+    Eval initEval = evaluate(initial);
+    State root{initial, initEval, 0, 0, -1, initEval.rank};
+
+    vector<State> beam;
+    beam.push_back(root);
+
+    int bestS = initEval.bestTree;
+    int bestK = 0;
+    int bestHist = 0;
+    const int full = cells - 1;
+
+    unordered_map<uint64_t, int> reachedDepth;
+    reachedDepth.reserve(1800000);
+    reachedDepth[initial.hash] = 0;
+
+    auto start = chrono::steady_clock::now();
+
+    for (int depth = 0; depth < Tlim && !beam.empty(); ++depth) {
+        if ((depth & 7) == 0) {
+            auto now = chrono::steady_clock::now();
+            long long ms = chrono::duration_cast<chrono::milliseconds>(now - start).count();
+            if (ms > 2780) break;
+        }
+
+        vector<Candidate> cand;
+        cand.reserve(beam.size() * 3);
+
+        for (const State &cur : beam) {
+            for (int d = 0; d < 4; ++d) {
+                if (cur.previousDir >= 0 && (cur.previousDir ^ 1) == d) continue;
+
+                Board nb = cur.board;
+                if (!nb.move(d)) continue;
+
+                int nd = cur.depth + 1;
+                auto it = reachedDepth.find(nb.hash);
+                if (it != reachedDepth.end()) {
+                    if (it->second <= nd) continue;
+                    it->second = nd;
+                } else if (reachedDepth.size() < 1800000) {
+                    reachedDepth.emplace(nb.hash, nd);
+                }
+
+                Eval ev = evaluate(nb);
+
+                // Mild blank-position noise avoids repeatedly keeping exactly
+                // equivalent structural states in the same region.
+                int br = nb.empty / N, bc = nb.empty % N;
+                long long val = ev.rank - 3LL * nd;
+                val += ((br + bc) & 1) ? 7 : 0;
+
+                int h = (int)history.size();
+                history.push_back({cur.hist, mch[d]});
+                cand.push_back({State{nb, ev, h, nd, d, val}});
+
+                if (ev.bestTree > bestS ||
+                    (ev.bestTree == full && bestS == full && nd < bestK)) {
+                    bestS = ev.bestTree;
+                    bestK = nd;
+                    bestHist = h;
+                }
+            }
+        }
+
+        if (cand.empty()) break;
+        sort(cand.begin(), cand.end(), betterState);
+
+        vector<State> next;
+        next.reserve(width);
+        vector<char> used(cand.size(), 0);
+
+        // Diversity phase: retain the best representative for every possible
+        // empty-square position before filling the rest with global elites.
+        vector<int> bestAtBlank(cells, -1);
+        for (int i = 0; i < (int)cand.size(); ++i) {
+            int p = cand[i].s.board.empty;
+            if (bestAtBlank[p] == -1) bestAtBlank[p] = i;
+        }
+        for (int p = 0; p < cells && (int)next.size() < width / 4; ++p) {
+            int i = bestAtBlank[p];
+            if (i >= 0) {
+                used[i] = 1;
+                next.push_back(cand[i].s);
+            }
+        }
+
+        int eliteTarget = (width * 3) / 4;
+        for (int i = 0; i < (int)cand.size() && (int)next.size() < eliteTarget; ++i) {
+            if (!used[i]) {
+                used[i] = 1;
+                next.push_back(cand[i].s);
+            }
+        }
+
+        // Fill remaining places from a shuffled high-quality fringe.
+        vector<int> fringe;
+        int lim = min((int)cand.size(), width * 4);
+        for (int i = eliteTarget; i < lim; ++i)
+            if (!used[i]) fringe.push_back(i);
+        shuffle(fringe.begin(), fringe.end(), rng);
+        for (int i : fringe) {
+            if ((int)next.size() >= width) break;
+            used[i] = 1;
+            next.push_back(cand[i].s);
+        }
+        for (int i = 0; i < (int)cand.size() && (int)next.size() < width; ++i) {
+            if (!used[i]) next.push_back(cand[i].s);
+        }
+
+        beam.swap(next);
+
+        if (history.size() > 2400000) break;
+    }
+
+    cout << reconstruct(history, bestHist) << '\n';
+    return 0;
+}
+// EVOLVE-BLOCK-END
+```
+</CODE>

@@ -1,0 +1,158 @@
+<NAME>
+steiner_tree_broadcast_with_capacity
+
+NAME>
+<DESCRIPTION>
+Implement a directed Takahashi-Matsuyama-style Steiner heuristic to build a shared broadcast tree instead of independent per-destination shortest paths. Shortest paths to different dsts often share edges (e.g., src->hub), so routing all partitions over one shared tree removes redundant transfers and cuts total cost. Each candidate merge uses a fresh graph copy (no mutation during iteration); Dijkstra runs from the growing tree's node set (reverse-neighborhood trick for directed edges) to find the cheapest connection of a new terminal; per-edge aggregate partition flow is checked against throughput capacity before committing. Only the final tree's per-partition full src->dst paths are emitted.
+
+DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Pre-compute single-source shortest paths once (avoids repeated Dijkstra runs)
+    dist, paths = nx.single_source_dijkstra(h, src, weight="cost")
+
+    for dst in dsts:
+        # Consider multiple candidate paths to exploit multi-network topologies
+        best_path = paths.get(dst)
+        best_cost = dist.get(dst, float("inf"))
+        try:
+            count = 0
+            for cand in nx.shortest_simple_paths(h, src, dst, weight="cost"):
+                cand_cost = sum(h[u][v]["cost"] for u, v in zip(cand, cand[1:]))
+                if cand_cost < best_cost:
+                    best_cost = cand_cost
+                    best_path = cand
+                count += 1
+                if count >= 5:
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            pass
+
+        path = best_path
+        if path is None:
+            path = nx.dijkstra_path(h, src, dst, weight="cost")
+
+        # Record each edge once per partition (dedupe shared segments)
+        for j in range(bc_topology.num_partitions):
+            seen_edges = set()
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                if (s, t) in seen_edges:
+                    continue
+                seen_edges.add((s, t))
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def _edge_key(s, t):
+    return (s, t)
+
+
+def _try_connect_terminal(tree_nodes, dst, h, edge_partition_flow, num_partitions, throughput_attr="throughput"):
+    """
+    Find the cheapest capacity-feasible directed path from any tree node to dst.
+    Returns (path, cost) or (None, inf). Uses Dijkstra restricted to tree-reachable starts.
+    Non-mutating: works on a copy of the graph with infeasible edges removed.
+    """
+    best_path = None
+    best_cost = float("inf")
+    # Try Dijkstra from each tree node on a filtered copy (no mutation of h).
+    work = h.copy()
+    # Remove edges whose aggregate flow (already committed) + this partition demand
+    # would exceed throughput.
+    for (u, v, data) in list(work.edges(data=True)):
+        tp = data.get(throughput_attr)
+        if tp is None:
+            continue
+        used = edge_partition_flow.get(_edge_key(u, v), 0)
+        if used + 1 > tp + 1e-9:
+            work.remove_edge(u, v)
+
+    for start in tree_nodes:
+        if start == dst:
+            # Already connected: no new edges needed.
+            return ([dst], 0.0)
+        try:
+            dist, path = nx.single_source_dijkstra(work, start, dst, weight="cost")
+        except nx.NetworkXNoPath:
+            continue
+        c = dist.get(dst, float("inf"))
+        if c < best_cost:
+            best_cost = c
+            best_path = path[dst]
+    return best_path, best_cost
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    # ---- Steiner-tree style shared broadcast tree (non-mutating) ----
+    # Track per-edge committed partition flow for capacity feasibility.
+    edge_partition_flow = {}
+    tree_edges = set()  # set of (s, t)
+    tree_nodes = {src}
+
+    # Order terminals by shortest-path cost from src (cheap heuristic ordering).
+    try:
+        dist_src, _ = nx.single_source_dijkstra(h, src, weight="cost")
+    except Exception:
+        dist_src = {}
+    ordered_dsts = sorted(dsts, key=lambda d: dist_src.get(d, float("inf")))
+
+    terminals_in_tree = {src}
+    for dst in ordered_dsts:
+        if dst in terminals_in_tree:
+            continue
+        path, cost = _try_connect_terminal(
+            tree_nodes, dst, h, edge_partition_flow, num_partitions
+        )
+        if path is None:
+            # Fallback: plain Dijkstra without capacity filter (best effort).
+            try:
+                path = nx.dijkstra_path(h, src, dst, weight="cost")
+            except nx.NetworkXNoPath:
+                continue
+        # Commit the new branch edges (whole per-edge flow committed once).
+        for i in range(len(path) - 1):
+            s, t = path[i], path[i + 1]
+            key = _edge_key(s, t)
+            if key not in tree_edges:
+                tree_edges.add(key)
+                tree_nodes.update([s, t])
+            # Each partition traverses this edge (aggregate flow).
+            edge_partition_flow[key] = edge_partition_flow.get(key, 0) + num_partitions
+        terminals_in_tree.add(dst)
+
+    # ---- Emit whole per-partition src->dst paths over the shared tree ----
+    # Build a subgraph of the tree for path extraction.
+    tree = nx.DiGraph()
+    tree.add_nodes_from(h.nodes())
+    for (s, t) in tree_edges:
+        if h.has_edge(s, t):
+            tree.add_edge(s, t, **h[s][t])
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    for dst in dsts:
+        if dst == src:
+            continue
+        try:
+            path = nx.shortest_path(tree, src, dst)  # unweighted: unique tree routes
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            try:
+                path = nx.dijkstra_path(h, src, dst, weight="cost")
+            except nx.NetworkXNoPath:
+                continue
+        for j in range(bc_topology.num_partitions):
+            for i in range(len(path) - 1):
+                s, t = path[i], path[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+>>>>>>> REPLACE
+DIFF>

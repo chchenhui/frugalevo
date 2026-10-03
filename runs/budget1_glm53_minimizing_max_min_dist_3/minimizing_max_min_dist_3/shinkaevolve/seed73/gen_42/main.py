@@ -1,0 +1,233 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.optimize import minimize
+
+N, D = 14, 3
+PAIRS_I, PAIRS_J = np.triu_indices(N, k=1)
+ANTIPODAL_TARGET = 0.4903  # just above known-best dmin/dmax (~0.4899)
+
+
+def _pair_dists(P):
+    return np.linalg.norm(P[PAIRS_I] - P[PAIRS_J], axis=1)
+
+
+def _ratio(pts):
+    ds = _pair_dists(pts)
+    dmax = ds.max()
+    if dmax <= 0:
+        return -1.0
+    return ds.min() / dmax
+
+
+def _unit(v):
+    return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+
+
+def _normalize(pts):
+    ds = _pair_dists(pts)
+    dmax = ds.max()
+    if dmax > 0:
+        pts = pts / dmax
+    return pts
+
+
+def _repulsion_stage(pts, iters=400, step=0.03):
+    """Diameter-normalized inverse-power repulsion to spread close pairs."""
+    pts = pts.copy()
+    for _ in range(iters):
+        diff = pts[PAIRS_I] - pts[PAIRS_J]
+        dist = np.sqrt(np.maximum((diff * diff).sum(-1), 1e-18))
+        dmax = dist.max()
+        if dmax <= 0:
+            break
+        pts /= dmax
+        diff = pts[PAIRS_I] - pts[PAIRS_J]
+        dist = np.sqrt(np.maximum((diff * diff).sum(-1), 1e-18))
+        w = 1.0 / dist ** 12
+        forces = (w[:, None] * diff) / dist[:, None]
+        grad = np.zeros_like(pts)
+        np.add.at(grad, PAIRS_I, forces)
+        np.add.at(grad, PAIRS_J, -forces)
+        norm = np.linalg.norm(grad, axis=1, keepdims=True)
+        norm[norm == 0] = 1.0
+        pts += step * grad / norm
+        step *= 0.995
+    return pts
+
+
+def _slsqp_cascade(pts, rng, passes=((300, 1e-12), (300, 1e-15), (300, 1e-16))):
+    """Escalating SLSQP passes with tiny perturbation restarts between passes.
+    Every pass is guarded: keep the best configuration seen (risk-free)."""
+    pts = _normalize(pts)
+    best_pts = pts.copy()
+    best_r = _ratio(pts)
+
+    def objective(flat):
+        return -_pair_dists(flat.reshape(N, D)).min()
+
+    def constraint(flat):
+        return 1.0 - _pair_dists(flat.reshape(N, D)).max()
+
+    cur = pts.copy()
+    for maxiter, ftol in passes:
+        res = minimize(objective, cur.ravel(), method='SLSQP',
+                       constraints={'type': 'ineq', 'fun': constraint},
+                       options={'maxiter': maxiter, 'ftol': ftol})
+        out = res.x.reshape(N, D)
+        if np.all(np.isfinite(out)):
+            out = _normalize(out)
+            r = _ratio(out)
+            if r > best_r:
+                best_r, best_pts = r, out
+            cur = out
+        # tiny kick to escape a stalled active set
+        cur = _normalize(cur + 1e-6 * rng.standard_normal(cur.shape))
+
+    return best_pts, best_r
+
+
+def _antipodal_optimize(seed_pts, rng, passes=((300, 1e-13), (300, 1e-16))):
+    """Reparameterize as 7 antipodal pairs; optimize the 7 free vectors."""
+    pts = _normalize(seed_pts - seed_pts.mean(0))
+    # match each point to its best antipodal partner
+    cost = np.linalg.norm(pts[:, None, :] + pts[None, :, :], axis=2)
+    np.fill_diagonal(cost, np.inf)
+    partner = np.argmin(cost, axis=1)
+    mutual = partner[partner] == np.arange(N)
+    if not np.all(mutual):
+        return None, -1.0
+    # build 7 representative vectors
+    reps = []
+    seen = set()
+    for i in range(N):
+        if i not in seen and partner[i] not in seen:
+            reps.append(pts[i] - pts[partner[i]])
+            seen.add(i)
+            seen.add(partner[i])
+    if len(reps) != 7:
+        return None, -1.0
+    V = np.array(reps)  # (7,3); config = +-V rows
+
+    def build(vflat):
+        Vm = vflat.reshape(7, 3)
+        return np.vstack([Vm, -Vm])
+
+    def objective(vflat):
+        return -_pair_dists(build(vflat)).min()
+
+    def constraint(vflat):
+        return 1.0 - _pair_dists(build(vflat)).max()
+
+    best_v = V.copy()
+    best_pts = build(V.ravel())
+    best_r = _ratio(best_pts)
+    cur = V.copy()
+    for maxiter, ftol in passes:
+        res = minimize(objective, cur.ravel(), method='SLSQP',
+                       constraints={'type': 'ineq', 'fun': constraint},
+                       options={'maxiter': maxiter, 'ftol': ftol})
+        out = res.x.reshape(7, 3)
+        if np.all(np.isfinite(out)):
+            cfg = _normalize(build(out.ravel()))
+            r = _ratio(cfg)
+            if r > best_r:
+                best_r, best_v, best_pts = r, out, cfg
+            cur = out
+        cur = cur + 1e-6 * rng.standard_normal(cur.shape)
+    return best_pts, best_r
+
+
+def _icosahedron():
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    ico = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    ], dtype=float)
+    return _unit(ico)
+
+
+def _fibonacci_sphere(offset=0.0):
+    k = np.arange(N) + 0.5
+    ph = np.arccos(1.0 - 2.0 * k / N)
+    th = np.pi * (1.0 + 5.0 ** 0.5) * k + offset
+    return np.stack([np.cos(th) * np.sin(ph),
+                     np.sin(th) * np.sin(ph),
+                     np.cos(ph)], axis=1)
+
+
+def _seeds(rng):
+    seeds = []
+    # Antipodal 7-ring seeds (heptagonal antiprism style) — likely symmetry class
+    for z in (0.35, 0.42, 0.5):
+        r = np.sqrt(max(1.0 - z * z, 1e-9))
+        th1 = np.arange(7) * (2 * np.pi / 7)
+        th2 = th1 + np.pi / 7
+        up = np.stack([r * np.cos(th1), r * np.sin(th1),
+                       np.full(7, z)], axis=1)
+        dn = np.stack([r * np.cos(th2), r * np.sin(th2),
+                       np.full(7, -z)], axis=1)
+        seeds.append(np.vstack([up, dn]))
+    # Icosahedron + 2 poles
+    ico = _icosahedron()
+    for _ in range(2):
+        extra = np.array([[0, 0, 1], [0, 0, -1]]) + 0.05 * rng.standard_normal((2, 3))
+        seeds.append(np.vstack([ico, _unit(extra)]))
+    # Fibonacci variants
+    for off in (0.0, 0.7, 1.9):
+        seeds.append(_fibonacci_sphere(off))
+    # Random on sphere
+    for _ in range(4):
+        seeds.append(_unit(rng.standard_normal((N, D))))
+    return seeds
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3 dimensions in order to maximize the ratio of
+    minimum to maximum pairwise distance.
+
+    Returns
+        points: np.ndarray of shape (14, 3)
+    """
+    rng = np.random.default_rng(42)
+    best_pts, best_ratio = None, -1.0
+
+    for init in _seeds(rng):
+        for cand in (init, _repulsion_stage(init)):
+            # antipodal-parameterized optimization first (low-dimensional)
+            apt_pts, apt_r = _antipodal_optimize(cand, rng)
+            if apt_pts is not None and apt_r > best_ratio:
+                best_ratio, best_pts = apt_r, apt_pts
+            # full 14-point escalating cascade
+            pts, r = _slsqp_cascade(cand, rng)
+            if r > best_ratio:
+                best_ratio, best_pts = r, pts
+            # symmetrize the cascade output and re-polish antipodally
+            sym_pts, sym_r = _antipodal_optimize(pts, rng,
+                                                 passes=((200, 1e-15),))
+            if sym_pts is not None and sym_r > best_ratio:
+                best_ratio, best_pts = sym_r, sym_pts
+        if best_ratio >= ANTIPODAL_TARGET:
+            break
+
+    if best_pts is None:
+        np.random.seed(42)
+        best_pts = np.random.randn(N, D)
+
+    # final tiny polish on the winner
+    pts, r = _slsqp_cascade(best_pts, rng,
+                            passes=((200, 1e-15), (200, 1e-16)))
+    if r > best_ratio:
+        best_pts = pts
+
+    # normalize into [-1,1]^3 (convenience only)
+    best_pts = best_pts - best_pts.mean(0)
+    scale = np.abs(best_pts).max()
+    if scale > 0:
+        best_pts = best_pts / scale
+
+    return np.asarray(best_pts, dtype=float)
+
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,125 @@
+<NAME>
+disjoint_partition_routing_with_overlay_multicast
+</NAME>
+<DESCRIPTION>
+The current algorithm routes every partition along the same single shortest path per destination, causing redundant transfers over shared edges and ignoring multi-network parallel paths. A much cheaper broadcast structure is a two-level overlay: (1) build a minimum-cost Steiner-like multicast tree from src to all destinations at the *aggregate* level using shortest-path distances (this shares links, so the data is sent over each tree edge only once instead of num_partitions times), and (2) assign each partition a different parallel path (k shortest node/edge-disjoint paths) so load is balanced across networks and no single bottleneck link carries all partitions. This reduces total cost both by multicast sharing (avoiding redundant src->relay transfers) and by spreading partitions across disjoint low-cost routes.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h))))
+
+    # Clean out edges with missing cost data (avoid routing through unknown-cost links)
+    for u, v in list(h.edges()):
+        if h[u][v].get("cost") is None:
+            h.remove_edge(u, v)
+
+    # --- Step 1: Build a shared low-cost multicast overlay (Steiner-like) ---
+    # Compute pairwise shortest-path distances from src to all dsts.
+    dist, paths_from_src = nx.single_source_dijkstra(h, src, weight="cost")
+
+    # Build a metric closure over {src} U dsts, then a MST on it to share links.
+    terminals = [src] + [d for d in dsts if d in dist]
+    closure = nx.Graph()
+    # Precompute pairwise shortest paths between terminals
+    pair_paths = {}
+    all_pairs_dists = {}
+    for t in terminals:
+        d_t, p_t = nx.single_source_dijkstra(h, t, weight="cost")
+        all_pairs_dists[t] = d_t
+        for u in terminals:
+            if u == t or u not in d_t:
+                continue
+            closure.add_edge(t, u, weight=d_t[u])
+            pair_paths[(t, u)] = p_t[u]
+
+    mst = nx.minimum_spanning_tree(closure, weight="weight")
+
+    # Expand the MST back into the original graph -> overlay edges used by broadcast tree
+    overlay_edges = set()
+    tree_paths = {}  # (root, dst) -> path in original graph
+    for t, u, data in mst.edges(data=True):
+        p = pair_paths.get((t, u)) or list(reversed(pair_paths[(u, t)]))
+        tree_paths[(t, u)] = p
+        tree_paths[(u, t)] = list(reversed(p))
+        for i in range(len(p) - 1):
+            overlay_edges.add((p[i], p[i + 1]))
+
+    # For each terminal, find its path in the overlay tree from src
+    # by walking the tree structure.
+    tree_adj = {t: [] for t in terminals}
+    for t, u in mst.edges():
+        tree_adj[t].append(u)
+        tree_adj[u].append(t)
+
+    overlay_path_to = {src: [src]}
+    visited = {src}
+    queue = [src]
+    while queue:
+        node = queue.pop(0)
+        for nb in tree_adj[node]:
+            if nb in visited:
+                continue
+            visited.add(nb)
+            seg = tree_paths[(node, nb)]
+            overlay_path_to[nb] = overlay_path_to[node] + seg[1:]
+            queue.append(nb)
+
+    # --- Step 2: Build the BroadCastTopology with partition-level load balancing ---
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        # Base overlay path (shared, low-cost)
+        base_path = overlay_path_to.get(dst) or paths_from_src.get(dst)
+        if base_path is None:
+            # Fallback: direct dijkstra on full graph
+            base_path = nx.dijkstra_path(G, src, dst, weight="cost")
+
+        # Find k alternative edge-disjoint paths to balance load across networks
+        try:
+            alt_paths = list(nx.shortest_simple_paths(h, src, dst, weight="cost"))
+        except Exception:
+            alt_paths = []
+
+        # Deduplicate and cap the number of alternatives
+        candidate_paths = []
+        seen = set()
+        for p in [base_path] + alt_paths:
+            key = tuple(p)
+            if key not in seen:
+                seen.add(key)
+                candidate_paths.append(p)
+            if len(candidate_paths) >= num_partitions:
+                break
+
+        for j in range(num_partitions):
+            # Round-robin assignment of partitions across candidate paths,
+            # prioritizing the shared overlay path first (cheapest aggregate).
+            if len(candidate_paths) == 1 or j < len(candidate_paths) - 1:
+                path = base_path if j == 0 else candidate_paths[j % len(candidate_paths)]
+            else:
+                path = candidate_paths[j % len(candidate_paths)]
+            if len(candidate_paths) == 1:
+                path = base_path
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

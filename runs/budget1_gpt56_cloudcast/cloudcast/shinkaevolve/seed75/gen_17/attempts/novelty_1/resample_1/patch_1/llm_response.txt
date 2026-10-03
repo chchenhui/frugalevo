@@ -1,0 +1,353 @@
+<NAME>
+exact_shared_steiner
+</NAME>
+
+<DESCRIPTION>
+Replace the destination-order-dependent greedy attachment with an exact directed-Steiner dynamic program for modest destination sets. The DP explicitly evaluates every useful subset merge at each relay cloud, then applies reverse shortest-path closure to discover cheap shared trunks. This minimizes the union cost of broadcast links rather than merely minimizing the next attachment path. For larger requests, the existing scalable greedy strategy is retained, but corrected to treat already-installed links as zero marginal-cost edges. Invalid costs and unreachable destinations are handled without failing otherwise valid broadcast configurations.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+=======
+import heapq
+import math
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+=======
+EXACT_TERMINAL_LIMIT = 11
+EPSILON = 1e-12
+
+
+def _safe_cost(data):
+    """Return a finite non-negative edge cost, or infinity for invalid links."""
+    try:
+        value = float(data.get("cost"))
+        if math.isfinite(value) and value >= 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    return math.inf
+
+
+def _path_edges(path):
+    return {(u, v) for u, v in zip(path, path[1:])}
+
+
+def _reverse_closure(graph, initial_costs, initial_decisions):
+    """
+    Extend DP states upstream using a multi-source Dijkstra traversal over
+    reverse edges.  A state rooted at predecessor forwards through `node`.
+    """
+    distances = dict(initial_costs)
+    decisions = dict(initial_decisions)
+    queue = []
+
+    for node, distance in distances.items():
+        if math.isfinite(distance):
+            heapq.heappush(queue, (distance, str(node), node))
+
+    while queue:
+        distance, _, node = heapq.heappop(queue)
+        if distance > distances.get(node, math.inf) + EPSILON:
+            continue
+
+        for predecessor in graph.predecessors(node):
+            candidate = distance + _safe_cost(graph[predecessor][node])
+            if candidate + EPSILON < distances.get(predecessor, math.inf):
+                distances[predecessor] = candidate
+                decisions[predecessor] = ("edge", node)
+                heapq.heappush(queue, (candidate, str(predecessor), predecessor))
+
+    return distances, decisions
+
+
+def _exact_steiner_tree(graph, src, terminals):
+    """
+    Find a minimum-cost directed tree rooted at src reaching all terminals.
+
+    dp[mask][node] is the cost of a subtree rooted at node.  At every cloud,
+    subset states can merge and thereby reuse a single upstream transfer.
+    """
+    nodes = list(graph.nodes())
+    count = len(terminals)
+    full_mask = (1 << count) - 1
+    dp = [None] * (full_mask + 1)
+    decisions = [None] * (full_mask + 1)
+
+    for index, terminal in enumerate(terminals):
+        mask = 1 << index
+        initial = {node: math.inf for node in nodes}
+        initial[terminal] = 0.0
+        dp[mask], decisions[mask] = _reverse_closure(
+            graph, initial, {terminal: ("terminal",)}
+        )
+
+    for mask in range(1, full_mask + 1):
+        if not (mask & (mask - 1)):
+            continue
+
+        initial = {node: math.inf for node in nodes}
+        initial_decisions = {}
+        subset = (mask - 1) & mask
+        while subset:
+            other = mask ^ subset
+            if other and subset < other:
+                for node in nodes:
+                    candidate = dp[subset][node] + dp[other][node]
+                    if candidate + EPSILON < initial[node]:
+                        initial[node] = candidate
+                        initial_decisions[node] = ("merge", subset, other)
+            subset = (subset - 1) & mask
+
+        dp[mask], decisions[mask] = _reverse_closure(
+            graph, initial, initial_decisions
+        )
+
+    if not math.isfinite(dp[full_mask].get(src, math.inf)):
+        return None
+
+    edges = set()
+    active = set()
+
+    def collect(mask, node):
+        state = (mask, node)
+        if state in active:
+            return
+        active.add(state)
+        decision = decisions[mask].get(node)
+        if decision:
+            if decision[0] == "edge":
+                edges.add((node, decision[1]))
+                collect(mask, decision[1])
+            elif decision[0] == "merge":
+                collect(decision[1], node)
+                collect(decision[2], node)
+        active.discard(state)
+
+    collect(full_mask, src)
+    return edges
+
+
+def _greedy_shared_tree(graph, src, terminals):
+    """Scalable fallback with installed broadcast edges free to reuse."""
+    tree_nodes = {src}
+    tree_edges = set()
+    remaining = set(terminals)
+
+    while remaining:
+        distances = {node: math.inf for node in graph.nodes()}
+        parents = {}
+        queue = [(0.0, str(src), src)]
+        distances[src] = 0.0
+
+        while queue:
+            distance, _, node = heapq.heappop(queue)
+            if distance > distances[node] + EPSILON:
+                continue
+            for _, nxt, data in graph.out_edges(node, data=True):
+                edge_cost = 0.0 if (node, nxt) in tree_edges else _safe_cost(data)
+                candidate = distance + edge_cost
+                if candidate + EPSILON < distances[nxt]:
+                    distances[nxt] = candidate
+                    parents[nxt] = node
+                    heapq.heappush(queue, (candidate, str(nxt), nxt))
+
+        reachable = [dst for dst in remaining if math.isfinite(distances[dst])]
+        if not reachable:
+            return None
+
+        destination = min(reachable, key=lambda dst: (distances[dst], str(dst)))
+        path = [destination]
+        while path[-1] not in tree_nodes:
+            parent = parents.get(path[-1])
+            if parent is None:
+                return None
+            path.append(parent)
+        path.reverse()
+        tree_edges.update(_path_edges(path))
+        tree_nodes.update(path)
+        remaining.remove(destination)
+
+    return tree_edges
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Build a shared multicast tree rather than independently charging each
+    destination for an identical source-side transfer.
+    """
+    destinations = list(dict.fromkeys(dsts))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    if not destinations:
+        return bc_topology
+
+    # Ignore invalid/unpriced links: they cannot be used to make a reliable
+    # cost-minimizing route.
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    h.remove_edges_from([
+        (u, v) for u, v, data in h.edges(data=True)
+        if data.get("cost") is None
+    ])
+
+    def tree_cost(edges):
+        return sum(h[u][v]["cost"] for u, v in edges)
+
+    def path_union(paths):
+        return {(path[i], path[i + 1])
+                for path in paths
+                for i in range(len(path) - 1)}
+
+    # Independent shortest paths are a safe baseline.  The union is important:
+    # shared edges are broadcast once and can fan out at downstream clouds.
+    baseline_paths = [
+        nx.dijkstra_path(h, src, dst, weight="cost") for dst in destinations
+    ]
+    best_edges = path_union(baseline_paths)
+    best_cost = tree_cost(best_edges)
+
+    # Try each destination as the first branch of a greedy directed Steiner
+    # tree.  Each subsequent receiver attaches to any existing tree node, so
+    # low-cost trunks are reused instead of being retransmitted from src.
+    for first_dst in destinations:
+        tree_nodes = {src}
+        tree_edges = set()
+        first_path = nx.dijkstra_path(h, src, first_dst, weight="cost")
+        tree_edges.update(path_union([first_path]))
+        tree_nodes.update(first_path)
+        remaining = set(destinations) - {first_dst}
+
+        while remaining:
+            chosen_path = None
+            chosen_dst = None
+            chosen_cost = float("inf")
+
+            for dst in remaining:
+                try:
+                    distance, path = nx.multi_source_dijkstra(
+                        h, tree_nodes, dst, weight="cost"
+                    )
+                except nx.NetworkXNoPath:
+                    continue
+                if distance < chosen_cost:
+                    chosen_cost = distance
+                    chosen_path = path
+                    chosen_dst = dst
+
+            if chosen_path is None:
+                # Preserve the existing failure behavior for unreachable nodes.
+                raise nx.NetworkXNoPath(
+                    "No multicast route from {} to {}".format(src, remaining)
+                )
+
+            tree_edges.update(path_union([chosen_path]))
+            tree_nodes.update(chosen_path)
+            remaining.remove(chosen_dst)
+
+        candidate_cost = tree_cost(tree_edges)
+        if candidate_cost < best_cost:
+            best_edges = tree_edges
+            best_cost = candidate_cost
+
+    # A tree edge is represented once in the selected topology; each partition
+    # follows its source-to-destination branch and can transfer concurrently.
+    multicast_graph = nx.DiGraph()
+    for u, v in best_edges:
+        multicast_graph.add_edge(u, v, **G[u][v])
+
+    for dst in destinations:
+        path = nx.dijkstra_path(multicast_graph, src, dst, weight="cost")
+        edge_path = [
+            [path[i], path[i + 1], G[path[i]][path[i + 1]]]
+            for i in range(len(path) - 1)
+        ]
+        for partition in range(bc_topology.num_partitions):
+            bc_topology.set_dst_partition_paths(dst, partition, list(edge_path))
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    """Construct a low-cost shared tree for concurrent cloud broadcast."""
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    if src not in G:
+        return bc_topology
+
+    destinations = list(dict.fromkeys(dsts))
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    h.remove_edges_from([
+        (u, v) for u, v, data in h.edges(data=True)
+        if not math.isfinite(_safe_cost(data))
+    ])
+
+    if src in bc_topology.paths:
+        for partition in range(num_partitions):
+            bc_topology.set_dst_partition_paths(src, partition, [])
+
+    terminals = []
+    for dst in destinations:
+        if dst == src or dst not in h:
+            continue
+        try:
+            nx.dijkstra_path(h, src, dst, weight=lambda u, v, d: _safe_cost(d))
+            terminals.append(dst)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+
+    if not terminals:
+        return bc_topology
+
+    if len(terminals) <= EXACT_TERMINAL_LIMIT:
+        selected_edges = _exact_steiner_tree(h, src, terminals)
+    else:
+        selected_edges = _greedy_shared_tree(h, src, terminals)
+
+    if selected_edges is None:
+        return bc_topology
+
+    multicast_graph = nx.DiGraph()
+    multicast_graph.add_node(src)
+    for u, v in selected_edges:
+        multicast_graph.add_edge(u, v, **G[u][v])
+
+    for dst in terminals:
+        try:
+            path = nx.dijkstra_path(
+                multicast_graph, src, dst,
+                weight=lambda u, v, data: _safe_cost(data)
+            )
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+
+        edge_path = [
+            [u, v, G[u][v]]
+            for u, v in zip(path, path[1:])
+        ]
+        for partition in range(num_partitions):
+            bc_topology.set_dst_partition_paths(dst, partition, list(edge_path))
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,161 @@
+<NAME>
+worst_triplet_refinement
+</NAME>
+<DESCRIPTION>
+The recommendation: interleave discrete worst-triplet refinement between annealing stages. After each Powell temperature stage in `run_start`, find the argmin triplet, extract its 3 points' 9 barycentric params, and run a cheap Powell optimization on only those 9 variables with a low-temperature softmin. This adds targeted, triplet-aware local moves at low cost, breaking the 0.03 plateau while keeping the global schedule. Also reduce the per-stage iteration budgets slightly to offset added time, and add a final extra polish loop over the incumbent.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    def active_softmin(theta, temp):
+        pts = unpack(theta)
+        a = all_areas(pts)
+        # bottom-k areas
+        part = np.partition(a, K_ACTIVE - 1)[:K_ACTIVE]
+        # soft-min of the active set: -temp*log(sum(exp(-a/temp)))
+        m = part.min()
+        e = np.exp(-(part - m) / temp)
+        return temp * np.log(e.sum()) - m
+=======
+    def active_softmin(theta, temp):
+        pts = unpack(theta)
+        a = all_areas(pts)
+        # bottom-k areas
+        part = np.partition(a, K_ACTIVE - 1)[:K_ACTIVE]
+        # soft-min of the active set: -temp*log(sum(exp(-a/temp)))
+        m = part.min()
+        e = np.exp(-(part - m) / temp)
+        return temp * np.log(e.sum()) - m
+
+    def worst_triplet_refine(theta, it=25, temp=None):
+        """Optimize only the 3 points of the current argmin triplet (9 params)
+        against the softmin objective. Cheap, targeted, triple-aware move."""
+        if not _HAVE_SCIPY:
+            return theta
+        theta = np.asarray(theta, dtype=float).ravel().copy()
+        for _ in range(2):  # re-identify the worst triplet once after a pass
+            pts = unpack(theta)
+            a = all_areas(pts)
+            t = int(np.argmin(a))
+            i, j, k = triples[t]
+            loc = np.concatenate([[3 * i, 3 * i + 1, 3 * i + 2],
+                                  [3 * j, 3 * j + 1, 3 * j + 2],
+                                  [3 * k, 3 * k + 1, 3 * k + 2]])
+            lo = theta[loc].copy()
+
+            def obj9(sub, temp_=temp):
+                th = theta.copy()
+                th[loc] = sub
+                return active_softmin(th, temp_)
+
+            try:
+                res = _scipy_minimize(
+                    obj9, lo, method="Powell",
+                    options={"maxiter": it, "xtol": 1e-8, "ftol": 1e-11},
+                )
+                if np.all(np.isfinite(res.x)):
+                    th = theta.copy()
+                    th[loc] = res.x
+                    # accept only if the true min-area does not degrade
+                    if min_area(unpack(th)) >= min_area(unpack(theta)) - 1e-15:
+                        theta = th
+            except Exception:
+                pass
+        return theta
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def run_start(theta0, iters=(150, 100, 80, 60)):
+        """Coarse-to-fine Powell annealing: short budgets at coarse temperatures
+        (precision irrelevant there), finer polish at low temperature."""
+        theta = np.asarray(theta0, dtype=float).ravel()
+        if not _HAVE_SCIPY:
+            return unpack(theta)
+        for temp, it in zip(temps, iters):
+            try:
+                res = _scipy_minimize(
+                    active_softmin, theta, args=(temp,),
+                    method="Powell",
+                    options={"maxiter": it, "xtol": 1e-7, "ftol": 1e-10},
+                )
+                if np.all(np.isfinite(res.x)):
+                    theta = res.x
+            except Exception:
+                pass
+        return unpack(theta)
+=======
+    def run_start(theta0, iters=(120, 80, 60, 50)):
+        """Coarse-to-fine Powell annealing with interleaved worst-triplet
+        refinement between stages (discrete, triple-aware local moves)."""
+        theta = np.asarray(theta0, dtype=float).ravel()
+        if not _HAVE_SCIPY:
+            return unpack(theta)
+        for temp, it in zip(temps, iters):
+            try:
+                res = _scipy_minimize(
+                    active_softmin, theta, args=(temp,),
+                    method="Powell",
+                    options={"maxiter": it, "xtol": 1e-7, "ftol": 1e-10},
+                )
+                if np.all(np.isfinite(res.x)):
+                    theta = res.x
+            except Exception:
+                pass
+            # discrete worst-triplet refinement between stages
+            theta = worst_triplet_refine(theta, it=20, temp=temp)
+        return unpack(theta)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ---------- final polish of the incumbent ----------
+    if _HAVE_SCIPY and best_val > 0.0:
+        try:
+=======
+    # ---------- final polish of the incumbent ----------
+    if _HAVE_SCIPY and best_val > 0.0:
+        for _round in range(3):
+            try:
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            cand = polish(theta_best)
+            if np.all(np.isfinite(cand)):
+                v = min_area(cand)
+                if v > best_val:
+                    best_val = v
+                    best_pts = cand
+        except Exception:
+            pass
+=======
+                cand = polish(theta_best)
+                if np.all(np.isfinite(cand)):
+                    v = min_area(cand)
+                    if v > best_val:
+                        best_val = v
+                        best_pts = cand
+                # triplet-aware refinement of the incumbent as well
+                w = worst_triplet_refine(theta_best, it=30,
+                                         temp=5e-4 * area_T)
+                cand2 = unpack(w)
+                v2 = min_area(cand2)
+                if v2 > best_val:
+                    best_val = v2
+                    best_pts = cand2
+                    theta_best = w
+            except Exception:
+                pass
+            if _round < 2:
+                # refresh barycentric weights from the (possibly improved) best
+                x, y = best_pts[:, 0], best_pts[:, 1]
+                wC = 2.0 * y / sqrt3
+                wB = x - 0.5 * wC
+                wA = 1.0 - wB - wC
+                theta_best = np.stack([wA, wB, wC], axis=1).ravel()
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

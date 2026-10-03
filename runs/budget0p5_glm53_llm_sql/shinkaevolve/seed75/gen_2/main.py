@@ -1,0 +1,206 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+from solver import Algorithm
+from typing import Tuple, List, Dict, Optional
+import numpy as np
+
+
+class Evolved(Algorithm):
+    """
+    Column reordering optimized for LLM prompt prefix caching, measured by
+    ideal character-Trie reuse (sum of adjacent LCPs of sorted serialized rows).
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ---------------- helpers ----------------
+
+    @staticmethod
+    def _serialize_cell(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, float) and pd.isna(v):
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        if isinstance(v, bool):
+            return str(v)
+        if isinstance(v, str):
+            return v
+        return str(v)
+
+    def _serialize_all(self, df: pd.DataFrame) -> List[List[str]]:
+        return [[self._serialize_cell(v) for v in row] for row in df.itertuples(index=False, name=None)]
+
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        """Longest common prefix length using C-speed slice comparisons."""
+        n = min(len(a), len(b))
+        if n == 0 or a[0] != b[0]:
+            return 0
+        lo, hi = 0, n
+        # exponential search for the first mismatch boundary
+        step = 1
+        while lo < hi:
+            mid = min(lo + step, hi)
+            if a[:mid] == b[:mid]:
+                lo = mid
+                if mid == hi:
+                    break
+                step *= 2
+            else:
+                hi = mid - 1
+                step = 1
+                # refine with binary search
+                l, h = lo, hi
+                while l < h:
+                    m = (l + h + 1) // 2
+                    if a[:m] == b[:m]:
+                        l = m
+                    else:
+                        h = m - 1
+                return l
+        return lo
+
+    def _trie_score(self, strings: List[str]) -> int:
+        """Ideal Trie reuse = total chars minus distinct character edges,
+        computed as sum of adjacent LCPs of sorted strings."""
+        if len(strings) <= 1:
+            return 0
+        s = sorted(strings)
+        total = 0
+        prev = s[0]
+        for cur in s[1:]:
+            total += self._lcp(prev, cur)
+            prev = cur
+        return total
+
+    # ---------------- candidate orderings ----------------
+
+    def _column_scores(self, df: pd.DataFrame) -> Dict[str, float]:
+        """len(v) * cnt * (cnt-1) summed over values, per column."""
+        scores: Dict[str, float] = {}
+        for col in df.columns:
+            s = 0.0
+            for v, cnt in df[col].value_counts(dropna=False).items():
+                sv = self._serialize_cell(v)
+                s += len(sv) * cnt * (cnt - 1)
+            scores[col] = s
+        return scores
+
+    def _candidates(self, df: pd.DataFrame, scores: Dict[str, float], col_merge: List[List[str]]) -> List[List[str]]:
+        cols = list(df.columns)
+        in_merge = {c for group in col_merge for c in group if c in cols}
+
+        # rank free (non-merged) columns by score desc, deterministic tie-break by column name
+        free = [c for c in cols if c not in in_merge]
+        ranked_desc = sorted(free, key=lambda c: (-scores.get(c, 0.0), str(c)))
+
+        blocks: List[List[str]] = []
+        for group in col_merge:
+            g = [c for c in group if c in cols]
+            if g:
+                blocks.append(g)
+
+        # score each merge block by max member score for ordering blocks deterministically
+        block_scores = [
+            (max(scores.get(c, 0.0) for c in b), -len(b), str(b[0]), b) for b in blocks
+        ]
+
+        def assemble(ranked_free: List[str], blocks_desc: bool) -> List[str]:
+            bs = sorted(block_scores, key=lambda t: (-t[0], t[1], t[2]))
+            if not blocks_desc:
+                bs = sorted(block_scores, key=lambda t: (t[0], t[1], t[2]))
+            block_list = [t[3] for t in bs]
+            # interleave: place blocks first (they tend to be repetitive groups),
+            # then remaining free columns
+            seen = set()
+            order: List[str] = []
+            for b in block_list:
+                for c in b:
+                    order.append(c)
+                    seen.add(c)
+            for c in ranked_free:
+                if c not in seen:
+                    order.append(c)
+                    seen.add(c)
+            # keep any remaining columns (merged groups referencing missing cols handled above)
+            for c in cols:
+                if c not in seen:
+                    order.append(c)
+                    seen.add(c)
+            return order
+
+        cands = [
+            assemble(ranked_desc, True),
+            assemble(ranked_desc, False),
+            list(cols),  # original order
+            list(reversed(cols)),  # reversed original order as cheap alternative
+        ]
+        # dedupe while preserving order
+        seen_orders = set()
+        unique = []
+        for c in cands:
+            key = tuple(c)
+            if key not in seen_orders:
+                seen_orders.add(key)
+                unique.append(c)
+        return unique
+
+    # ---------------- main API ----------------
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        # Empty / trivial cases
+        if df is None or len(df.columns) == 0:
+            return df.copy(), []
+
+        out = df.copy()
+        # Preserve mixed types with object dtype
+        if len(out) > 0:
+            out = out.astype(object)
+
+        if len(out) == 0:
+            order = list(out.columns)
+            return out, []
+
+        # Serialize cells once, reused across all candidate scoring
+        ser = self._serialize_all(out)
+
+        scores = self._column_scores(out)
+        col_index = {c: i for i, c in enumerate(out.columns)}
+
+        best_order = None
+        best_score = -1
+        for cand in self._candidates(out, scores, col_merge):
+            if sorted(map(str, cand)) != sorted(map(str, out.columns)):
+                # safety: candidate must be a permutation of all columns
+                continue
+            idxs = [col_index[c] for c in cand]
+            strings = ["".join(row[i] for i in idxs) for row in ser]
+            sc = self._trie_score(strings)
+            if sc > best_score:
+                best_score = sc
+                best_order = cand
+
+        if best_order is None:
+            best_order = list(out.columns)
+
+        reordered = out[best_order]
+        column_orderings = [list(best_order) for _ in range(len(out))]
+        return reordered, column_orderings
+
+# EVOLVE-BLOCK-END

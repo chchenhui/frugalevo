@@ -1,0 +1,267 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+_V0 = np.array([0.0, 0.0])
+_V1 = np.array([1.0, 0.0])
+_V2 = np.array([0.5, np.sqrt(3.0) / 2.0])
+_H = np.sqrt(3.0) / 2.0
+_TRI_AREA = 0.5 * _H
+_TRIP = np.array(list(combinations(range(11), 3)), dtype=int)
+_I, _J, _K = _TRIP[:, 0], _TRIP[:, 1], _TRIP[:, 2]
+# Per-point triplet rows: rows of _TRIP containing each point index.
+_PT_TRIPS = [np.where((_I == p) | (_J == p) | (_K == p))[0] for p in range(11)]
+# Boolean mask over triplets per point (True where the point appears).
+_PT_MASK = [np.zeros(len(_TRIP), dtype=bool) for _ in range(11)]
+for _p in range(11):
+    _PT_MASK[_p][_PT_TRIPS[_p]] = True
+
+
+def _cross_all(pts):
+    p, q, r = pts[_I], pts[_J], pts[_K]
+    return np.abs((q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1]) - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0]))
+
+
+def _min_from_cross(cross):
+    return float(np.min(cross)) / (2.0 * _TRI_AREA)
+
+
+def _min_area(pts):
+    a = pts[_I]
+    b = pts[_J]
+    c = pts[_K]
+    cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    return np.min(np.abs(cross)) / (2.0 * _TRI_AREA)
+
+
+def _clip(pts):
+    l2 = pts[:, 1] / _H
+    l1 = pts[:, 0] - 0.5 * l2
+    l0 = 1.0 - l1 - l2
+    L = np.stack([l0, l1, l2], axis=1)
+    L = np.clip(L, 1e-9, 1.0)
+    L = L / L.sum(axis=1, keepdims=True)
+    return L @ np.array([_V0, _V1, _V2])
+
+
+def _lattice(k=3):
+    pts = []
+    for i in range(k + 1):
+        for j in range(k + 1 - i):
+            l = k - i - j
+            pts.append((i * _V0 + j * _V1 + l * _V2) / k)
+    pts.append(np.array([0.5, _H / 3.0]))
+    return np.array(pts)
+
+
+def _golden_seed():
+    """Golden-ratio low-discrepancy barycentric layout, vertices pinned."""
+    g = (np.sqrt(5.0) - 1.0) / 2.0
+    pts = [np.array([0.0, 0.0]), np.array([1.0, 0.0]), np.array([0.5, _H])]
+    for kk in range(3, 11):
+        u = (kk * g) % 1.0
+        v = (kk * g * g) % 1.0 * (1.0 - u)
+        lam = np.array([1.0 - u - v, u, v])
+        lam = np.clip(lam, 0.02, 1.0)
+        lam /= lam.sum()
+        pts.append(lam[0] * _V0 + lam[1] * _V1 + lam[2] * _V2)
+    return _clip(np.array(pts))
+
+
+def _repulsion_seed(seed, iters=50):
+    """Vectorized inverse-square repulsion from a jittered layout (50 iters)."""
+    rng = np.random.default_rng(seed)
+    base = _lattice()
+    pts = _clip(base + rng.normal(0.0, 0.05, base.shape))
+    step0 = 0.004
+    for t in range(iters):
+        d = pts[:, None, :] - pts[None, :, :]
+        dist2 = (d ** 2).sum(axis=2) + 1e-6
+        np.fill_diagonal(dist2, np.inf)
+        f = (d / (dist2 ** 2)[:, :, None]).sum(axis=1)
+        step = step0 * (0.95 ** t)
+        cand = _clip(pts + step * f)
+        # accept move only if it doesn't create tiny min-area (keeps spread)
+        pts = cand
+    return _clip(pts)
+
+
+def _initial(seed):
+    rng = np.random.default_rng(seed)
+    return _clip(_lattice() + rng.normal(0.0, 0.02, _lattice().shape))
+
+
+def _adam(pts, iters=500, lr=0.02):
+    m = np.zeros_like(pts)
+    v = np.zeros_like(pts)
+    b1, b2, eps = 0.9, 0.999, 1e-8
+    for it in range(1, iters + 1):
+        tau = max(0.0004, 0.02 * np.exp(-it / 150.0))
+        x, y = pts[:, 0], pts[:, 1]
+        xi, yi = x[_I], y[_I]
+        xj, yj = x[_J], y[_J]
+        xk, yk = x[_K], y[_K]
+        c = (xj - xi) * (yk - yi) - (yj - yi) * (xk - xi)
+        a = 0.5 * np.abs(c)
+        s = np.sign(c)
+        z = np.exp(-(a - a.min()) / tau)
+        w = z / z.sum()
+        coef = -0.5 * w * s
+        g = np.zeros_like(pts)
+        np.add.at(g, _I, np.stack([coef * (yj - yk), coef * (xk - xj)], axis=1))
+        np.add.at(g, _J, np.stack([coef * (yk - yi), coef * (xi - xk)], axis=1))
+        np.add.at(g, _K, np.stack([coef * (yi - yj), coef * (xj - xi)], axis=1))
+        m = b1 * m + (1 - b1) * g
+        v = b2 * v + (1 - b2) * (g * g)
+        mh = m / (1 - b1 ** it)
+        vh = v / (1 - b2 ** it)
+        pts = pts - lr * mh / (np.sqrt(vh) + eps)
+        pts = _clip(pts)
+    return pts
+
+
+def _polish(pts, steps=(0.01, 0.004, 0.001, 0.0003)):
+    """Incremental multi-direction local search: moving one point only
+    changes the triplets containing it, so maintain the full cross vector
+    and update just the affected entries (~90 rows) per candidate."""
+    best = _clip(pts)
+    cross = _cross_all(best)
+    best_val = _min_from_cross(cross)
+    ang = 2.0 * np.pi * np.arange(24) / 24
+    dirs = np.stack([np.cos(ang), np.sin(ang)], axis=1)
+    for s in steps:
+        improved = True
+        while improved:
+            improved = False
+            tight = cross <= cross.min() * 1.5
+            cnt = np.zeros(11)
+            np.add.at(cnt, _I[tight], 1)
+            np.add.at(cnt, _J[tight], 1)
+            np.add.at(cnt, _K[tight], 1)
+            order = np.argsort(-cnt)
+            # try all points, prioritized by tight-triangle count
+            for pt in order:
+                if cnt[pt] <= 0:
+                    continue
+                rows = _PT_TRIPS[pt]
+                ri, rj, rk = _I[rows], _J[rows], _K[rows]
+                for d in dirs:
+                    cand = best.copy()
+                    cand[pt] += s * d
+                    cand = _clip(cand)
+                    p, q, r = cand[ri], cand[rj], cand[rk]
+                    newc = np.abs((q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1]) - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0]))
+                    # candidate min over unaffected + updated entries
+                    v = min(float(np.min(cross[~_PT_MASK[pt]])), float(np.min(newc))) / (2.0 * _TRI_AREA)
+                    if v > best_val + 1e-14:
+                        cross[rows] = newc
+                        best_val, best, improved = v, cand, True
+                        break
+                if improved:
+                    break
+    return best, best_val
+
+
+def _boost(pts, rounds=300):
+    """Bottleneck boost: repeatedly take the single minimum-area triangle
+    and line-search each of its three vertices along the exact gradient of
+    its signed area (projected into the triangle). Escapes optima where
+    the fixed-direction polish stalls."""
+    best = _clip(pts)
+    cross = _cross_all(best)
+    best_val = _min_from_cross(cross)
+    for _ in range(rounds):
+        t = int(np.argmin(cross))
+        i, j, k = int(_I[t]), int(_J[t]), int(_K[t])
+        p, q, r = best[i], best[j], best[k]
+        sgn = np.sign((q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]))
+        if sgn == 0.0:
+            break
+        grads = {
+            i: sgn * np.array([q[1] - r[1], r[0] - q[0]]),
+            j: sgn * np.array([r[1] - p[1], p[0] - r[0]]),
+            k: sgn * np.array([p[1] - q[1], q[0] - p[0]]),
+        }
+        moved = False
+        for pt in (i, j, k):
+            d = grads[pt]
+            nd = float(np.linalg.norm(d))
+            if nd < 1e-15:
+                continue
+            d = d / nd
+            step = 0.02
+            while step > 1e-6:
+                cand = best.copy()
+                cand[pt] += step * d
+                cand = _clip(cand)
+                v = _min_area(cand)
+                if v > best_val + 1e-15:
+                    best, best_val = cand, v
+                    cross = _cross_all(cand)
+                    moved = True
+                    break
+                step *= 0.5
+            if moved:
+                break
+        if not moved:
+            break
+    return best, best_val
+
+
+def _seeds():
+    s = []
+    # lattice seeds (perturbed)
+    rng = np.random.default_rng(2024)
+    for seed in (1234, 1235, 1236):
+        s.append(_initial(seed))
+    # (a) golden-ratio low-discrepancy seed
+    s.append(_golden_seed())
+    # (b) repulsion seeds from jittered layouts
+    for rs in (11, 202):
+        s.append(_repulsion_seed(rs))
+    # jittered-lattice variant with larger sigma to break symmetry
+    base = _lattice()
+    s.append(_clip(base + rng.normal(0.0, 0.05, base.shape)))
+    return s
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    n = 11
+    try:
+        best_pts, best_val = None, -1.0
+        for init in _seeds():
+            try:
+                p = _adam(_clip(init.copy()))
+                try:
+                    p, val = _polish(p)
+                except Exception:
+                    val = _min_area(p)
+                try:
+                    p2, val2 = _boost(p)
+                    if val2 >= val:
+                        p, val = p2, val2
+                except Exception:
+                    pass  # keep polish result
+            except Exception:
+                continue  # skip this seed, keep previous best
+            if val > best_val:
+                best_val, best_pts = val, p
+        if best_pts is None or not np.all(np.isfinite(best_pts)) or best_val < 1e-6:
+            raise RuntimeError("optimization failed")
+        # Self-check: reported value must match the returned configuration
+        if abs(_min_area(best_pts) - best_val) > 1e-9:
+            best_val = _min_area(best_pts)
+        return np.ascontiguousarray(best_pts, dtype=float)
+    except Exception:
+        base = _initial(1234)
+        try:
+            pts, val = _polish(base)
+            if val < 1e-6:
+                raise RuntimeError("polish degenerate")
+            pts, _ = _boost(pts)
+        except Exception:
+            pts = _clip(base)
+        return np.ascontiguousarray(pts, dtype=float)
+
+
+# EVOLVE-BLOCK-END

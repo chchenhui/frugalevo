@@ -1,0 +1,268 @@
+--- a/original.py
++++ b/original.py
+@@ -1,130 +1,180 @@
+ GPU_MEM_SIZE = 80 # GB
+ 
+ # EVOLVE-BLOCK-START
+ 
+ def compute_model_placement(gpu_num, models):
+     """
+     Compute a model placement that minimizes the maximum KVPR across all GPUs.
++    Multi-start randomized greedy + steepest-descent local search (moves & swaps
++    over all GPU pairs).
+     """
++
++    import random
+ 
+     def kvpr(rate, free):
+         return rate / free if free > 0 else float('inf')
+ 
+-    # Sort models by ratio req_rate/slo descending, then by size descending
+-    sorted_models = sorted(models, key=lambda m: (m.req_rate / m.slo, m.model_size), reverse=True)
++    def greedy(order):
++        placement = {g: [] for g in range(gpu_num)}
++        free = [GPU_MEM_SIZE] * gpu_num
++        rate = [0.0] * gpu_num
++        for m in order:
++            r = m.req_rate / m.slo
++            cands = []
++            for g in range(gpu_num):
++                if m.model_size <= free[g]:
++                    nr = (rate[g] + r) / (free[g] - m.model_size)
++                    cands.append((nr, g))
++            if not cands:
++                return None
++            cands.sort()
++            # randomized tie-breaking among near-best candidates
++            best = cands[0][0]
++            pool = [g for nr, g in cands if nr <= best * 1.05]
++            g = random.choice(pool)
++            placement[g].append(m)
++            free[g] -= m.model_size
++            rate[g] += r
++        return placement, free, rate
+ 
+-    placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+-    free_mem = [GPU_MEM_SIZE] * gpu_num
+-    rate = [0.0] * gpu_num  # sum of req_rate/slo per GPU
++    def max_ratio(free, rate):
++        return max(kvpr(rate[g], free[g]) for g in range(gpu_num))
+ 
+-    # Greedy: place each model on the GPU with smallest resulting KVPR
+-    for model in sorted_models:
+-        best_idx = None
+-        best_ratio = float('inf')
+-        for gpu_id in range(gpu_num):
+-            if model.model_size <= free_mem[gpu_id]:
+-                new_free = free_mem[gpu_id] - model.model_size
+-                new_ratio = kvpr(rate[gpu_id] + model.req_rate / model.slo, new_free)
+-                if new_ratio < best_ratio:
+-                    best_ratio = new_ratio
+-                    best_idx = gpu_id
+-        if best_idx is None:
+-            raise ValueError(
+-                f"Unable to place model of size {model.model_size} GB on any GPU."
+-            )
+-        placement[best_idx].append(model)
+-        free_mem[best_idx] -= model.model_size
+-        rate[best_idx] += model.req_rate / model.slo
++    def local_search(placement, free, rate):
++        improved = True
++        while improved:
++            improved = False
++            cur_max = max_ratio(free, rate)
++            best_gain = 0.0
++            best_action = None
+ 
+-    # Local search: move a model from the worst GPU elsewhere if it lowers max KVPR
+-    improved = True
+-    while improved:
+-        improved = False
+-        ratios = [kvpr(rate[g], free_mem[g]) for g in range(gpu_num)]
+-        worst = max(range(gpu_num), key=lambda g: ratios[g])
+-        for m in list(placement[worst]):
+-            for g in range(gpu_num):
+-                if g == worst:
+-                    continue
+-                if m.model_size <= free_mem[g]:
+-                    old_max = max(ratios)
+-                    # compute new ratios after move
+-                    new_r_worst = kvpr(rate[worst] - m.req_rate / m.slo, free_mem[worst] + m.model_size)
+-                    new_r_g = kvpr(rate[g] + m.req_rate / m.slo, free_mem[g] - m.model_size)
+-                    others = [ratios[k] for k in range(gpu_num) if k not in (worst, g)]
+-                    new_max = max(others + [new_r_worst, new_r_g])
+-                    if new_max < old_max - 1e-12:
+-                        placement[worst].remove(m)
+-                        placement[g].append(m)
+-                        free_mem[worst] += m.model_size
+-                        free_mem[g] -= m.model_size
+-                        rate[worst] -= m.req_rate / m.slo
+-                        rate[g] += m.req_rate / m.slo
+-                        improved = True
+-                        break
+-            if improved:
+-                break
++            # Move any model from any GPU to any other GPU
++            for src in range(gpu_num):
++                for m in placement[src]:
++                    rm = m.req_rate / m.slo
++                    for dst in range(gpu_num):
++                        if dst == src or m.model_size > free[dst]:
++                            continue
++                        new_free_src = free[src] + m.model_size
++                        new_free_dst = free[dst] - m.model_size
++                        new_rate_src = rate[src] - rm
++                        new_rate_dst = rate[dst] + rm
++                        nmax = max(
++                            kvpr(new_rate_src, new_free_src),
++                            kvpr(new_rate_dst, new_free_dst),
++                            cur_max
++                        )
++                        # recompute full max among affected + others
++                        full = max(
++                            [kvpr(new_rate_src, new_free_src),
++                             kvpr(new_rate_dst, new_free_dst)] +
++                            [kvpr(rate[k], free[k]) for k in range(gpu_num)
++                             if k not in (src, dst)]
++                        )
++                        if cur_max - full > best_gain + 1e-12:
++                            best_gain = cur_max - full
++                            best_action = ('move', src, dst, m)
+ 
+-        if improved:
++            # Swap models between any two GPUs
++            for a in range(gpu_num):
++                for b in range(a + 1, gpu_num):
++                    for ma in placement[a]:
++                        for mb in placement[b]:
++                            ra = ma.req_rate / ma.slo
++                            rb = mb.req_rate / mb.slo
++                            fa = free[a] + ma.model_size - mb.model_size
++                            fb = free[b] + mb.model_size - ma.model_size
++                            if fa <= 0 or fb <= 0:
++                                continue
++                            na = rate[a] - ra + rb
++                            nb = rate[b] - rb + ra
++                            full = max(
++                                [kvpr(na, fa), kvpr(nb, fb)] +
++                                [kvpr(rate[k], free[k]) for k in range(gpu_num)
++                                 if k not in (a, b)]
++                            )
++                            if cur_max - full > best_gain + 1e-12:
++                                best_gain = cur_max - full
++                                best_action = ('swap', a, b, ma, mb)
++
++            if best_action is not None:
++                act = best_action
++                if act[0] == 'move':
++                    _, src, dst, m = act
++                    placement[src].remove(m)
++                    placement[dst].append(m)
++                    rm = m.req_rate / m.slo
++                    free[src] += m.model_size
++                    free[dst] -= m.model_size
++                    rate[src] -= rm
++                    rate[dst] += rm
++                else:
++                    _, a, b, ma, mb = act
++                    placement[a].remove(ma)
++                    placement[b].remove(mb)
++                    placement[a].append(mb)
++                    placement[b].append(ma)
++                    ra = ma.req_rate / ma.slo
++                    rb = mb.req_rate / mb.slo
++                    free[a] += ma.model_size - mb.model_size
++                    free[b] += mb.model_size - ma.model_size
++                    rate[a] += -ra + rb
++                    rate[b] += -rb + ra
++                improved = True
++        return placement, free, rate
++
++    best_result = None
++    best_val = float('inf')
++
++    n = len(models)
++    base_order = sorted(models, key=lambda m: (m.req_rate / m.slo, m.model_size),
++                        reverse=True)
++
++    restarts = max(10, min(60, 200 // max(1, n)))
++    for trial in range(restarts):
++        if trial == 0:
++            order = list(base_order)
++        else:
++            order = list(base_order)
++            # perturb order slightly
++            random.shuffle(order)
++        res = greedy(order)
++        if res is None:
+             continue
++        placement, free, rate = res
++        placement, free, rate = local_search(placement, free, rate)
++        val = max_ratio(free, rate)
++        if val < best_val:
++            best_val = val
++            best_result = placement
+ 
+-        # Swap phase: swap a model on worst GPU with a model on another GPU
+-        for m_worst in list(placement[worst]):
+-            for g in range(gpu_num):
+-                if g == worst:
+-                    continue
+-                for m_other in list(placement[g]):
+-                    old_max = max(ratios)
+-                    r_w = m_worst.req_rate / m_worst.slo
+-                    r_o = m_other.req_rate / m_other.slo
+-                    free_worst = free_mem[worst] + m_worst.model_size - m_other.model_size
+-                    free_g = free_mem[g] + m_other.model_size - m_worst.model_size
+-                    if free_worst <= 0 or free_g <= 0:
+-                        continue
+-                    new_r_worst = (rate[worst] - r_w + r_o) / free_worst
+-                    new_r_g = (rate[g] - r_o + r_w) / free_g
+-                    others = [ratios[k] for k in range(gpu_num) if k not in (worst, g)]
+-                    new_max = max(others + [new_r_worst, new_r_g])
+-                    if new_max < old_max - 1e-12:
+-                        placement[worst].remove(m_worst)
+-                        placement[g].remove(m_other)
+-                        placement[worst].append(m_other)
+-                        placement[g].append(m_worst)
+-                        free_mem[worst] = free_worst
+-                        free_mem[g] = free_g
+-                        rate[worst] = rate[worst] - r_w + r_o
+-                        rate[g] = rate[g] - r_o + r_w
+-                        improved = True
+-                        break
+-                if improved:
+-                    break
+-            if improved:
+-                break
++    if best_result is None:
++        raise ValueError("Unable to place all models into available GPUs.")
+ 
+-    return placement
++    return best_result
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ if __name__ == "__main__":
+     # Test the algorithm
+ 
+     from evaluator import generate_test_gpu_models
+     from evaluator import calculate_kvcache_pressure
+     from evaluator import safe_float
+     import numpy as np
+ 
+     test_cases = generate_test_gpu_models()
+     all_kvpr = []
+     for i, (gpu_num, gpu_models) in enumerate(test_cases):
+ 
+         results = compute_model_placement(gpu_num, gpu_models)
+         max_kvpr = calculate_kvcache_pressure(results)
+         all_kvpr.append(safe_float(max_kvpr))
+ 
+     avg_kvpr = np.mean(all_kvpr)
+     if avg_kvpr != 0:
+         avg_kvpr = 1.0 / avg_kvpr
+ 
+ 
+     print(f"Max KVPR: {avg_kvpr:.3f}")

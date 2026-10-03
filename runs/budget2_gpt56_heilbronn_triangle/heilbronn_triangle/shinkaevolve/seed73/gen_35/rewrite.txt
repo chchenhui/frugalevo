@@ -1,0 +1,265 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct 11 points in the reference equilateral triangle.
+
+    Internal coordinates are simplex coordinates (u, v), where
+    x = u + v/2 and y = sqrt(3)*v/2.  Determinants in these coordinates
+    equal triangle area divided by the containing triangle area.
+    """
+    rng = np.random.default_rng(11031987)
+
+    n = 11
+    movable = 8
+    vertices = np.array(
+        ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)),
+        dtype=float,
+    )
+
+    triples = np.array(
+        [(i, j, k)
+         for i in range(n)
+         for j in range(i + 1, n)
+         for k in range(j + 1, n)],
+        dtype=np.intp,
+    )
+
+    def project_simplex(q: np.ndarray) -> np.ndarray:
+        """Map arbitrary planar coordinates safely into u>=0, v>=0, u+v<=1."""
+        q = np.asarray(q, dtype=float).copy()
+        q = np.maximum(q, 0.0)
+        total = q[..., 0] + q[..., 1]
+        mask = total > 1.0
+        if np.any(mask):
+            q[mask] /= total[mask, None]
+        return q
+
+    def canonicalize(layouts: np.ndarray) -> np.ndarray:
+        """
+        Points are unlabeled.  A consistent ordering lets pointwise crossover
+        preserve geometric regions instead of mixing arbitrary point labels.
+        """
+        tail = layouts[:, 3:].copy()
+        for r in range(len(tail)):
+            order = np.lexsort((tail[r, :, 0], tail[r, :, 1]))
+            tail[r] = tail[r, order]
+        layouts[:, 3:] = tail
+        return layouts
+
+    def determinants(layouts: np.ndarray) -> np.ndarray:
+        a = layouts[:, triples[:, 0]]
+        b = layouts[:, triples[:, 1]]
+        c = layouts[:, triples[:, 2]]
+        return np.abs(
+            (b[:, :, 0] - a[:, :, 0]) * (c[:, :, 1] - a[:, :, 1])
+            - (b[:, :, 1] - a[:, :, 1]) * (c[:, :, 0] - a[:, :, 0])
+        )
+
+    def score(layouts: np.ndarray) -> np.ndarray:
+        return determinants(layouts).min(axis=1)
+
+    # A collection of staggered interior templates gives the evolutionary
+    # phase useful non-random structure from its first generation.
+    templates = np.array(
+        [
+            ((0.14, 0.08), (0.42, 0.07), (0.72, 0.08), (0.17, 0.31),
+             (0.48, 0.27), (0.12, 0.57), (0.37, 0.49), (0.20, 0.75)),
+            ((0.12, 0.10), (0.38, 0.10), (0.66, 0.10), (0.18, 0.36),
+             (0.48, 0.32), (0.10, 0.62), (0.34, 0.55), (0.18, 0.79)),
+            ((0.16, 0.09), (0.47, 0.10), (0.75, 0.09), (0.10, 0.38),
+             (0.39, 0.33), (0.65, 0.25), (0.13, 0.67), (0.36, 0.54)),
+            ((0.11, 0.13), (0.39, 0.08), (0.70, 0.11), (0.20, 0.34),
+             (0.51, 0.26), (0.09, 0.55), (0.36, 0.51), (0.19, 0.76)),
+        ],
+        dtype=float,
+    )
+
+    pop_size = 112
+    layouts = np.empty((pop_size, n, 2), dtype=float)
+    layouts[:, :3] = vertices
+
+    raw = rng.exponential(1.0, size=(pop_size, movable, 3))
+    raw /= raw.sum(axis=2, keepdims=True)
+    layouts[:, 3:, 0] = raw[:, :, 1]
+    layouts[:, 3:, 1] = raw[:, :, 2]
+
+    structured = 52
+    for i in range(structured):
+        base = templates[i % len(templates)]
+        jitter = rng.normal(0.0, 0.035 + 0.012 * (i // len(templates)),
+                            size=(movable, 2))
+        layouts[i, 3:] = project_simplex(base + jitter)
+
+    canonicalize(layouts)
+    values = score(layouts)
+
+    best_i = int(np.argmax(values))
+    best = layouts[best_i].copy()
+    best_value = float(values[best_i])
+
+    # Constraint-exchange evolutionary phase.
+    # Each generation generates an offspring population through a mixture of
+    # elite pointwise inheritance, differential region shifts, and targeted
+    # active-small-triangle repairs.
+    generations = 1450
+    indices = np.arange(pop_size)
+
+    for gen in range(generations):
+        progress = gen / max(1, generations - 1)
+        order = np.argsort(values)[::-1]
+        elite_count = 18 if progress < 0.70 else 12
+        elites = order[:elite_count]
+
+        offspring = layouts.copy()
+        offspring[:, :3] = vertices
+
+        # Conservative elite recombination.  Canonical ordering makes each
+        # coordinate slot correspond approximately to a common geometric band.
+        parent_a = elites[rng.integers(elite_count, size=pop_size)]
+        parent_b = elites[rng.integers(elite_count, size=pop_size)]
+        pa = layouts[parent_a, 3:]
+        pb = layouts[parent_b, 3:]
+
+        use_a = rng.random((pop_size, movable, 1)) < 0.55
+        blend = rng.uniform(0.15, 0.85, size=(pop_size, movable, 1))
+        inherited = np.where(use_a, pa, blend * pa + (1.0 - blend) * pb)
+
+        # A subset receives coherent differential displacement, retaining
+        # correlations that pure pointwise recombination intentionally breaks.
+        r1 = rng.integers(pop_size, size=pop_size)
+        r2 = rng.integers(pop_size, size=pop_size)
+        differential = layouts[r1, 3:] - layouts[r2, 3:]
+        diff_scale = 0.20 * (1.0 - progress) + 0.045
+        coherent = inherited + diff_scale * differential
+
+        coherent_mask = rng.random(pop_size) < 0.38
+        inherited[coherent_mask] = coherent[coherent_mask]
+
+        sigma = 0.050 * (1.0 - progress) ** 1.35 + 0.004
+        sparse_probability = 0.58 - 0.26 * progress
+        noise = rng.normal(0.0, sigma, size=(pop_size, movable, 2))
+        sparse = rng.random((pop_size, movable, 1)) < sparse_probability
+        offspring[:, 3:] = inherited + noise * sparse
+        offspring[:, 3:] = project_simplex(offspring[:, 3:])
+        canonicalize(offspring)
+
+        # Preserve a small exact elite set; all remaining members compete
+        # against their own newly generated candidate.
+        offspring[:5] = layouts[order[:5]]
+        candidate_values = score(offspring)
+        keep = candidate_values >= values
+        layouts[keep] = offspring[keep]
+        values[keep] = candidate_values[keep]
+
+        current = int(np.argmax(values))
+        if values[current] > best_value:
+            best_value = float(values[current])
+            best = layouts[current].copy()
+
+        # Active-constraint exchange: periodically identify a weakest
+        # triangle in high-quality layouts and make several local repairs
+        # around one of its movable vertices.
+        if gen % 11 == 0:
+            source_ids = order[:16]
+            sources = layouts[source_ids]
+            det = determinants(sources)
+            weakest = np.argmin(det, axis=1)
+            tri = triples[weakest]
+
+            repairs = np.repeat(sources, 3, axis=0)
+            for s in range(len(source_ids)):
+                involved = tri[s]
+                movable_members = involved[involved >= 3]
+                if len(movable_members):
+                    p = int(movable_members[rng.integers(len(movable_members))])
+                    block = slice(3 * s, 3 * s + 3)
+                    local_sigma = 0.030 * (1.0 - progress) + 0.003
+                    repairs[block, p] += rng.normal(
+                        0.0, local_sigma, size=(3, 2)
+                    )
+
+            repairs[:, 3:] = project_simplex(repairs[:, 3:])
+            canonicalize(repairs)
+            repair_values = score(repairs)
+
+            # Exchange successful repairs into the least useful population
+            # members, only if the replacement improves that member.
+            rep_order = np.argsort(repair_values)[::-1]
+            worst = np.argsort(values)
+            for rr, ww in zip(rep_order[:12], worst[:12]):
+                if repair_values[rr] > values[ww]:
+                    layouts[ww] = repairs[rr]
+                    values[ww] = repair_values[rr]
+
+            current = int(np.argmax(values))
+            if values[current] > best_value:
+                best_value = float(values[current])
+                best = layouts[current].copy()
+
+        # Controlled restarts retain useful ancestry while preventing a single
+        # local arrangement family from occupying the whole population.
+        if gen > 0 and gen % 250 == 0:
+            worst = np.argsort(values)[:18]
+            restarted = np.repeat(best[None, :, :], len(worst), axis=0)
+            restart_sigma = 0.075 * (1.0 - progress) + 0.018
+            restarted[:, 3:] += rng.normal(
+                0.0, restart_sigma, size=(len(worst), movable, 2)
+            )
+            restarted[:, 3:] = project_simplex(restarted[:, 3:])
+            canonicalize(restarted)
+            layouts[worst] = restarted
+            values[worst] = score(restarted)
+
+    # Final focused maximin polish.  Candidate batches perturb one point in
+    # several radial directions, accepting only genuine minimum-area gains.
+    directions = np.array(
+        [
+            (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
+            (0.7071067812, 0.7071067812), (-0.7071067812, -0.7071067812),
+            (0.7071067812, -0.7071067812), (-0.7071067812, 0.7071067812),
+            (0.9238795325, 0.3826834324), (-0.9238795325, -0.3826834324),
+            (0.3826834324, 0.9238795325), (-0.3826834324, -0.9238795325),
+        ],
+        dtype=float,
+    )
+
+    for step in (0.012, 0.006, 0.003, 0.0014, 0.00065):
+        changed = True
+        passes = 0
+        while changed and passes < 4:
+            changed = False
+            passes += 1
+            for point in range(3, n):
+                candidates = np.repeat(best[None, :, :], len(directions), axis=0)
+                candidates[:, point] += step * directions
+                candidates[:, 3:] = project_simplex(candidates[:, 3:])
+                candidate_values = score(candidates)
+                choice = int(np.argmax(candidate_values))
+                if candidate_values[choice] > best_value + 1e-13:
+                    best = candidates[choice]
+                    best_value = float(candidate_values[choice])
+                    changed = True
+
+    # A final small stochastic active polish is useful for diagonal motions
+    # not aligned with the fixed direction stencil.
+    for radius in (0.0015, 0.0007, 0.0003):
+        candidates = np.repeat(best[None, :, :], 40, axis=0)
+        candidates[:, 3:] += rng.normal(0.0, radius, size=(40, movable, 2))
+        candidates[:, 3:] = project_simplex(candidates[:, 3:])
+        canonicalize(candidates)
+        candidate_values = score(candidates)
+        choice = int(np.argmax(candidate_values))
+        if candidate_values[choice] > best_value:
+            best = candidates[choice]
+            best_value = float(candidate_values[choice])
+
+    result = np.empty((n, 2), dtype=float)
+    result[:, 0] = best[:, 0] + 0.5 * best[:, 1]
+    result[:, 1] = (np.sqrt(3.0) * 0.5) * best[:, 1]
+    return result
+
+
+# EVOLVE-BLOCK-END

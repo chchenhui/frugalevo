@@ -1,0 +1,274 @@
+--- a/original.py
++++ b/original.py
+@@ -1,122 +1,169 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+-
+-def _min_area(points, idx_i, idx_j, idx_k):
+-    """Vectorized minimum absolute triangle area over all triplets (normalized by container area)."""
+-    pi = points[idx_i]
+-    pj = points[idx_j]
+-    pk = points[idx_k]
+-    cross = (pj[:, 0] - pi[:, 0]) * (pk[:, 1] - pi[:, 1]) - (pj[:, 1] - pi[:, 1]) * (pk[:, 0] - pi[:, 0])
+-    return 0.5 * np.min(np.abs(cross)) / (np.sqrt(3) / 4.0)
++S3 = np.sqrt(3.0)
++AREA = S3 / 4.0  # container area
+ 
+ 
+-def _clip_bary(p, eps=0.0):
+-    """Clip a point into the triangle with vertices (0,0),(1,0),(0.5,sqrt(3)/2) via barycentric coords."""
+-    s = np.sqrt(3.0)
+-    x, y = p
+-    # barycentric: a (apex), b (origin), c (1,0)
+-    a = y / (s / 2.0)
+-    b = 1.0 - a - (x - 0.5 * a)
+-    c = 1.0 - a - b
+-    a = np.clip(a, eps, 1.0 - eps)
+-    b = np.clip(b, eps, 1.0 - eps)
+-    c = np.clip(c, eps, 1.0 - eps)
+-    t = a + b + c
+-    a, b, c = a / t, b / t, c / t
+-    x = c + 0.5 * a
+-    y = a * s / 2.0
+-    return np.array([x, y])
++def _triplet_indices(n=11):
++    ii, jj, kk = np.array(np.meshgrid(np.arange(n), np.arange(n), np.arange(n))).reshape(3, -1)
++    mask = (ii < jj) & (jj < kk)
++    return ii[mask], jj[mask], kk[mask]
++
++
++def _min_area(pts, idx):
++    i, j, k = idx
++    pi, pj, pk = pts[i], pts[j], pts[k]
++    cross = (pj[:, 0] - pi[:, 0]) * (pk[:, 1] - pi[:, 1]) - (pj[:, 1] - pi[:, 1]) * (pk[:, 0] - pi[:, 0])
++    a = np.abs(cross)
++    m = int(np.argmin(a))
++    return 0.5 * a[m] / AREA, (int(i[m]), int(j[m]), int(k[m]))
++
++
++def _bary_clip(pts):
++    """Project points into the triangle via clipped barycentric coords."""
++    h = S3 / 2.0
++    x, y = pts[:, 0], pts[:, 1]
++    a = y / h
++    c = x - 0.5 * a
++    b = 1.0 - a - c
++    lam = np.stack([a, b, c], axis=1)
++    lam = np.clip(lam, 0.0, None)
++    lam /= lam.sum(axis=1, keepdims=True)
++    a, b, c = lam[:, 0], lam[:, 1], lam[:, 2]
++    return np.column_stack([c + 0.5 * a, a * h])
++
++
++def _perp_dir(pa, pb, pc):
++    """Unit vector from c perpendicular to line ab, on c's side (increases |area|)."""
++    ex, ey = pb[0] - pa[0], pb[1] - pa[1]
++    L = np.hypot(ex, ey) + 1e-12
++    ux, uy = ex / L, ey / L
++    dx, dy = pc[0] - pa[0], pc[1] - pa[1]
++    side = -uy * dx + ux * dy
++    if side >= 0:
++        return np.array([-uy, ux])
++    return np.array([uy, -ux])
++
++
++def _polish(pts, idx, rng, iters=900, step=0.02):
++    best_val, _ = _min_area(pts, idx)
++    for it in range(iters):
++        cur, worst = _min_area(pts, idx)
++        i, j, k = worst
++        d = {
++            i: _perp_dir(pts[j], pts[k], pts[i]),
++            j: _perp_dir(pts[i], pts[k], pts[j]),
++            k: _perp_dir(pts[i], pts[j], pts[k]),
++        }
++        improved = False
++        for trial in [(i, j, k), (i, j), (i, k), (j, k), (i,), (j,), (k,)]:
++            cand = pts.copy()
++            for m in trial:
++                cand[m] = pts[m] + step * d[m]
++            cand = _bary_clip(cand)
++            new, _ = _min_area(cand, idx)
++            if new > cur + 1e-14:
++                pts = cand
++                improved = True
++                break
++        if not improved:
++            step *= 0.85
++            if step < 1e-7:
++                break
++        # occasional random kick to escape local optima
++        if it % 250 == 249 and it + 1 < iters:
++            v, _ = _min_area(pts, idx)
++            if v >= best_val - 1e-15:
++                best_val = v
++                best_pts = pts.copy()
++            cand = pts.copy()
++            m = rng.integers(0, 11)
++            cand[m] = cand[m] + rng.normal(0.0, 0.02, size=2)
++            cand = _bary_clip(cand)
++            nv, _ = _min_area(cand, idx)
++            if nv > 0.5 * v:
++                pts = cand
++                step = max(step, 0.01)
++    v, _ = _min_area(pts, idx)
++    return pts, v
++
++
++def _seeds():
++    s = S3
++    layouts = []
++    # A: vertices + edge midpoints + symmetric interior cluster
++    layouts.append(np.array([
++        [0.0, 0.0], [1.0, 0.0], [0.5, s / 2.0],
++        [0.5, 0.0], [0.25, s / 4.0], [0.75, s / 4.0],
++        [0.5, s / 18.0], [0.5, s / 4.0],
++        [0.25, s / 12.0], [0.75, s / 12.0], [0.5, s / 3.0],
++    ]))
++    # B: centroid + two pentagonal rings (symmetric-ish)
++    cx, cy = 0.5, s / 6.0
++    B = [[cx, cy]]
++    for r, rot in ((0.30, 0.0), (0.18, np.pi / 5.0)):
++        for t in np.linspace(0, 2 * np.pi, 5, endpoint=False) + rot:
++            B.append([cx + r * np.cos(t), cy + r * np.sin(t)])
++    layouts.append(np.array(B))
++    # C: jitter of A
++    rng = np.random.default_rng(777)
++    layouts.append(layouts[0] + rng.normal(scale=0.02, size=layouts[0].shape))
++    # D: coarse triangular lattice, 11 of 15 nodes
++    D = []
++    m = 4
++    for i in range(m + 1):
++        for j in range(m + 1 - i):
++            kk = m - i - j
++            D.append([(j + 0.5 * kk) / m, (kk * s / 2.0) / m])
++    layouts.append(np.array(D[:11]))
++    return layouts
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+-    Construct an arrangement of 11 points on or inside an equilateral triangle maximizing the
+-    smallest triangle area (Heilbronn problem, n = 11).
++    Construct an arrangement of 11 points on or inside an equilateral triangle
++    maximizing the smallest triangle area (Heilbronn problem, n = 11).
+ 
+     Returns:
+         points: np.ndarray of shape (11,2).
+     """
+     n = 11
++    s = S3
++    fallback = np.array([
++        [0.0, 0.0], [1.0, 0.0], [0.5, s / 2.0],
++        [0.5, 0.0], [0.25, s / 4.0], [0.75, s / 4.0],
++        [0.25, s / 12.0], [0.75, s / 12.0],
++        [0.5, s / 6.0], [0.125, s / 8.0], [0.875, s / 8.0],
++    ])
+     try:
++        idx = _triplet_indices(n)
+         rng = np.random.default_rng(20240517)
+-        s = np.sqrt(3.0)
+-
+-        # ---- Warm start: vertices, edge points, and spread interior points ----
+-        pts = [
+-            [0.0, 0.0],
+-            [1.0, 0.0],
+-            [0.5, s / 2.0],
+-            [0.5, 0.0],
+-            [0.25, s / 4.0],
+-            [0.75, s / 4.0],
+-            [0.0, 0.0],  # placeholder replaced below
+-        ]
+-        # build a well-spread 11-point start
+-        pts = []
+-        # vertices
+-        pts.append([0.0, 0.0])
+-        pts.append([1.0, 0.0])
+-        pts.append([0.5, s / 2.0])
+-        # edge midpoints
+-        pts.append([0.5, 0.0])
+-        pts.append([0.25, s / 4.0])
+-        pts.append([0.75, s / 4.0])
+-        # interior: points on a small triangular grid around centroid
+-        cx, cy = 0.5, s / 6.0
+-        for (dx, dy) in [(0.0, 0.14), (-0.18, -0.10), (0.18, -0.10),
+-                         (-0.09, 0.24), (0.09, 0.24)]:
+-            pts.append([cx + dx, cy + dy])
+-        points = np.array(pts, dtype=float)
+-        points = np.array([_clip_bary(p) for p in points])
+-
+-        # triplet indices
+-        ii, jj, kk = np.array(np.meshgrid(np.arange(n), np.arange(n), np.arange(n))).reshape(3, -1)
+-        mask = (ii < jj) & (jj < kk)
+-        idx_i, idx_j, idx_k = ii[mask], jj[mask], kk[mask]
+-
+-        best = _min_area(points, idx_i, idx_j, idx_k)
+-        best_points = points.copy()
+-
+-        # ---- Deterministic local search: one-point perturbations, shrink on stall ----
+-        step = 0.06
+-        budget = 3000
+-        it = 0
+-        while step > 1e-4 and it < budget:
+-            improved = False
+-            for i in range(n):
+-                for _ in range(4):
+-                    it += 1
+-                    if it >= budget:
+-                        break
+-                    cand = points.copy()
+-                    cand[i] = _clip_bary(points[i] + rng.normal(0.0, step, size=2))
+-                    if np.min(np.linalg.norm(np.delete(cand, i, axis=0) - cand[i], axis=1)) < 1e-7:
+-                        continue
+-                    a = _min_area(cand, idx_i, idx_j, idx_k)
+-                    if a > best + 1e-14:
+-                        points = cand
+-                        best = a
+-                        improved = True
+-            if not improved:
+-                step *= 0.6
+-
+-        if best > _min_area(best_points, idx_i, idx_j, idx_k):
+-            best_points = points.copy()
+-        return best_points
++        best_pts, best_val = None, -np.inf
++        for layout in _seeds():
++            pts = _bary_clip(np.asarray(layout, dtype=float))
++            # ensure 11 distinct points (nudge duplicates)
++            for a in range(n):
++                for b in range(a + 1, n):
++                    if np.linalg.norm(pts[a] - pts[b]) < 1e-9:
++                        pts[b] = pts[b] + np.array([1e-4, 1e-4])
++            pts = _bary_clip(pts)
++            pts, val = _polish(pts, idx, rng)
++            if val > best_val:
++                best_val, best_pts = val, pts
++        # final validity checks
++        if best_pts is None or best_pts.shape != (11, 2) or not np.all(np.isfinite(best_pts)):
++            raise RuntimeError("bad result")
++        # confirm points inside triangle (barycentric nonneg)
++        chk = _bary_clip(best_pts)
++        if not np.allclose(chk, best_pts, atol=1e-7):
++            best_pts = chk
++        v, _ = _min_area(best_pts, idx)
++        if v <= 0:
++            raise RuntimeError("degenerate")
++        return best_pts
+     except Exception:
+-        # Graceful fallback: triangular lattice of 11 points
+-        s = np.sqrt(3.0)
+-        fallback = []
+-        m = 4
+-        for i in range(m + 1):
+-            for j in range(m + 1 - i):
+-                k = m - i - j
+-                fallback.append([(j + 0.5 * k) / m, (k * s / 2.0) / m])
+-        arr = np.zeros((11, 2))
+-        for idx in range(11):
+-            arr[idx] = fallback[idx % len(fallback)]
+-        return arr
++        return fallback
+ 
+ 
+ # EVOLVE-BLOCK-END

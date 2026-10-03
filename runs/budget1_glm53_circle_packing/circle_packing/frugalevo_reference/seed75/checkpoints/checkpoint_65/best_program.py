@@ -1,0 +1,639 @@
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles"""
+import numpy as np
+
+
+def _pair_dist(centers):
+    """Pairwise distance matrix of an (n,2) array of centers."""
+    diff = centers[:, None, :] - centers[None, :, :]
+    return np.sqrt((diff ** 2).sum(-1))
+
+
+def _init_radii(centers):
+    """Feasible starting radii: wall distance capped by half nearest-neighbor gap."""
+    n = centers.shape[0]
+    x, y = centers[:, 0], centers[:, 1]
+    r = np.minimum(np.minimum(x, 1 - x), np.minimum(y, 1 - y))
+    dist = _pair_dist(centers)
+    np.fill_diagonal(dist, np.inf)
+    r = np.minimum(r, dist.min(axis=1) / 2.0)
+    return r * 0.999
+
+
+def _constraint_vals(centers, radii):
+    """Concatenated inequality constraints (all >= 0): wall clearances and pairwise gaps."""
+    x, y = centers[:, 0], centers[:, 1]
+    walls = np.concatenate([x - radii, y - radii, (1 - x) - radii, (1 - y) - radii])
+    dist = _pair_dist(centers)
+    iu = np.triu_indices(centers.shape[0], 1)
+    gaps = dist[iu] - radii[iu[0]] - radii[iu[1]]
+    return np.concatenate([walls, gaps])
+
+
+def _smooth_constraint_vals(centers, radii, eps):
+    """C1-smoothed constraints: pairwise distance sqrt(d^2+eps^2) removes the
+    nonsmooth kink at near-touching pairs, restoring SLSQP gradient quality.
+    Since sqrt(d^2+eps^2) >= d, smoothed-feasible implies exactly feasible.
+    Wall terms are already smooth and kept exact."""
+    x, y = centers[:, 0], centers[:, 1]
+    walls = np.concatenate([x - radii, y - radii, (1 - x) - radii, (1 - y) - radii])
+    diff = centers[:, None, :] - centers[None, :, :]
+    dist = np.sqrt((diff ** 2).sum(-1) + eps * eps)
+    iu = np.triu_indices(centers.shape[0], 1)
+    gaps = dist[iu] - radii[iu[0]] - radii[iu[1]]
+    return np.concatenate([walls, gaps])
+
+
+def _expand_symmetric(p):
+    """Expand 6 shape parameters into 25 D4-symmetric centers.
+
+    p = (a, b, c, d, g, h):
+      center singleton (0.5, 0.5);
+      two general orbits of 8 from (a, b) and (c, d);
+      one diagonal orbit of 4 from (g, g);
+      one edge orbit of 4 from (0.5, h).
+    Exact D4 symmetry cannot tile 26 circles (orbit sizes are 1, 4, 8),
+    so the skeleton has 25; the 26th is added in the symmetry-breaking stage.
+    """
+    a, b, c, d, g, h = p
+    pts = [(0.5, 0.5)]
+    for (u, v) in ((a, b), (c, d)):
+        pts += [(u, v), (1 - u, v), (u, 1 - v), (1 - u, 1 - v),
+                (v, u), (1 - v, u), (v, 1 - u), (1 - v, 1 - u)]
+    pts += [(g, g), (1 - g, g), (g, 1 - g), (1 - g, 1 - g)]
+    pts += [(0.5, h), (0.5, 1 - h), (h, 0.5), (1 - h, 0.5)]
+    return np.array(pts, dtype=float)
+
+
+def construct_packing():
+    """
+    D4-symmetric two-stage construction for n=26 circles.
+
+    Stage 1 (symmetric): SLSQP over 6 shape parameters + 25 radii,
+    maximizing total radius of the 25-circle D4 skeleton (corner/edge
+    orbits replace border-limited ring circles; <=300 iterations).
+    Stage 2 (symmetry-breaking): all 52 positions + 26 radii free; a
+    26th circle is seeded in the largest gap and SLSQP refines the
+    full asymmetric packing (<=200 iterations).
+    Stage 3 (radius polish): with centers frozen, SLSQP maximizes the
+    radius sum over 26 radii from the feasible shrink solution — the
+    proportional pairwise shrink is suboptimal, and this recovers the
+    exact maximal radius vector at the achieved centers.
+    Feasibility is guaranteed by a final pairwise-shrink safety clip.
+    """
+    from scipy.optimize import minimize, dual_annealing, linprog
+
+    # --- Stage 1 (bilevel): global shape search with exact LP radii ---
+    def _expand26(z):
+        """Expand 12 shape parameters into exactly 26 centers.
+
+        z = (a, b, c, d, g, h, e1x, e1y, e2x, e2y, sx, sy):
+        D4 skeleton orbits plus asymmetric offsets (e1, e2) on the two
+        8-orbits; one orbit-8 point is split into two half-offset points
+        (sx, sy) to reach 26 circles.
+        """
+        a, b, c, d, g, h, e1x, e1y, e2x, e2y, sx, sy = z
+        pts = [(0.5, 0.5)]
+        for (u, v) in ((a + e1x, b + e1y), (c + e2x, d + e2y)):
+            pts += [(u, v), (1 - u, v), (u, 1 - v), (1 - u, 1 - v),
+                    (v, u), (1 - v, u), (v, 1 - u), (1 - v, 1 - u)]
+        pts += [(g, g), (1 - g, g), (g, 1 - g), (1 - g, 1 - g)]
+        pts += [(0.5, h), (0.5, 1 - h), (h, 0.5), (1 - h, 0.5)]
+        ux, uy = pts.pop(1)
+        pts.append((ux + sx, uy + sy))
+        pts.append((ux - sx, uy - sy))
+        return np.array(pts, dtype=float)
+
+    def _lp_radii(cen):
+        """Exact maximal radius sum at fixed centers via HiGHS LP."""
+        n = cen.shape[0]
+        iu = np.triu_indices(n, 1)
+        m = 4 * n + iu[0].size
+        A = np.zeros((m, n))
+        b = np.zeros(m)
+        for k in range(n):
+            A[k, k] = -1.0
+            b[k] = -cen[k, 0]
+            A[n + k, k] = -1.0
+            b[n + k] = -(1.0 - cen[k, 0])
+            A[2 * n + k, k] = -1.0
+            b[2 * n + k] = -cen[k, 1]
+            A[3 * n + k, k] = -1.0
+            b[3 * n + k] = -(1.0 - cen[k, 1])
+        r0 = 4 * n
+        for k in range(iu[0].size):
+            i, j = iu[0][k], iu[1][k]
+            A[r0 + k, i] = -1.0
+            A[r0 + k, j] = -1.0
+            b[r0 + k] = -float(np.sqrt(((cen[i] - cen[j]) ** 2).sum()))
+        res = linprog(-np.ones(n), A_ub=A, b_ub=b,
+                      bounds=[(0.0, 0.5)] * n, method="highs")
+        if res.success:
+            rr = np.asarray(res.x, dtype=float)
+            return rr, float(rr.sum())
+        return None, -1.0
+
+    def _hex_seed():
+        """Deterministic 26-center hex-row-varistratum seed (incumbent basin).
+
+        Staggered hexagonal rows of 5,4,5,4,5,3 circles: spacing s = 0.2 so
+        5-wide rows span the square, vertical row pitch sqrt(3)/2*s, rows
+        vertically centered, alternate rows offset s/2 (proper hex lattice).
+        """
+        s = 0.2
+        rows = [5, 4, 5, 4, 5, 3]
+        dy = np.sqrt(3.0) / 2.0 * s
+        y0 = (1.0 - (len(rows) - 1) * dy) / 2.0
+        pts = []
+        for k, m in enumerate(rows):
+            y = y0 + k * dy
+            x0 = s / 2.0 if m == 5 else s
+            for i in range(m):
+                pts.append((x0 + i * s, y))
+        return np.array(pts, dtype=float)
+
+    def _rotated_seed(theta):
+        """Rotated hexagonal-lattice seed for 26 circles.
+
+        Builds a hex lattice (spacing s, pitch sqrt(3)/2*s) centered at the
+        square's center, keeps the 26 lattice points closest to the center,
+        rotates the cluster by theta about (0.5, 0.5), and bisects s (<=20
+        steps) so the rotated cluster just fits inside the unit square.
+        theta>0 yields staggered wall pockets instead of aligned columns —
+        a contact topology the axis-aligned basins cannot reach.
+        """
+        th = np.float64(np.deg2rad(theta))
+        R = np.array([[np.cos(th), -np.sin(th)],
+                      [np.sin(th), np.cos(th)]], dtype=float)
+
+        def cluster(s):
+            pts = []
+            for j in range(-4, 5):
+                off = 0.5 * s if (j % 2 != 0) else 0.0
+                for i in range(-5, 6):
+                    pts.append((i * s + off, j * (np.sqrt(3.0) / 2.0) * s))
+            P = np.array(pts, dtype=float)
+            d = np.sqrt((P ** 2).sum(axis=1))
+            idx = np.argsort(d, kind="stable")[:26]
+            return 0.5 + P[idx] @ R.T
+
+        lo, hi = 0.04, 0.34
+        for _ in range(20):
+            mid = 0.5 * (lo + hi)
+            Q = cluster(mid)
+            if Q.min() >= 0.0 and Q.max() <= 1.0:
+                lo = mid
+            else:
+                hi = mid
+        return np.ascontiguousarray(cluster(lo), dtype=float)
+
+    def _seed_pair(c26):
+        """LP radii for a seed, with deterministic init fallback."""
+        r26, _ = _lp_radii(np.ascontiguousarray(c26, dtype=float))
+        if r26 is None:
+            r26 = _init_radii(c26)
+        return c26, np.clip(np.asarray(r26, dtype=float) * 0.999, 1e-6, 0.5)
+
+    # Seed set: incumbent hex-row basin + 12 rotated angles in (0, 45 deg].
+    _angles = [2.0, 5.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0, 36.0, 40.0, 45.0]
+    seeds = [_seed_pair(np.clip(_hex_seed(), 1e-4, 1.0 - 1e-4))]
+    seeds += [_seed_pair(np.clip(_rotated_seed(t), 1e-4, 1.0 - 1e-4))
+              for t in _angles]
+
+    # Stage-2 joint SLSQP starts from the incumbent seed (theta=0 path kept),
+    # with a small fixed symmetry-breaking nudge as before.
+    centers26, r26 = seeds[0]
+    _pert = np.array([0.004, -0.003, 0.005, -0.002, 0.003, 0.004,
+                      -0.004, 0.002, -0.005, 0.003], dtype=float)
+    centers26 = np.array(centers26, dtype=float, copy=True)
+    for k in range(26):
+        centers26[k, 0] = min(max(centers26[k, 0] + _pert[(2 * k) % 10], 1e-4), 1 - 1e-4)
+        centers26[k, 1] = min(max(centers26[k, 1] + _pert[(2 * k + 1) % 10], 1e-4), 1 - 1e-4)
+    z2 = np.concatenate([centers26.flatten(), r26])
+
+    def obj2(z):
+        # Log-radii objective: equal relative weight per circle; the frozen-
+        # center polish afterwards still maximizes the true linear sum.
+        return -np.sum(np.log(np.maximum(z[52:], 1e-9)))
+
+    def cons2(z):
+        return _constraint_vals(z[:52].reshape(26, 2), z[52:])
+
+    res2 = minimize(obj2, z2, method="SLSQP", constraints=[{"type": "ineq", "fun": cons2}],
+                    bounds=[(0.0, 1.0)] * 52 + [(0.0, 0.5)] * 26,
+                    options={"maxiter": 200, "ftol": 1e-9})
+    cand_c = res2.x[:52].reshape(26, 2)
+    cand_r = res2.x[52:]
+    if np.isfinite(res2.fun) and cand_c.min() >= -1e-9 and cand_c.max() <= 1 + 1e-9:
+        centers = np.clip(cand_c, 1e-6, 1 - 1e-6)
+        radii = np.clip(cand_r, 1e-6, 0.5)
+
+    # Guaranteed-feasible radii for the final configuration (pairwise shrink only)
+    radii = compute_max_radii(centers, start=radii)
+
+    # --- Radius polish: exact maximal radii at fixed centers ---
+    # compute_max_radii shrinks both circles of a tight pair proportionally,
+    # which is suboptimal when one circle has slack via other contacts. With
+    # centers frozen, maximizing the radius sum is a 26-variable feasibility
+    # problem; SLSQP from the feasible shrink solution strictly improves it.
+    def _rcons(r):
+        return _constraint_vals(centers, r)
+
+    def _robj(r):
+        return -np.sum(r)
+
+    resr = minimize(_robj, radii, method="SLSQP",
+                    constraints=[{"type": "ineq", "fun": _rcons}],
+                    bounds=[(0.0, 0.5)] * centers.shape[0],
+                    options={"maxiter": 300, "ftol": 1e-12})
+    if np.isfinite(resr.fun):
+        r_pol = np.clip(resr.x, 1e-6, 0.5)
+        # Accept only if it does not violate feasibility (safety margin)
+        if _constraint_vals(centers, r_pol).min() > -1e-9 and np.sum(r_pol) > np.sum(radii):
+            radii = r_pol
+            # One final guaranteed-feasible shrink pass as safety net
+            radii = compute_max_radii(centers, start=radii)
+
+    # --- Stage 4: contact-graph continuation (replaces blind grid relocation) ---
+    # At a true local optimum every circle is pinned by >=3 active contacts
+    # (walls or neighbours); circles with <3 are underconstrained and can
+    # grow if relocated. For the <=3 most underconstrained circles: delete
+    # one, reinsert it at the exact largest-void center (fine 200x200 grid,
+    # removing the 70x70 quantization loss of the old heuristic), warm-start
+    # a bounded joint SLSQP. The incumbent's blind-relocation baseline is
+    # kept as one additional candidate. Every candidate is scored on the
+    # SAME guaranteed-feasible radius pipeline (shrink -> frozen-center
+    # polish -> shrink) as the incumbent, and a candidate is accepted only
+    # if its post-clip sum beats the incumbent's post-clip sum by a margin,
+    # so the returned value can never drop below the incumbent path.
+    def _shrink_stable(cen, r0):
+        """Iterate compute_max_radii to a fixed point (guaranteed feasible)."""
+        rr = np.array(r0, dtype=float, copy=True)
+        for _ in range(60):
+            rr2 = compute_max_radii(cen, start=rr)
+            if np.allclose(rr2, rr, rtol=0.0, atol=1e-13):
+                return rr2
+            rr = rr2
+        return rr
+
+    def _score_feasible(cen, r0):
+        """Refine (centers free, <=150 iters) then frozen-center polish; return
+        (centers, radii, post-clip sum) with radii guaranteed feasible."""
+        z = np.concatenate([np.asarray(cen, dtype=float).flatten(),
+                            np.asarray(r0, dtype=float)])
+        # Joint refinement, two-phase objective continuation on the same
+        # feasible set (identical constraints/bounds, same per-start caps):
+        # Phase A: multiplicative (log) radii objective - unlike the linear
+        # objective, whose gradient is dominated by the largest circles, log
+        # weights every circle equally relative to its size, so
+        # under-contacted small/medium circles actively grow.
+        # Phase B: one bounded linear-objective joint pass warm-started from
+        # the log solution - near the log optimum its gradient flattens and
+        # the sum stalls; re-linearizing with the true sum objective at the
+        # new point recovers additional growth without any new search start.
+        # The final linear polish at frozen centers still recovers the exact
+        # maximal sum of radii.
+        _jbnd = [(0.0, 1.0)] * 52 + [(0.0, 0.5)] * 26
+
+        def _mkcon(e):
+            return [{"type": "ineq",
+                     "fun": (lambda zz, e=e: _smooth_constraint_vals(
+                         zz[:52].reshape(26, 2), zz[52:], e))}]
+
+        _zc = np.ascontiguousarray(z, dtype=float)
+        # Smoothed-distance homotopy (log-led). Pass 1 keeps the log
+        # objective (equal relative weighting per circle) on the eps=1e-2
+        # smoothed constraints; passes 2-3 switch to the linear sum
+        # objective at eps=3e-3, 1e-3, each warm-started from the previous
+        # solution, tracking the smoothed optimum down to the true one.
+        # sqrt(d^2+eps^2) >= d, so every intermediate point is exactly
+        # feasible; the final exact-constraint pass converts residual
+        # smoothed slack into radius sum. Four joint passes, 200 iters each.
+        res = minimize(lambda zz: -np.sum(np.log(np.maximum(zz[52:], 1e-9))),
+                       _zc, method="SLSQP", constraints=_mkcon(1e-2),
+                       bounds=_jbnd,
+                       options={"maxiter": 200, "ftol": 1e-11})
+        _zc = np.ascontiguousarray(res.x, dtype=float)
+        for _e in (3e-3, 1e-3):
+            res = minimize(lambda zz: -np.sum(zz[52:]), _zc, method="SLSQP",
+                           constraints=_mkcon(_e), bounds=_jbnd,
+                           options={"maxiter": 200, "ftol": 1e-11})
+            _zc = np.ascontiguousarray(res.x, dtype=float)
+        _jcon = [{"type": "ineq",
+                  "fun": lambda zz: _constraint_vals(
+                      zz[:52].reshape(26, 2), zz[52:])}]
+        res = minimize(lambda zz: -np.sum(zz[52:]), _zc, method="SLSQP",
+                       constraints=_jcon, bounds=_jbnd,
+                       options={"maxiter": 200, "ftol": 1e-12})
+        cc = res.x[:52].reshape(26, 2)
+        if not (np.isfinite(res.fun) and cc.min() >= -1e-9 and cc.max() <= 1 + 1e-9):
+            return None
+        cc = np.clip(np.ascontiguousarray(cc), 1e-6, 1 - 1e-6)
+        rr = _shrink_stable(cc, np.clip(res.x[52:], 1e-6, 0.5))
+        if _constraint_vals(cc, rr).min() < -1e-12:
+            return None
+        # Smoothed frozen-center radius polish: the exact-constraint polish
+        # stalls at the same per-contact slack the joint homotopy removed,
+        # so run the radius LP-like pass through its own eps ladder
+        # (3e-3 -> 1e-3 -> exact). Radii are 1-D, so each smoothed-feasible
+        # point is exactly feasible and _shrink_stable remains the guarantee.
+        _rc0 = np.ascontiguousarray(rr, dtype=float)
+        for _e in (3e-3, 1e-3, 0.0):
+            _cns = (lambda r, e=_e: _smooth_constraint_vals(cc, r, e)) \
+                if _e > 0 else (lambda r: _constraint_vals(cc, r))
+            resp = minimize(lambda r: -np.sum(r), _rc0, method="SLSQP",
+                            constraints=[{"type": "ineq", "fun": _cns}],
+                            bounds=[(0.0, 0.5)] * 26,
+                            options={"maxiter": 300, "ftol": 1e-12})
+            if np.isfinite(resp.fun):
+                rpl = np.clip(resp.x, 1e-6, 0.5)
+                if _constraint_vals(cc, rpl).min() > -1e-12:
+                    _rc0 = np.ascontiguousarray(rpl, dtype=float)
+        # Final monotone safety clip (guaranteed-feasible shrink), no
+        # gratuitous pre-shrink: the homotopy's tight contacts are the gain.
+        rr = _shrink_stable(cc, np.clip(_rc0, 1e-6, 0.5))
+        if _constraint_vals(cc, rr).min() < -1e-12:
+            return None
+        return cc, rr, float(rr.sum())
+
+    def _largest_void(rest):
+        """Largest empty-circle center for fixed circles + walls.
+
+        Fine 200x200 grid scan for global coverage, then the top-3 distinct
+        grid cells are polished by bounded Nelder-Mead (<=40 iters each) on
+        the exact gap function, removing quantization loss and single-argmax
+        local-basin traps. Cost is negligible (no SLSQP calls added).
+        """
+        from scipy.optimize import minimize as _min
+        gx = np.linspace(0.005, 0.995, 200)
+        dxg = gx[:, None] - rest[None, :, 0]
+        dyg = gx[:, None] - rest[None, :, 1]
+        dmin = np.sqrt(dxg ** 2 + dyg ** 2).min(axis=1)  # (200, 200)
+        wall = np.minimum(np.minimum(gx[:, None], 1 - gx[:, None]),
+                          np.minimum(gx[None, :], 1 - gx[None, :]))
+        gap = np.minimum(dmin, wall)
+        flat = gap.ravel()
+        k = min(3, flat.size)
+        top = np.argpartition(flat, -k)[-k:]
+        top = top[np.argsort(flat[top])[::-1]]
+
+        def _neg_gap(p):
+            px, py = p
+            if px < 0.0 or px > 1.0 or py < 0.0 or py > 1.0:
+                return 10.0
+            d = np.sqrt(((rest - np.array([px, py])) ** 2).sum(axis=1)).min()
+            return -min(d, px, 1.0 - px, py, 1.0 - py)
+
+        best_px = best_py = None
+        best_pg = -1.0
+        for idx in top:
+            iy0, ix0 = divmod(int(idx), gap.shape[1])
+            res = _min(_neg_gap, np.array([gx[ix0], gx[iy0]]),
+                       method="Nelder-Mead",
+                       options={"maxiter": 40, "xatol": 1e-10, "fatol": 1e-12})
+            if np.isfinite(res.fun):
+                px = float(np.clip(res.x[0], 0.0, 1.0))
+                py = float(np.clip(res.x[1], 0.0, 1.0))
+                pg = float(-res.fun)
+            else:
+                px, py, pg = gx[ix0], gx[iy0], float(gap[iy0, ix0])
+            if pg > best_pg:
+                best_px, best_py, best_pg = px, py, pg
+        if best_px is None:
+            iy, ix = np.unravel_index(np.argmax(gap), gap.shape)
+            return gx[ix], gx[iy], float(gap[iy, ix])
+        return best_px, best_py, best_pg
+
+    def _active_contacts(cen):
+        """Active contacts (slack < 1e-7) per circle: walls + tight pairs."""
+        x, y = cen[:, 0], cen[:, 1]
+        cnt = ((x <= 1e-7) | ((1 - x) <= 1e-7) |
+               (y <= 1e-7) | ((1 - y) <= 1e-7)).astype(int)
+        dist = _pair_dist(cen)
+        iu = np.triu_indices(cen.shape[0], 1)
+        for i, j in zip(iu[0], iu[1]):
+            if dist[i, j] <= 2e-7:
+                cnt[i] += 1
+                cnt[j] += 1
+        return cnt
+
+    # Seed race: every seed (incumbent hex-row, 12 rotated angles) plus the
+    # stage-2 SLSQP result is scored on the identical guaranteed-feasible
+    # pipeline (shrink -> log+2x linear joint SLSQP -> frozen-center polish
+    # -> shrink). The best post-clip sum wins; the incumbent seed and the
+    # stage-2 result are included, so the return can only improve.
+    base_c = base_r = None
+    base_sum = -1.0
+    for c0, r0 in seeds + [(centers, radii)]:
+        out = _score_feasible(np.ascontiguousarray(c0, dtype=float),
+                              np.ascontiguousarray(r0, dtype=float))
+        if out is not None and out[2] > base_sum:
+            base_c, base_r, base_sum = out
+    if base_c is None:
+        base_c, base_r, base_sum = centers, radii, float(np.sum(radii))
+
+    # --- Contact-graph edge-flip enumeration (replaces relocation hopping) ---
+    # SLSQP and any continuous refinement preserve the contact topology: which
+    # pairs touch is fixed by the basin, and that is what caps the incumbent.
+    # A flip changes the topology discretely: pick a tight pair (i, j) that
+    # shares a common tight contact k (circle or wall), delete edge (i, j),
+    # freeze all other circles, and solve the tangency system for the four
+    # unknowns (xi, yi, xj, yj): circle i tangent to k plus up to two of its
+    # other active contacts, circle j likewise. Each solution is a candidate
+    # topology SLSQP cannot reach (it lies across a constraint-degeneracy
+    # boundary). Budget: <=20 flips, damped least-squares solve with
+    # max_nfev=60 each, hard wall-clock guard at 240 s; every surviving
+    # candidate is projected through the same guaranteed-feasible
+    # _score_feasible pipeline and accepted only on strict post-clip
+    # improvement, so the incumbent is an unchanged fallback.
+    import time
+    from scipy.optimize import least_squares
+    _t0 = time.time()
+
+    def _contact_lists(cen, rad, tol=1e-5):
+        """Active contact list per circle and tight pair set.
+
+        Wall contacts are ("w", side) with side in {0:left, 1:right,
+        2:bottom, 3:top}; circle contacts are ("c", other_index). A contact
+        is active if its slack is below tol.
+        """
+        n = cen.shape[0]
+        dist = _pair_dist(cen)
+        contacts = [[] for _ in range(n)]
+        for k in range(n):
+            xk, yk = float(cen[k, 0]), float(cen[k, 1])
+            rk = float(rad[k])
+            if xk <= rk + tol:
+                contacts[k].append(("w", 0))
+            if 1.0 - xk <= rk + tol:
+                contacts[k].append(("w", 1))
+            if yk <= rk + tol:
+                contacts[k].append(("w", 2))
+            if 1.0 - yk <= rk + tol:
+                contacts[k].append(("w", 3))
+        tight = []
+        iu = np.triu_indices(n, 1)
+        for a, b in zip(iu[0], iu[1]):
+            if dist[a, b] <= rad[a] + rad[b] + tol:
+                contacts[a].append(("c", int(b)))
+                contacts[b].append(("c", int(a)))
+                tight.append((int(a), int(b)))
+        return contacts, tight
+
+    def _tangency_res(t, x, y, c, cen, rad):
+        """Residual of 'circle c at (x, y) tangent to contact t' (>=0 slack)."""
+        if t[0] == "w":
+            r = float(rad[c])
+            return [x - r, (1.0 - x) - r, y - r, (1.0 - y) - r][t[1]]
+        o = t[1]
+        d = np.hypot(x - cen[o, 0], y - cen[o, 1])
+        return [float(d - rad[c] - rad[o])]
+
+    def _try_flip(cen, rad, i, j):
+        """Enumerate one-edge flips of tight pair (i, j); return candidate
+        centers (or None if no square tangency system is solvable)."""
+        contacts, _ = _contact_lists(cen, rad)
+        ci = [t for t in contacts[i] if t != ("c", j)]
+        cj = [t for t in contacts[j] if t != ("c", i)]
+        common = [t for t in ci if t in cj]
+        cands = []
+        for k in common:
+            rest_i = [t for t in ci if t != k][:2]
+            rest_j = [t for t in cj if t != k][:2]
+            eqs_i = [k] + rest_i
+            eqs_j = [k] + rest_j
+
+            def resid(z, i=i, j=j, ei=tuple(eqs_i), ej=tuple(eqs_j)):
+                xi, yi, xj, yj = z
+                out = []
+                for t in ei:
+                    out += _tangency_res(t, xi, yi, i, cen, rad)
+                for t in ej:
+                    out += _tangency_res(t, xj, yj, j, cen, rad)
+                return np.array(out, dtype=float)
+
+            z0 = np.array([cen[i, 0], cen[i, 1], cen[j, 0], cen[j, 1]])
+            if resid(z0).size < 4:
+                continue
+            try:
+                sol = least_squares(resid, z0, method="lm", max_nfev=60)
+            except Exception:
+                continue
+            if not np.all(np.isfinite(sol.x)) or np.linalg.norm(resid(sol.x)) > 1e-7:
+                continue
+            cc = np.array(cen, dtype=float, copy=True)
+            cc[i] = (sol.x[0], sol.x[1])
+            cc[j] = (sol.x[2], sol.x[3])
+            if cc.min() < -1e-9 or cc.max() > 1.0 + 1e-9:
+                continue
+            cands.append(np.ascontiguousarray(np.clip(cc, 1e-6, 1 - 1e-6)))
+        return cands
+
+    contacts, tight_pairs = _contact_lists(base_c, base_r)
+    flips_tried = 0
+    for (i, j) in tight_pairs:
+        if flips_tried >= 20 or time.time() - _t0 > 240.0:
+            break
+        if base_r[i] + base_r[j] < 0.02:  # skip trivial micro-circles
+            continue
+        for cc in _try_flip(base_c, base_r, i, j):
+            flips_tried += 1
+            rr0 = _shrink_stable(cc, compute_max_radii(cc, start=base_r))
+            if _constraint_vals(cc, rr0).min() < -1e-12:
+                continue
+            out = _score_feasible(np.ascontiguousarray(cc),
+                                  np.ascontiguousarray(np.maximum(rr0, 1e-6)))
+            if out is not None and out[2] > base_sum + 1e-9:
+                base_c = np.ascontiguousarray(out[0])
+                base_r = np.ascontiguousarray(out[1])
+                base_sum = out[2]
+
+    return base_c, base_r, float(np.sum(base_r))
+
+
+def compute_max_radii(centers, start=None):
+    """
+    Compute feasible radii for the given centers by shrinking a starting
+    radius vector (default: all ones) under wall limits and pairwise
+    proportional scaling until no pair overlaps. Only ever decreases
+    radii, so the result is guaranteed valid.
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        start: optional np.array of shape (n) with initial radii
+
+    Returns:
+        np.array of shape (n) with radius of each circle
+    """
+    n = centers.shape[0]
+    radii = np.ones(n) if start is None else np.array(start, dtype=float, copy=True)
+
+    # First, limit by distance to square borders
+    for i in range(n):
+        x, y = centers[i]
+        # Distance to borders
+        radii[i] = min(radii[i], x, y, 1 - x, 1 - y)
+
+    # Then, limit by distance to other circles
+    # Each pair of circles with centers at distance d can have
+    # sum of radii at most d to avoid overlap
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+
+            # If current radii would cause overlap
+            if radii[i] + radii[j] > dist:
+                # Scale both radii proportionally
+                scale = dist / (radii[i] + radii[j])
+                radii[i] *= scale
+                radii[j] *= scale
+
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

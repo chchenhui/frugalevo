@@ -1,0 +1,139 @@
+<NAME>
+add_reversal_gate_and_hysteresis
+</NAME>
+<DESCRIPTION>
+The current program's strengths are low lag (0.28) and low slope changes (66), but its false_reversals (49.2) and smoothness (0.23) trail the best prior variants, which used two mechanisms the current pipeline lacks: (1) a trend-reversal gate that temporarily boosts the Kalman process noise at statistically significant turning points, so the filter re-locks onto genuine reversals quickly instead of dithering through them, and (2) a final localized reversal-suppression hysteresis pass that smooths only neighborhoods with weak, rapidly-flipping gradients (residual micro-oscillations) — a targeted way to cut spurious slope sign changes without adding global lag.
+
+This is a crossover: keep the current multi-scale SG stage and slope-lead compensation untouched (they deliver the current lag/responsiveness), and graft on the two reversal-suppression mechanisms. The gate uses the filter's own slope-state covariance to judge significance (slope change > 1.5 sigma of slope uncertainty AND a significant innovation), so it fires only on genuine turning points — boosting Q there actually *reduces* lag error at reversals. The hysteresis pass is restricted to weak, flipping-gradient neighborhoods (dilated by 2 samples), so genuine trend dynamics elsewhere are preserved; its SG kernel is zero-phase, adding no phase delay. Expected effect: fewer slope_changes and false_reversals with lag unchanged.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def adaptive_filter(x, window_size=20):
+    """Adaptive Kalman prefilter + locally-adaptive zero-phase SG smoothing.
+=======
+def _local_hysteresis(y, flip_span=4, k=0.35):
+    """Suppress weak micro-oscillations: where the gradient sign flips
+    within a few samples while |g| is small, apply a tiny zero-phase
+    order-2 SG pass restricted to those neighborhoods only."""
+    n = len(y)
+    if n < 7:
+        return y
+    g = np.gradient(y)
+    med_g = np.median(np.abs(g)) + 1e-12
+    weak = np.abs(g) < k * med_g
+    s = np.sign(g)
+    flip = np.zeros(n, dtype=bool)
+    for lag in range(1, flip_span + 1):
+        if lag < n:
+            flip[lag:] |= (s[lag:] * s[:-lag]) < 0
+    flag = weak & flip
+    if not np.any(flag):
+        return y
+    # dilate flags by a couple samples on each side
+    dil = np.zeros(n, dtype=bool)
+    r = 2
+    idx = np.where(flag)[0]
+    for i in idx:
+        dil[max(0, i - r):min(n, i + r + 1)] = True
+    out = y.copy()
+    # fixed order-2 SG coefficients (window 5, zero-phase)
+    c = np.array([-3.0, 12.0, 17.0, 12.0, -3.0]) / 35.0
+    # process each flagged neighborhood
+    i = 0
+    while i < n:
+        if dil[i]:
+            j = i
+            while j < n and dil[j]:
+                j += 1
+            lo = max(0, i - 2)
+            hi = min(n, j + 2)
+            seg = y[lo:hi]
+            if len(seg) >= 5:
+                padded = np.concatenate((
+                    2 * seg[0] - seg[2:0:-1],
+                    seg,
+                    2 * seg[-1] - seg[-2:-4:-1],
+                )) if len(seg) >= 4 else seg
+                sm = np.convolve(padded, c, mode='valid')
+                core_start = i - lo
+                core_len = j - i
+                avail = min(core_len, len(sm) - core_start)
+                if avail > 0:
+                    out[i:i + avail] = sm[core_start:core_start + avail]
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def adaptive_filter(x, window_size=20):
+    """Adaptive Kalman prefilter + locally-adaptive zero-phase SG smoothing.
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    Q = np.eye(2) * (q_scale ** 2) * 0.05  # process noise (allows trend changes)
+    P = np.eye(2) * (r_arr[0] ** 2)
+    s = np.array([x[0], 0.0])
+=======
+    Q = np.eye(2) * (q_scale ** 2) * 0.05  # process noise (allows trend changes)
+    Q_boost = np.eye(2) * (q_scale ** 2) * 0.5  # boosted Q at genuine turning points
+    P = np.eye(2) * (r_arr[0] ** 2)
+    s = np.array([x[0], 0.0])
+
+    # Trend-reversal gate bookkeeping: track slope history and boost counter
+    slope_history = np.zeros(n)
+    reversal_window = max(3, window_size // 4)
+    boost_counter = 0
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    for i in range(1, n):
+        # Predict
+        s = F @ s
+        P = F @ P @ F.T + Q
+        P_pred[i] = P
+=======
+    for i in range(1, n):
+        # Predict (with boosted process noise while a genuine turning point
+        # is being tracked, so the filter re-locks quickly on real reversals)
+        s = F @ s
+        P = F @ P @ F.T + (Q_boost if boost_counter > 0 else Q)
+        if boost_counter > 0:
+            boost_counter -= 1
+        P_pred[i] = P
+
+        # --- Trend reversal gate: fire only on statistically significant
+        # turning points (large slope change vs slope uncertainty AND a
+        # significant innovation). This cuts noise-induced dithering near
+        # extrema without slowing genuine trend changes. ---
+        slope_hat = s[1]
+        slope_var = max(P[1, 1], 1e-12)
+        if i >= reversal_window:
+            prev_slope = slope_history[i - reversal_window]
+            if prev_slope * slope_hat < 0:
+                sig = abs(slope_hat - prev_slope) / (np.sqrt(slope_var) + 1e-9)
+                innov_gate = x[i] - s[0]
+                inno_sig = abs(innov_gate) / (np.sqrt(P[0, 0] + r_arr[i] ** 2) + 1e-9)
+                if sig > 1.5 and inno_sig > 1.0:
+                    boost_counter = max(2, window_size // 8)
+        slope_history[i] = slope_hat
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # --- Trim to sliding-window output length, end-aligned (minimal lag) ---
+    y = smoothed[-output_length:]
+    return y
+=======
+    # --- Localized reversal-suppression hysteresis (crossover from best
+    # prior variants): smooth only weak, rapidly-flipping gradient
+    # neighborhoods; zero-phase, so no added lag elsewhere. ---
+    smoothed = _local_hysteresis(smoothed)
+
+    # --- Trim to sliding-window output length, end-aligned (minimal lag) ---
+    y = smoothed[-output_length:]
+    return y
+>>>>>>> REPLACE
+</DIFF>

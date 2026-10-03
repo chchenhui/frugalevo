@@ -1,0 +1,184 @@
+<NAME>
+conditional_partition_tree_candidate
+</NAME>
+<DESCRIPTION>
+Add a fifth candidate construction: a conditional prefix partition tree. Within each group of rows, pick the remaining column with the largest length-weighted pair repetition sum(len(v)*cnt*(cnt-1)) using precomputed integer factorizations and vectorized bincount, place it at the front, partition rows by its factorized value code, and recurse on the suffix separately per group. This produces per-row column orderings (explicitly allowed by the API), which lets rows with different shared leading values get different optimized orders — something no global ordering can achieve. Guard: only run when col_merge is empty, scoring is enabled, total chars <= 30M, and depth is bounded (12 when n_cols>=8 and n_rows<=200k, else 8), with at most 10 split candidates per node. Score the tree with the exact sorted-adjacent LCP Trie objective and select it only if it actually beats all global orderings. Output applies each row's permutation to that row's values (object dtype, all cells preserved) with matching per-row column_orderings. This targets the weaker datasets (0.44/0.62 hit rates) where row-conditional structure exists but global orders cannot exploit it, while the exact-objective selection prevents regressions.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    def _build_candidates(self, columns, col_stats, col_merge):
+=======
+    @staticmethod
+    def _factorize_cols(ser, n_rows, n_cols):
+        """Factorize each column's serialized strings to integer codes once."""
+        codes = []
+        uniq_lens = []
+        for j in range(n_cols):
+            c, uniques = pd.factorize(ser[:, j], sort=False)
+            codes.append(np.asarray(c, dtype=np.int64))
+            uniq_lens.append(np.fromiter((len(u) for u in uniques),
+                                         dtype=np.int64, count=len(uniques)))
+        return codes, uniq_lens
+
+    def _tree_row_orders(self, codes, uniq_lens, freq_rank, n_rows, n_cols,
+                         max_depth):
+        """Conditional prefix partition tree -> per-row column index orders.
+
+        Within each row group, choose the remaining column maximizing
+        sum(len(v) * cnt * (cnt-1)) (vectorized bincount over integer codes),
+        place it next, partition rows by its value code, and recurse on the
+        suffix inside each group. Cheap deterministic freq-ranked tail when
+        branching stops.
+        """
+        orders = [None] * n_rows
+        freq_pos = {c: p for p, c in enumerate(freq_rank)}
+
+        def tail_order(remaining):
+            return sorted(remaining, key=lambda j: freq_pos[j])
+
+        def rec(rows, prefix, remaining, depth):
+            if rows.shape[0] < 2 or depth == 0 or not remaining:
+                t = list(prefix) + tail_order(remaining)
+                for i in rows:
+                    orders[i] = t
+                return
+            if len(remaining) <= 10:
+                cands = remaining
+            else:
+                cands = sorted(remaining, key=lambda j: freq_pos[j])[:10]
+            best_j = -1
+            best_gain = 0
+            for j in cands:
+                c = codes[j][rows]
+                cnt = np.bincount(c)
+                lens = uniq_lens[j][:cnt.shape[0]]
+                gain = int(np.sum(lens * cnt * (cnt - 1)))
+                if gain > best_gain:
+                    best_gain = gain
+                    best_j = j
+            if best_j < 0:
+                t = list(prefix) + tail_order(remaining)
+                for i in rows:
+                    orders[i] = t
+                return
+            new_rem = [j for j in remaining if j != best_j]
+            new_pref = prefix + [best_j]
+            c = codes[best_j][rows]
+            for v in np.unique(c):
+                rec(rows[c == v], new_pref, new_rem, depth - 1)
+
+        rec(np.arange(n_rows, dtype=np.int64), [], list(range(n_cols)),
+            max_depth)
+        return orders
+
+    def _build_candidates(self, columns, col_stats, col_merge):
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+        # ---- candidate column orderings ----
+        candidates = self._build_candidates(original_columns, col_stats, col_merge)
+
+        # ---- score candidates with exact Trie reuse (bounded) ----
+        best_order = candidates[0]
+        best_score = -1
+        # bound the scoring work: skip full LCP scoring if dataset is huge
+        do_score = total_chars <= 30_000_000 and len(candidates) <= 6
+
+        if do_score:
+            for cand in candidates:
+                idxs = [col_index[c] for c in cand]
+                # build serialized rows for this ordering
+                # (join per row using precomputed cell strings)
+                if n_cols <= 64:
+                    row_strings = ["".join(ser[i, j] for j in idxs) for i in range(n_rows)]
+                else:
+                    # vectorized-ish join for wide tables
+                    row_strings = []
+                    for i in range(n_rows):
+                        parts = ser[i]
+                        row_strings.append("".join([parts[j] for j in idxs]))
+                score = self._trie_reuse(row_strings)
+                if score > best_score:
+                    best_score = score
+                    best_order = cand
+        else:
+            # fall back to the frequency-ranked heuristic
+            best_order = candidates[1] if len(candidates) > 1 else candidates[0]
+=======
+        # ---- candidate column orderings ----
+        candidates = self._build_candidates(original_columns, col_stats, col_merge)
+
+        # ---- score candidates with exact Trie reuse (bounded) ----
+        best_order = candidates[0]
+        best_score = -1
+        best_row_orders = None  # per-row index orders if the tree wins
+        # bound the scoring work: skip full LCP scoring if dataset is huge
+        do_score = total_chars <= 30_000_000 and len(candidates) <= 6
+
+        if do_score:
+            for cand in candidates:
+                idxs = [col_index[c] for c in cand]
+                # build serialized rows for this ordering
+                # (join per row using precomputed cell strings)
+                row_strings = ["".join([ser[i, j] for j in idxs])
+                               for i in range(n_rows)]
+                score = self._trie_reuse(row_strings)
+                if score > best_score:
+                    best_score = score
+                    best_order = cand
+
+            # ---- conditional partition tree candidate (per-row orders) ----
+            # only when no col_merge constraints must be honored contiguously
+            if not col_merge and n_cols <= 512 and n_rows <= 500_000:
+                codes, uniq_lens = self._factorize_cols(ser, n_rows, n_cols)
+                freq_rank = [c for c in sorted(
+                    original_columns, key=lambda c: (-col_stats[c][0], str(c)))]
+                max_depth = 12 if (n_cols >= 8 and n_rows <= 200_000) else 8
+                tree_orders = self._tree_row_orders(
+                    codes, uniq_lens, freq_rank, n_rows, n_cols, max_depth)
+                tree_strings = [
+                    "".join([ser[i, j] for j in tree_orders[i]])
+                    for i in range(n_rows)
+                ]
+                tree_score = self._trie_reuse(tree_strings)
+                if tree_score > best_score:
+                    best_score = tree_score
+                    best_row_orders = tree_orders
+        else:
+            # fall back to the frequency-ranked heuristic
+            best_order = candidates[1] if len(candidates) > 1 else candidates[0]
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+        # ---- apply the winning order (same order for every row) ----
+        out = work[best_order]
+
+        # ensure identical result: verify shape and that values are preserved
+        assert out.shape == df.shape, "Shape mismatch after reorder"
+
+        column_orderings = [list(best_order) for _ in range(n_rows)]
+=======
+        if best_row_orders is not None:
+            # ---- per-row orders won: permute each row's values directly ----
+            out_vals = np.empty((n_rows, n_cols), dtype=object)
+            for i in range(n_rows):
+                o = best_row_orders[i]
+                rv = values[i]
+                out_vals[i] = [rv[j] for j in o]
+            first_names = [original_columns[j] for j in best_row_orders[0]]
+            out = pd.DataFrame(out_vals, columns=first_names, index=df.index)
+            assert out.shape == df.shape, "Shape mismatch after reorder"
+            column_orderings = [
+                [original_columns[j] for j in o] for o in best_row_orders
+            ]
+            return out, column_orderings
+
+        # ---- apply the winning order (same order for every row) ----
+        out = work[best_order]
+
+        # ensure identical result: verify shape and that values are preserved
+        assert out.shape == df.shape, "Shape mismatch after reorder"
+
+        column_orderings = [list(best_order) for _ in range(n_rows)]
+>>>>>>> REPLACE
+</DIFF>

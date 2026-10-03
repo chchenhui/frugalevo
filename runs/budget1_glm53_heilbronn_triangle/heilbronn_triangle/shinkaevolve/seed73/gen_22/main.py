@@ -1,0 +1,153 @@
+# EVOLVE-BLOCK-START
+import time
+import numpy as np
+from itertools import combinations
+
+_TRI_AREA = np.sqrt(3.0) / 4.0  # area of the unit equilateral triangle
+_TRIPLETS = np.array(list(combinations(range(11), 3)), dtype=int)
+
+_A = np.array([0.0, 0.0])
+_B = np.array([1.0, 0.0])
+_C = np.array([0.5, np.sqrt(3.0) / 2.0])
+_VERTS = np.stack([_A, _B, _C])
+
+# precomputed Gram terms for barycentric fold
+_V0 = _B - _A
+_V1 = _C - _A
+_D00 = _V0 @ _V0
+_D01 = _V0 @ _V1
+_D11 = _V1 @ _V1
+_DEN = _D00 * _D11 - _D01 * _D01
+
+
+def _barycentric_fold(pts):
+    """Map possibly-outside points back inside the triangle via barycentric clamping."""
+    v2 = pts - _A
+    d20 = v2 @ _V0
+    d21 = v2 @ _V1
+    b1 = (_D11 * d20 - _D01 * d21) / _DEN
+    b2 = (_D00 * d21 - _D01 * d20) / _DEN
+    b0 = 1.0 - b1 - b2
+    b = np.stack([b0, b1, b2], axis=1)
+    b = np.maximum(b, 0.0)
+    b /= b.sum(axis=1, keepdims=True)
+    return b @ _VERTS
+
+
+def _min_area_and_triplet(pts):
+    """Vectorized minimal (normalized) triangle area and its triplet index."""
+    p = pts[_TRIPLETS]  # (165, 3, 2)
+    a = np.abs((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) -
+               (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
+    m = a.argmin()
+    return a[m] / (2.0 * _TRI_AREA), m
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of 11 points on or inside the unit equilateral
+    triangle maximizing the minimum triangle area (Heilbronn problem, n=11).
+
+    Deterministic: fixed seed, fixed time budget. Returns (11,2) array.
+    """
+    n = 11
+    h = np.sqrt(3.0) / 2.0
+    # Symmetric initial configuration: 3 vertices + median-layer points
+    base = np.array([
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [0.5, h],
+        [0.25, h / 2.0],
+        [0.75, h / 2.0],
+        [0.5, 0.0],
+        [0.125, h / 4.0],
+        [0.875, h / 4.0],
+        [0.375, 3.0 * h / 4.0],
+        [0.625, 3.0 * h / 4.0],
+        [0.5, h / 4.0],
+    ])
+
+    rng = np.random.default_rng(12345)
+    deadline = time.time() + 1.8
+
+    # Deterministic multi-restart seeds: symmetric layout + perturbations
+    seeds = [base.copy()]
+    for _ in range(4):
+        q = base + rng.normal(0.0, 0.03, base.shape)
+        seeds.append(_barycentric_fold(q))
+
+    best = seeds[0]
+    best_val = _min_area_and_triplet(best)[0]
+
+    for seed in seeds:
+        if time.time() > deadline or best_val >= 0.0365:
+            break
+        cur = seed.copy()
+        cur_val, tri_m = _min_area_and_triplet(cur)
+        tri = _TRIPLETS[tri_m]
+        step = 0.05
+
+        while time.time() < deadline:
+            improved = False
+
+            # --- targeted phase: push minimal-triangle vertices outward ---
+            i0, i1, i2 = tri
+            cen = cur[[i0, i1, i2]].mean(axis=0)
+            moves = []
+            for vi in (i0, i1, i2):
+                d = cur[vi] - cen
+                nrm = np.hypot(*d)
+                d = d / nrm if nrm > 1e-12 else np.array([0.0, 1.0])
+                perp = np.array([-d[1], d[0]])
+                for st in (step, 0.5 * step):
+                    moves.append((vi, d * st))
+                    moves.append((vi, d * st + perp * 0.4 * st))
+                    moves.append((vi, d * st - perp * 0.4 * st))
+                    moves.append((vi, -d * 0.3 * st))
+
+            # --- exploration moves: random point, annealed Gaussian ---
+            for _ in range(5):
+                moves.append((int(rng.integers(n)), rng.normal(0.0, step, 2)))
+
+            for vi, mv in moves:
+                cand = cur.copy()
+                cand[vi] = _barycentric_fold((cand[vi] + mv).reshape(1, 2))[0]
+                v, m2 = _min_area_and_triplet(cand)
+                if v > cur_val + 1e-12:
+                    cur, cur_val, tri = cand, v, _TRIPLETS[m2]
+                    improved = True
+                    break
+
+            if not improved:
+                step *= 0.5
+                if step < 1e-5:
+                    break
+            if cur_val > best_val:
+                best, best_val = cur.copy(), cur_val
+
+        # --- fine polish with tiny steps ---
+        step = 1e-3
+        while time.time() < deadline:
+            improved_any = False
+            for i in range(n):
+                if time.time() > deadline:
+                    break
+                cand = cur.copy()
+                cand[i] = _barycentric_fold((cand[i] + rng.normal(0.0, step, 2)).reshape(1, 2))[0]
+                v, m2 = _min_area_and_triplet(cand)
+                if v > cur_val + 1e-15:
+                    cur, cur_val, tri = cand, v, _TRIPLETS[m2]
+                    improved_any = True
+            if not improved_any:
+                step *= 0.5
+                if step < 1e-6:
+                    break
+        if cur_val > best_val:
+            best, best_val = cur.copy(), cur_val
+
+    pts = np.asarray(best, dtype=float)
+    assert pts.shape == (n, 2)
+    return pts
+
+
+# EVOLVE-BLOCK-END

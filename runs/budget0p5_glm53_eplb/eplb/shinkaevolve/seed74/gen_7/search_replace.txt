@@ -1,0 +1,96 @@
+<NAME>
+vectorized_packing_and_smarter_replication
+
+<DESCRIPTION>
+Two targeted improvements:
+
+1. **Speed up `balanced_packing`**: the current implementation has a Python loop over all `num_groups` items per layer (O(num_layers × num_groups) Python iterations, each doing a `min` over packs). Since `num_groups % num_packs == 0`, each pack must receive exactly `groups_per_pack` items. We can therefore assign items in `groups_per_pack` rounds: in each round the `num_packs` heaviest remaining items (items sorted globally descending) are given to the packs sorted by ascending current weight. This is the same greedy but the Python loop shrinks from `num_groups` to `groups_per_pack` iterations (e.g. 256 → 16), and everything inside is vectorized tensor ops batched over all layers. Each pack gets exactly one item per round, so its in-pack rank is simply the round index, and the capacity constraint is automatically satisfied.
+
+2. **Improve expert balancedness in `replicate_experts`**: currently the expert to replicate is chosen by `max(weight / logcnt)` (its *current* per-replica load). Choosing instead the expert whose *resulting* per-replica load `weight / (logcnt + 1)` is largest directly targets minimizing the maximum per-replica load — this is the standard greedy for minimizing makespan with divisible loads and yields noticeably better per-expert balance (balancedness_score_expert), which also improves the subsequent GPU packing quality since the input weights are more even.
+
+These changes require no new configuration and preserve all function signatures and output semantics.
+</DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    # Sort items descending by weight once, batched over all layers.
+    indices = weight.sort(-1, descending=True).indices
+    sorted_weights = weight.gather(-1, indices)
+
+    pack_index = torch.full((num_layers, num_groups),
+                            fill_value=-1,
+                            dtype=torch.int64,
+                            device=weight.device)
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    pack_weights = torch.zeros((num_layers, num_packs),
+                               dtype=weight.dtype,
+                               device=weight.device)
+
+    # Each pack must hold exactly `groups_per_pack` items, so we assign in
+    # rounds: in each round the `num_packs` heaviest remaining items go to
+    # the packs with the smallest current weight (ties broken by pack id via
+    # a stable sort). Every pack receives exactly one item per round, so the
+    # capacity constraint is automatically satisfied and the in-pack rank of
+    # an item is simply the round index.
+    for r in range(groups_per_pack):
+        round_items = indices[:, r * num_packs:(r + 1) * num_packs]
+        round_weights = sorted_weights[:, r * num_packs:(r + 1) * num_packs]
+        # Lightest packs first (stable => deterministic tie-breaking).
+        pack_order = pack_weights.argsort(-1, stable=True)
+        pack_index.scatter_(1, round_items, pack_order)
+        rank_in_pack.scatter_(1, round_items,
+                              torch.full_like(pack_order, r))
+        pack_weights.scatter_add_(1, pack_order, round_weights)
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+
+<DIFF>
+<<<<<<< SEARCH
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+=======
+    for i in range(num_log, num_phy):
+        # Pick the expert whose *resulting* per-replica load
+        # (weight / (logcnt + 1)) would be the largest; this directly targets
+        # minimizing the maximum per-replica load (greedy for divisible loads).
+        redundant_indices = (weight / (logcnt + 1)).max(dim=-1).indices
+>>>>>>> REPLACE
+
+<DIFF>
+<<<<<<< SEARCH
+    if groups_per_pack == 1:
+        pack_index = torch.arange(weight.size(-1),
+                                  dtype=torch.int64,
+                                  device=weight.device).expand(weight.shape)
+        rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
+        return pack_index, rank_in_pack
+=======
+    if groups_per_pack == 1:
+        pack_index = torch.arange(weight.size(-1),
+                                  dtype=torch.int64,
+                                  device=weight.device).expand(weight.shape)
+        rank_in_pack = torch.zeros(weight.shape,
+                                   dtype=torch.int64,
+                                   device=weight.device)
+        return pack_index, rank_in_pack
+>>>>>>> REPLACE

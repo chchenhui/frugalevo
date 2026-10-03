@@ -1,0 +1,303 @@
+<NAME>
+lp_polished_multistart
+</NAME>
+
+<DESCRIPTION>
+This constructor retains the public interface while strengthening the search strategy around the successful square-grid-with-defect family. It uses several defect locations, asymmetric perturbations, staggered/hexagonal alternatives, exact fixed-center LP radius polishing, and a second joint SLSQP continuation started from the polished geometry. The nonlinear solver uses analytic Jacobians for all boundary and pair-clearance constraints. Final radii are always recomputed by LP and conservatively repaired, ensuring all circles remain in the unit square and non-overlapping.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""LP-polished multistart nonlinear constructor for 26 circles in a unit square."""
+
+import numpy as np
+
+
+def _radius_lp(centers):
+    """Maximize the radius sum for fixed circle centers."""
+    n = len(centers)
+    border = np.minimum.reduce((
+        centers[:, 0], 1.0 - centers[:, 0],
+        centers[:, 1], 1.0 - centers[:, 1],
+    ))
+
+    try:
+        from scipy.optimize import linprog
+
+        pi, pj = np.triu_indices(n, 1)
+        distances = np.linalg.norm(centers[pi] - centers[pj], axis=1)
+
+        pair_rows = np.zeros((len(pi), n))
+        pair_rows[np.arange(len(pi)), pi] = 1.0
+        pair_rows[np.arange(len(pi)), pj] = 1.0
+        a_ub = np.vstack((pair_rows, np.eye(n)))
+        b_ub = np.concatenate((distances, border))
+
+        result = linprog(
+            c=-np.ones(n),
+            A_ub=a_ub,
+            b_ub=b_ub,
+            bounds=[(0.0, 0.5)] * n,
+            method="highs",
+        )
+        if result.success and np.all(np.isfinite(result.x)):
+            return np.maximum(result.x, 0.0)
+    except Exception:
+        pass
+
+    delta = centers[:, None, :] - centers[None, :, :]
+    d = np.sqrt(np.sum(delta * delta, axis=2))
+    d += np.eye(n) * 10.0
+    common = min(float(np.min(border)), 0.5 * float(np.min(d)))
+    return np.full(n, max(common, 1e-9))
+
+
+def _safe_radii(centers, radii):
+    """Apply a small numerical safety margin and repair any roundoff excess."""
+    radii = np.maximum(np.asarray(radii, dtype=float), 0.0).copy()
+    n = len(radii)
+    border = np.minimum.reduce((
+        centers[:, 0], 1.0 - centers[:, 0],
+        centers[:, 1], 1.0 - centers[:, 1],
+    ))
+    radii = np.minimum(radii, np.maximum(border, 0.0))
+
+    # Scaling only downward means repairing a later pair cannot spoil an
+    # already repaired pair.
+    for i in range(n):
+        for j in range(i + 1, n):
+            distance = float(np.linalg.norm(centers[i] - centers[j]))
+            total = radii[i] + radii[j]
+            if total > distance and total > 0.0:
+                factor = distance / total
+                radii[i] *= factor
+                radii[j] *= factor
+
+    return radii * (1.0 - 3e-9)
+
+
+def _square_defect(seed, jitter):
+    """Five-by-five grid with a twenty-sixth circle in a selected interstice."""
+    rng = np.random.default_rng(seed)
+    grid = np.array(
+        [[0.1 + 0.2 * col, 0.1 + 0.2 * row]
+         for row in range(5) for col in range(5)],
+        dtype=float,
+    )
+    gaps = np.array([
+        [0.2, 0.2], [0.4, 0.2], [0.6, 0.2], [0.8, 0.2],
+        [0.2, 0.4], [0.4, 0.4], [0.6, 0.4], [0.8, 0.4],
+        [0.2, 0.6], [0.4, 0.6], [0.6, 0.6], [0.8, 0.6],
+        [0.2, 0.8], [0.4, 0.8], [0.6, 0.8], [0.8, 0.8],
+    ])
+    centers = np.vstack((grid, gaps[seed % len(gaps)]))
+
+    if jitter:
+        centers += rng.normal(0.0, jitter, centers.shape)
+        # A deterministic shear avoids retaining artificial reflection
+        # symmetry in otherwise nearly symmetric random starts.
+        centers[:, 0] += (centers[:, 1] - 0.5) * jitter * 0.30
+        centers = np.clip(centers, 0.015, 0.985)
+    return centers
+
+
+def _staggered_seed(seed, jitter):
+    """A hexagonal-style layered seed, included as a distinct contact graph."""
+    rng = np.random.default_rng(1000 + seed)
+    rows = []
+    ys = np.linspace(0.09, 0.91, 5)
+    counts = (5, 5, 6, 5, 5)
+    for row, (y, count) in enumerate(zip(ys, counts)):
+        if count == 6:
+            xs = np.linspace(0.075, 0.925, 6)
+        else:
+            shift = 0.015 if row % 2 else -0.015
+            xs = np.linspace(0.10 + shift, 0.90 + shift, 5)
+        rows.extend((x, y) for x in xs)
+    centers = np.asarray(rows, dtype=float)
+    centers += rng.normal(0.0, jitter, centers.shape)
+    return np.clip(centers, 0.012, 0.988)
+
+
+def _nonlinear_improve(initial_centers, maxiter=650):
+    """Jointly optimize all centers and radii with analytic SLSQP derivatives."""
+    try:
+        from scipy.optimize import minimize
+    except Exception:
+        return np.asarray(initial_centers, dtype=float).copy()
+
+    centers0 = np.asarray(initial_centers, dtype=float)
+    n = len(centers0)
+    pi, pj = np.triu_indices(n, 1)
+    m = len(pi)
+    radii0 = 0.975 * _radius_lp(centers0)
+    z0 = np.concatenate((centers0.ravel(), radii0))
+
+    boundary_jac = np.zeros((4 * n, 3 * n))
+    for i in range(n):
+        x, y, r = 2 * i, 2 * i + 1, 2 * n + i
+        boundary_jac[4 * i + 0, x] = 1.0
+        boundary_jac[4 * i + 0, r] = -1.0
+        boundary_jac[4 * i + 1, x] = -1.0
+        boundary_jac[4 * i + 1, r] = -1.0
+        boundary_jac[4 * i + 2, y] = 1.0
+        boundary_jac[4 * i + 2, r] = -1.0
+        boundary_jac[4 * i + 3, y] = -1.0
+        boundary_jac[4 * i + 3, r] = -1.0
+
+    def constraints(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        boundary = np.empty(4 * n)
+        boundary[0::4] = c[:, 0] - r
+        boundary[1::4] = 1.0 - c[:, 0] - r
+        boundary[2::4] = c[:, 1] - r
+        boundary[3::4] = 1.0 - c[:, 1] - r
+        delta = c[pi] - c[pj]
+        pair = np.sum(delta * delta, axis=1) - (r[pi] + r[pj]) ** 2
+        return np.concatenate((boundary, pair))
+
+    def constraint_jacobian(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        jac = np.zeros((4 * n + m, 3 * n))
+        jac[:4 * n] = boundary_jac
+
+        delta = c[pi] - c[pj]
+        sums = r[pi] + r[pj]
+        rows = 4 * n + np.arange(m)
+        jac[rows, 2 * pi] = 2.0 * delta[:, 0]
+        jac[rows, 2 * pi + 1] = 2.0 * delta[:, 1]
+        jac[rows, 2 * pj] = -2.0 * delta[:, 0]
+        jac[rows, 2 * pj + 1] = -2.0 * delta[:, 1]
+        jac[rows, 2 * n + pi] = -2.0 * sums
+        jac[rows, 2 * n + pj] = -2.0 * sums
+        return jac
+
+    def objective(z):
+        return -float(np.sum(z[2 * n:]))
+
+    def objective_jacobian(z):
+        grad = np.zeros(3 * n)
+        grad[2 * n:] = -1.0
+        return grad
+
+    try:
+        result = minimize(
+            objective,
+            z0,
+            method="SLSQP",
+            jac=objective_jacobian,
+            bounds=[(1e-7, 1.0 - 1e-7)] * (2 * n) + [(0.0, 0.5)] * n,
+            constraints={
+                "type": "ineq",
+                "fun": constraints,
+                "jac": constraint_jacobian,
+            },
+            options={"maxiter": maxiter, "ftol": 2e-11, "disp": False},
+        )
+        candidate = result.x[:2 * n].reshape(n, 2)
+        if np.all(np.isfinite(candidate)):
+            return np.clip(candidate, 1e-7, 1.0 - 1e-7)
+    except Exception:
+        pass
+
+    return centers0.copy()
+
+
+def construct_packing():
+    """Construct a valid high-sum packing of 26 circles in the unit square."""
+    best_centers = None
+    best_radii = None
+    best_score = -np.inf
+
+    starts = [
+        ("square", 0, 0.000), ("square", 1, 0.008),
+        ("square", 6, 0.013), ("square", 11, 0.018),
+        ("square", 14, 0.023), ("square", 9, 0.029),
+        ("square", 3, 0.035), ("square", 12, 0.042),
+        ("square", 7, 0.050), ("square", 15, 0.058),
+        ("staggered", 2, 0.012), ("staggered", 8, 0.024),
+        ("staggered", 13, 0.038), ("staggered", 17, 0.052),
+    ]
+
+    for family, seed, jitter in starts:
+        if family == "square":
+            initial = _square_defect(seed, jitter)
+        else:
+            initial = _staggered_seed(seed, jitter)
+
+        first = _nonlinear_improve(initial, maxiter=650)
+        first_radii = _safe_radii(first, _radius_lp(first))
+        first_score = float(np.sum(first_radii))
+
+        # LP sizing after the first solve exposes radius slack.  A fresh
+        # nonlinear run then allows the contact graph to change around that
+        # polished fixed-center packing.
+        second = _nonlinear_improve(first, maxiter=900)
+
+        for centers in (initial, first, second):
+            radii = _safe_radii(centers, _radius_lp(centers))
+            score = float(np.sum(radii))
+            if score > best_score:
+                best_score = score
+                best_centers = centers.copy()
+                best_radii = radii.copy()
+
+        if first_score > best_score:
+            best_score = first_score
+            best_centers = first.copy()
+            best_radii = first_radii.copy()
+
+    return best_centers, best_radii, float(np.sum(best_radii))
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)
+``` 
+</CODE>

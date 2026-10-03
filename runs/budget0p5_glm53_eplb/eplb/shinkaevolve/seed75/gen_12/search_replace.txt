@@ -1,0 +1,104 @@
+<NAME>
+lpt_swap_refinement_and_policy_selection
+
+</NAME>
+<DESCRIPTION>
+Two targeted improvements:
+
+1. **`balanced_packing` refinement**: The current greedy (LPT-style) assignment can leave the heaviest and lightest packs far apart. I add a cheap local-search pass that repeatedly swaps items between the heaviest and lightest packs whenever the swap strictly reduces the maximum pack weight. This lowers the per-GPU load spread (improving both GPU balancedness and the per-replica load uniformity that drives the expert balancedness score), at negligible cost since it operates on plain Python lists.
+
+2. **Policy selection in `rebalance_experts`**: The hierarchical policy (group→node packing) constrains where experts can live, which can hurt balance when the group loads are uneven. The algorithm is already very fast (0.01s), so I additionally compute the global policy and directly measure per-GPU load balance of both candidate layouts (sum of squared deviations from the per-layer mean GPU load), keeping whichever is better. This gives the best of both policies without runtime concerns.
+</NAME>
+<DIFF>
+<<<<<<< SEARCH
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        # packs that still have capacity
+        candidates = list(range(num_packs))
+        for group in idx:
+            pack = min(candidates, key=pack_weights.__getitem__)
+            pi[group] = pack
+            ri[group] = pack_items[pack]
+            pack_weights[pack] += w[group]
+            pack_items[pack] += 1
+            if pack_items[pack] == groups_per_pack:
+                candidates.remove(pack)
+=======
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        pack_members = [[] for _ in range(num_packs)]
+        # packs that still have capacity
+        candidates = list(range(num_packs))
+        for group in idx:
+            pack = min(candidates, key=pack_weights.__getitem__)
+            pi[group] = pack
+            ri[group] = pack_items[pack]
+            pack_weights[pack] += w[group]
+            pack_members[pack].append(group)
+            pack_items[pack] += 1
+            if pack_items[pack] == groups_per_pack:
+                candidates.remove(pack)
+        # Local-search refinement: swap items between the heaviest and the
+        # lightest pack while it reduces the maximum pack weight.
+        for _ in range(num_groups):
+            hi = max(range(num_packs), key=pack_weights.__getitem__)
+            lo = min(range(num_packs), key=pack_weights.__getitem__)
+            if hi == lo or pack_weights[hi] == pack_weights[lo]:
+                break
+            best = None
+            for a in pack_members[hi]:
+                for b in pack_members[lo]:
+                    nh = pack_weights[hi] - w[a] + w[b]
+                    nl = pack_weights[lo] - w[b] + w[a]
+                    if nh >= pack_weights[hi] or nl >= pack_weights[hi]:
+                        continue
+                    if best is None or max(nh, nl) < best[0]:
+                        best = (max(nh, nl), a, b)
+            if best is None:
+                break
+            _, a, b = best
+            pi[a], pi[b] = pi[b], pi[a]
+            ri[a], ri[b] = ri[b], ri[a]
+            pack_members[hi].remove(a)
+            pack_members[lo].remove(b)
+            pack_members[hi].append(b)
+            pack_members[lo].append(a)
+            pack_weights[hi] = pack_weights[hi] - w[a] + w[b]
+            pack_weights[lo] = pack_weights[lo] - w[b] + w[a]
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    num_layers, num_logical_experts = weight.shape
+    weight = weight.float().cpu()
+    if num_groups % num_nodes == 0:
+        # use hierarchical load-balance policy
+        phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
+            weight, num_replicas, num_groups, num_nodes, num_gpus)
+    else:
+        # use global load-balance policy
+        phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
+            weight, num_replicas, 1, 1, num_gpus)
+=======
+    num_layers, num_logical_experts = weight.shape
+    weight = weight.float().cpu()
+
+    def gpu_imbalance(phy2log: torch.Tensor, logcnt: torch.Tensor) -> float:
+        """Sum of squared deviations of per-GPU loads from the layer mean."""
+        per_replica = (weight / logcnt).gather(-1, phy2log)
+        loads = per_replica.view(num_layers, num_gpus, -1).sum(-1)
+        mean = loads.mean(-1, keepdim=True)
+        return ((loads - mean) ** 2).sum().item()
+
+    g_phy2log, g_phrank, g_logcnt = rebalance_experts_hierarchical(
+        weight, num_replicas, 1, 1, num_gpus)
+    if num_groups % num_nodes == 0 and num_groups > 1:
+        # hierarchical load-balance policy
+        phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
+            weight, num_replicas, num_groups, num_nodes, num_gpus)
+        if gpu_imbalance(g_phy2log, g_logcnt) < gpu_imbalance(
+                phy2log, logcnt):
+            phy2log, phyrank, logcnt = g_phy2log, g_phrank, g_logcnt
+    else:
+        # use global load-balance policy
+        phy2log, phyrank, logcnt = g_phy2log, g_phrank, g_logcnt
+>>>>>>> REPLACE
+</DIFF>

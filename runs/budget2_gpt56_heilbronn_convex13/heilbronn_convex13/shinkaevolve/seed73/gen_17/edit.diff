@@ -1,0 +1,297 @@
+--- a/original.py
++++ b/original.py
+@@ -1,110 +1,204 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_convex13() -> np.ndarray:
+     """
+-    Deterministically search for a high-quality maximin configuration of 13
+-    points.  Coordinates are unconstrained because the convex hull of the
+-    returned points is itself the containing convex region; the objective is
+-    invariant under translation and uniform scaling.
++    Deterministically construct 13 points in a unit-area convex triangle.
++
++    The reference domain is x >= 0, y >= 0, x + y <= 1.  Its area is 1/2;
++    all returned coordinates are scaled by sqrt(2), making the final
++    containing right triangle have area exactly one.
++
++    The local optimizer is a coordinate feasibility pump.  With every point
++    except one fixed, each signed triangle determinant containing the moving
++    point is affine.  Thus testing whether a target minimum determinant is
++    attainable is just intersection of finitely many half-planes.
+     """
+     n = 13
+-    rng = np.random.default_rng(seed=91723)
+-    triangles = np.array(
+-        [(i, j, k) for i in range(n - 2) for j in range(i + 1, n - 1)
++    rng = np.random.default_rng(20250317)
++
++    triples = np.array(
++        [(i, j, k)
++         for i in range(n - 2)
++         for j in range(i + 1, n - 1)
+          for k in range(j + 1, n)],
+         dtype=np.intp,
+     )
+ 
+-    def hull_area(p: np.ndarray) -> float:
+-        """Area of the convex hull, using the monotone-chain algorithm."""
+-        order = np.lexsort((p[:, 1], p[:, 0]))
+-        hull = []
+-
+-        def turn(a: int, b: int, c: int) -> float:
+-            return ((p[b, 0] - p[a, 0]) * (p[c, 1] - p[a, 1])
+-                    - (p[b, 1] - p[a, 1]) * (p[c, 0] - p[a, 0]))
+-
+-        for q in order:
+-            while len(hull) >= 2 and turn(hull[-2], hull[-1], q) <= 0.0:
+-                hull.pop()
+-            hull.append(q)
+-        lower_size = len(hull)
+-        for q in order[-2::-1]:
+-            while len(hull) > lower_size and turn(hull[-2], hull[-1], q) <= 0.0:
+-                hull.pop()
+-            hull.append(q)
+-
+-        vertices = p[np.asarray(hull[:-1], dtype=np.intp)]
+-        return 0.5 * abs(
+-            np.dot(vertices[:, 0], np.roll(vertices[:, 1], -1))
+-            - np.dot(vertices[:, 1], np.roll(vertices[:, 0], -1))
+-        )
+-
+-    def evaluate(p: np.ndarray) -> tuple[float, int]:
+-        a = p[triangles[:, 0]]
+-        b = p[triangles[:, 1]]
+-        c = p[triangles[:, 2]]
+-        double_areas = np.abs(
+-            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+-            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+-        )
+-        worst = int(np.argmin(double_areas))
+-        area = hull_area(p)
+-        if area <= 1.0e-14:
+-            return -np.inf, worst
+-        return 0.5 * double_areas[worst] / area, worst
++    incident = [[] for _ in range(n)]
++    for t, (i, j, k) in enumerate(triples):
++        incident[i].append(t)
++        incident[j].append(t)
++        incident[k].append(t)
++    incident = [np.asarray(x, dtype=np.intp) for x in incident]
++
++    incident_mask = np.zeros((n, len(triples)), dtype=bool)
++    for q in range(n):
++        incident_mask[q, incident[q]] = True
++
++    def determinants(p: np.ndarray) -> np.ndarray:
++        a = p[triples[:, 0]]
++        b = p[triples[:, 1]]
++        c = p[triples[:, 2]]
++        return ((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
++                - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
++
++    def clip_halfplane(poly: np.ndarray, ax: float, ay: float,
++                       rhs: float) -> np.ndarray:
++        """Clip convex polygon by ax*x + ay*y >= rhs."""
++        if len(poly) == 0:
++            return poly
++
++        values = poly[:, 0] * ax + poly[:, 1] * ay - rhs
++        output = []
++        previous = poly[-1]
++        previous_value = values[-1]
++        previous_inside = previous_value >= -2.0e-13
++
++        for current, current_value in zip(poly, values):
++            current_inside = current_value >= -2.0e-13
++            if current_inside != previous_inside:
++                denom = previous_value - current_value
++                if abs(denom) > 1.0e-16:
++                    ratio = previous_value / denom
++                    output.append(previous + ratio * (current - previous))
++            if current_inside:
++                output.append(current)
++            previous = current
++            previous_value = current_value
++            previous_inside = current_inside
++
++        if not output:
++            return np.empty((0, 2), dtype=float)
++        return np.asarray(output, dtype=float)
++
++    def feasible_polygon(p: np.ndarray, q: int, target: float,
++                         signs: np.ndarray) -> np.ndarray:
++        """
++        Intersect the reference triangle with all signed determinant
++        constraints involving point q.
++        """
++        poly = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=float)
++
++        for t in incident[q]:
++            i, j, k = triples[t]
++            a, b, c = p[i], p[j], p[k]
++
++            # det(a,b,c) = d0 + dx*x_q + dy*y_q.
++            if q == i:
++                d0 = b[0] * c[1] - b[1] * c[0]
++                dx = c[1] - b[1]
++                dy = b[0] - c[0]
++            elif q == j:
++                d0 = a[1] * c[0] - a[0] * c[1]
++                dx = c[1] - a[1]
++                dy = a[0] - c[0]
++            else:
++                d0 = a[0] * b[1] - a[1] * b[0]
++                dx = a[1] - b[1]
++                dy = b[0] - a[0]
++
++            s = signs[t]
++            poly = clip_halfplane(poly, s * dx, s * dy, target - s * d0)
++            if len(poly) == 0:
++                break
++
++        return poly
++
++    def improve_coordinate(p: np.ndarray, q: int,
++                           dets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++        """
++        Maximize the attainable global determinant floor for a single point.
++        Signs are fixed during this update; crossing a sign would require a
++        zero-area triangle and therefore cannot improve a positive solution.
++        """
++        signs = np.where(dets >= 0.0, 1.0, -1.0)
++        other = np.abs(dets[~incident_mask[q]])
++        lower = float(np.min(np.abs(dets)))
++        upper = float(np.min(other)) if len(other) else 0.5
++
++        # Binary search is intentionally modest: geometric clipping, rather
++        # than a noisy stochastic proposal, supplies the refinement accuracy.
++        best_poly = feasible_polygon(p, q, lower * (1.0 - 2.0e-12), signs)
++        for _ in range(16):
++            middle = 0.5 * (lower + upper)
++            poly = feasible_polygon(p, q, middle, signs)
++            if len(poly):
++                lower = middle
++                best_poly = poly
++            else:
++                upper = middle
++
++        if len(best_poly) == 0:
++            return p, dets
++
++        # The centroid is interior whenever the feasible cell has area.  This
++        # preserves slack for subsequent coordinates better than an arbitrary
++        # extreme intersection point.
++        candidate = p.copy()
++        candidate[q] = np.mean(best_poly, axis=0)
++        new_dets = determinants(candidate)
++
++        if np.min(np.abs(new_dets)) + 1.0e-12 >= np.min(np.abs(dets)):
++            return candidate, new_dets
++        return p, dets
+ 
+     best_points = None
+-    best_score = -np.inf
+-
+-    # Four rotated rings plus a centre give a useful non-collinear, threefold
+-    # initial geometry.  Each restart relaxes this prior independently.
+-    base_radii = np.array([0.31, 0.55, 0.79, 1.00])
+-    base_phases = np.array([0.03, 0.29, 0.57, 0.84])
+-
+-    for restart in range(10):
+-        points = np.zeros((n, 2), dtype=float)
+-        radii = base_radii + rng.normal(0.0, 0.035, 4)
+-        phases = base_phases + rng.normal(0.0, 0.045, 4)
+-        points[0] = rng.normal(0.0, 0.018, 2)
+-        index = 1
+-        for radius, phase in zip(radii, phases):
+-            angles = phase + 2.0 * np.pi * np.arange(3) / 3.0
+-            points[index:index + 3] = radius * np.column_stack(
+-                (np.cos(angles), np.sin(angles))
+-            )
+-            index += 3
+-        points += rng.normal(0.0, 0.012, points.shape)
+-
+-        score, worst = evaluate(points)
+-        for iteration in range(12000):
+-            # Cooling remains mildly nonzero so that equal-area bottlenecks can
+-            # exchange roles instead of freezing at the first local optimum.
+-            fraction = iteration / 11999.0
+-            step = 0.115 * (1.0 - fraction) ** 1.7 + 0.0025
+-            temperature = 0.0022 * (1.0 - fraction) ** 2 + 0.000015
+-
+-            candidate = points.copy()
+-            if rng.random() < 0.82:
+-                moved = int(triangles[worst, rng.integers(0, 3)])
+-            else:
+-                moved = int(rng.integers(n))
+-            candidate[moved] += rng.normal(0.0, step, 2)
+-
+-            candidate_score, candidate_worst = evaluate(candidate)
+-            delta = candidate_score - score
+-            if delta >= 0.0 or rng.random() < np.exp(delta / temperature):
+-                points, score, worst = candidate, candidate_score, candidate_worst
+-
+-            if score > best_score:
+-                best_score = score
++    best_value = -np.inf
++
++    # Independent simplex samples choose different determinant-sign chambers.
++    # The later sweeps are deterministic given this fixed generator seed.
++    for restart in range(36):
++        points = np.empty((n, 2), dtype=float)
++        points[:3] = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
++
++        uv = rng.random((10, 2))
++        fold = np.sum(uv, axis=1) > 1.0
++        uv[fold] = 1.0 - uv[fold]
++
++        # A small restart-dependent cyclic displacement avoids repeatedly
++        # selecting identical low-slack orientation patterns.
++        shift = (restart * 0.6180339887498949) % 1.0
++        uv[:, 0] = (uv[:, 0] + 0.17 * shift) % 1.0
++        fold = np.sum(uv, axis=1) > 1.0
++        uv[fold] = 1.0 - uv[fold]
++        points[3:] = uv
++
++        dets = determinants(points)
++
++        for sweep in range(22):
++            # Reordering coordinates helps avoid a directional coordinate-
++            # descent bias while retaining completely reproducible behavior.
++            order = rng.permutation(np.arange(3, n))
++            for q in order:
++                points, dets = improve_coordinate(points, int(q), dets)
++
++            value = float(np.min(np.abs(dets)))
++            if value > best_value:
++                best_value = value
+                 best_points = points.copy()
+ 
++            # A very small deterministic kick between early sweeps permits
++            # movement between nearby active-constraint faces.  It is accepted
++            # only if it retains the current floor.
++            if sweep in (5, 11) and restart % 3 == 0:
++                trial = points.copy()
++                trial[3:] += rng.normal(0.0, 0.006 / (sweep + 1), (10, 2))
++                trial[3:] = np.maximum(trial[3:], 0.0)
++                sums = np.sum(trial[3:], axis=1)
++                over = sums > 0.999999
++                trial[3:][over] /= sums[over, None] / 0.999999
++                trial_dets = determinants(trial)
++                if np.min(np.abs(trial_dets)) >= 0.995 * np.min(np.abs(dets)):
++                    points, dets = trial, trial_dets
++
+     if best_points is None or not np.all(np.isfinite(best_points)):
+-        raise RuntimeError("deterministic Heilbronn search failed to produce a configuration")
+-    return best_points
++        raise RuntimeError("Heilbronn feasibility pump failed")
++
++    # The reference hull area is 1/2.  Scaling by sqrt(2) gives a unit-area
++    # convex containing region without changing normalized triangle areas.
++    return best_points * np.sqrt(2.0)
+ 
+ 
+ # EVOLVE-BLOCK-END

@@ -1,0 +1,261 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+try:
+    from scipy.optimize import minimize
+    HAVE_SCIPY = True
+except Exception:
+    HAVE_SCIPY = False
+
+
+def _pairwise_sq(points):
+    diff = points[:, None, :] - points[None, :, :]
+    d2 = np.sum(diff * diff, axis=-1)
+    return d2, diff
+
+
+def _true_score(points):
+    d2, _ = _pairwise_sq(points)
+    iu = np.triu_indices(len(points), 1)
+    dm2 = d2[iu].min()
+    dx2 = d2[iu].max()
+    if dx2 <= 0:
+        return 0.0
+    return dm2 / dx2
+
+
+def _neg_obj(flat, n, beta, sphere):
+    pts = flat.reshape(n, 3).copy()
+    d2, diff = _pairwise_sq(pts)
+    iu = np.triu_indices(n, 1)
+    dij2 = d2[iu]
+    dij = diff[iu]
+
+    a = -beta * dij2
+    amax = a.max()
+    lse_min = amax + np.log(np.sum(np.exp(a - amax)))
+    soft_min = -lse_min / beta
+
+    b = beta * dij2
+    bmax = b.max()
+    lse_max = bmax + np.log(np.sum(np.exp(b - bmax)))
+    soft_max = lse_max / beta
+
+    F = soft_min - soft_max
+    obj = -F
+
+    w_min = np.exp(a - amax); w_min /= w_min.sum()
+    w_max = np.exp(b - bmax); w_max /= w_max.sum()
+
+    g_dij2 = (-1.0) * w_min - 1.0 * w_max
+    grad_pts = np.zeros((n, 3))
+    idx_i, idx_j = iu
+    contrib = 2.0 * g_dij2[:, None] * dij
+    np.add.at(grad_pts, idx_i, contrib)
+    np.add.at(grad_pts, idx_j, -contrib)
+
+    if sphere:
+        norms = np.linalg.norm(pts, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-12)
+        u = pts / norms
+        grad_pts = grad_pts - np.sum(grad_pts * u, axis=1, keepdims=True) * u
+
+    return obj, grad_pts.ravel()
+
+
+def _slsqp_packing(P0, n, maxiter=400):
+    """Maximize min pairwise distance subject to max pairwise distance <= 1.
+    Under this constraint, dmin/dmax equals dmin exactly."""
+    if not HAVE_SCIPY:
+        return None
+    from itertools import combinations
+    pairs = list(combinations(range(n), 2))
+    ii = np.array([a for a, b in pairs])
+    jj = np.array([b for a, b in pairs])
+
+    def pdists(flat):
+        P = flat.reshape(n, 3)
+        return np.linalg.norm(P[ii] - P[jj], axis=1)
+
+    def obj_soft(flat, beta):
+        # smooth soft-min: -1/beta * log(sum(exp(-beta*d)))
+        ds = pdists(flat)
+        a = -beta * ds
+        amax = a.max()
+        return (amax + np.log(np.sum(np.exp(a - amax)))) / beta
+
+    def cons(flat):
+        return 1.0 - pdists(flat).max()
+
+    # scale so initial diameter is 1 (feasible start)
+    P = np.asarray(P0, dtype=float).copy()
+    P = P - P.mean(axis=0)
+    dm = np.linalg.norm(P[:, None, :] - P[None, :, :], axis=-1)
+    dm = dm[np.triu_indices(n, 1)].max()
+    if dm > 0:
+        P = P / dm
+
+    # escalating sharpness with internal restarts: smooth objective
+    # gives gradients even away from the active pair, then sharpens.
+    res = None
+    for beta in (20.0, 60.0, 200.0, 1000.0):
+        res = minimize(obj_soft, P.ravel(), args=(beta,), method='SSLQP' if False else 'SLSQP',
+                       constraints={'type': 'ineq', 'fun': cons},
+                       options={'maxiter': maxiter, 'ftol': 1e-14})
+        if not np.all(np.isfinite(res.x)) or res.x.size != 3 * n:
+            break
+        P = res.x.reshape(n, 3)
+        # re-normalize diameter for the next round (feasible restart)
+        dcur = pdists(P.ravel()).max()
+        if dcur > 1e-12:
+            P = P / dcur
+    assert P.shape == (n, 3) and np.all(np.isfinite(P)), "SLSQP output malformed"
+    d2, _ = _pairwise_sq(P)
+    iu = np.triu_indices(n, 1)
+    dx2 = d2[iu].max()
+    if dx2 <= 0:
+        return None
+    score = d2[iu].min() / dx2
+    return P, score
+
+
+def _opt(flat, n, beta, sphere, maxiter):
+    if HAVE_SCIPY:
+        res = minimize(_neg_obj, flat, args=(n, beta, sphere),
+                       jac=True, method="L-BFGS-B",
+                       options={"maxiter": maxiter, "maxfun": 4 * maxiter})
+        return res.x.reshape(n, 3)
+    else:
+        step = 0.02
+        cur = flat.copy()
+        for _ in range(maxiter):
+            f, g = _neg_obj(cur, n, beta, sphere)
+            cur = cur - step * g
+            if sphere:
+                p = cur.reshape(n, 3)
+                p = p / np.maximum(np.linalg.norm(p, axis=1, keepdims=True), 1e-12)
+                cur = p.ravel()
+        return cur.reshape(n, 3)
+
+
+def _structured_inits():
+    """Structured starting configurations known to be good for 14 points in 3D."""
+    inits = []
+    phi = (1 + np.sqrt(5)) / 2
+    # icosahedron (12 verts) + 2 poles
+    ico = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    ], dtype=float)
+    ico /= np.linalg.norm(ico, axis=1, keepdims=True)
+    inits.append(np.vstack([ico, [[0, 0, 1.3], [0, 0, -1.3]]]))
+    inits.append(np.vstack([ico, [[0, 0, 1.0], [0, 0, -1.0]]]))
+    # cube (8) + octahedron (6)
+    cube = np.array([[i, j, k] for i in (-1, 1) for j in (-1, 1) for k in (-1, 1)], dtype=float)
+    cube /= np.linalg.norm(cube, axis=1, keepdims=True)
+    octa = np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]], dtype=float)
+    inits.append(np.vstack([cube, 1.05 * octa]))
+    inits.append(np.vstack([1.05 * cube, octa]))
+    # hexagonal bipyramid (6+2) + 6-point equatorial ring offset
+    t = np.linspace(0, 2 * np.pi, 6, endpoint=False)
+    ring1 = np.stack([np.cos(t), np.sin(t), 0.55 * np.ones(6)], axis=1)
+    ring2 = np.stack([np.cos(t + np.pi / 6), np.sin(t + np.pi / 6), -0.55 * np.ones(6)], axis=1)
+    poles = np.array([[0, 0, 1.6], [0, 0, -1.6]])
+    inits.append(np.vstack([ring1, ring2, poles]))
+    # twisted double ring (7+7)
+    t = np.linspace(0, 2 * np.pi, 7, endpoint=False)
+    r1 = np.stack([np.cos(t), np.sin(t), 0.5 * np.ones(7)], axis=1)
+    r2 = np.stack([np.cos(t + np.pi / 7), np.sin(t + np.pi / 7), -0.5 * np.ones(7)], axis=1)
+    inits.append(np.vstack([r1, r2]))
+    return inits
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    n = 14
+    best_pts = None
+    best = -1.0
+    target = 0.2400
+
+    starts = []
+    for p in _structured_inits():
+        starts.append(p / np.linalg.norm(p, axis=1, keepdims=True))
+    rng = np.random.RandomState(7)
+    for seed in range(16):
+        v = np.random.RandomState(seed).randn(n, 3)
+        starts.append(v / np.linalg.norm(v, axis=1, keepdims=True))
+
+    # phase 1: cheap ranking pass over all starts
+    ranked = []
+    for pts0 in starts:
+        pts = _opt(pts0.ravel().copy(), n, 20.0, True, 80)
+        pts = _opt(pts.ravel().copy(), n, 60.0, True, 80)
+        s = _true_score(pts)
+        ranked.append((s, pts))
+    ranked.sort(key=lambda x: -x[0])
+
+    # phase 2: fully converge the top candidates with SLSQP on the
+    # exact constrained problem (dmax <= 1, maximize dmin)
+    for s0, pts in ranked[:5]:
+        out = _slsqp_packing(pts, n, maxiter=400)
+        if out is not None:
+            P, s = out
+        else:
+            P = pts
+            for beta in [20.0, 60.0, 150.0, 400.0]:
+                P = _opt(P.ravel().copy(), n, beta, True, 300)
+            s = _true_score(P)
+        if s > best:
+            best = s
+            best_pts = P
+        if best >= target:
+            break
+
+    # free-space (off-sphere) refinement with increasing sharpness
+    if best_pts is not None:
+        cand = best_pts
+        out = _slsqp_packing(cand, n, maxiter=600)
+        if out is not None:
+            P, s = out
+            if s > best:
+                best = s
+                cand = P
+        for beta in [60.0, 150.0, 400.0]:
+            cand = _opt(cand.ravel().copy(), n, beta, False, 400)
+            cand = cand - cand.mean(axis=0)
+            out = _slsqp_packing(cand, n, maxiter=600)
+            if out is not None:
+                cand, s = out
+            else:
+                s = _true_score(cand)
+            if s > best:
+                best = s
+                best_pts = cand
+
+    # greedy local polish: small random perturbations re-optimized
+    if best_pts is not None:
+        rng = np.random.RandomState(123)
+        for _ in range(6):
+            cand = best_pts + 0.02 * rng.randn(n, 3)
+            for beta in [150.0, 400.0]:
+                cand = _opt(cand.ravel().copy(), n, beta, False, 250)
+                cand = cand - cand.mean(axis=0)
+            out = _slsqp_packing(cand, n, maxiter=600)
+            if out is not None:
+                cand, s = out
+            else:
+                s = _true_score(cand)
+            if s > best:
+                best = s
+                best_pts = cand
+
+    if best_pts is None:
+        np.random.seed(42)
+        best_pts = np.random.randn(n, 3)
+
+    best_pts = best_pts - best_pts.mean(axis=0)
+    scale = np.max(np.abs(best_pts))
+    if scale > 0:
+        best_pts = best_pts / scale
+    return np.asarray(best_pts, dtype=float)
+# EVOLVE-BLOCK-END

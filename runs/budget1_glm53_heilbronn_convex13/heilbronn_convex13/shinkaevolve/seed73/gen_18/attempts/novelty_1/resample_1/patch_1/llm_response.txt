@@ -1,0 +1,166 @@
+<NAME>
+fast_basin_hopping_heilbronn13
+</NAME>
+<DESCRIPTION>
+All prior attempts score ~0.18 (min_area_normalized ≈ 0.006), far below the ~0.031 benchmark. They rely on slow softmin gradient ascent that gets stuck in symmetric ring configurations where small triangles persist. This rewrite uses a completely different paradigm: fast vectorized evaluation of the exact objective (min triangle area / hull area) plus basin-hopping stochastic hill climbing. Each move perturbs one point; the move is accepted only if the true (non-smoothed) objective improves. Adaptive step sizes plus repeated perturbation-restart (basin hopping) from multiple deterministic seeds escape the poor symmetric local optima that plague gradient methods. Since the exact objective is evaluated directly (not a soft approximation), progress is never lost to smoothing bias. The convex hull of the final configuration is rescaled to unit area, which only helps (interior points stay inside, hull area becomes exactly 1).
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+_N = 13
+_idx = np.array([(i, j, k) for i in range(_N - 2)
+                 for j in range(i + 1, _N - 1)
+                 for k in range(j + 1, _N)], dtype=np.int64)
+_I, _J, _K = _idx[:, 0], _idx[:, 1], _idx[:, 2]
+
+
+def _min_tri(P):
+    ax, ay = P[_I, 0], P[_I, 1]
+    bx, by = P[_J, 0], P[_J, 1]
+    cx, cy = P[_K, 0], P[_K, 1]
+    return np.abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay)).min() * 0.5
+
+
+def _hull_area(P):
+    # Monotone chain, numpy-friendly
+    order = np.lexsort((P[:, 1], P[:, 0]))
+    pts = P[order]
+    def chain(pts):
+        out = []
+        for p in pts:
+            while len(out) >= 2:
+                o, a = out[-2], out[-1]
+                if (a[0]-o[0])*(p[1]-o[1]) - (a[1]-o[1])*(p[0]-o[0]) <= 0:
+                    out.pop()
+                else:
+                    break
+            out.append(p)
+        return out
+    lo = chain(pts)
+    up = chain(pts[::-1])
+    hull = np.array(lo[:-1] + up[:-1])
+    m = len(hull)
+    a = 0.0
+    for i in range(m):
+        x1, y1 = hull[i]
+        x2, y2 = hull[(i + 1) % m]
+        a += x1 * y2 - x2 * y1
+    return abs(a) * 0.5
+
+
+def _ratio(P):
+    ha = _hull_area(P)
+    if ha < 1e-12:
+        return 0.0
+    return _min_tri(P) / ha
+
+
+def _climb(P, rng, iters, amp0=0.05, target=None):
+    """Stochastic hill climbing on the exact ratio; moves one point at a time."""
+    P = P.copy()
+    best = _ratio(P)
+    best_P = P.copy()
+    amp = amp0
+    fails = 0
+    for it in range(iters):
+        i = rng.integers(_N)
+        d = rng.normal(size=2) * amp
+        old = P[i].copy()
+        new = old + d
+        # keep in unit box (hull area <= 1 automatically)
+        if not (0.0 <= new[0] <= 1.0 and 0.0 <= new[1] <= 1.0):
+            amp *= 0.98
+            continue
+        P[i] = new
+        v = _ratio(P)
+        if v > best + 1e-14:
+            best = v
+            best_P = P.copy()
+            fails = 0
+            amp = min(amp * 1.02, 0.15)
+        else:
+            P[i] = old
+            fails += 1
+            if fails > 60:
+                amp *= 0.85
+                fails = 0
+                if amp < 1e-4:
+                    break
+    return best_P, best
+
+
+def _inits(rng):
+    inits = []
+    # regular 13-gon squeezed into unit box
+    th = 2 * np.pi * np.arange(_N) / _N
+    inits.append(0.5 + 0.45 * np.stack([np.cos(th), np.sin(th)], axis=1))
+    # 3-fold symmetric: center + 4 orbits
+    P = np.full((_N, 2), 0.5)
+    for oi, b in enumerate([(0.25, 0.3), (0.4, 0.15), (0.3, 0.45), (0.45, 0.4)]):
+        for r in range(3):
+            a = 2 * np.pi * r / 3
+            R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+            v = R @ (np.array(b) - 0.5)
+            P[1 + 3 * oi + r] = 0.5 + v
+    inits.append(P)
+    # jittered grid 5x3 in unit box
+    xs = np.linspace(0.1, 0.9, 5)
+    ys = np.linspace(0.15, 0.85, 3)
+    P = np.stack([[x, y] for y in ys for x in xs])
+    P = P + rng.normal(scale=0.02, size=P.shape)
+    inits.append(np.clip(P, 0, 1))
+    # random
+    inits.append(rng.random((_N, 2)) * 0.9 + 0.05)
+    return inits
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct an arrangement of 13 points in a convex region maximizing
+    the smallest triangle area (Heilbronn problem, n = 13).
+
+    Returns:
+        points: np.ndarray of shape (13,2) with x,y coordinates.
+    """
+    best_P = None
+    best_val = -1.0
+
+    for seed in (42, 7, 123, 2024):
+        rng = np.random.default_rng(seed)
+        for init in _inits(rng):
+            # Phase 1: coarse climb
+            P, v = _climb(init, rng, iters=4000, amp0=0.06)
+            # Phase 2: basin hopping around the local optimum
+            for hop in range(6):
+                Q = P + rng.normal(scale=0.03, size=P.shape)
+                Q = np.clip(Q, 0.0, 1.0)
+                Q, vq = _climb(Q, rng, iters=2500, amp0=0.02)
+                if vq > v:
+                    P, v = Q, vq
+            if v > best_val:
+                best_val = v
+                best_P = P.copy()
+
+    if best_P is None or best_val <= 0:
+        th = 2 * np.pi * np.arange(_N) / _N
+        best_P = 0.5 + 0.45 * np.stack([np.cos(th), np.sin(th)], axis=1)
+
+    # Final deterministic polish on the global best
+    rng = np.random.default_rng(12345)
+    best_P, best_val = _climb(best_P, rng, iters=6000, amp0=0.01)
+
+    # Rescale so the convex hull has unit area (ratio invariant under this)
+    ha = _hull_area(best_P)
+    if ha > 1e-12:
+        c = best_P.mean(axis=0)
+        best_P = (best_P - c) / np.sqrt(ha) + c
+
+    assert np.all(np.isfinite(best_P)) and best_P.shape == (13, 2)
+    return best_P
+
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

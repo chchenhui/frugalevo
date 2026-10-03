@@ -1,0 +1,415 @@
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """
+    Place models to minimize the largest GPU KV cache pressure while respecting
+    GPU memory capacity.
+
+    For a pressure threshold T, each model has effective packing size:
+        model_size + (req_rate / slo) / T
+    A bin packing of those effective sizes is a valid placement at T.
+    """
+    EPS = 1e-10
+    BINARY_STEPS = 30
+    MAX_LOCAL_PASSES = 36
+    REPAIR_TAIL = 8
+    REPAIR_NODES = 12000
+
+    if gpu_num <= 0:
+        if models:
+            raise ValueError("gpu_num must be positive")
+        return {}
+
+    n = len(models)
+    if n == 0:
+        return {gpu: [] for gpu in range(gpu_num)}
+
+    sizes = [float(model.model_size) for model in models]
+    weights = [float(model.req_rate) / float(model.slo) for model in models]
+
+    if any(size > GPU_MEM_SIZE + EPS for size in sizes):
+        raise ValueError(
+            f"Unable to place a model exceeding GPU memory of {GPU_MEM_SIZE} GB."
+        )
+
+    if sum(sizes) > gpu_num * GPU_MEM_SIZE + EPS:
+        raise ValueError("Unable to place all models: total memory exceeds capacity.")
+
+    def pressure(load, free):
+        if free <= EPS:
+            return float("inf") if load > EPS else 0.0
+        return load / free
+
+    def value(loads, remaining):
+        return max(pressure(loads[gpu], remaining[gpu]) for gpu in range(gpu_num))
+
+    def state(assignments):
+        loads = [0.0] * gpu_num
+        remaining = [float(GPU_MEM_SIZE)] * gpu_num
+        for i, gpu in enumerate(assignments):
+            loads[gpu] += weights[i]
+            remaining[gpu] -= sizes[i]
+        return loads, remaining
+
+    def greedy_place(order, pack_ties=False):
+        assignments = [-1] * n
+        loads = [0.0] * gpu_num
+        remaining = [float(GPU_MEM_SIZE)] * gpu_num
+
+        for i in order:
+            best_gpu = None
+            best_key = None
+            for gpu in range(gpu_num):
+                if sizes[i] > remaining[gpu] + EPS:
+                    continue
+                free = remaining[gpu] - sizes[i]
+                p = pressure(loads[gpu] + weights[i], free)
+                peak = p
+                for other in range(gpu_num):
+                    if other != gpu:
+                        peak = max(peak, pressure(loads[other], remaining[other]))
+                key = (peak, p, free if pack_ties else -free, gpu)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_gpu = gpu
+
+            if best_gpu is None:
+                return None
+
+            assignments[i] = best_gpu
+            loads[best_gpu] += weights[i]
+            remaining[best_gpu] -= sizes[i]
+
+        return assignments, loads, remaining
+
+    def pack_for_threshold(target):
+        """Construct a verified effective-size packing for a pressure target."""
+        if target <= EPS:
+            return None
+
+        effective = [sizes[i] + weights[i] / target for i in range(n)]
+        if max(effective) > GPU_MEM_SIZE + EPS:
+            return None
+        if sum(effective) > gpu_num * GPU_MEM_SIZE + EPS:
+            return None
+
+        ids = list(range(n))
+        orders = [
+            sorted(ids, key=lambda i: (-effective[i], -sizes[i], -weights[i])),
+            sorted(ids, key=lambda i: (-effective[i], -weights[i], -sizes[i])),
+            sorted(
+                ids,
+                key=lambda i: (
+                    -effective[i],
+                    -(weights[i] / max(sizes[i], EPS)),
+                    -sizes[i],
+                ),
+            ),
+        ]
+
+        def try_order(order, first_fit):
+            assignments = [-1] * n
+            free = [float(GPU_MEM_SIZE)] * gpu_num
+
+            for pos, model_id in enumerate(order):
+                item = effective[model_id]
+                feasible = [
+                    gpu for gpu in range(gpu_num)
+                    if free[gpu] + EPS >= item
+                ]
+                if not feasible:
+                    # Preserve the successful prefix and repair the final
+                    # models using bounded backtracking.
+                    start = max(0, pos - REPAIR_TAIL)
+                    for undo_pos in range(start, pos):
+                        undo_id = order[undo_pos]
+                        gpu = assignments[undo_id]
+                        free[gpu] += effective[undo_id]
+                        assignments[undo_id] = -1
+
+                    tail = order[start:]
+                    nodes = [0]
+
+                    def search(index):
+                        if index == len(tail):
+                            return True
+                        if nodes[0] >= REPAIR_NODES:
+                            return False
+                        nodes[0] += 1
+
+                        current = tail[index]
+                        item_size = effective[current]
+                        seen_free = set()
+
+                        choices = sorted(
+                            range(gpu_num),
+                            key=lambda gpu: free[gpu] - item_size
+                            if free[gpu] + EPS >= item_size else float("inf"),
+                        )
+                        for gpu in choices:
+                            if free[gpu] + EPS < item_size:
+                                break
+                            signature = round(free[gpu], 9)
+                            if signature in seen_free:
+                                continue
+                            seen_free.add(signature)
+
+                            free[gpu] -= item_size
+                            assignments[current] = gpu
+                            if search(index + 1):
+                                return True
+                            assignments[current] = -1
+                            free[gpu] += item_size
+                        return False
+
+                    if search(0):
+                        loads, remaining = state(assignments)
+                        return assignments, loads, remaining
+                    return None
+
+                if first_fit:
+                    chosen = feasible[0]
+                else:
+                    chosen = min(feasible, key=lambda gpu: (free[gpu] - item, gpu))
+
+                assignments[model_id] = chosen
+                free[chosen] -= item
+
+            loads, remaining = state(assignments)
+            return assignments, loads, remaining
+
+        best = None
+        best_value = float("inf")
+
+        for order_index, order in enumerate(orders):
+            candidate = try_order(order, first_fit=(order_index == 1))
+            if candidate is not None:
+                candidate_value = value(candidate[1], candidate[2])
+                if candidate_value < best_value - EPS:
+                    best = candidate
+                    best_value = candidate_value
+
+        # For small instances, a complete bounded search avoids greedy false
+        # infeasibility at the most important binary-search thresholds.
+        if best is None and n <= 18:
+            order = orders[0]
+            assignments = [-1] * n
+            free = [float(GPU_MEM_SIZE)] * gpu_num
+            nodes = [0]
+
+            def exact_search(pos):
+                if pos == n:
+                    return True
+                if nodes[0] >= REPAIR_NODES:
+                    return False
+                nodes[0] += 1
+
+                model_id = order[pos]
+                item = effective[model_id]
+                seen_free = set()
+                for gpu in sorted(range(gpu_num), key=lambda g: free[g] - item):
+                    if free[gpu] + EPS < item:
+                        continue
+                    signature = round(free[gpu], 9)
+                    if signature in seen_free:
+                        continue
+                    seen_free.add(signature)
+                    free[gpu] -= item
+                    assignments[model_id] = gpu
+                    if exact_search(pos + 1):
+                        return True
+                    assignments[model_id] = -1
+                    free[gpu] += item
+                return False
+
+            if exact_search(0):
+                loads, remaining = state(assignments)
+                best = (assignments, loads, remaining)
+
+        return best
+
+    def improve(assignments, loads, remaining):
+        """Apply best strictly improving relocations and pairwise swaps."""
+        for _ in range(MAX_LOCAL_PASSES):
+            current = value(loads, remaining)
+            best_value = current
+            best_action = None
+
+            for i in range(n):
+                source = assignments[i]
+                for target in range(gpu_num):
+                    if target == source or sizes[i] > remaining[target] + EPS:
+                        continue
+
+                    source_p = pressure(
+                        loads[source] - weights[i],
+                        remaining[source] + sizes[i],
+                    )
+                    target_p = pressure(
+                        loads[target] + weights[i],
+                        remaining[target] - sizes[i],
+                    )
+                    candidate = max(source_p, target_p)
+                    for gpu in range(gpu_num):
+                        if gpu != source and gpu != target:
+                            candidate = max(
+                                candidate, pressure(loads[gpu], remaining[gpu])
+                            )
+
+                    if candidate < best_value - EPS:
+                        best_value = candidate
+                        best_action = ("move", i, target)
+
+            for i in range(n):
+                left = assignments[i]
+                for j in range(i + 1, n):
+                    right = assignments[j]
+                    if left == right:
+                        continue
+
+                    left_free = remaining[left] + sizes[i] - sizes[j]
+                    right_free = remaining[right] + sizes[j] - sizes[i]
+                    if left_free < -EPS or right_free < -EPS:
+                        continue
+
+                    left_p = pressure(
+                        loads[left] - weights[i] + weights[j], left_free
+                    )
+                    right_p = pressure(
+                        loads[right] - weights[j] + weights[i], right_free
+                    )
+                    candidate = max(left_p, right_p)
+                    for gpu in range(gpu_num):
+                        if gpu != left and gpu != right:
+                            candidate = max(
+                                candidate, pressure(loads[gpu], remaining[gpu])
+                            )
+
+                    if candidate < best_value - EPS:
+                        best_value = candidate
+                        best_action = ("swap", i, j)
+
+            if best_action is None:
+                break
+
+            if best_action[0] == "move":
+                _, i, target = best_action
+                source = assignments[i]
+                assignments[i] = target
+                loads[source] -= weights[i]
+                remaining[source] += sizes[i]
+                loads[target] += weights[i]
+                remaining[target] -= sizes[i]
+            else:
+                _, i, j = best_action
+                left, right = assignments[i], assignments[j]
+                assignments[i], assignments[j] = right, left
+                loads[left] += weights[j] - weights[i]
+                loads[right] += weights[i] - weights[j]
+                remaining[left] += sizes[i] - sizes[j]
+                remaining[right] += sizes[j] - sizes[i]
+
+        return assignments, loads, remaining
+
+    total_weight = sum(weights)
+    free_memory = gpu_num * GPU_MEM_SIZE - sum(sizes)
+    low = total_weight / free_memory if free_memory > EPS else 0.0
+    for size, weight in zip(sizes, weights):
+        if weight > EPS and GPU_MEM_SIZE - size > EPS:
+            low = max(low, weight / (GPU_MEM_SIZE - size))
+
+    high = max(1.0, low * 2.0)
+    initial = pack_for_threshold(high)
+    while initial is None and high < 1e15:
+        high *= 10.0
+        initial = pack_for_threshold(high)
+
+    if initial is None:
+        raise ValueError("Unable to place all models within GPU memory.")
+
+    candidates = [initial]
+    best_threshold_candidate = initial
+
+    for _ in range(BINARY_STEPS):
+        middle = (low + high) / 2.0
+        candidate = pack_for_threshold(middle)
+        if candidate is None:
+            low = middle
+        else:
+            high = middle
+            candidates.append(candidate)
+            if value(candidate[1], candidate[2]) < value(
+                best_threshold_candidate[1], best_threshold_candidate[2]
+            ) - EPS:
+                best_threshold_candidate = candidate
+
+    ids = list(range(n))
+    greedy_orders = [
+        sorted(ids, key=lambda i: (-weights[i], -sizes[i])),
+        sorted(ids, key=lambda i: (-sizes[i], -weights[i])),
+        sorted(
+            ids,
+            key=lambda i: (
+                -(weights[i] / max(GPU_MEM_SIZE - sizes[i], EPS)),
+                -sizes[i],
+            ),
+        ),
+        sorted(
+            ids,
+            key=lambda i: (
+                -(weights[i] / max(sizes[i], EPS)),
+                -sizes[i],
+            ),
+        ),
+    ]
+
+    for index, order in enumerate(greedy_orders):
+        candidate = greedy_place(order, pack_ties=(index == 1))
+        if candidate is not None:
+            candidates.append(candidate)
+
+    best_assignments = None
+    best_score = float("inf")
+
+    for assignments, loads, remaining in candidates:
+        assignments, loads, remaining = improve(
+            assignments[:], loads[:], remaining[:]
+        )
+        candidate_score = value(loads, remaining)
+        if candidate_score < best_score - EPS:
+            best_score = candidate_score
+            best_assignments = assignments
+
+    placement = {gpu: [] for gpu in range(gpu_num)}
+    for model_id, gpu in enumerate(best_assignments):
+        placement[gpu].append(models[model_id])
+
+    return placement
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

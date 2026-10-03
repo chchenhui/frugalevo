@@ -1,0 +1,83 @@
+<NAME>
+shared_trunk_multicast_discount
+</NAME>
+<DESCRIPTION>
+The current algorithm routes each destination independently with Dijkstra, ignoring that broadcast traffic shares trunks across destinations. Prior attempts at per-destination path diversification failed, but cross-destination trunk consolidation has never been validly tested. The idea: process destinations sequentially, maintaining a `used_edges` set of (src, dst) node pairs already routed. For each destination, enumerate a small number (≤6) of bounded candidate simple paths via `nx.shortest_simple_paths` (a generator, so only the first few paths are materialized — cheap). Score each candidate as `true_cost - alpha * (cost of candidate edges already in used_edges)`, where alpha ≈ 0.3. Pick the candidate with the minimum discounted score, but only adopt it if its true cost is ≤ the pure Dijkstra baseline cost. This guarantees we are never worse than the current proven baseline (1035.14), while allowing reuse of already-paid-for trunks to guide selection when multiple equal/near-equal routes exist — encouraging consolidation onto shared multicast trees, which reduces redundant transfers. Costs are guarded with `.get("cost") or 0` for robustness, and exceptions for unreachable nodes fall back to baseline behavior, preserving the 100% success rate.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Shared-trunk multicast routing: destinations processed sequentially,
+    # edges already used by earlier destinations earn a discount so that
+    # among (near-)equal-cost routes, paths reusing existing trunks win.
+    used_edges = set()
+    alpha = 0.3  # reuse discount factor
+    max_candidates = 6  # bounded candidate enumeration per destination
+
+    def edge_cost(u, v):
+        c = G[u][v].get("cost")
+        return c if c is not None else 0.0
+
+    for dst in dsts:
+        # Proven baseline: plain Dijkstra path
+        base_path = nx.dijkstra_path(h, src, dst, weight="cost")
+        base_cost = sum(edge_cost(u, v) for u, v in zip(base_path, base_path[1:]))
+
+        best_path = base_path
+        best_score = base_cost - alpha * sum(
+            edge_cost(u, v) for u, v in zip(base_path, base_path[1:])
+            if (u, v) in used_edges
+        )
+
+        # Bounded enumeration of alternative simple paths
+        try:
+            cand_count = 0
+            for cand in nx.shortest_simple_paths(h, src, dst, weight="cost"):
+                if cand_count >= max_candidates:
+                    break
+                cand_cost = sum(edge_cost(u, v) for u, v in zip(cand, cand[1:]))
+                # Never adopt a path whose true cost exceeds the baseline
+                if cand_cost > base_cost:
+                    cand_count += 1
+                    continue
+                reuse = sum(
+                    edge_cost(u, v) for u, v in zip(cand, cand[1:])
+                    if (u, v) in used_edges
+                )
+                score = cand_cost - alpha * reuse
+                if score < best_score:
+                    best_score = score
+                    best_path = cand
+                cand_count += 1
+        except (nx.NetworkXNoPath, nx.NetworkXNotImplemented, StopIteration):
+            # Fall back to baseline path if enumeration fails
+            pass
+
+        # Commit the chosen path for all partitions
+        for i in range(0, len(best_path) - 1):
+            s, t = best_path[i], best_path[i + 1]
+            used_edges.add((s, t))
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

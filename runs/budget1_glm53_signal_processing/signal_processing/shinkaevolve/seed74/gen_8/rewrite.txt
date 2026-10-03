@@ -1,0 +1,266 @@
+# EVOLVE-BLOCK-START
+"""
+Real-Time Adaptive Signal Processing Pipeline for Non-Stationary Time Series
+
+Architecture (data flow):
+    raw window --> [Stage 1] ZeroLagEstimator (local quadratic endpoint fit)
+                --> [Stage 2] AdaptiveKalmanFusion (constant-velocity model,
+                       innovation-gated measurement noise)
+                --> [Stage 3] SlopeStabilizer (damps output when slope sign
+                       is unstable; preserves genuine trends)
+                --> filtered output
+"""
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: Zero-lag local polynomial (Savitzky-Golay style endpoint) estimator
+# ---------------------------------------------------------------------------
+class ZeroLagEstimator:
+    """Fits a local quadratic to each window and evaluates it at the newest
+    sample (t = 1), giving a smoothed estimate with essentially no phase lag."""
+
+    def __init__(self, window_size):
+        self.n = window_size
+        t = np.linspace(-1.0, 1.0, window_size)
+        V = np.vstack([np.ones(window_size), t, t * t]).T
+        self.VtV_inv = np.linalg.pinv(V.T @ V)
+        self.V = V
+        # Evaluation row at t = 1: [1, 1, 1]
+        self.eval_row = np.array([1.0, 1.0, 1.0])
+        # Precompute full projection: eval_row @ pinv(VtV) @ V.T  (shape n)
+        self.filter_taps = self.eval_row @ self.VtV_inv @ V.T
+
+    def estimate_all(self, x):
+        """Vectorized: convolution with fixed taps == local quadratic
+        endpoint estimates for every window position."""
+        n = self.n
+        out_len = len(x) - n + 1
+        # correlate gives sliding dot products; taps reversed for convolution
+        y = np.correlate(x, self.filter_taps[::-1], mode="valid")
+        return y
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Adaptive Kalman fusion (constant-velocity model)
+# ---------------------------------------------------------------------------
+class AdaptiveKalmanFusion:
+    """1D constant-velocity Kalman filter. Measurement noise R is adapted
+    per-step: when the innovation (prediction error) is large relative to
+    the state uncertainty, treat the sample as less trustworthy (noise
+    burst) so the model smooths it; when small, trust it (genuine move)."""
+
+    def __init__(self, q=0.02, r_base=0.15, r_gate=2.5):
+        self.q = q            # process noise (allows trend following)
+        self.r_base = r_base  # base measurement noise
+        self.r_gate = r_gate  # innovation gate multiplier
+        # State: [level, velocity]
+        self.x = None
+        self.P = np.eye(2) * 1.0
+
+    def _reset(self, z0):
+        self.x = np.array([z0, 0.0])
+        self.P = np.eye(2)
+
+    def run(self, z_seq):
+        out = np.empty_like(z_seq)
+        H = np.array([1.0, 0.0])
+        F = np.array([[1.0, 1.0], [0.0, 1.0]])
+        for i, z in enumerate(z_seq):
+            if self.x is None:
+                self._reset(z)
+                out[i] = z
+                continue
+            # Predict
+            self.x = F @ self.x
+            self.P = F @ self.P @ F.T + self.q * np.eye(2)
+            # Innovation statistics
+            S = self.P[0, 0] + self.r_base
+            innov = z - self.x[0]
+            # Adaptive measurement noise: gate on normalized innovation
+            if abs(innov) > self.r_gate * np.sqrt(S):
+                r = self.r_base * (1.0 + (innov ** 2) / max(S, 1e-12))
+            else:
+                r = self.r_base
+            # Update
+            S_a = self.P[0, 0] + r
+            K = self.P[:, 0] / S_a
+            self.x = self.x + K * innov
+            self.P = (np.eye(2) - np.outer(K, H)) @ self.P
+            out[i] = self.x[0]
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: Slope stabilizer (reduces spurious reversals / false sign flips)
+# ---------------------------------------------------------------------------
+class SlopeStabilizer:
+    """Tracks a robust slope estimate; when the output slope sign disagrees
+    with the recently dominant slope, it damps the update to avoid
+    noise-induced reversals while letting genuine trend changes through."""
+
+    def __init__(self, stability=0.35, release=0.75):
+        self.alpha_up = stability   # damping when conflicting with dominant trend
+        self.alpha_free = release   # responsiveness when trend is confirmed
+        self.slope_ema = 0.0
+
+    def run(self, y):
+        out = np.empty_like(y)
+        out[0] = y[0]
+        for i in range(1, len(y)):
+            dy = y[i] - out[i - 1]
+            dominant = self.slope_ema
+            # Do signs conflict and is the dominant slope well established?
+            conflict = (dominant * dy < 0) and (abs(dominant) > 0.15 * (abs(dy) + 1e-9))
+            alpha = self.alpha_up if conflict else self.alpha_free
+            out[i] = out[i - 1] + alpha * dy
+            # Update robust slope memory (slow EMA of realized increments)
+            self.slope_ema = 0.9 * self.slope_ema + 0.1 * (out[i] - out[i - 1])
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Pipeline assembly
+# ---------------------------------------------------------------------------
+class FilterPipeline:
+    def __init__(self, window_size):
+        self.stage1 = ZeroLagEstimator(window_size)
+        self.stage2 = AdaptiveKalmanFusion()
+        self.stage3 = SlopeStabilizer()
+
+    def apply(self, x):
+        y1 = self.stage1.estimate_all(x)
+        y2 = self.stage2.run(y1)
+        y3 = self.stage3.run(y2)
+        return y3
+
+
+def adaptive_filter(x, window_size=20):
+    """Basic mode: zero-lag polynomial endpoint estimator only (fast path)."""
+    if len(x) < window_size:
+        raise ValueError(
+            f"Input signal length ({len(x)}) must be >= window_size ({window_size})"
+        )
+    return ZeroLagEstimator(window_size).estimate_all(np.asarray(x, dtype=float))
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """Full three-stage adaptive pipeline."""
+    x = np.asarray(x, dtype=float)
+    if len(x) < window_size:
+        raise ValueError(
+            f"Input signal length ({len(x)}) must be >= window_size ({window_size})"
+        )
+    return FilterPipeline(window_size).apply(x)
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """
+    Main signal processing function that applies the selected algorithm.
+
+    Args:
+        input_signal: Input time series data
+        window_size: Window size for processing
+        algorithm_type: Type of algorithm to use ("basic" or "enhanced")
+
+    Returns:
+        Filtered signal
+    """
+    if algorithm_type == "enhanced":
+        return enhanced_filter_with_trend_preservation(input_signal, window_size)
+    return adaptive_filter(input_signal, window_size)
+
+
+# EVOLVE-BLOCK-END
+
+
+def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+    """
+    Generate synthetic test signal with known characteristics.
+
+    Returns:
+        Tuple of (noisy_signal, clean_signal)
+    """
+    np.random.seed(seed)
+    t = np.linspace(0, 10, length)
+
+    clean_signal = (
+        2 * np.sin(2 * np.pi * 0.5 * t)
+        + 1.5 * np.sin(2 * np.pi * 2 * t)
+        + 0.5 * np.sin(2 * np.pi * 5 * t)
+        + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)
+    )
+
+    trend = 0.1 * t * np.sin(0.2 * t)
+    clean_signal += trend
+
+    random_walk = np.cumsum(np.random.randn(length) * 0.05)
+    clean_signal += random_walk
+
+    noise = np.random.normal(0, noise_level, length)
+    noisy_signal = clean_signal + noise
+
+    return noisy_signal, clean_signal
+
+
+def run_signal_processing(noisy_signal=None, signal_length=1000, noise_level=0.3, window_size=20):
+    """
+    Run the signal processing algorithm on a test signal.
+    """
+    if noisy_signal is not None:
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+        clean_signal = None
+    else:
+        noisy_signal, clean_signal = generate_test_signal(signal_length, noise_level)
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+
+    if len(filtered_signal) > 0 and clean_signal is not None:
+        delay = window_size - 1
+        aligned_clean = clean_signal[delay:]
+        aligned_noisy = noisy_signal[delay:]
+
+        min_length = min(len(filtered_signal), len(aligned_clean))
+        filtered_signal = filtered_signal[:min_length]
+        aligned_clean = aligned_clean[:min_length]
+        aligned_noisy = aligned_noisy[:min_length]
+
+        correlation = np.corrcoef(filtered_signal, aligned_clean)[0, 1] if min_length > 1 else 0
+
+        noise_before = np.var(aligned_noisy - aligned_clean)
+        noise_after = np.var(filtered_signal - aligned_clean)
+        noise_reduction = (noise_before - noise_after) / noise_before if noise_before > 0 else 0
+
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": aligned_clean,
+            "noisy_signal": aligned_noisy,
+            "correlation": correlation,
+            "noise_reduction": noise_reduction,
+            "signal_length": min_length,
+        }
+    elif len(filtered_signal) > 0:
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": None,
+            "noisy_signal": None,
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": len(filtered_signal),
+        }
+    else:
+        return {
+            "filtered_signal": [],
+            "clean_signal": [],
+            "noisy_signal": [],
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": 0,
+        }
+
+
+if __name__ == "__main__":
+    results = run_signal_processing()
+    print("Signal processing completed!")
+    print(f"Correlation with clean signal: {results['correlation']:.3f}")
+    print(f"Noise reduction: {results['noise_reduction']:.3f}")
+    print(f"Processed signal length: {results['signal_length']}")

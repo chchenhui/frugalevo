@@ -1,0 +1,296 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+from solver import Algorithm
+from typing import Tuple, List, Dict, Optional
+import math
+
+
+class Evolved(Algorithm):
+    """
+    Column-ordering optimizer for serialized character-Trie prefix reuse.
+
+    Strategy: build a small number of bounded candidate per-row column
+    orderings, measure each with the exact serial Trie reuse objective
+    (sum of adjacent LCPs over the sorted serialized rows), and return the
+    best. All original cell values, rows and columns are preserved.
+    """
+
+    MAX_TREE_DEPTH = 8
+    MIN_TREE_ROWS = 16
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------
+    # Serialization helpers
+    # ------------------------------------------------------------------
+    def _serialize_cell(self, v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, float) and math.isnan(v):
+            return ""
+        if v is pd.NA or v is pd.NaT:
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        if isinstance(v, bool):
+            return "True" if v else "False"
+        return str(v)
+
+    def _serialize_frame(self, df: pd.DataFrame) -> List[Dict[str, str]]:
+        cols = list(df.columns)
+        ser_cols = {}
+        for c in cols:
+            ser_cols[c] = [self._serialize_cell(v) for v in df[c].tolist()]
+        rows = []
+        n = len(df)
+        for i in range(n):
+            rows.append({c: ser_cols[c][i] for c in cols})
+        return rows
+
+    # ------------------------------------------------------------------
+    # Exact ideal Trie reuse objective
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        if a == b:
+            return len(a)
+        m = min(len(a), len(b))
+        if m == 0:
+            return 0
+        # quick reject on first character
+        if a[0] != b[0]:
+            return 0
+        lo, hi = 0, m
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _score_strings(self, strings: List[str]) -> int:
+        if len(strings) <= 1:
+            return 0
+        s = sorted(strings)
+        lcp = self._lcp
+        total = 0
+        prev = s[0]
+        for i in range(1, len(s)):
+            cur = s[i]
+            total += lcp(prev, cur)
+            prev = cur
+        return total
+
+    # ------------------------------------------------------------------
+    # Column groups (honoring col_merge adjacency, no value changes)
+    # ------------------------------------------------------------------
+    def _build_groups(self, cols: List[str], col_merge) -> List[tuple]:
+        used = set()
+        groups = []
+        for mg in col_merge or []:
+            if isinstance(mg, str):
+                mg = [mg]
+            g = tuple(c for c in mg if c in cols and c not in used)
+            for c in g:
+                used.add(c)
+            if g:
+                groups.append(g)
+        for c in cols:
+            if c not in used:
+                groups.append((c,))
+        return groups
+
+    def _group_value(self, row: Dict[str, str], g: tuple) -> str:
+        return "".join(row[c] for c in g)
+
+    # ------------------------------------------------------------------
+    # Candidate orderings
+    # ------------------------------------------------------------------
+    def _rank_groups(
+        self, rows: List[Dict[str, str]], groups: List[tuple], mode: str
+    ) -> Dict[tuple, float]:
+        """Rank each group by length-weighted repetition of its group value."""
+        n = len(rows)
+        ranks = {}
+        for g in groups:
+            cnt: Dict[str, int] = {}
+            lens: Dict[str, int] = {}
+            for r in rows:
+                v = self._group_value(r, g)
+                cnt[v] = cnt.get(v, 0) + 1
+                lens[v] = len(v)
+            if mode == "len_weighted":
+                score = sum(lens[v] * c * (c - 1) for v, c in cnt.items())
+            elif mode == "freq_first":
+                score = sum(c * (c - 1) for v, c in cnt.items())
+            else:  # total chars, ties toward fewer distinct values
+                score = sum(lens[v] * c for v, c in cnt.items()) - len(cnt)
+            ranks[g] = score
+        return ranks
+
+    def _group_sort_key(self, ranks: Dict[tuple, float]):
+        def key(g: tuple):
+            return (-ranks[g], g)
+
+        return key
+
+    def _global_orders(
+        self, rows: List[Dict[str, str]], groups: List[tuple], mode: str
+    ) -> List[List[str]]:
+        ranks = self._rank_groups(rows, groups, mode)
+        order = [c for g in sorted(groups, key=self._group_sort_key(ranks)) for c in g]
+        return [list(order) for _ in rows]
+
+    def _tree_orders(
+        self,
+        rows_idx: List[int],
+        avail: List[tuple],
+        ranks: Dict[tuple, float],
+        row_values_cache: Dict[tuple, Dict[int, str]],
+        depth: int,
+    ) -> Dict[int, List[tuple]]:
+        """Return, per row, an ordered list of the available groups."""
+        order_rest = sorted(avail, key=self._group_sort_key(ranks))
+        if (
+            depth >= self.MAX_TREE_DEPTH
+            or len(rows_idx) < self.MIN_TREE_ROWS
+            or not avail
+        ):
+            return {r: order_rest for r in rows_idx}
+
+        # choose the leading group by length-weighted pair repetition
+        best_g = None
+        best_score = 0
+        for g in avail:
+            vals = row_values_cache[g]
+            cnt: Dict[str, int] = {}
+            for r in rows_idx:
+                v = vals[r]
+                cnt[v] = cnt.get(v, 0) + 1
+            score = sum(len(v) * c * (c - 1) for v, c in cnt.items())
+            if score > best_score:
+                best_score = score
+                best_g = g
+        if best_g is None or best_score <= 0:
+            return {r: order_rest for r in rows_idx}
+
+        rest = [g for g in order_rest if g != best_g]
+        vals = row_values_cache[best_g]
+        parts: Dict[str, List[int]] = {}
+        for r in rows_idx:
+            parts.setdefault(vals[r], []).append(r)
+        result: Dict[int, List[tuple]] = {}
+        for _v, sub in parts.items():
+            subres = self._tree_orders(sub, rest, ranks, row_values_cache, depth + 1)
+            for r, o in subres.items():
+                result[r] = [best_g] + o
+        return result
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: Optional[int] = None,
+        col_stop: Optional[int] = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        # Work on a copy; never mutate caller data.
+        df = df.copy()
+        cols = list(df.columns)
+        n = len(df)
+
+        # Trivial cases
+        if n == 0 or len(cols) == 0:
+            return df, [[] for _ in range(n)] if len(cols) == 0 else [
+                list(cols) for _ in range(n)
+            ]
+        if len(cols) == 1:
+            return df, [list(cols) for _ in range(n)]
+
+        # Serialize once (scoring representation only; stored values unchanged)
+        ser_rows = self._serialize_frame(df)
+
+        # Column groups honoring merges (adjacency only, no value changes)
+        groups = self._build_groups(cols, col_merge)
+        group_of_col: Dict[str, tuple] = {}
+        for g in groups:
+            for c in g:
+                group_of_col[c] = g
+
+        # Cache each group's value per row for tree construction
+        row_values_cache: Dict[tuple, Dict[int, str]] = {}
+        for g in groups:
+            d = {}
+            for i, r in enumerate(ser_rows):
+                d[i] = self._group_value(r, g)
+            row_values_cache[g] = d
+
+        candidates: List[List[List[str]]] = []
+
+        # Candidate 1: global ordering, length-weighted pair repetition
+        candidates.append(self._global_orders(ser_rows, groups, "len_weighted"))
+
+        # Candidate 2: global ordering, frequency-first tradeoff
+        candidates.append(self._global_orders(ser_rows, groups, "freq_first"))
+
+        # Candidate 3: conditional partition tree with deterministic tail
+        if len(groups) > 1 and n >= 2:
+            ranks = self._rank_groups(ser_rows, groups, "len_weighted")
+            tree = self._tree_orders(
+                list(range(n)), groups, ranks, row_values_cache, 0
+            )
+            tree_orders = [
+                [c for g in tree[i] for c in g] for i in range(n)
+            ]
+            candidates.append(tree_orders)
+
+        # Score all candidates with the exact Trie reuse objective
+        def orders_to_strings(orders: List[List[str]]) -> List[str]:
+            return [
+                "".join(row[c] for c in orders[i]) for i, row in enumerate(ser_rows)
+            ]
+
+        best_orders = candidates[0]
+        best_score = -1
+        for cand in candidates:
+            # sanity: valid permutation per row
+            ok = all(
+                sorted(o) == sorted(cols) for o in cand
+            )
+            if not ok:
+                continue
+            sc = self._score_strings(orders_to_strings(cand))
+            if sc > best_score:
+                best_score = sc
+                best_orders = cand
+
+        # Build output DataFrame: original row order, each row permuted by its
+        # own column ordering. Values preserved exactly; object dtype.
+        orig_rows = [df.iloc[i] for i in range(n)]
+        data = []
+        for i in range(n):
+            row = orig_rows[i]
+            data.append([row[c] for c in best_orders[i]])
+
+        out = pd.DataFrame(data, columns=cols).astype(object)
+        out.index = df.index.copy()
+
+        # Restore original dtypes column-wise where safe, to avoid altering
+        # the stored values' semantics (object holds the exact objects).
+        for c in cols:
+            out[c] = [df[c].iloc[i] for i in range(n)]
+
+        return out, [list(o) for o in best_orders]
+
+# EVOLVE-BLOCK-END

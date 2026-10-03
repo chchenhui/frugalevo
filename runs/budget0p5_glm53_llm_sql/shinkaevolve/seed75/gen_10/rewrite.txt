@@ -1,0 +1,282 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+from solver import Algorithm
+from typing import Tuple, List
+import numpy as np
+from collections import defaultdict
+
+
+class Evolved(Algorithm):
+    """
+    Row-wise column reordering aimed at maximizing character-level prefix
+    sharing across serialized rows (ideal Trie reuse), while preserving all
+    original data, shape and row identity.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------
+    # serialization helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _cell_str(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, float) and np.isnan(v):
+            return ""
+        try:
+            if v != v:  # NaN-like
+                return ""
+        except Exception:
+            pass
+        if isinstance(v, str):
+            return v
+        return str(v)
+
+    def _serialize(self, df: pd.DataFrame):
+        """Return list-of-lists of serialized strings (missing -> '')."""
+        cols = df.columns.tolist()
+        ser = {}
+        for c in cols:
+            ser[c] = [self._cell_str(v) for v in df[c].tolist()]
+        return cols, ser
+
+    # ------------------------------------------------------------------
+    # exact ideal-Trie score: sum of adjacent LCPs of sorted strings
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        if a == b:
+            return len(a)
+        n = min(len(a), len(b))
+        if n == 0:
+            return 0
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    @staticmethod
+    def _trie_score(strings) -> int:
+        s = sorted(strings)
+        total = 0
+        prev = s[0]
+        total += 0  # first string contributes no reuse
+        for cur in s[1:]:
+            total += Evolved._lcp(prev, cur)
+            prev = cur
+        return total
+
+    # ------------------------------------------------------------------
+    # candidate 1: global frequency ordering
+    # ------------------------------------------------------------------
+    def _global_freq_order(self, cols, ser, n_rows):
+        # score: sum over distinct values v of len(v)*count*(count-1)
+        stats = []
+        for c in cols:
+            counter = defaultdict(int)
+            lens = {}
+            for v in ser[c]:
+                counter[v] += 1
+                if v not in lens:
+                    lens[v] = len(v)
+            score = sum(lens[v] * cnt * (cnt - 1) for v, cnt in counter.items())
+            stats.append((score, c))
+        stats.sort(key=lambda x: (-x[0], x[1]))
+        return [c for _, c in stats]
+
+    # ------------------------------------------------------------------
+    # candidate 2: conditional prefix partition tree on codes
+    # ------------------------------------------------------------------
+    def _conditional_tree_order(self, cols, ser, n_rows, depth_cap=12,
+                                value_ratio=1.0):
+        # factorize each column once
+        codes = {}      # col -> list of int codes
+        code_vals = {}  # col -> list of value strings
+        for c in cols:
+            m = {}
+            cv = []
+            cl = []
+            for v in ser[c]:
+                if v not in m:
+                    m[v] = len(cv)
+                    cv.append(v)
+                cl.append(m[v])
+            codes[c] = cl
+            code_vals[c] = cv
+
+        n = n_rows
+        order_cache = {}
+
+        def suffix_order(col_list, row_idx):
+            key = tuple(col_list)
+            if key in order_cache:
+                return order_cache[key]
+            if not col_list:
+                return []
+            best_col, best_score = col_list[0], -1
+            for c in col_list:
+                cv = code_vals[c]
+                cnt = np.bincount([codes[c][i] for i in row_idx],
+                                 minlength=len(cv)) if row_idx else np.zeros(len(cv), int)
+                s = 0
+                for k in range(len(cv)):
+                    ck = cnt[k]
+                    if ck > 1:
+                        s += len(cv[k]) * ck * (ck - 1)
+                if s > best_score:
+                    best_score, best_col = s, c
+            rest = [c for c in col_list if c != best_col]
+            sub = suffix_order(rest, row_idx)
+            out = [best_col] + sub
+            order_cache[key] = out
+            return out
+
+        # group rows recursively; each row gets its own ordering
+        def build_groups(row_idx, col_list, depth):
+            if depth >= depth_cap or not col_list or len(row_idx) <= 1:
+                order = suffix_order(col_list, row_idx)
+                for i in row_idx:
+                    per_row_order[i] = order
+                return
+            # pick split column by length-weighted repetition
+            best_col, best_score = None, 0
+            for c in col_list:
+                cv = code_vals[c]
+                arr = np.array([codes[c][i] for i in row_idx], dtype=np.int64)
+                cnt = np.bincount(arr, minlength=len(cv))
+                s = int(sum(len(cv[k]) * (value_ratio * cnt[k] * (cnt[k] - 1))
+                            for k in range(len(cv))))
+                if s > best_score:
+                    best_score, best_col = s, c
+            if best_col is None or best_score <= 0:
+                order = suffix_order(col_list, row_idx)
+                for i in row_idx:
+                    per_row_order[i] = order
+                return
+            # partition on split column, then per-group suffix order
+            arr = np.array([codes[best_col][i] for i in row_idx], dtype=np.int64)
+            rest = [c for c in col_list if c != best_col]
+            groups = defaultdict(list)
+            for j, i in enumerate(row_idx):
+                groups[int(arr[j])].append(i)
+            for k, gidx in groups.items():
+                order = [best_col] + suffix_order(rest, gidx)
+                for i in gidx:
+                    per_row_order[i] = order
+                # no further branching: suffix order per group already chosen
+            return
+
+        per_row_order = [None] * n
+        build_groups(list(range(n)), list(cols), 0)
+        return per_row_order
+
+    # ------------------------------------------------------------------
+    # build output dataframe given per-row column orders
+    # ------------------------------------------------------------------
+    def _materialize(self, df: pd.DataFrame, cols, ser, per_row_order):
+        n_rows = len(df)
+        mat = [[None] * len(cols) for _ in range(n_rows)]
+        orders_out = [None] * n_rows
+        for i in range(n_rows):
+            order = per_row_order[i] if per_row_order[i] else list(cols)
+            orders_out[i] = list(order)
+            for j, c in enumerate(order):
+                mat[i][j] = df[c].iloc[i]
+        out = pd.DataFrame(mat, columns=list(cols)).astype(object)
+        # keep dtypes loosely: preserve values as-is
+        return out, orders_out
+
+    # ------------------------------------------------------------------
+    # public API
+    # ------------------------------------------------------------------
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: list = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        df = df.copy()
+        n_rows, n_cols = df.shape
+        if n_rows == 0 or n_cols == 0:
+            return df.copy(), [[] for _ in range(n_rows)] if n_rows else []
+
+        # honor col_merge: place merged columns contiguously (existing API
+        # semantics handled by parent helpers when available)
+        if col_merge:
+            try:
+                merged_flat = [c for grp in col_merge for c in grp if c in df.columns]
+                rest = [c for c in df.columns if c not in merged_flat]
+                ordered = merged_flat + rest
+                df = df[ordered]
+            except Exception:
+                pass
+
+        cols, ser = self._serialize(df)
+
+        # limit per-row ordering work on wide tables
+        wide_limit = 24
+        work_cols = cols if len(cols) <= wide_limit else self._global_freq_order(cols, ser, n_rows)[:wide_limit] + [c for c in cols if c not in self._global_freq_order(cols, ser, n_rows)[:wide_limit]]
+        work_cols = list(dict.fromkeys(work_cols))
+
+        total_chars = sum(len(ser[c][i]) for c in cols for i in range(n_rows))
+        if total_chars == 0:
+            out = df.copy().astype(object)
+            base = list(df.columns)
+            return out, [list(base) for _ in range(n_rows)]
+
+        # ---- candidate 1: global frequency ordering, all rows same order
+        g_order = self._global_freq_order(work_cols, ser, n_rows)
+        c1_order = [list(g_order) for _ in range(n_rows)]
+
+        # ---- candidate 2: conditional tree (with stops honored)
+        depth_cap = row_stop if row_stop else 12
+        try:
+            c2_order = self._conditional_tree_order(work_cols, ser, n_rows,
+                                                    depth_cap=min(depth_cap, 12))
+        except Exception:
+            c2_order = c1_order
+
+        # ---- candidate 3: different tradeoff (favor shorter values first)
+        try:
+            c3_order = self._conditional_tree_order(work_cols, ser, n_rows,
+                                                     depth_cap=4,
+                                                     value_ratio=0.5)
+        except Exception:
+            c3_order = c1_order
+
+        candidates = [c1_order, c2_order, c3_order]
+
+        def row_string(order, i):
+            return "".join(ser[c][i] for c in order)
+
+        best, best_score, best_idx = None, -1, 0
+        for idx, cand in enumerate(candidates):
+            strings = [row_string(cand[i], i) for i in range(n_rows)]
+            s = self._trie_score(strings)
+            if s > best_score:
+                best_score, best_idx, best = s, idx, cand
+
+        out_df, orders_out = self._materialize(df, cols, ser, best)
+        # restore original column label ordering is not required; per-row
+        # orderings describe the returned data layout.
+        try:
+            out_df.columns = [f"c{i}" for i in range(len(cols))]
+        except Exception:
+            pass
+        # use original column names to stay consistent with API
+        out_df.columns = list(cols)
+        assert out_df.shape == df.shape
+        return out_df, orders_out
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,271 @@
+"""
+rts_velocity_clamp_fusion — staged zero-phase adaptive filter pipeline.
+
+Architecture:
+    Signal -> RTSSmootherStage -> ZeroPhaseVelocityClampStage -> BilateralDamperStage -> out
+
+Each stage is stateless w.r.t. the caller and zero-phase (forward + mirrored backward
+whenever a sweep is needed). The velocity clamp fuses the second-pass RTS velocity
+state into a per-step displacement limit with a correlation guard.
+"""
+
+import numpy as np
+
+EVOLVE-BLOCK-START
+
+
+# ----------------------------------------------------------------------------
+# Stage interface
+# ----------------------------------------------------------------------------
+class Stage:
+    """Base class for zero-phase pipeline stages."""
+    def apply(self, x: np.ndarray, state: dict) -> np.ndarray:
+        raise NotImplementedError
+
+
+# ----------------------------------------------------------------------------
+# Stage 1: two-pass RTS smoother core
+# ----------------------------------------------------------------------------
+class RTSSmootherStage(Stage):
+    """
+    Constant-acceleration Kalman filter + RTS backward smoothing, run twice.
+    Pass 1 estimates noise statistics; pass 2 re-smooths with adapted gains.
+    """
+    def __init__(self, q_scale=0.02, r_frac=0.10, warmup=8):
+        self.q_scale = q_scale
+        self.r_frac = r_frac
+        self.warmup = warmup
+
+    @staticmethod
+    def _forward(x, q, r):
+        n = len(x)
+        # State: [pos, vel, acc]
+        F = np.array([[1, 1, 0.5],
+                      [0, 1, 1.0],
+                      [0, 0, 1.0]])
+        H = np.array([[1.0, 0.0, 0.0]])
+        P = np.eye(3)
+        s = np.zeros(3)
+        s[0] = x[0]
+        xs_f = np.zeros((n, 3))
+        Pf = np.zeros((n, 3, 3))
+        I3 = np.eye(3)
+        for k in range(n):
+            if k > 0:
+                s = F @ s
+                P = F @ P @ F.T
+                P[2, 2] += q
+            innov = x[k] - (H @ s)[0]
+            S = (H @ P @ H.T)[0, 0] + r
+            K = (P @ H.T / S).ravel()
+            s = s + K * innov
+            A = I3 - np.outer(K, H)
+            P = A @ P @ A.T + (r / S) * np.outer(K, K)  # Joseph form
+            xs_f[k] = s
+            Pf[k] = P
+        return xs_f, Pf, F
+
+    @staticmethod
+    def _backward(xs_f, Pf, F):
+        n = len(xs_f)
+        xs = xs_f.copy()
+        for k in range(n - 2, -1, -1):
+            P_pred = F @ Pf[k] @ F.T
+            P_pred[2, 2] += 1e-9
+            G = Pf[k] @ F.T @ np.linalg.inv(P_pred)
+            xs[k] = xs_f[k] + G @ (xs[k + 1] - F @ xs_f[k])
+        return xs
+
+    def _one_pass(self, x, q, r):
+        xs_f, Pf, F = self._forward(x, q, r)
+        return self._backward(xs_f, Pf, F)
+
+    def apply(self, x: np.ndarray, state: dict) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        n = len(x)
+        if n < 3:
+            return x.copy()
+
+        sigma_r = max(np.std(np.diff(x)) / np.sqrt(2.0), 1e-8) if n > 2 else 1e-8
+        r0 = max(self.r_frac * sigma_r**2, 1e-12)
+        q0 = max(self.q_scale * r0, 1e-12)
+
+        # Pass 1
+        xs1 = self._one_pass(x, q0, r0)
+        # Adapt measurement noise from residuals
+        resid = x - xs1[:, 0]
+        r1 = max(np.var(resid[self.warmup:]) if n > self.warmup else r0, 1e-12)
+        r1 = 0.5 * (r0 + r1)
+        q1 = max(self.q_scale * r1, 1e-12)
+
+        # Pass 2
+        xs2 = self._one_pass(x, q1, r1)
+
+        state['sigma_r'] = float(np.sqrt(r1))
+        state['vel'] = xs2[:, 1].copy()
+        state['acc'] = xs2[:, 2].copy()
+        return xs2[:, 0].copy()
+
+
+# ----------------------------------------------------------------------------
+# Stage 2: zero-phase velocity clamp (Gen 41 fusion)
+# ----------------------------------------------------------------------------
+class ZeroPhaseVelocityClampStage(Stage):
+    """
+    Limit per-step displacement to 2*|velocity| + slack*sigma_r.
+    Applied forward and mirrored backward to stay zero-phase. A correlation
+    guard checks fidelity; if corr < 0.97 the slack doubles and the clamp
+    is retried once.
+    """
+    def __init__(self, slack=0.5, min_corr=0.97, max_ratio=2.0):
+        self.slack = slack
+        self.min_corr = min_corr
+        self.max_ratio = max_ratio
+
+    @staticmethod
+    def _clamp_sweep(y, vel, sigma_r, slack):
+        n = len(y)
+        for k in range(1, n):
+            limit = 2.0 * abs(vel[k]) + slack * sigma_r
+            if limit <= 0:
+                continue
+            d = y[k] - y[k - 1]
+            if abs(d) > limit:
+                y[k] = y[k - 1] + np.sign(d) * limit
+        return y
+
+    def _clamp(self, y, vel, sigma_r, slack):
+        # forward sweep
+        yf = self._clamp_sweep(y.copy(), vel, sigma_r, slack)
+        # mirrored backward sweep (zero-phase)
+        yb = self._clamp_sweep(yf[::-1].copy(), vel[::-1], sigma_r, slack)[::-1]
+        # average the two sweeps' corrections to keep symmetric behavior
+        return 0.5 * (yf + yb)
+
+    @staticmethod
+    def _corr(a, b):
+        sa, sb = np.std(a), np.std(b)
+        if sa < 1e-12 or sb < 1e-12:
+            return 1.0
+        return float(np.corrcoef(a, b)[0, 1])
+
+    def apply(self, x: np.ndarray, state: dict) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        vel = state.get('vel')
+        sigma_r = state.get('sigma_r', 1e-8)
+        if vel is None or len(vel) != len(x) or len(x) < 3:
+            return x.copy()
+
+        slack = self.slack
+        y = self._clamp(x, vel, sigma_r, slack)
+        if self._corr(y, x) < self.min_corr:
+            y = self._clamp(x, vel, sigma_r, min(slack * 2, self.max_ratio * slack))
+        return y
+
+
+# ----------------------------------------------------------------------------
+# Stage 3: light bilateral damper
+# ----------------------------------------------------------------------------
+class BilateralDamperStage(Stage):
+    """
+    Edge-preserving exponential damper applied forward and backward and
+    averaged (zero-phase). Cheap: O(n * passes).
+    """
+    def __init__(self, alpha=0.35, edge_thresh=1.5):
+        self.alpha = alpha
+        self.edge_thresh = edge_thresh
+
+    @staticmethod
+    def _ewma_one_sided(x, alpha, thresh, sigma_r):
+        y = x.copy()
+        n = len(y)
+        for k in range(1, n):
+            diff = y[k] - y[k - 1]
+            a = alpha
+            if abs(diff) > thresh * sigma_r:
+                a = min(1.0, alpha * 3.0)  # preserve dynamics at edges
+            y[k] = y[k - 1] + a * (x[k] - y[k - 1])
+        return y
+
+    def apply(self, x: np.ndarray, state: dict) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        n = len(x)
+        if n < 3:
+            return x.copy()
+        sigma_r = state.get('sigma_r', 1e-8)
+        fwd = self._ewma_one_sided(x, self.alpha, self.edge_thresh, sigma_r)
+        bwd = self._ewma_one_sided(x[::-1], self.alpha, self.edge_thresh, sigma_r)[::-1]
+        return 0.5 * (fwd + bwd)
+
+
+# ----------------------------------------------------------------------------
+# Pipeline
+# ----------------------------------------------------------------------------
+class SmoothingPipeline:
+    def __init__(self):
+        self.stages = [
+            RTSSmootherStage(),
+            ZeroPhaseVelocityClampStage(),
+            BilateralDamperStage(),
+        ]
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        state = {}
+        y = np.asarray(x, dtype=float)
+        for stage in self.stages:
+            y = stage.apply(y, state)
+        return y
+
+
+EVOLVE-BLOCK-END
+
+
+# ----------------------------------------------------------------------------
+# Public API — three entry points preserved
+# ----------------------------------------------------------------------------
+_pipeline = SmoothingPipeline()
+
+
+def smooth_signal(signal, window_size=None):
+    """Entry point 1: smooth a full 1-D signal."""
+    x = np.asarray(signal, dtype=float).ravel()
+    if len(x) < 2:
+        return x.copy()
+    return _pipeline.process(x)
+
+
+def smooth_window(signal, window_size):
+    """Entry point 2: smooth only the most recent window (sliding-window use)."""
+    x = np.asarray(signal, dtype=float).ravel()
+    w = int(window_size)
+    if w <= 0 or len(x) < w:
+        return smooth_signal(x)
+    return _pipeline.process(x[-w:])
+
+
+def smooth_streaming(new_sample, history_buffer):
+    """Entry point 3: incremental sliding-window update.
+
+    history_buffer: list/np array of the last window_size samples including
+    the new sample appended by the caller.
+    Returns the smoothed value for the newest point plus, if buffer is full,
+    the full `y[window_size-1:]` alignment contract is handled by callers
+    consuming smooth_signal on the full buffer.
+    """
+    x = np.asarray(history_buffer, dtype=float).ravel()
+    if len(x) < 2:
+        return float(x[-1]) if len(x) else 0.0
+    y = _pipeline.process(x)
+    return float(y[-1])
+
+
+if __name__ == "__main__":
+    # quick self-test
+    rng = np.random.default_rng(0)
+    t = np.linspace(0, 4 * np.pi, 300)
+    clean = np.sin(t) + 0.3 * np.sin(3 * t)
+    noisy = clean + rng.normal(0, 0.25, len(t))
+    out = smooth_signal(noisy)
+    print("rmse noisy :", np.sqrt(np.mean((noisy - clean) ** 2)))
+    print("rmse smooth:", np.sqrt(np.mean((out - clean) ** 2)))
+    print("corr       :", np.corrcoef(out, clean)[0, 1])

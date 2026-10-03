@@ -1,0 +1,98 @@
+<NAME>
+multi_start_slsqp_and_fast_grow</NAME>
+<DESCRIPTION>
+Two targeted improvements: (1) Instead of polishing only the single best heuristic candidate with SLSQP, collect all refined candidates, rank them by achieved sum, and run the SLSQP continuous polish on the top-5 distinct basins, keeping the overall best. Different hex-row count sets lead to genuinely different local optima; polishing several of them dramatically increases the chance of landing in a near-global basin (the AlphaEvolve n=26 solution is asymmetric, so multiple distinct starting basins matter). (2) Vectorize the inner sweep of `grow_radii` with NumPy broadcasting (radii += where growth possible via a single vectorized candidate computation). Since `grow_radii` is called from inside the 60-iteration refine loop for dozens of candidates, this cuts eval time substantially, freeing budget for the extra SLSQP restarts.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    best = None
+    for cand in candidates:
+        centers, radii, s = refine_layout(cand, r0)
+        if best is None or s > best[2]:
+            best = (centers, radii, s)
+
+    centers, radii, sum_radii = best
+
+    # SLSQP polish with iterative restart passes from repaired endpoints.
+    for _ in range(3):
+        out = slsqp_refine(centers, max_iters=400)
+        if out is None or out[0].shape[0] != 26:
+            break
+        if out[2] > sum_radii + 1e-9:
+            centers, radii, sum_radii = out
+        else:
+            centers, radii, _ = out  # still move to repaired endpoint
+            if out[2] <= sum_radii - 1e-9:
+                # restart from the SLSQP-repaired endpoint anyway; keep best sum
+                pass
+            break
+
+    return centers, radii, sum_radii
+=======
+    results = []
+    for cand in candidates:
+        centers, radii, s = refine_layout(cand, r0)
+        results.append((s, centers, radii))
+    results.sort(key=lambda t: -t[0])
+
+    # Multi-start SLSQP polish: refine the top-k distinct basins and
+    # keep the overall best. Different count sets converge to
+    # genuinely different local optima; polishing several of them
+    # greatly increases the chance of finding the near-global one.
+    best = (results[0][1], results[0][2], results[0][0])
+    seen = []
+    polished = 0
+    for s0, c0, r0v in results:
+        if polished >= 5:
+            break
+        # skip basins too similar to one already polished
+        if any(np.linalg.norm(c0 - cc) < 0.05 for cc in seen):
+            continue
+        seen.append(c0)
+        polished += 1
+        out = slsqp_refine(c0, max_iters=400)
+        if out is not None and out[0].shape[0] == 26 and out[2] > best[2]:
+            best = out
+        # one extra restart pass from the polished endpoint
+        out2 = slsqp_refine(out[0], max_iters=400) if out is not None else None
+        if out2 is not None and out2[0].shape[0] == 26 and out2[2] > best[2]:
+            best = out2
+
+    centers, radii, sum_radii = best
+    return centers, radii, sum_radii
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    radii = np.zeros(n)
+    for _ in range(iters):
+        grew = False
+        for i in range(n):
+            cand = min(b[i], float(np.min(d[i, :] - radii)))
+            cand = max(cand, 1e-9)
+            if cand > radii[i] + 1e-12:
+                radii[i] = cand
+                grew = True
+        if not grew:
+            break
+    return radii
+=======
+    radii = np.zeros(n)
+    for _ in range(iters):
+        # Vectorized sweep: candidate radius for every circle at once.
+        cand = np.minimum(b, np.min(d - radii[None, :], axis=1))
+        cand = np.maximum(cand, 1e-9)
+        grew_mask = cand > radii + 1e-12
+        if not grew_mask.any():
+            break
+        # Gauss-Seidel flavor: apply updates circle-by-circle so that
+        # later circles in the sweep see the already-updated radii.
+        for i in np.flatnonzero(grew_mask):
+            ci = min(b[i], float(np.min(d[i, :] - radii)))
+            ci = max(ci, 1e-9)
+            if ci > radii[i] + 1e-12:
+                radii[i] = ci
+    return radii
+>>>>>>> REPLACE
+</DIFF>

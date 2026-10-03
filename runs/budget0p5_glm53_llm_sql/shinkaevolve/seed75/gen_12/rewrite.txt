@@ -1,0 +1,258 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List, Dict
+
+
+class Evolved(Algorithm):
+    """
+    Serial character-Trie prefix-cache optimizer.
+
+    Builds a small number of cheap candidate row-field orderings, scores each
+    with the exact ideal Trie reuse objective (sum of adjacent LCPs of the
+    sorted serialized rows), and returns the best. All original cell values,
+    rows and columns are preserved; each row receives a valid column ordering
+    consistent with the returned data.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------ #
+    # serialization helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _ser(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, float) and np.isnan(v):
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        if isinstance(v, bool):
+            return str(v)
+        if isinstance(v, str):
+            return v
+        return str(v)
+
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        # binary search on prefix-slice equality (comparisons run in C)
+        hi = min(len(a), len(b))
+        if hi == 0:
+            return 0
+        if a == b:
+            return len(a)
+        lo = 0
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    @classmethod
+    def _trie_score(cls, row_strings) -> int:
+        """Ideal serial-Trie reuse: sum of adjacent LCPs after sorting."""
+        if len(row_strings) < 2:
+            return 0
+        s = sorted(row_strings)
+        total = 0
+        prev = s[0]
+        for cur in s[1:]:
+            total += cls._lcp(prev, cur)
+            prev = cur
+        return total
+
+    # ------------------------------------------------------------------ #
+    # candidate constructions
+    # ------------------------------------------------------------------ #
+    def _global_order(self, codes, val_strs, val_lens, m, colnames,
+                      weighted: bool) -> List[int]:
+        """Rank columns by sum over values of len*(cnt*(cnt-1)) (weighted)
+        or len*(cnt-1) (immediate). Deterministic tie-break by name."""
+        scores = []
+        for c in range(m):
+            cc = codes[c]
+            cnt = np.bincount(cc, minlength=len(val_lens[c]))
+            s = 0
+            for v in range(len(cnt)):
+                k = cnt[v]
+                if k > 1:
+                    lv = val_lens[c][v]
+                    s += lv * (k * (k - 1)) if weighted else lv * (k - 1)
+            scores.append(s)
+        order = sorted(range(m), key=lambda c: (-scores[c], colnames[c]))
+        return order
+
+    def _conditional_orders(self, n, m, codes, val_lens,
+                            base_order, max_depth=12,
+                            max_group_cols=None) -> List[List[int]]:
+        """Recursive conditional prefix partition tree. Returns per-row
+        column orders (lists of column indices)."""
+        if max_group_cols is None:
+            max_group_cols = max(8, min(m, 32))
+        orders = [None] * n
+        # groups: (row_indices ndarray, prefix list of col idx)
+        groups = [(np.arange(n), [])]
+        depth = 0
+        while groups and depth < max_depth:
+            new_groups = []
+            progressed = False
+            for rows, prefix in groups:
+                if len(rows) < 2 or len(prefix) >= m:
+                    new_groups.append((rows, prefix))
+                    continue
+                used = set(prefix)
+                # candidate unused columns (bounded)
+                cands = [c for c in range(m) if c not in used]
+                if len(cands) > max_group_cols:
+                    cands = cands[:max_group_cols]
+                best_c, best_sav = None, 0
+                for c in cands:
+                    cc = codes[c][rows]
+                    cnt = np.bincount(cc, minlength=len(val_lens[c]))
+                    sav = 0
+                    for v in range(len(cnt)):
+                        k = cnt[v]
+                        if k > 1:
+                            sav += val_lens[c][v] * k * (k - 1)
+                    if sav > best_sav:
+                        best_c, best_sav = c, sav
+                if best_c is None:
+                    new_groups.append((rows, prefix))
+                    continue
+                progressed = True
+                cc = codes[best_c][rows]
+                for val in np.unique(cc):
+                    sub = rows[cc == val]
+                    new_groups.append((sub, prefix + [best_c]))
+            if not progressed:
+                break
+            groups = new_groups
+            depth += 1
+        for rows, prefix in groups:
+            used = set(prefix)
+            tail = [c for c in base_order if c not in used]
+            perm = prefix + tail
+            for r in rows:
+                orders[int(r)] = perm
+        # safety: fill any gaps
+        for i in range(n):
+            if orders[i] is None:
+                orders[i] = list(base_order)
+        return orders
+
+    # ------------------------------------------------------------------ #
+    # main entry
+    # ------------------------------------------------------------------ #
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        work = df.copy()
+        # honor col_merge with the parent helper when available
+        if col_merge and hasattr(self, "merging_columns"):
+            try:
+                for col_to_merge in col_merge:
+                    final_col_order = [c for c in work.columns if c in col_to_merge]
+                    if len(final_col_order) > 1:
+                        work = self.merging_columns(work, final_col_order, prepended=False)
+            except Exception:
+                work = df.copy()
+
+        n, m = work.shape
+        if n == 0 or m == 0:
+            return work.reset_index(drop=True), [
+                list(work.columns) for _ in range(n)
+            ]
+
+        colnames = list(work.columns)
+        # positional row access; keep original index for identity
+        orig_index = work.index
+        vals = work.to_numpy(dtype=object)
+
+        # serialize cells exactly; factorize once into integer codes
+        ser = [[None] * m for _ in range(n)]
+        codes = []
+        val_strs = []
+        val_lens = []
+        for c in range(m):
+            col_vals = [self._ser(vals[i][c]) for i in range(n)]
+            uniq = {}
+            code_arr = np.empty(n, dtype=np.int64)
+            lens_list = []
+            strs_list = []
+            for i, s in enumerate(col_vals):
+                key = s
+                idx = uniq.get(key)
+                if idx is None:
+                    idx = len(strs_list)
+                    uniq[key] = idx
+                    strs_list.append(s)
+                    lens_list.append(len(s))
+                code_arr[i] = idx
+                ser[i][c] = s
+            codes.append(code_arr)
+            val_strs.append(strs_list)
+            val_lens.append(lens_list)
+
+        # ---- candidate A: global weighted frequency order ----
+        orderA = self._global_order(codes, val_strs, val_lens, m, colnames,
+                                    weighted=True)
+        # ---- candidate B: conditional partition tree ----
+        try:
+            ordersB = self._conditional_orders(n, m, codes, val_lens, orderA)
+        except Exception:
+            ordersB = [list(orderA) for _ in range(n)]
+        # ---- candidate C: immediate (count-1) global order ----
+        orderC = self._global_order(codes, val_strs, val_lens, m, colnames,
+                                    weighted=False)
+        ordersC = [list(orderC) for _ in range(n)]
+
+        candidates = [([list(orderA) for _ in range(n)], "A"),
+                     (ordersB, "B"),
+                     (ordersC, "C")]
+
+        best_score = -1
+        best_orders = None
+        total_chars = None
+        for orders, tag in candidates:
+            rows_strs = ["".join(ser[i][c] for c in orders[i]) for i in range(n)]
+            if total_chars is None:
+                total_chars = sum(len(s) for s in rows_strs)
+            sc = self._trie_score(rows_strs)
+            if sc > best_score:
+                best_score = sc
+                best_orders = orders
+
+        orders = best_orders
+
+        # ---- build output: object dtype, all values preserved ----
+        col_pos = {name: c for c, name in enumerate(colnames)}
+        data = []
+        orderings = []
+        for i in range(n):
+            perm = orders[i]
+            data.append([vals[i][col_pos[colnames[c]]] for c in perm])
+            orderings.append([colnames[c] for c in perm])
+
+        out_cols = [colnames[c] for c in orderA]
+        out = pd.DataFrame(data, columns=out_cols, index=orig_index)
+        out = out.astype(object)
+
+        return out, orderings
+
+# EVOLVE-BLOCK-END

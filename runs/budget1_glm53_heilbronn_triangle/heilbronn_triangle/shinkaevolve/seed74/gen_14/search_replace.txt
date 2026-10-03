@@ -1,0 +1,254 @@
+<NAME>
+multistart_vectorized_local_search</NAME>
+<DESCRIPTION>
+The previous edit failed because my SEARCH text was missing a line (`best, best_val = cur.copy(), cur_val`) that exists in the actual file. I split the change into two targeted edits with exact SEARCH text. Edit 1 replaces the chunked `_min_area` with a fully vectorized objective (all 165 triplets at once via a precomputed index array), a vectorized barycentric clip (the recommended hot-path fix), and helper samplers. Edit 2 replaces the weak simulated-annealing core (which only moved 8 of 11 points and got stuck at score 0.18) with a deterministic multi-start greedy hill-climbing scheme with decaying step sizes that perturbs the vertices of the near-worst triangles, moving any of the 11 points, plus a final coordinate-descent polish. Multi-start with random barycentric restarts is the key improvement for escaping the poor local optimum.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+import numpy as np
+
+def _min_area(points):
+    """Vectorized minimum (doubled) triangle area over all triplets, normalized by triangle area."""
+    n = len(points)
+    i, j = np.triu_indices(n, k=1)
+    # vectors from point i to point j
+    d = points[j] - points[i]      # (m,2)
+    m = len(d)
+    best = np.inf
+    # for each k, area = |d x (p_k - p_i)| / 2 over pairs (i,j)
+    # chunk over k to limit memory
+    for k0 in range(n):
+        v = points[k0] - points[i]         # (m,2)
+        cross = np.abs(d[:,0]*v[:,1] - d[:,1]*v[:,0])
+        # exclude triplets where k equals i or j
+        mask = (i != k0) & (j != k0)
+        if mask.any():
+            best = min(best, cross[mask].min())
+    return best  # doubled area; divide by 2*sqrt(3)/2 for normalized
+=======
+import numpy as np
+from itertools import combinations
+
+_H = np.sqrt(3.0) / 2.0
+_VERTS = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, _H]])
+_TRI = np.array(list(combinations(range(11), 3)), dtype=int)  # (165,3)
+
+
+def _clip(pts: np.ndarray) -> np.ndarray:
+    """Vectorized clip of all points into the equilateral triangle via barycentric clamping."""
+    l2 = pts[:, 1] / _H
+    l1 = pts[:, 0] - 0.5 * l2
+    l0 = 1.0 - l1 - l2
+    bc = np.stack([l0, l1, l2], axis=1)
+    bc = np.clip(bc, 0.0, None)
+    bc = bc / bc.sum(axis=1, keepdims=True)
+    return bc @ _VERTS
+
+
+def _areas(pts: np.ndarray) -> np.ndarray:
+    """All 165 triangle areas at once, fully vectorized."""
+    a = pts[_TRI[:, 0]]
+    b = pts[_TRI[:, 1]]
+    c = pts[_TRI[:, 2]]
+    return 0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+                         - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+
+
+def _min_area(pts: np.ndarray) -> float:
+    return float(_areas(pts).min())
+
+
+def _random_in_triangle(rng, n=11):
+    """Uniform random points in the triangle via barycentric sampling."""
+    u = rng.random((n, 2))
+    su = np.sqrt(u[:, 0])
+    bc = np.empty((n, 3))
+    bc[:, 0] = 1.0 - su
+    bc[:, 1] = su * (1.0 - u[:, 1])
+    bc[:, 2] = su * u[:, 1]
+    return bc @ _VERTS
+
+
+def _refine(pts, rng, steps=(0.05, 0.02, 0.01, 0.004, 0.002, 8e-4, 3e-4, 1e-4)):
+    """Greedy hill climbing with decaying steps; moves vertices of near-worst triangles."""
+    pts = _clip(pts)
+    cur = _min_area(pts)
+    n = len(pts)
+    for h in steps:
+        improved = True
+        it = 0
+        while improved and it < 300:
+            improved = False
+            it += 1
+            ar = _areas(pts)
+            thr = ar.min() * 1.05
+            bad = _TRI[ar <= thr]
+            cand = pts.copy()
+            movers = np.unique(bad.ravel())
+            cand[movers] += rng.normal(0.0, h, (len(movers), 2))
+            cand = _clip(cand)
+            v = _min_area(cand)
+            if v > cur + 1e-15:
+                pts, cur, improved = cand, v, True
+                continue
+            # fallback: random single-point move
+            cand = pts.copy()
+            k = rng.integers(0, n)
+            cand[k] += rng.normal(0.0, h, 2)
+            cand = _clip(cand)
+            v = _min_area(cand)
+            if v > cur + 1e-15:
+                pts, cur, improved = cand, v, True
+    return pts, cur
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def heilbronn_triangle11() -> np.ndarray:
+    n = 11
+    verts = np.array([[0.0,0.0],[1.0,0.0],[0.5, np.sqrt(3)/2]])
+    TRI_AREA = np.sqrt(3)/2
+
+    rng = np.random.default_rng(12345)
+
+    # Start: vertices + ring structure for remaining 8 points
+    pts = np.vstack([verts, np.zeros((8,2))])
+    # initial guess: points on a scaled inner triangle grid (feels good for Heilbronn)
+    # barycentric candidates
+    bary = np.array([
+        [1/3,1/3,1/3],
+        [0.5,0.25,0.25],[0.25,0.5,0.25],[0.25,0.25,0.5],
+        [2/3,1/6,1/6],[1/6,2/3,1/6],[1/6,1/6,2/3],
+        [0.5,0.5,0.0],
+    ])
+    for idx in range(8):
+        pts[3+idx] = bary[idx,0]*verts[0] + bary[idx,1]*verts[1] + bary[idx,2]*verts[2]
+
+    def objective(P):
+        return _min_area(P)  # larger is better
+
+    cur = pts.copy()
+    cur_val = objective(cur)
+    best, best_val = cur.copy(), cur_val
+
+    # Simulated annealing on the 8 free interior/boundary points
+    T0, T1 = 5e-3, 1e-5
+    iters = 4000
+    for t in range(iters):
+        T = T0 * (T1/T0) ** (t/iters)
+        cand = cur.copy()
+        k = 3 + rng.integers(0, 8)
+        step = rng.normal(0, T, size=2)
+        cand[k] += step
+        # project back inside triangle via barycentric clamping
+        v0 = verts[1]-verts[0]; v1 = verts[2]-verts[0]; v2 = cand[k]-verts[0]
+        d00 = v0@v0; d01 = v0@v1; d11 = v1@v1; d20 = v2@v0; d21 = v2@v1
+        den = d00*d11 - d01*d01
+        a = (d11*d20 - d01*d21)/den; b = (d00*d21 - d01*d20)/den
+        # clamp barycentric coords to [0,1], renormalize
+        bc = np.array([1-a-b, a, b])
+        bc = np.clip(bc, 0.0, 1.0); bc /= bc.sum()
+        cand[k] = bc[0]*verts[0] + bc[1]*verts[1] + bc[2]*verts[2]
+        val = objective(cand)
+        if val >= cur_val or rng.random() < np.exp((val-cur_val)/(T*TRI_AREA*2+1e-12)):
+            cur, cur_val = cand, val
+            if val > best_val:
+                best, best_val = cand.copy(), val
+
+    # Greedy polish: coordinate descent on the point participating in the worst triangle
+    P = best.copy()
+    for _ in range(300):
+        improved = False
+        # find worst triangle
+        areas = []
+        idx3 = np.array(list(itertools.combinations(range(n),3))) if False else None
+        # recompute worst via manual loop (cheap, 165 triplets)
+        worst_val, worst_tri = np.inf, None
+        for a in range(n):
+            for b in range(a+1,n):
+                for c in range(b+1,n):
+                    ar = abs(np.cross(P[b]-P[a], P[c]-P[a]))
+                    if ar < worst_val:
+                        worst_val, worst_tri = ar, (a,b,c)
+        for k in worst_tri:
+            for ax in range(2):
+                for s in (1,-1):
+                    for h in (3e-3, 1e-3, 3e-4):
+                        cand = P.copy()
+                        cand[k,ax] += s*h
+                        # clamp into triangle
+                        v0 = verts[1]-verts[0]; v1 = verts[2]-verts[0]; v2 = cand[k]-verts[0]
+                        d00=v0@v0; d01=v0@v1; d11=v1@v1; d20=v2@v0; d21=v2@v1
+                        den=d00*d11-d01*d01
+                        a2=(d11*d20-d01*d21)/den; b2=(d00*d21-d01*d20)/den
+                        bc=np.clip(np.array([1-a2-b2,a2,b2]),0,1); bc/=bc.sum()
+                        cand[k]=bc[0]*verts[0]+bc[1]*verts[1]+bc[2]*verts[2]
+                        if objective(cand) > objective(P) + 1e-15:
+                            P = cand; improved = True; break
+                    if improved: break
+            if improved: break
+        if not improved:
+            break
+
+    return P
+=======
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of n points on or inside a convex region in order to maximize the area of the
+    smallest triangle formed by these points. Here n = 11.
+
+    Deterministic multi-start greedy local search with a fully vectorized objective.
+
+    Returns:
+        points: np.ndarray of shape (11,2) with the x,y coordinates of the points.
+    """
+    n = 11
+    s = np.sqrt(3.0)
+    rng = np.random.default_rng(12345)
+
+    seeds = [np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.5, s / 2.0],
+        [0.5, 0.0], [0.25, s / 8.0], [0.75, s / 8.0],
+        [0.5, s / 4.0], [0.125, s / 16.0], [0.875, s / 16.0],
+        [0.375, 3.0 * s / 16.0], [0.625, 3.0 * s / 16.0],
+    ])]
+
+    best, best_val = None, -np.inf
+    try:
+        # Multi-start: deterministic seed + 30 random barycentric restarts
+        for t in range(31):
+            start = seeds[0] if t == 0 else _random_in_triangle(rng, n)
+            pts, val = _refine(start.copy(), rng)
+            if val > best_val:
+                best, best_val = pts.copy(), val
+
+        # Final polish: coordinate descent on worst-triangle vertices
+        P = best.copy()
+        for _ in range(200):
+            ar = _areas(P)
+            worst = _TRI[np.argmin(ar)]
+            improved = False
+            for k in worst:
+                for ax in range(2):
+                    for sgn in (1.0, -1.0):
+                        for h in (2e-3, 5e-4, 1e-4):
+                            cand = P.copy()
+                            cand[k, ax] += sgn * h
+                            cand = _clip(cand)
+                            v = _min_area(cand)
+                            if v > best_val + 1e-15:
+                                P, best_val, improved = cand, v, True
+                                break
+                        if improved:
+                            break
+                if improved:
+                    break
+            if not improved:
+                break
+        best = P
+    except Exception:
+        if best is None:
+            best = seeds[0]
+        best = _clip(best)
+
+    return best
+>>>>>>> REPLACE
+</DIFF>

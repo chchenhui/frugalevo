@@ -1,0 +1,104 @@
+<NAME>
+softmin_annealing_with_clipped_exponentials</NAME>
+<DESCRIPTION>
+Add a gradient-based annealing stage that maximizes a smooth soft-min/soft-max surrogate of the ratio using exponentially-weighted distance aggregation. A soft-min (log-sum-exp of -d/tau) and soft-max (log-sum-exp of +d/tau) give differentiable lower/upper bounds on dmin/dmax, so gradient ascent on their ratio smoothly approaches the true discrete metric as tau shrinks. A tau schedule annealing down to 0.002 and 0.001 (with exp arguments clipped to ±50 for numerical safety) sharpens the surrogate before the existing force-relax and SLSQP polish, letting the hill-climb start from a better basin. This directly implements the recommendation of extending the annealing floor below 0.005 with clipped exponentials, and it complements (rather than replaces) the existing discrete stages.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _initial_candidates(rng: np.random.Generator, n: int, k: int = 6):
+=======
+def _soft_ratio_anneal(points: np.ndarray,
+                       taus=(0.05, 0.02, 0.01, 0.005, 0.002, 0.001),
+                       iters_per_tau: int = 250,
+                       lr: float = 0.02) -> np.ndarray:
+    """Gradient ascent on a smooth soft-min/soft-max ratio surrogate.
+
+    soft_min(d) = -tau * log sum exp(-d/tau)   (<= dmin)
+    soft_max(d) =  tau * log sum exp(+d/tau)   (>= dmax)
+    The ratio soft_min/soft_max is a differentiable lower bound on
+    dmin/dmax that sharpens as tau -> 0. Exp arguments are clipped to
+    +-50 to avoid overflow at the smallest taus.
+    """
+    pts = points / np.linalg.norm(points, axis=1, keepdims=True)
+    n = len(pts)
+    best_pts = pts.copy()
+    best_hard = _score(pts)
+    for tau in taus:
+        for it in range(iters_per_tau):
+            diff = pts[:, None, :] - pts[None, :, :]
+            d = np.sqrt((diff ** 2).sum(-1) + 1e-12)
+            iu = np.triu_indices(n, k=1)
+            du = d[iu]
+            ii, jj = iu[0], iu[1]
+            # soft-min weights (softmax of -d/tau)
+            a = -du / tau
+            a -= a.min()
+            wa = np.exp(np.clip(a, -50, 50))
+            wa /= wa.sum()
+            smin = -tau * np.log(np.exp(np.clip((-du / tau) - a.max(), -50, 50)).sum()) - tau * a.max() * 0.0
+            smin = -tau * (np.log(wa.sum() * 0 + 1) * 0 + np.log(np.exp(np.clip(-du / tau - (-du / tau).max(), -50, 50)).sum()) + (-du / tau).max())
+            # soft-max weights
+            b = du / tau
+            b -= b.max()
+            wb = np.exp(np.clip(b, -50, 50))
+            wb /= wb.sum()
+            smax = tau * (np.log(np.exp(np.clip(du / tau - (du / tau).max(), -50, 50)).sum()) + (du / tau).max())
+            # gradient of smin/smax wrt each pairwise distance
+            gs_min = wa / tau   # d smin / d du  (approximately +wa/tau)
+            gs_max = wb / tau   # d smax / d du
+            # d(du)/d pts: pull along unit vectors
+            uij = diff[ii, jj] / du[:, None]
+            # maximize smin/smax => ascend smin - (smin0/smax0)*smax approx:
+            # use current ratio weight
+            r_now = max(smin / max(smax, 1e-9), 1e-6)
+            coef = gs_min - r_now * gs_max
+            gpair = coef[:, None] * uij
+            grad = np.zeros_like(pts)
+            np.add.at(grad, ii, gpair)
+            np.add.at(grad, jj, -gpair)
+            # tangential projection to stay on sphere
+            rad = pts / np.maximum(np.linalg.norm(pts, axis=1, keepdims=True), 1e-12)
+            grad_t = grad - rad * np.sum(grad * rad, axis=1, keepdims=True)
+            step = lr * (1.0 / (1.0 + it * 0.01))
+            sn = np.linalg.norm(grad_t, axis=1, keepdims=True).max()
+            if sn > 1e-12 and np.isfinite(sn):
+                grad_t = grad_t / sn
+            pts = pts + step * grad_t
+            pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+            hard = _score(pts)
+            if hard > best_hard:
+                best_hard = hard
+                best_pts = pts.copy()
+        # restart each tau block from the best found so far
+        pts = best_pts.copy()
+    return best_pts
+
+
+def _initial_candidates(rng: np.random.Generator, n: int, k: int = 6):
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+                p = _refine_on_sphere(p)
+                sc = _score(p)
+                if sc > best_sc:
+                    best_sc = sc
+                    best_pts = p.copy()
+=======
+                p = _refine_on_sphere(p)
+                sc = _score(p)
+                if sc > best_sc:
+                    best_sc = sc
+                    best_pts = p.copy()
+
+        # soft-min/soft-max annealing sharpening of the best config
+        try:
+            soft = _soft_ratio_anneal(best_pts)
+            s = _score(soft)
+            if s > best_sc and np.isfinite(soft).all():
+                best_sc, best_pts = s, soft.copy()
+        except Exception:
+            pass
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

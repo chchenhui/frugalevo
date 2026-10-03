@@ -1,0 +1,141 @@
+--- a/original.py
++++ b/original.py
+@@ -1,84 +1,134 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def min_max_dist_dim3_14() -> np.ndarray:
+     """Construct a deterministic, locally refined 14-point 3D code."""
+ 
+     n = 14
+     iu, ju = np.triu_indices(n, 1)
+ 
+     def normalize(x: np.ndarray) -> np.ndarray:
+         x = x - x.mean(axis=0, keepdims=True)
+         return x / np.sqrt(np.mean(np.sum(x * x, axis=1)))
+ 
+     def exact_ratio(x: np.ndarray) -> float:
+         delta = x[iu] - x[ju]
+         distances = np.sqrt(np.sum(delta * delta, axis=1))
+         return float(distances.min() / distances.max())
+ 
+     # Eight cube vertices plus six axial vertices is a strong 14-point
+     # starting family.  Independent fixed perturbations deliberately break
+     # the symmetry, allowing the refinement to find better asymmetric codes.
+     cube = np.array(
+         [[sx, sy, sz] for sx in (-1.0, 1.0)
+                       for sy in (-1.0, 1.0)
+                       for sz in (-1.0, 1.0)],
+         dtype=float,
+     )
+     axes = np.array(
+         [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0],
+          [0.0, 1.0, 0.0], [0.0, -1.0, 0.0],
+          [0.0, 0.0, 1.0], [0.0, 0.0, -1.0]],
+         dtype=float,
+     )
+ 
+     rng = np.random.default_rng(18473)
+     best = None
+     best_value = -np.inf
+ 
+     # A range of axial radii samples several nearby cube--octahedron basins.
+     for axial_radius in (1.25, 1.45, 1.65, 1.85, 2.05, 2.25):
+         x = np.vstack((cube, axial_radius * axes))
+         x += rng.normal(scale=0.115, size=x.shape)
+         x = normalize(x)
+ 
+         # Continue from a smooth objective to one concentrated on the
+         # active closest and farthest pairs.
+         for p, iterations, step in (
+             (4.0, 180, 0.075),
+             (8.0, 260, 0.050),
+             (16.0, 360, 0.032),
+             (32.0, 420, 0.020),
+             (64.0, 460, 0.012),
+         ):
+             for _ in range(iterations):
+                 delta = x[iu] - x[ju]
+                 d2 = np.sum(delta * delta, axis=1)
+                 distances = np.sqrt(np.maximum(d2, 1e-15))
+ 
+                 # Gradient of log(soft-min distance / soft-max distance).
+                 low = distances ** (-p)
+                 high = distances ** p
+                 pair_weight = low / low.sum() - high / high.sum()
+                 pair_gradient = pair_weight[:, None] * delta / d2[:, None]
+ 
+                 gradient = np.zeros_like(x)
+                 np.add.at(gradient, iu, pair_gradient)
+                 np.add.at(gradient, ju, -pair_gradient)
+ 
+                 # Remove translational drift and use a bounded displacement.
+                 gradient -= gradient.mean(axis=0, keepdims=True)
+                 gscale = np.sqrt(np.mean(np.sum(gradient * gradient, axis=1)))
+                 if gscale > 0.0:
+                     x = normalize(x + step * gradient / gscale)
+ 
+-        value = exact_ratio(x)
+-        if value > best_value:
+-            best_value = value
+-            best = x.copy()
++        # The smooth objective locates a useful basin, but its force remains
++        # spread over non-limiting pairs.  Finish with an accept-only descent
++        # on the actual contact sets, retaining the best exact-ratio iterate.
++        candidate = x.copy()
++        candidate_value = exact_ratio(candidate)
++
++        for tolerance, base_step, iterations in (
++            (0.030, 0.030, 180),
++            (0.015, 0.016, 240),
++            (0.006, 0.008, 300),
++        ):
++            for _ in range(iterations):
++                delta = x[iu] - x[ju]
++                d2 = np.sum(delta * delta, axis=1)
++                distances = np.sqrt(np.maximum(d2, 1e-15))
++                dmin = distances.min()
++                dmax = distances.max()
++
++                # Average logarithmic forces over all nearly active contacts.
++                # Closest pairs are expanded; diameter pairs are contracted.
++                near_low = distances <= dmin * (1.0 + tolerance)
++                near_high = distances >= dmax * (1.0 - tolerance)
++                weights = np.zeros_like(distances)
++                weights[near_low] = 1.0 / np.count_nonzero(near_low)
++                weights[near_high] -= 1.0 / np.count_nonzero(near_high)
++                pair_force = weights[:, None] * delta / d2[:, None]
++
++                force = np.zeros_like(x)
++                np.add.at(force, iu, pair_force)
++                np.add.at(force, ju, -pair_force)
++                force -= force.mean(axis=0, keepdims=True)
++                fscale = np.sqrt(np.mean(np.sum(force * force, axis=1)))
++                if fscale == 0.0:
++                    break
++
++                # The nonsmooth objective can reject a full force step near a
++                # contact switch, so deterministically backtrack on its exact
++                # value rather than allowing a polishing step to lose quality.
++                accepted = False
++                for multiplier in (1.0, 0.5, 0.25, 0.125):
++                    trial = normalize(x + base_step * multiplier * force / fscale)
++                    trial_value = exact_ratio(trial)
++                    if trial_value > candidate_value + 1e-13:
++                        x = trial
++                        candidate = trial.copy()
++                        candidate_value = trial_value
++                        accepted = True
++                        break
++                if not accepted:
++                    break
++
++        if candidate_value > best_value:
++            best_value = candidate_value
++            best = candidate
+ 
+     return best
+ 
+ 
+ # EVOLVE-BLOCK-END

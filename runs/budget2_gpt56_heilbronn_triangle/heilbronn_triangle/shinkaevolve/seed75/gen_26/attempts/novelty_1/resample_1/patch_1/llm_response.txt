@@ -1,0 +1,366 @@
+<NAME>
+active_constraint_islands
+</NAME>
+
+<DESCRIPTION>
+This redesign uses a cached, modular active-constraint optimization pipeline. It searches several deterministic “islands” in affine simplex coordinates, generates directed proposals from gradients of the currently smallest triangle determinants, mixes these with coupled stochastic repairs, and finishes with an optional SLSQP maximin polish. The result is validated against a safe fallback before conversion to Cartesian coordinates, keeping calls to the public constructor effectively constant-time after initialization.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+_SQRT3 = float(np.sqrt(3.0))
+_HEIGHT = 0.5 * _SQRT3
+_N = 11
+_FREE = 8
+
+# Affine/simplex coordinates: (u, v) maps to
+# Cartesian (u + v/2, sqrt(3)*v/2).
+_CORNERS_UV = np.array(
+    [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+    dtype=float,
+)
+
+_TRIPLES = np.array(
+    [
+        (i, j, k)
+        for i in range(_N)
+        for j in range(i + 1, _N)
+        for k in range(j + 1, _N)
+    ],
+    dtype=np.intp,
+)
+
+
+def _project_simplex(values: np.ndarray, margin: float = 0.0) -> np.ndarray:
+    """Project affine point coordinates into u>=0, v>=0, u+v<=1."""
+    z = np.asarray(values, dtype=float).copy()
+    z = np.maximum(z, margin)
+
+    total = z[..., 0] + z[..., 1]
+    cap = 1.0 - margin
+    outside = total > cap
+
+    if np.any(outside):
+        z[outside] *= (cap / total[outside])[..., None]
+
+    return z
+
+
+def _all_points(population: np.ndarray) -> np.ndarray:
+    """Append fixed enclosing-triangle vertices to a batch of free layouts."""
+    batch = population.shape[0]
+    result = np.empty((batch, _N, 2), dtype=float)
+    result[:, :3] = _CORNERS_UV
+    result[:, 3:] = population
+    return result
+
+
+def _signed_areas(population: np.ndarray) -> np.ndarray:
+    """Return signed normalized determinant values for every point triple."""
+    points = _all_points(population)
+    a = points[:, _TRIPLES[:, 0]]
+    b = points[:, _TRIPLES[:, 1]]
+    c = points[:, _TRIPLES[:, 2]]
+
+    return (
+        (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
+        - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
+    )
+
+
+def _areas(population: np.ndarray) -> np.ndarray:
+    """Return normalized triangle areas for every population member."""
+    return np.abs(_signed_areas(population))
+
+
+def _minimum_area(layout: np.ndarray) -> float:
+    return float(np.min(_areas(layout[None, :, :])[0]))
+
+
+def _tail_score(area_matrix: np.ndarray, temperature: float) -> np.ndarray:
+    """
+    Smooth lower-tail selection score.
+
+    This retains a maximin emphasis but distinguishes layouts with equally
+    small limiting triangles according to their nearby active constraints.
+    """
+    low = np.min(area_matrix, axis=1)
+    shifted = area_matrix - low[:, None]
+    return low - temperature * np.log(np.sum(np.exp(-shifted / temperature), axis=1))
+
+
+def _affine_to_cartesian(uv: np.ndarray) -> np.ndarray:
+    result = np.empty_like(uv)
+    result[:, 0] = uv[:, 0] + 0.5 * uv[:, 1]
+    result[:, 1] = _HEIGHT * uv[:, 1]
+    return result
+
+
+def _gradient_field(layout: np.ndarray, signed: np.ndarray) -> np.ndarray:
+    """
+    Aggregate determinant-ascent directions from the active small triangles.
+
+    A determinant is linear in each one of its three vertices.  For every
+    restrictive triangle, its signed gradient is added to each participating
+    movable point.  The resulting vector field proposes coordinated repairs
+    rather than only random coordinate replacement.
+    """
+    absolute = np.abs(signed)
+    active_count = min(28, len(absolute))
+    active_indices = np.argpartition(absolute, active_count - 1)[:active_count]
+
+    points = np.vstack((_CORNERS_UV, layout))
+    direction = np.zeros((_FREE, 2), dtype=float)
+
+    limit = max(float(np.min(absolute)) + 0.009, 0.006)
+
+    for tri_index in active_indices:
+        i, j, k = _TRIPLES[tri_index]
+        a, b, c = points[i], points[j], points[k]
+
+        sign = 1.0 if signed[tri_index] >= 0.0 else -1.0
+        weight = 1.0 / max(absolute[tri_index], 0.004)
+        if absolute[tri_index] > limit:
+            weight *= 0.25
+
+        gradients = (
+            np.array((b[1] - c[1], c[0] - b[0])),
+            np.array((c[1] - a[1], a[0] - c[0])),
+            np.array((a[1] - b[1], b[0] - a[0])),
+        )
+
+        for point_index, gradient in zip((i, j, k), gradients):
+            if point_index >= 3:
+                direction[point_index - 3] += sign * weight * gradient
+
+    norm = np.linalg.norm(direction, axis=1)
+    good = norm > 1.0e-14
+    direction[good] /= norm[good, None]
+    return direction
+
+
+def _initial_layout(rng: np.random.Generator, island: int) -> np.ndarray:
+    """
+    Produce structured but diversified starts.
+
+    The base is a staggered triangular packing; alternating islands perturb it
+    or use farthest-point simplex samples to explore different orientation
+    chambers.
+    """
+    base = np.array(
+        [
+            [0.145, 0.075],
+            [0.445, 0.055],
+            [0.755, 0.075],
+            [0.075, 0.335],
+            [0.355, 0.275],
+            [0.650, 0.235],
+            [0.145, 0.625],
+            [0.420, 0.470],
+        ],
+        dtype=float,
+    )
+
+    if island % 2 == 0:
+        return _project_simplex(base + rng.normal(0.0, 0.085, size=base.shape))
+
+    pool = rng.dirichlet((1.15, 1.15, 1.15), size=120)[:, 1:]
+    selected = [pool[rng.integers(len(pool))]]
+
+    while len(selected) < _FREE:
+        existing = np.asarray(selected)
+        delta = pool[:, None, :] - existing[None, :, :]
+        distance = np.sum(delta * delta, axis=2)
+        selected.append(pool[int(np.argmax(np.min(distance, axis=1)))])
+
+    return _project_simplex(np.asarray(selected))
+
+
+def _active_island_search(rng: np.random.Generator, start: np.ndarray) -> np.ndarray:
+    """Run one deterministic directed maximin search island."""
+    current = start.copy()
+    current_area = _minimum_area(current)
+    best = current.copy()
+    best_area = current_area
+
+    iterations = 980
+    batch_size = 56
+    directed_count = 18
+
+    for iteration in range(iterations):
+        progress = iteration / float(iterations - 1)
+        scale = 0.075 * (1.0 - progress) ** 1.45 + 0.0011
+        temperature = 0.0038 * (1.0 - progress) + 0.00018
+
+        signed = _signed_areas(current[None, :, :])[0]
+        absolute = np.abs(signed)
+        gradient = _gradient_field(current, signed)
+
+        candidates = np.broadcast_to(
+            current, (batch_size, _FREE, 2)
+        ).copy()
+
+        # Directed full-layout candidates use several step lengths.  These
+        # explicitly move all points participating in the active bottleneck.
+        multipliers = np.linspace(0.20, 1.75, directed_count)
+        candidates[:directed_count] += (
+            multipliers[:, None, None] * scale * gradient[None, :, :]
+        )
+        candidates[:directed_count] += rng.normal(
+            0.0,
+            scale * 0.075,
+            size=(directed_count, _FREE, 2),
+        )
+
+        # Point-specific mutations preserve combinatorial flexibility.
+        remainder = np.arange(directed_count, batch_size - 1)
+        moving = rng.integers(0, _FREE, size=len(remainder))
+        candidates[remainder, moving] += rng.normal(
+            0.0, scale, size=(len(remainder), 2)
+        )
+
+        # Some candidates jointly perturb points in active triples.
+        active = np.argpartition(absolute, min(20, len(absolute)) - 1)[:20]
+        involved = np.unique(_TRIPLES[active][_TRIPLES[active] >= 3]) - 3
+
+        if len(involved):
+            joint_rows = remainder[: min(12, len(remainder))]
+            candidates[joint_rows[:, None], involved[None, :]] += rng.normal(
+                0.0,
+                scale * 0.48,
+                size=(len(joint_rows), len(involved), 2),
+            )
+
+        # The incumbent makes the state update monotone under tail selection.
+        candidates[-1] = current
+        candidates = _project_simplex(candidates)
+
+        candidate_areas = _areas(candidates)
+        score = _tail_score(candidate_areas, temperature)
+        winner = int(np.argmax(score))
+
+        current = candidates[winner]
+        current_area = float(np.min(candidate_areas[winner]))
+
+        if current_area > best_area:
+            best = current.copy()
+            best_area = current_area
+
+    return best
+
+
+def _slsqp_polish(layout: np.ndarray) -> np.ndarray:
+    """
+    Optionally polish a fixed orientation chamber with an epigraph maximin NLP.
+    """
+    try:
+        from scipy.optimize import minimize
+
+        reference_signed = _signed_areas(layout[None, :, :])[0]
+        orientation = np.sign(reference_signed)
+        orientation[orientation == 0.0] = 1.0
+        initial_area = float(np.min(np.abs(reference_signed)))
+
+        def constraints(vector: np.ndarray) -> np.ndarray:
+            tail = vector[:-1].reshape(_FREE, 2)
+            level = vector[-1]
+            signed = _signed_areas(tail[None, :, :])[0]
+            return np.concatenate(
+                (
+                    orientation * signed - level,
+                    1.0 - np.sum(tail, axis=1),
+                )
+            )
+
+        result = minimize(
+            fun=lambda vector: -vector[-1],
+            x0=np.r_[layout.ravel(), initial_area],
+            method="SLSQP",
+            bounds=[(0.0, 1.0)] * (2 * _FREE) + [(0.0, 1.0)],
+            constraints={"type": "ineq", "fun": constraints},
+            options={"maxiter": 900, "ftol": 1.0e-12, "disp": False},
+        )
+
+        if result.success and np.all(np.isfinite(result.x)):
+            candidate = _project_simplex(result.x[:-1].reshape(_FREE, 2))
+            if _minimum_area(candidate) > _minimum_area(layout) + 1.0e-12:
+                return candidate
+    except Exception:
+        pass
+
+    return layout
+
+
+def _fallback() -> np.ndarray:
+    affine = np.array(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.15, 0.07],
+            [0.45, 0.06],
+            [0.75, 0.07],
+            [0.08, 0.34],
+            [0.36, 0.28],
+            [0.65, 0.23],
+            [0.15, 0.62],
+            [0.42, 0.47],
+        ],
+        dtype=float,
+    )
+    return _affine_to_cartesian(affine)
+
+
+def _construct_layout() -> np.ndarray:
+    """Build, validate, and convert the best deterministic search result."""
+    try:
+        rng = np.random.default_rng(11031987)
+        best = None
+        best_value = -np.inf
+
+        for island in range(6):
+            candidate = _active_island_search(rng, _initial_layout(rng, island))
+            value = _minimum_area(candidate)
+
+            if value > best_value:
+                best = candidate
+                best_value = value
+
+        if best is None or not np.all(np.isfinite(best)):
+            return _fallback()
+
+        best = _slsqp_polish(best)
+        affine = np.vstack((_CORNERS_UV, best))
+        result = _affine_to_cartesian(affine)
+
+        if result.shape != (11, 2) or not np.all(np.isfinite(result)):
+            return _fallback()
+
+        return result
+    except Exception:
+        return _fallback()
+
+
+# Search only once; public calls are cheap and deterministic.
+_CACHED_LAYOUT = _construct_layout()
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Return eleven deterministic points in the unit equilateral triangle.
+
+    Returns
+    -------
+    np.ndarray
+        Cartesian coordinates with shape ``(11, 2)``.
+    """
+    return _CACHED_LAYOUT.copy()
+
+
+# EVOLVE-BLOCK-END
+``` 
+</CODE>

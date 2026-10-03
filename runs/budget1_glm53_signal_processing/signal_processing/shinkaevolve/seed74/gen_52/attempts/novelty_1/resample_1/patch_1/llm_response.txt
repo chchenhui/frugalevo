@@ -1,0 +1,150 @@
+<NAME>
+noise_floor_subtracted_two_pass_q
+</NAME>
+<DESCRIPTION>
+The recommendation targets lag_error (0.27) and avg_error (0.29): a single global Q under-serves the 5 Hz component. Instead of estimating Q from the raw denoised input (which mixes measurement noise into the "dynamics"), run the Kalman pass once with a conservative base Q, then estimate per-sample Q from the *smoothed* first-pass output's second differences. Because the smoothed output's d2 contains far less measurement noise, its block-MAD reflects genuine local dynamics. We subtract the expected residual noise floor per block — the residual noise in a window-mean-like estimate scales as σ_r/√w, and second differences amplify it by √6 — then floor at 0.05σ_r and cap at 1.5σ_r, interpolating to per-sample Q[k]. This gives large Q (fast tracking) in genuinely busy segments and small Q (heavy smoothing) in slow segments, directly reducing lag on transients while suppressing spurious reversals elsewhere. σ_r is estimated robustly from the Hampel residual via MAD.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _local_process_noise(x, window_size, q_base=0.05, power=2.0,
+                          lo_frac=0.1, hi_frac=8.0):
+    """
+    Estimate per-sample process noise q[k] from local signal dynamics.
+
+    sigma_acc is estimated as the block MAD of second differences over
+    sliding blocks (length ~ window_size, 50% overlap), then linearly
+    interpolated between block centers. q[k] is q_base scaled by
+    (sigma/local_median)^power, floored/capped so it stays in a sane range.
+    """
+    n = len(x)
+    if n < 6:
+        return np.full(n, q_base)
+
+    xs = _median3(x)                    # suppress noise before differencing
+    d2 = np.diff(xs, n=2)              # approximates acceleration * dt^2
+    m = len(d2)
+    if m < 3:
+        return np.full(n, q_base)
+
+    block = max(4, int(window_size))
+    step = max(1, block // 2)
+
+    starts = list(range(0, max(1, m - block + 1), step))
+    if m > block and starts[-1] < m - block:
+        starts.append(m - block)
+    if not starts:
+        starts = [0]
+
+    centers = np.empty(len(starts))
+    ratios = np.empty(len(starts))
+    sigs = []
+    for j, s in enumerate(starts):
+        seg = d2[s:s + block]
+        sig = 1.4826 * np.median(np.abs(seg - np.median(seg)))
+        sig = max(sig, 1e-6)
+        sigs.append(sig)
+        centers[j] = s + len(seg) / 2.0
+    sigs = np.asarray(sigs)
+
+    med = max(np.median(sigs), 1e-12)
+    ratios = (sigs / med) ** power
+    ratios = np.clip(ratios, lo_frac, hi_frac)
+
+    # d2 index i corresponds to sample ~i+1; shift centers into sample space
+    k = np.arange(n, dtype=float)
+    q = q_base * np.interp(k, centers + 1.0, ratios)
+    return np.clip(q, q_base * lo_frac, q_base * hi_frac)
+=======
+def _local_process_noise(x, window_size, q_base=0.05, power=2.0,
+                          lo_frac=0.1, hi_frac=8.0, sigma_r=1.0):
+    """
+    Estimate per-sample process noise q[k] from local signal dynamics.
+
+    sigma_acc is estimated as the block MAD of second differences over
+    sliding blocks (length ~ window_size, 50% overlap). A residual-noise
+    floor (sigma_r / sqrt(w)) * sqrt(6) is subtracted per block so that
+    only genuine dynamics remain; the result is floored at 0.05*sigma_r,
+    capped at 1.5*sigma_r, and linearly interpolated to per-sample Q[k].
+    """
+    n = len(x)
+    if n < 6:
+        return np.full(n, q_base)
+
+    xs = _median3(x)                    # suppress noise before differencing
+    d2 = np.diff(xs, n=2)              # approximates acceleration * dt^2
+    m = len(d2)
+    if m < 3:
+        return np.full(n, q_base)
+
+    block = max(4, int(window_size))
+    step = max(1, block // 2)
+
+    # Noise floor of d2 for a smoothed series: residual noise sigma_r/sqrt(w)
+    # amplified by second differencing (factor sqrt(6)).
+    noise_floor = (sigma_r / np.sqrt(block)) * np.sqrt(6.0)
+    floor_val = 0.05 * sigma_r
+    cap_val = 1.5 * sigma_r
+
+    starts = list(range(0, max(1, m - block + 1), step))
+    if m > block and starts[-1] < m - block:
+        starts.append(m - block)
+    if not starts:
+        starts = [0]
+
+    centers = np.empty(len(starts))
+    sigs = []
+    for j, s in enumerate(starts):
+        seg = d2[s:s + block]
+        sig = 1.4826 * np.median(np.abs(seg - np.median(seg)))
+        sigs.append(sig)
+        centers[j] = s + len(seg) / 2.0
+    sigs = np.asarray(sigs)
+
+    # Subtract noise floor, then robust floor/cap against sigma_r.
+    dyn = sigs - noise_floor
+    dyn = np.maximum(dyn, floor_val)
+    dyn = np.minimum(dyn, cap_val)
+    dyn = np.maximum(dyn, 1e-9)
+
+    med = max(np.median(dyn), 1e-12)
+    ratios = (dyn / med) ** power
+    ratios = np.clip(ratios, lo_frac, hi_frac)
+
+    # d2 index i corresponds to sample ~i+1; shift centers into sample space
+    k = np.arange(n, dtype=float)
+    q = q_base * np.interp(k, centers + 1.0, ratios)
+    return np.clip(q, q_base * lo_frac, q_base * hi_frac)
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 1: robust impulsive-noise suppression
+    xr = _robust_denoise(x, k=max(3, window_size // 6), t=3.0)
+
+    # Stage 2: per-sample process noise from local dynamics
+    q_arr = _local_process_noise(xr, window_size, q_base=0.05)
+
+    # Stage 3: forward Kalman pass (locally adaptive Q, adaptive R)
+    fw = _kalman_pass(xr, q_arr)
+=======
+    # Stage 1: robust impulsive-noise suppression
+    xr = _robust_denoise(x, k=max(3, window_size // 6), t=3.0)
+
+    # Robust measurement-noise estimate from Hampel residual (MAD)
+    resid = x - xr
+    sigma_r = 1.4826 * np.median(np.abs(resid - np.median(resid)))
+    if sigma_r < 1e-12:
+        sigma_r = np.std(resid) + 1e-12
+
+    # Stage 2a: conservative first pass (uniform base Q)
+    fw0 = _kalman_pass(xr, np.full(n, 0.05))
+
+    # Stage 2b: per-sample process noise from FIRST-PASS SMOOTHED output's
+    # second differences, with the residual noise floor subtracted per block.
+    q_arr = _local_process_noise(fw0, window_size, q_base=0.05,
+                                 sigma_r=sigma_r)
+
+    # Stage 3: forward Kalman pass (locally adaptive Q, adaptive R)
+    fw = _kalman_pass(xr, q_arr)
+>>>>>>> REPLACE
+</DIFF>

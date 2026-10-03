@@ -1,0 +1,228 @@
+--- a/original.py
++++ b/original.py
+@@ -1,132 +1,143 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def min_max_dist_dim3_14() -> np.ndarray:
+     """
+-    Construct 14 three-dimensional points with a large minimum pairwise
+-    distance relative to their maximum pairwise distance.
++    Construct exactly fourteen points in R^3 with a large squared ratio of
++    minimum pairwise distance to maximum pairwise distance.
+ 
+-    The construction is deterministic and uses multi-start projected
+-    optimization of a smooth, annealed min/max-distance objective.
++    Translation and uniform scale are removed after every update, leaving a
++    compact optimization problem.  The returned configuration is selected
++    exclusively by the exact nonsmooth distance ratio used by the evaluator.
+     """
+-    n = 14
+-    dim = 3
++    n, dim = 14, 3
+     rng = np.random.default_rng(917263)
+-
+     ii, jj = np.triu_indices(n, 1)
+-    pair_count = len(ii)
+ 
+     def normalize(x: np.ndarray) -> np.ndarray:
+         x = x - x.mean(axis=0, keepdims=True)
+-        rms = np.sqrt(np.sum(x * x) / n)
+-        return x / rms
++        norm = np.sqrt(np.sum(x * x) / n)
++        return x / max(norm, 1.0e-15)
+ 
+     def exact_ratio_squared(x: np.ndarray) -> float:
+         delta = x[ii] - x[jj]
+-        dsq = np.sum(delta * delta, axis=1)
+-        return float(dsq.min() / dsq.max())
++        dsq = np.einsum("ij,ij->i", delta, delta)
++        return float(np.min(dsq) / np.max(dsq))
+ 
+     def smooth_gradient(x: np.ndarray, beta: float) -> np.ndarray:
+         delta = x[ii] - x[jj]
+-        dsq = np.sum(delta * delta, axis=1)
++        dsq = np.einsum("ij,ij->i", delta, delta)
+ 
+-        # Stable soft minimum of squared distances.
+-        mn = float(dsq.min())
+-        low = np.exp(-beta * (dsq - mn))
+-        low /= low.sum()
+-        soft_min = mn - np.log(np.exp(-beta * (dsq - mn)).sum()) / beta
++        lo = float(np.min(dsq))
++        a = np.exp(-beta * (dsq - lo))
++        suma = float(np.sum(a))
++        low_weights = a / suma
++        soft_low = lo - np.log(suma) / beta
+ 
+-        # Stable soft maximum of squared distances.
+-        mx = float(dsq.max())
+-        high = np.exp(beta * (dsq - mx))
+-        high /= high.sum()
+-        soft_max = mx + np.log(np.exp(beta * (dsq - mx)).sum()) / beta
++        hi = float(np.max(dsq))
++        b = np.exp(beta * (dsq - hi))
++        sumb = float(np.sum(b))
++        high_weights = b / sumb
++        soft_high = hi + np.log(sumb) / beta
+ 
+-        # Derivative of log(soft_min / soft_max).
+-        coeff = low / max(soft_min, 1.0e-12) - high / max(soft_max, 1.0e-12)
++        coeff = low_weights / max(soft_low, 1.0e-12)
++        coeff -= high_weights / max(soft_high, 1.0e-12)
++
+         grad = np.zeros_like(x)
+-        weighted = 2.0 * coeff[:, None] * delta
+-        np.add.at(grad, ii, weighted)
+-        np.add.at(grad, jj, -weighted)
++        force = 2.0 * coeff[:, None] * delta
++        np.add.at(grad, ii, force)
++        np.add.at(grad, jj, -force)
+ 
+-        # Translation and scale directions are removed because configurations
+-        # are re-centered and re-normalized after every update.
+         grad -= grad.mean(axis=0, keepdims=True)
+-        radial = np.sum(grad * x) / np.sum(x * x)
+-        grad -= radial * x
++        grad -= (np.sum(grad * x) / np.sum(x * x)) * x
+         return grad
+ 
++    best_value = -np.inf
+     best_points = None
+-    best_value = -np.inf
+ 
+-    # Independent starts are useful because the extremal-distance landscape
+-    # has several distinct local optima.
+-    starts = 18
+-    iterations = 1450
++    # Broad multistart continuation finds several distinct candidate contact
++    # graphs.  A common schedule makes the quality of starts directly
++    # comparable rather than depending on an arbitrary schedule assignment.
++    starts = 20
++    iterations = 1500
+ 
+     for restart in range(starts):
+         x = normalize(rng.normal(size=(n, dim)))
+-
+-        # Adam-style projected ascent of the annealed smooth objective.
+-        first_moment = np.zeros_like(x)
+-        second_moment = np.zeros_like(x)
++        first = np.zeros_like(x)
++        second = np.zeros_like(x)
+ 
+         for step in range(iterations):
+-            u = step / (iterations - 1)
+-
+-            # Use several continuation paths: different contact graphs often
+-            # become accessible depending on when the soft extrema sharpen.
+-            schedule = restart % 3
+-            if schedule == 0:
+-                # Gentle quadratic continuation, effective for broad basins.
+-                beta = 6.0 + 94.0 * (u * u)
+-            elif schedule == 1:
+-                # Keep the objective smooth longer before a slower late focus.
+-                beta = 6.0 + 194.0 * (u ** 2.3)
+-            else:
+-                # First settle a moderate-distance packing, then concentrate
+-                # rapidly on its limiting closest and farthest contacts.
+-                if u < 0.55:
+-                    beta = 12.0
+-                else:
+-                    v = (u - 0.55) / 0.45
+-                    beta = 12.0 + 288.0 * (v * v)
++            t = step / (iterations - 1)
++            beta = 9.0 + 245.0 * (t ** 1.7)
+             grad = smooth_gradient(x, beta)
+ 
+-            first_moment = 0.88 * first_moment + 0.12 * grad
+-            second_moment = 0.96 * second_moment + 0.04 * (grad * grad)
++            first = 0.88 * first + 0.12 * grad
++            second = 0.96 * second + 0.04 * grad * grad
++            lr = 0.044 * (1.0 - t) + 0.004
++            x = normalize(x + lr * first / (np.sqrt(second) + 1.0e-8))
+ 
+-            # Large initial moves explore the basin; later moves polish it.
+-            learning_rate = 0.045 * (1.0 - u) + 0.0045
+-            x = x + learning_rate * first_moment / (np.sqrt(second_moment) + 1.0e-8)
+-            x = normalize(x)
+-
+-            # Preserve the exact best state, rather than only the smoothed one.
+             if step % 25 == 0 or step == iterations - 1:
+                 value = exact_ratio_squared(x)
+                 if value > best_value:
+                     best_value = value
+                     best_points = x.copy()
+ 
+-    # A final high-sharpness polish on the strongest configuration.
+-    x = best_points.copy()
+-    first_moment = np.zeros_like(x)
+-    second_moment = np.zeros_like(x)
++    # High-sharpness polish with exact-ratio checkpointing.  At this stage
++    # contact-pair changes can make a smooth ascent direction temporarily
++    # harmful, so regressions restore the last best exact checkpoint.
++    for attempt in range(4):
++        if attempt == 0:
++            x = best_points.copy()
++        else:
++            noise = rng.normal(size=(n, dim))
++            noise -= noise.mean(axis=0, keepdims=True)
++            noise -= (
++                np.sum(noise * best_points) / np.sum(best_points * best_points)
++            ) * best_points
++            x = normalize(best_points + (0.010 + 0.004 * attempt) * noise)
+ 
+-    for step in range(500):
+-        grad = smooth_gradient(x, 360.0)
+-        first_moment = 0.9 * first_moment + 0.1 * grad
+-        second_moment = 0.97 * second_moment + 0.03 * (grad * grad)
+-        lr = 0.009 * (1.0 - step / 500.0) + 0.0015
+-        x = normalize(x + lr * first_moment / (np.sqrt(second_moment) + 1.0e-8))
++        first = np.zeros_like(x)
++        second = np.zeros_like(x)
++        local_best = exact_ratio_squared(x)
++        local_point = x.copy()
++        step_scale = 1.0
++        regressions = 0
+ 
+-        value = exact_ratio_squared(x)
+-        if value > best_value:
+-            best_value = value
+-            best_points = x.copy()
++        for step in range(850):
++            t = step / 849.0
++            beta = 260.0 + 850.0 * (t * t)
++            grad = smooth_gradient(x, beta)
++
++            first = 0.90 * first + 0.10 * grad
++            second = 0.975 * second + 0.025 * grad * grad
++            lr = step_scale * (0.0070 * (1.0 - t) + 0.00065)
++            x = normalize(x + lr * first / (np.sqrt(second) + 1.0e-8))
++
++            if step % 25 == 24 or step == 849:
++                value = exact_ratio_squared(x)
++
++                if value > local_best:
++                    local_best = value
++                    local_point = x.copy()
++
++                if value > best_value:
++                    best_value = value
++                    best_points = x.copy()
++
++                if value + 1.0e-12 < local_best:
++                    regressions += 1
++                    if regressions >= 2:
++                        x = local_point.copy()
++                        first.fill(0.0)
++                        second *= 0.15
++                        step_scale *= 0.62
++                        regressions = 0
++                else:
++                    regressions = 0
++                    step_scale = min(1.10, step_scale * 1.015)
+ 
+     return np.asarray(best_points, dtype=np.float64)
+ 
+ 
+ # EVOLVE-BLOCK-END

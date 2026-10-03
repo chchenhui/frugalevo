@@ -1,0 +1,183 @@
+<NAME>
+evidence_gated_turns
+</NAME>
+
+<DESCRIPTION>
+Replace the one-sample reversal attenuation with signed, normalized cumulative turn evidence. A reversal now requires agreement between the proposed velocity direction, local regression slope, and clipped innovation across persistent samples. While evidence is pending, a directional max/min output lock prevents small opposite innovations from creating visible false reversals. Decisive, coherent turns retain a fast bypass to limit lag on genuine sharp changes.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    position = 0.0
+    velocity = 0.0
+    previous_direction = 0.0
+=======
+    position = 0.0
+    velocity = 0.0
+    previous_direction = 0.0
+    pending_direction = 0.0
+    pending_evidence = 0.0
+    pending_samples = 0
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        # Estimate local noise from residuals without allowing spikes to inflate
+        # the scale estimate and make the tracker insensitive.
+        residuals = window - (measurement + local_slope * time)
+        noise_scale = max(1.4826 * np.median(np.abs(residuals)), 1e-8)
+=======
+        # Center the residual MAD so a locally biased endpoint fit does not
+        # mistake trend curvature for noise and weaken reversal discrimination.
+        residuals = window - (measurement + local_slope * time)
+        residual_center = np.median(residuals)
+        noise_scale = max(
+            1.4826 * np.median(np.abs(residuals - residual_center)),
+            1e-8,
+        )
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        prediction = position + velocity
+        innovation = measurement - prediction
+
+        # Significant innovations receive a rapid update; ordinary innovations
+        # use conservative gains to improve smoothness.
+        activity = min(abs(innovation) / (2.5 * noise_scale), 1.0)
+        alpha = 0.18 + 0.52 * activity
+        beta = 0.012 + 0.10 * activity
+
+        candidate_velocity = velocity + beta * innovation
+        candidate_direction = np.sign(candidate_velocity)
+        reversal_threshold = 2.0 * noise_scale
+
+        # Do not flip direction on a small innovation.  Decaying the velocity
+        # still permits a sustained opposite trend to reverse promptly.
+        if (
+            previous_direction != 0.0
+            and candidate_direction != 0.0
+            and candidate_direction != previous_direction
+            and abs(innovation) < reversal_threshold
+        ):
+            candidate_velocity = 0.5 * velocity
+
+        position = prediction + alpha * innovation
+        velocity = candidate_velocity
+        if abs(velocity) > noise_scale / max(window_size, 1):
+            previous_direction = np.sign(velocity)
+        y[i] = position
+=======
+        prediction = position + velocity
+        innovation = measurement - prediction
+        bounded_innovation = np.clip(
+            innovation,
+            -3.1 * noise_scale,
+            3.1 * noise_scale,
+        )
+
+        # Significant but bounded innovations receive a rapid update.  Clipping
+        # prevents one corrupted endpoint fit from injecting a false turn.
+        activity = min(abs(innovation) / (2.5 * noise_scale), 1.0)
+        alpha = 0.18 + 0.52 * activity
+        beta = 0.012 + 0.10 * activity
+
+        candidate_velocity = velocity + beta * bounded_innovation
+        velocity_floor = 0.06 * noise_scale
+        candidate_direction = (
+            np.sign(candidate_velocity)
+            if abs(candidate_velocity) > velocity_floor
+            else 0.0
+        )
+        slope_direction = (
+            np.sign(local_slope)
+            if abs(local_slope) > 0.06 * noise_scale
+            else 0.0
+        )
+
+        is_reversal = (
+            previous_direction != 0.0
+            and candidate_direction != 0.0
+            and candidate_direction != previous_direction
+        )
+        turn_support = (
+            is_reversal
+            and slope_direction == candidate_direction
+            and candidate_direction * bounded_innovation > 0.55 * noise_scale
+        )
+        decisive_turn = (
+            turn_support
+            and abs(innovation) > 2.9 * noise_scale
+            and abs(local_slope) > 0.14 * noise_scale
+        )
+
+        reversal_confirmed = False
+        if is_reversal:
+            if turn_support:
+                sample_evidence = min(
+                    1.35,
+                    max(
+                        0.0,
+                        candidate_direction * bounded_innovation / noise_scale,
+                    ),
+                )
+                if candidate_direction == pending_direction:
+                    pending_evidence += sample_evidence
+                    pending_samples += 1
+                else:
+                    pending_direction = candidate_direction
+                    pending_evidence = sample_evidence
+                    pending_samples = 1
+
+                reversal_confirmed = (
+                    decisive_turn
+                    or pending_evidence >= 2.65
+                    or pending_samples >= 3
+                )
+            else:
+                pending_direction = 0.0
+                pending_evidence = 0.0
+                pending_samples = 0
+
+            if reversal_confirmed:
+                previous_direction = candidate_direction
+                pending_direction = 0.0
+                pending_evidence = 0.0
+                pending_samples = 0
+                candidate_velocity = (
+                    0.28 * velocity + 0.72 * candidate_velocity
+                )
+                alpha = max(alpha, 0.38)
+            else:
+                # Retain the established state while collecting coherent
+                # evidence; this rejects alternating weak pullbacks.
+                candidate_velocity = 0.90 * velocity
+                alpha = min(alpha, 0.34)
+        else:
+            pending_direction = 0.0
+            pending_evidence = 0.0
+            pending_samples = 0
+            if candidate_direction != 0.0:
+                previous_direction = candidate_direction
+
+        proposed_position = prediction + alpha * bounded_innovation
+        if is_reversal and not reversal_confirmed:
+            # A hard directional output lock prevents pending noise evidence
+            # from creating an observable slope reversal before confirmation.
+            if previous_direction > 0.0:
+                position = max(position, proposed_position)
+            elif previous_direction < 0.0:
+                position = min(position, proposed_position)
+            else:
+                position = proposed_position
+        else:
+            position = proposed_position
+
+        velocity = candidate_velocity
+        if abs(velocity) > velocity_floor and not (
+            is_reversal and not reversal_confirmed
+        ):
+            previous_direction = np.sign(velocity)
+        y[i] = position
+>>>>>>> REPLACE
+</DIFF>

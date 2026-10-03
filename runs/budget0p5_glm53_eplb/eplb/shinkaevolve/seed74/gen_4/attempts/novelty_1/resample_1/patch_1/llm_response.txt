@@ -1,0 +1,68 @@
+<NAME>
+vectorize_balanced_packing
+
+</NAME>
+<DESCRIPTION>
+The dominant cost of the current algorithm is `balanced_packing`: it runs a pure-Python double loop (num_layers × num_groups iterations) with a `min()` generator per item, plus a `.cpu()` sync and per-item Python indexing. Since the greedy least-loaded-pack assignment is sequential only within a single layer's item sequence, we can vectorize across all layers: process items in sorted order step-by-step, but for every step compute the pack selection for ALL layers at once with tensor ops (masked argmin over pack weights, scatter_add updates). This reduces Python iterations from L×G to G, removing the per-item Python overhead entirely and avoiding repeated syncs. The resulting assignment is identical to the original greedy (argmin with +inf masking on full packs breaks ties toward the lowest pack index, same as Python's `min`). Sorting stays on CPU but is done once with `argsort` on the whole tensor instead of per-layer `.cpu()` round-trips in a loop. This substantially cuts algorithm execution time (speed_score is currently 0.00, times_algorithm 0.55), while producing the same (or better) balancedness since the greedy semantics are preserved.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    # Vectorized across layers: the greedy item-to-pack assignment is only
+    # sequential along the sorted item order, so each step can select packs
+    # for all layers at once with tensor ops.
+    order = weight.float().argsort(-1, descending=True)  # [L, G]
+    sorted_w = weight.float().gather(-1, order)  # [L, G]
+    pack_weights = weight.new_zeros((num_layers, num_packs),
+                                    dtype=torch.float32)
+    pack_items = torch.zeros((num_layers, num_packs),
+                             dtype=torch.int64,
+                             device=weight.device)
+    pack_index_sorted = torch.empty((num_layers, num_groups),
+                                    dtype=torch.int64,
+                                    device=weight.device)
+    rank_sorted = torch.empty_like(pack_index_sorted)
+    INF = float("inf")
+    for t in range(num_groups):
+        # pick the least-loaded pack that still has capacity (per layer)
+        cand = torch.where(pack_items < groups_per_pack, pack_weights,
+                           torch.full_like(pack_weights, INF))
+        pack = cand.argmin(-1)  # [L]
+        rank = pack_items.gather(1, pack.unsqueeze(1)).squeeze(1)
+        pack_index_sorted[:, t] = pack
+        rank_sorted[:, t] = rank
+        pack_weights.scatter_add_(1, pack.unsqueeze(1),
+                                  sorted_w[:, t].unsqueeze(1))
+        pack_items.scatter_add_(
+            1, pack.unsqueeze(1),
+            torch.ones_like(pack).unsqueeze(1))
+    # scatter results back to the original item positions
+    pack_index = torch.empty_like(pack_index_sorted)
+    pack_index.scatter_(1, order, pack_index_sorted)
+    rank_in_pack = torch.empty_like(rank_sorted)
+    rank_in_pack.scatter_(1, order, rank_sorted)
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,137 @@
+<NAME>
+slack_directed_lp_search</NAME>
+<DESCRIPTION>
+The current program regressed badly (2.37 → 1.69) for two reasons: (1) `fast_radii` is a monotone shrinking heuristic that systematically *underestimates* the optimal radii, so the hill-climb accepts/rejects moves based on a biased objective, wasting the whole search budget on noise; (2) the search spreads 4000 steps over 5 layouts with an isotropic random walk that has low acceptance probability. The earlier LP-based version proved the LP objective is what makes the search work (2.37 in only 250 steps).
+
+The fix: restore the exact LP as the objective inside the loop, cut the step count to fit the time budget, and — following the targeted-move recommendation — replace isotropic Gaussian jitter with *slack-directed* moves: for each circle compute its slack (distance to nearest wall minus radius, and gaps to touching neighbors) and perturb preferentially along the direction of maximum slack, so a large fraction of the step lies in directions that are feasible by construction and thus more likely to be accepted. Random jitter is kept at a small fraction to preserve exploration. Fewer, more informative steps (each with exact LP evaluation) plus fewer layouts keeps runtime around the earlier ~1.5–3 s range while improving the attained sum.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def local_search(centers, steps=4000, step0=0.02, seed=0):
+    rng = np.random.default_rng(seed)
+    cur = centers.copy()
+    cur_r = fast_radii(cur)
+    cur_sum = cur_r.sum()
+    best, best_r, best_sum = cur.copy(), cur_r, cur_sum
+    grad_mode = True
+    since_gain = 0
+    for t in range(steps):
+        step = step0 * (0.3 + 0.7 * (1 - t / steps)) + 5e-5
+        cand = cur.copy()
+        if grad_mode:
+            g = contact_gradient(cur, cur_r)
+            # move a random subset of circles along their gradient
+            for i in range(len(cand)):
+                if rng.random() < 0.25 and np.linalg.norm(g[i]) > 0:
+                    cand[i] = cand[i] + g[i] * step * rng.uniform(0.5, 1.5)
+        # random jitter on a couple of circles always
+        for _ in range(2):
+            i = rng.integers(len(cand))
+            cand[i] = cand[i] + rng.normal(size=2) * step
+        np.clip(cand, 0.02, 0.98, out=cand)
+        r = fast_radii(cand)
+        s = r.sum()
+        if s > cur_sum + 1e-9:
+            cur, cur_r, cur_sum = cand, r, s
+            since_gain = 0
+            if s > best_sum:
+                best, best_r, best_sum = cand.copy(), r, s
+        else:
+            since_gain += 1
+            if since_gain > 150:  # restart from best, switch mode
+                cur, cur_r, cur_sum = best.copy(), best_r.copy(), best_sum
+                grad_mode = not grad_mode
+                since_gain = 0
+    return best, best_r
+=======
+def slack_direction(centers, radii, i):
+    """Direction of maximum available slack for circle i.
+
+    Slack = how much extra room circle i has: to walls and to the nearest
+    non-touching neighbors. Moving along this direction is much more
+    likely to be accepted than an isotropic random step.
+    """
+    n = len(centers)
+    x, y = centers[i]
+    cands = []
+    # wall slacks (move away from walls with room to spare)
+    walls = [(x - radii[i], [-1.0, 0.0]), (1 - x - radii[i], [1.0, 0.0]),
+             (y - radii[i], [0.0, -1.0]), (1 - y - radii[i], [0.0, 1.0])]
+    for slack, vec in walls:
+        if slack > 0:
+            cands.append((slack, np.array(vec, dtype=float)))
+    # neighbor gaps: direction away from each neighbor, weighted by gap
+    for j in range(n):
+        if j == i:
+            continue
+        diff = centers[i] - centers[j]
+        dist = np.hypot(*diff)
+        if dist < 1e-12:
+            continue
+        gap = dist - (radii[i] + radii[j])
+        if gap > 0:
+            cands.append((gap, diff / dist))
+    if not cands:
+        return np.zeros(2)
+    # pick the direction with the largest slack, with a tie-break toward
+    # the average of all slack directions
+    avg = sum(v for _, v in cands)
+    best_dir = max(cands, key=lambda t: t[0])[1]
+    d = 0.7 * best_dir + 0.3 * (avg / max(np.linalg.norm(avg), 1e-12))
+    nn = np.linalg.norm(d)
+    return d / nn if nn > 1e-12 else np.zeros(2)
+
+
+def local_search(centers, steps=300, step0=0.02, seed=0):
+    """Hill-climb with slack-directed moves and exact LP evaluation."""
+    rng = np.random.default_rng(seed)
+    cur = centers.copy()
+    cur_r = ensure_valid(cur, lp_radii(cur))
+    cur_sum = cur_r.sum()
+    best, best_r, best_sum = cur.copy(), cur_r.copy(), cur_sum
+    since_gain = 0
+    for t in range(steps):
+        step = step0 * (0.3 + 0.7 * (1 - t / steps)) + 1e-4
+        cand = cur.copy()
+        i = rng.integers(len(cand))
+        # 70% of the step along the direction of maximum slack,
+        # 30% random exploration
+        d_slack = slack_direction(cur, cur_r, i)
+        rand = rng.normal(size=2)
+        rand = rand / max(np.linalg.norm(rand), 1e-12)
+        cand[i] = cand[i] + (0.7 * d_slack + 0.3 * rand) * step * rng.uniform(0.5, 1.5)
+        cand[i] = np.clip(cand[i], 0.02, 0.98)
+        r = ensure_valid(cand, lp_radii(cand))
+        s = r.sum()
+        if s > cur_sum + 1e-9:
+            cur, cur_r, cur_sum = cand, r, s
+            since_gain = 0
+            if s > best_sum:
+                best, best_r, best_sum = cand.copy(), r.copy(), s
+        else:
+            since_gain += 1
+            if since_gain > 60:  # restart from best
+                cur, cur_r, cur_sum = best.copy(), best_r.copy(), best_sum
+                since_gain = 0
+    return best, best_r
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    best_c, best_r, best_sum = None, None, -1.0
+    for li, layout in enumerate(initial_layouts()):
+        c, r = local_search(layout, seed=li)
+        if r.sum() > best_sum:
+            best_c, best_r, best_sum = c, r, r.sum()
+=======
+    best_c, best_r, best_sum = None, None, -1.0
+    # Two strongest layouts, ~300 exact-LP steps each: keeps runtime low
+    # while every step is evaluated with the true objective.
+    layouts = initial_layouts()[:2]
+    for li, layout in enumerate(layouts):
+        c, r = local_search(layout, steps=300, seed=li)
+        if r.sum() > best_sum:
+            best_c, best_r, best_sum = c, r, r.sum()
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

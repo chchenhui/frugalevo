@@ -1,0 +1,191 @@
+<NAME>
+add_two_for_one_swaps</NAME>
+<DESCRIPTION>
+The current local-search loop only tries 1-for-1 moves, and its measured score (0/1) is far worse than the plain greedy (21.89), suggesting the move-only refinement is both weak and problematic. Following the recommendation, I extend the refinement phase to also perform swap moves: exchange one model on the worst GPU with one model from another GPU (1-for-1), and additionally try replacing one model on the worst GPU with two models from GPU g (2-for-1), reusing the same feasibility pattern (recompute both GPUs' free memory, skip if any denominator drops to ≤0, accept only on strict 1e-12 improvement of the global max KVPR). This handles size-vs-rate asymmetries that pure moves provably cannot fix, and strictly-decreasing acceptance guarantees termination and correctness.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Local search: move models off the worst GPU if it lowers max KVPR
+    improved = True
+    max_iters = 200
+    it = 0
+    while improved and it < max_iters:
+        improved = False
+        it += 1
+        worst = max(range(gpu_num), key=lambda g: kvpr(g))
+        worst_kvpr = kvpr(worst)
+        cur_max = max_kvpr()
+        for m_idx in range(len(placement[worst])):
+            model = placement[worst][m_idx]
+            for g in range(gpu_num):
+                if g == worst:
+                    continue
+                if model.model_size > free_mem[g]:
+                    continue
+                # simulate move
+                placement[worst].pop(m_idx)
+                free_mem[worst] += model.model_size
+                load[worst] -= model.req_rate / model.slo
+                free_mem[g] -= model.model_size
+                load[g] += model.req_rate / model.slo
+                new_max = max_kvpr()
+                # accept if global max decreases (strictly), or equal but worst improved
+                if new_max < cur_max - 1e-12:
+                    placement[g].append(model)
+                    improved = True
+                    break
+                # revert
+                free_mem[g] += model.model_size
+                load[g] -= model.req_rate / model.slo
+                free_mem[worst] -= model.model_size
+                load[worst] += model.req_rate / model.slo
+                placement[worst].insert(m_idx, model)
+            else:
+                continue
+            break
+
+    return placement
+=======
+    # Local search refinement: move, swap (1-for-1), and 2-for-1 exchanges
+    # off the worst GPU, accepted only on strict improvement of global max KVPR.
+    improved = True
+    max_iters = 200
+    it = 0
+    while improved and it < max_iters:
+        improved = False
+        it += 1
+        worst = max(range(gpu_num), key=lambda g: kvpr(g))
+        cur_max = max_kvpr()
+
+        def try_accept(new_max):
+            return new_max < cur_max - 1e-12
+
+        done = False
+        # 1) simple moves
+        for m_idx in range(len(placement[worst])):
+            if done:
+                break
+            model = placement[worst][m_idx]
+            for g in range(gpu_num):
+                if g == worst or model.model_size > free_mem[g]:
+                    continue
+                placement[worst].pop(m_idx)
+                free_mem[worst] += model.model_size
+                load[worst] -= model.req_rate / model.slo
+                free_mem[g] -= model.model_size
+                load[g] += model.req_rate / model.slo
+                if try_accept(max_kvpr()):
+                    placement[g].append(model)
+                    improved = True
+                    done = True
+                    break
+                free_mem[g] += model.model_size
+                load[g] -= model.req_rate / model.slo
+                free_mem[worst] -= model.model_size
+                load[worst] += model.req_rate / model.slo
+                placement[worst].insert(m_idx, model)
+        if done:
+            continue
+
+        # 2) 1-for-1 swaps: model on worst <-> one model from GPU g
+        for m_idx in range(len(placement[worst])):
+            if done:
+                break
+            model = placement[worst][m_idx]
+            for g in range(gpu_num):
+                if g == worst:
+                    continue
+                for o_idx in range(len(placement[g])):
+                    if done:
+                        break
+                    other = placement[g][o_idx]
+                    # simulate swap
+                    placement[worst].pop(m_idx)
+                    placement[g].pop(o_idx)
+                    free_mem[worst] += model.model_size
+                    load[worst] -= model.req_rate / model.slo
+                    free_mem[g] += other.model_size
+                    load[g] -= other.req_rate / other.slo
+                    if other.model_size <= free_mem[worst] and model.model_size <= free_mem[g]:
+                        free_mem[worst] -= other.model_size
+                        load[worst] += other.req_rate / other.slo
+                        free_mem[g] -= model.model_size
+                        load[g] += model.req_rate / model.slo
+                        if GPU_MEM_SIZE - free_mem[worst] > 0 and GPU_MEM_SIZE - free_mem[g] > 0 \
+                                and try_accept(max_kvpr()):
+                            placement[worst].append(other)
+                            placement[g].append(model)
+                            improved = True
+                            done = True
+                            break
+                        free_mem[worst] += other.model_size
+                        load[worst] -= other.req_rate / other.slo
+                        free_mem[g] += model.model_size
+                        load[g] -= model.req_rate / model.slo
+                    # revert swap
+                    free_mem[worst] -= model.model_size
+                    load[worst] += model.req_rate / model.slo
+                    free_mem[g] += other.model_size
+                    load[g] += other.req_rate / other.slo
+                    placement[worst].insert(m_idx, model)
+                    placement[g].insert(o_idx, other)
+                if done:
+                    break
+        if done:
+            continue
+
+        # 3) 2-for-1 exchanges: one model on worst <-> two models from GPU g
+        for m_idx in range(len(placement[worst])):
+            if done:
+                break
+            model = placement[worst][m_idx]
+            for g in range(gpu_num):
+                if g == worst or len(placement[g]) < 2:
+                    continue
+                n = len(placement[g])
+                for a in range(n):
+                    if done:
+                        break
+                    for b in range(a + 1, n):
+                        if done:
+                            break
+                        ma, mb = placement[g][a], placement[g][b]
+                        pair_size = ma.model_size + mb.model_size
+                        pair_load = ma.req_rate / ma.slo + mb.req_rate / mb.slo
+                        # simulate: remove model from worst, remove pair from g
+                        placement[worst].pop(m_idx)
+                        del placement[g][b]
+                        del placement[g][a]
+                        free_mem[worst] += model.model_size
+                        load[worst] -= model.req_rate / model.slo
+                        free_mem[g] += pair_size
+                        load[g] -= pair_load
+                        if pair_size <= free_mem[worst] and model.model_size <= free_mem[g]:
+                            free_mem[worst] -= pair_size
+                            load[worst] += pair_load
+                            free_mem[g] -= model.model_size
+                            load[g] += model.req_rate / model.slo
+                            if GPU_MEM_SIZE - free_mem[worst] > 0 and GPU_MEM_SIZE - free_mem[g] > 0 \
+                                    and try_accept(max_kvpr()):
+                                placement[worst].extend([ma, mb])
+                                placement[g].append(model)
+                                improved = True
+                                done = True
+                                break
+                            free_mem[worst] += pair_size
+                            load[worst] -= pair_load
+                            free_mem[g] += model.model_size
+                            load[g] -= model.req_rate / model.slo
+                        # revert
+                        free_mem[worst] -= model.model_size
+                        load[worst] += model.req_rate / model.slo
+                        free_mem[g] -= pair_size
+                        load[g] += pair_load
+                        placement[worst].insert(m_idx, model)
+                        placement[g].insert(a, ma)
+                        placement[g].insert(b, mb)
+                if done:
+                    break
+
+    return placement
+>>>>>>> REPLACE
+</DIFF>

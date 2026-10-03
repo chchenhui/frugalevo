@@ -1,0 +1,144 @@
+<NAME>
+antipodal_7code_on_sphere</NAME>
+<DESCRIPTION>
+Key geometric insight: if a point set is centrally symmetric (contains antipodal pairs), its diameter is exactly 2R. So take 7 well-separated directions on the unit sphere (a 7-point spherical code / Tammes problem, optimal min angle ≈ 77.9°, ≥72° even for the trivial pentagonal bipyramid) and output each direction together with its antipode → 14 points. Then dmax = 2 exactly and dmin = 2·sin(θ/2), giving ratio ≈ 0.63 (squared ≈ 0.39), far above the reference 0.24. The program numerically solves the 7-point Tammes problem via annealed soft-min gradient ascent on the sphere (many diverse starts: pentagonal bipyramid, Fibonacci, random) followed by an exact SLSQP polish (maximize t s.t. all pairwise chord distances ≥ t, all points on the unit sphere). Finally it stacks ±directions, verifies the true ratio, and normalizes the diameter to 1. This is a fundamentally different approach from generic free-space min/max optimization: it reduces the problem to the classical best-packing-on-a-sphere problem where near-optimal solutions are known and easy to reach.
+</CODE>
+
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3D maximizing dmin/dmax.
+
+    Strategy: build a centrally symmetric set = 7 well-separated unit
+    directions plus their antipodes. Diameter is then exactly 2 and
+    ratio = dmin/2 = sin(theta/2) where theta is the min angular
+    separation of the 7 directions (Tammes N=7, theta >= ~77.9 deg).
+    """
+    from scipy.optimize import minimize
+
+    n = 14
+    m = 7
+    rng = np.random.default_rng(20240517)
+    I, J = np.triu_indices(m, 1)
+
+    def dir_min_dist(X):
+        d = np.linalg.norm(X[I] - X[J], axis=1)
+        return d.min()
+
+    # ---- annealed soft-min gradient ascent on the unit sphere ----
+    def anneal(X0, ks=(4.0, 8.0, 16.0, 32.0, 64.0, 128.0), iters=180, lr=0.05):
+        X = np.asarray(X0, float).copy()
+        X /= np.linalg.norm(X, axis=1, keepdims=True)
+        for k in ks:
+            for _ in range(iters):
+                diff = X[I] - X[J]
+                d = np.maximum(np.linalg.norm(diff, axis=1), 1e-12)
+                w = np.exp(-k * (d - d.min()))
+                w /= w.sum()
+                u = diff / d[:, None]
+                G = np.zeros_like(X)
+                np.add.at(G, I, w[:, None] * u)
+                np.add.at(G, J, -w[:, None] * u)
+                # project gradient onto tangent plane of sphere
+                G -= X * (X * G).sum(axis=1, keepdims=True)
+                gn = np.linalg.norm(G)
+                if gn < 1e-14:
+                    break
+                X = X + (lr / np.sqrt(k)) * G / gn
+                X /= np.linalg.norm(X, axis=1, keepdims=True)
+        return X
+
+    # ---- exact SLSQP polish: maximize t s.t. ||xi||=1, ||xi-xj|| >= t ----
+    def polish(X0, maxiter=400):
+        X0 = X0 / np.linalg.norm(X0, axis=1, keepdims=True)
+        t0 = dir_min_dist(X0)
+        z0 = np.concatenate([X0.ravel(), [t0]])
+
+        def fobj(z):
+            return -z[-1]
+
+        def c_dist(z):
+            X = z[:3 * m].reshape(m, 3)
+            d2 = ((X[I] - X[J]) ** 2).sum(axis=1)
+            return d2 - z[-1] ** 2
+
+        def j_dist(z):
+            X = z[:3 * m].reshape(m, 3)
+            diff = X[I] - X[J]
+            g = np.zeros((len(I), 3 * m + 1))
+            g[:, 3 * I[:, None] + np.arange(3)] = 2 * diff
+            g[:, 3 * J[:, None] + np.arange(3)] = -2 * diff
+            g[:, -1] = -2 * z[-1]
+            return g
+
+        def c_norm(z):
+            X = z[:3 * m].reshape(m, 3)
+            return (X ** 2).sum(axis=1) - 1.0
+
+        def j_norm(z):
+            X = z[:3 * m].reshape(m, 3)
+            g = np.zeros((m, 3 * m + 1))
+            for i in range(m):
+                g[i, 3 * i:3 * i + 3] = 2 * X[i]
+            return g
+
+        try:
+            res = minimize(fobj, z0, method="SLSQP",
+                           constraints=[
+                               {"type": "ineq", "fun": c_dist, "jac": j_dist},
+                               {"type": "eq", "fun": c_norm, "jac": j_norm},
+                           ],
+                           options={"maxiter": maxiter, "ftol": 1e-12})
+            X = res.x[:3 * m].reshape(m, 3)
+            X /= np.linalg.norm(X, axis=1, keepdims=True)
+        except Exception:
+            X = X0
+        return X
+
+    # ---- diverse starts for the 7-direction code ----
+    starts = []
+    # pentagonal bipyramid (guaranteed >= 72 deg)
+    bp = [[0, 0, 1], [0, 0, -1]]
+    for t in range(5):
+        a = 2 * np.pi * t / 5
+        bp.append([np.cos(a), np.sin(a), 0])
+    starts.append(np.array(bp, float))
+    # fibonacci 7
+    kk = np.arange(m) + 0.5
+    ga = np.pi * (3 - np.sqrt(5))
+    z = 1 - 2 * kk / m
+    r_ = np.sqrt(np.maximum(0, 1 - z ** 2))
+    starts.append(np.stack([r_ * np.cos(ga * kk), r_ * np.sin(ga * kk), z], 1))
+    # octahedron + pole
+    octa = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0],
+            [0, 0, 1], [0, 0, -1], [0.5, 0.5, 0.7]]
+    starts.append(np.array(octa, float))
+    # random starts
+    for _ in range(18):
+        X = rng.standard_normal((m, 3))
+        starts.append(X)
+    # jittered bipyramids at various latitudes
+    for beta in (55, 65, 75, 85, 95):
+        s = [[0, 0, 1], [0, 0, -1]]
+        for t in range(5):
+            a = 2 * np.pi * t / 5 + 0.3
+            s.append([np.sin(np.radians(beta)) * np.cos(a),
+                      np.sin(np.radians(beta)) * np.sin(a),
+                      np.cos(np.radians(beta))])
+        starts.append(np.array(s, float) + 0.05 * rng.standard_normal((m, 3)))
+
+    # ---- search ----
+    best_X, best_d = None, -1.0
+    for X0 in starts:
+        X = anneal(X0)
+        d = dir_min_dist(X)
+        if d > best_d:
+            best_d, best_X = d, X
+    # polish top candidates
+    cands = []
+    for X0 in starts:
+        cands.append(anneal(X0

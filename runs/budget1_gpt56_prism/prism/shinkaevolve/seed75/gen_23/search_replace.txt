@@ -1,0 +1,111 @@
+<NAME>
+fix_moves_add_unlock
+</NAME>
+
+<DESCRIPTION>
+The relocation loop currently records an improved profile but never records the corresponding move, so direct improving moves are never applied. Fixing this enables the existing local-search phase to reach substantially better placements.
+
+Additionally, add a bounded deterministic two-step unlock search after swaps fail. It temporarily evacuates a small candidate model from a target GPU to create capacity, then moves a high-pressure model off one of the two most pressured GPUs into that target. Both intermediate and final placements remain memory-feasible; the intermediate pressure is bounded, and the final placement is accepted only when it strictly improves the KVPR profile. This repairs capacity-blocked hotspots without introducing broad expensive search.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+                    if better(trial_profile, candidate_profile):
+                        candidate_profile = trial_profile
+                        best_move = ("move", source, target, idx)
+=======
+                    if better(trial_profile, candidate_profile):
+                        candidate_profile = trial_profile
+                        best_move = ("move", source, target, idx)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if best_swap is None:
+            break
+
+        left_gpu, right_gpu, left_idx, right_idx = best_swap
+=======
+        if best_swap is None:
+            # A relocation can be blocked solely by target memory.  Try a
+            # bounded evacuation followed by the desired relocation.
+            best_unlock = None
+            candidate_profile = current_profile
+            pressures = [
+                ratio(gpu_weight[g], GPU_MEM_SIZE - used_mem[g])
+                for g in range(gpu_num)
+            ]
+            hot_gpus = sorted(
+                range(gpu_num), key=lambda g: (-pressures[g], g)
+            )[:2]
+
+            for source in hot_gpus:
+                source_models = sorted(
+                    bins[source], key=lambda idx: (-weights[idx], -sizes[idx], idx)
+                )[:12]
+                for idx in source_models:
+                    for target in range(gpu_num):
+                        if target == source or used_mem[target] + sizes[idx] <= GPU_MEM_SIZE + eps:
+                            continue
+
+                        blockers = sorted(
+                            bins[target],
+                            key=lambda item: (weights[item], -sizes[item], item),
+                        )[:8]
+                        for blocker in blockers:
+                            for buffer_gpu in range(gpu_num):
+                                if buffer_gpu == target:
+                                    continue
+                                if (used_mem[buffer_gpu] + sizes[blocker] >
+                                        GPU_MEM_SIZE + eps):
+                                    continue
+
+                                trial_mem = used_mem[:]
+                                trial_weight = gpu_weight[:]
+                                trial_mem[target] -= sizes[blocker]
+                                trial_weight[target] -= weights[blocker]
+                                trial_mem[buffer_gpu] += sizes[blocker]
+                                trial_weight[buffer_gpu] += weights[blocker]
+
+                                intermediate = profile(trial_mem, trial_weight)
+                                if intermediate[0] > current_profile[0] + eps:
+                                    continue
+                                if trial_mem[target] + sizes[idx] > GPU_MEM_SIZE + eps:
+                                    continue
+
+                                trial_mem[source] -= sizes[idx]
+                                trial_weight[source] -= weights[idx]
+                                trial_mem[target] += sizes[idx]
+                                trial_weight[target] += weights[idx]
+                                trial_profile = profile(trial_mem, trial_weight)
+
+                                if better(trial_profile, candidate_profile):
+                                    candidate_profile = trial_profile
+                                    best_unlock = (
+                                        source, target, buffer_gpu, idx, blocker
+                                    )
+
+            if best_unlock is None:
+                break
+
+            source, target, buffer_gpu, idx, blocker = best_unlock
+            bins[target].remove(blocker)
+            bins[buffer_gpu].append(blocker)
+            used_mem[target] -= sizes[blocker]
+            gpu_weight[target] -= weights[blocker]
+            used_mem[buffer_gpu] += sizes[blocker]
+            gpu_weight[buffer_gpu] += weights[blocker]
+
+            bins[source].remove(idx)
+            bins[target].append(idx)
+            used_mem[source] -= sizes[idx]
+            gpu_weight[source] -= weights[idx]
+            used_mem[target] += sizes[idx]
+            gpu_weight[target] += weights[idx]
+            current_profile = candidate_profile
+            continue
+
+        left_gpu, right_gpu, left_idx, right_idx = best_swap
+>>>>>>> REPLACE
+</DIFF>

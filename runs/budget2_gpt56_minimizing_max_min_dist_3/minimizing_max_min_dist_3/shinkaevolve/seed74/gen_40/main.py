@@ -1,0 +1,249 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+_N_POINTS = 14
+_PAIR_I, _PAIR_J = np.triu_indices(_N_POINTS, 1)
+
+
+def _normalize(points: np.ndarray) -> np.ndarray:
+    points = points - points.mean(axis=0, keepdims=True)
+    rms = np.sqrt(np.mean(np.sum(points * points, axis=1)))
+    return points / max(float(rms), 1.0e-14)
+
+
+def _pair_squared(points: np.ndarray) -> np.ndarray:
+    delta = points[_PAIR_I] - points[_PAIR_J]
+    return np.einsum("ij,ij->i", delta, delta)
+
+
+def _score(points: np.ndarray) -> float:
+    squared = _pair_squared(points)
+    return float(np.min(squared) / np.max(squared))
+
+
+def _batch_scores(points: np.ndarray) -> np.ndarray:
+    delta = points[:, _PAIR_I] - points[:, _PAIR_J]
+    squared = np.einsum("bpj,bpj->bp", delta, delta)
+    return np.min(squared, axis=1) / np.max(squared, axis=1)
+
+
+def _contact_direction(points: np.ndarray, sharpness: float) -> np.ndarray:
+    """Scale-invariant log-distance soft-contact ascent direction."""
+    delta = points[_PAIR_I] - points[_PAIR_J]
+    squared = np.einsum("ij,ij->i", delta, delta)
+    logs = np.log(np.maximum(squared, 1.0e-15))
+
+    low_origin = float(np.min(logs))
+    high_origin = float(np.max(logs))
+    low = np.exp(-sharpness * (logs - low_origin))
+    high = np.exp(sharpness * (logs - high_origin))
+    weights = low / np.sum(low) - high / np.sum(high)
+
+    force = 2.0 * weights[:, None] * delta / np.maximum(squared[:, None], 1.0e-15)
+    direction = np.zeros_like(points)
+    np.add.at(direction, _PAIR_I, force)
+    np.add.at(direction, _PAIR_J, -force)
+
+    direction -= direction.mean(axis=0, keepdims=True)
+    direction -= (
+        np.sum(direction * points) / max(np.sum(points * points), 1.0e-15)
+    ) * points
+
+    norm = np.sqrt(np.mean(np.sum(direction * direction, axis=1)))
+    if norm > 1.0e-14:
+        direction /= norm
+    return direction
+
+
+def _sharpness(progress: float, schedule: int) -> float:
+    if schedule == 0:
+        return 5.5 + 150.0 * progress ** 1.7
+    if schedule == 1:
+        return 7.0 + 255.0 * progress ** 1.32
+    if progress < 0.60:
+        return 8.0 + 65.0 * (progress / 0.60) ** 1.4
+    return 73.0 + 315.0 * ((progress - 0.60) / 0.40) ** 2.1
+
+
+def _refine(seed: np.ndarray, schedule: int, iterations: int = 1200) -> np.ndarray:
+    """
+    Continuation search with exact-score rollback and a temporary smoothing
+    retreat after a contact-graph transition proves harmful.
+    """
+    points = _normalize(seed)
+    best = points.copy()
+    best_score = _score(points)
+    velocity = np.zeros_like(points)
+
+    regressions = 0
+    step_factor = 1.0
+    damped = 0
+    beta_retreat = 0
+
+    for step in range(iterations):
+        progress = step / float(iterations - 1)
+        beta_scale = 0.78 if beta_retreat > 0 else 1.0
+        direction = _contact_direction(
+            points, beta_scale * _sharpness(progress, schedule)
+        )
+
+        persistence = 0.80 if damped == 0 else 0.58
+        velocity = persistence * velocity + (1.0 - persistence) * direction
+        step_size = step_factor * 0.044 * (1.0 - 0.69 * progress)
+        points = _normalize(points + step_size * velocity)
+        damped = max(0, damped - 1)
+        beta_retreat = max(0, beta_retreat - 1)
+
+        if step % 10 == 9 or step == iterations - 1:
+            value = _score(points)
+            loss = (best_score - value) / max(best_score, 1.0e-15)
+
+            if value > best_score:
+                best_score = value
+                best = points.copy()
+                regressions = 0
+            elif loss > 2.5e-4:
+                regressions += 1
+            else:
+                regressions = max(0, regressions - 1)
+
+            # Large losses generally mean that a newly dominant surrogate
+            # contact has changed the active graph.  Restore before momentum
+            # can carry the iterate farther into that inferior basin.
+            if loss > 1.1e-3 or regressions >= 2:
+                points = best.copy()
+                velocity.fill(0.0)
+                step_factor *= 0.76
+                damped = 85
+                beta_retreat = 90
+                regressions = 0
+
+    return best
+
+
+def _polish(seed: np.ndarray) -> np.ndarray:
+    """Exact-monotone high-sharpness portfolio refinement."""
+    branches = (
+        (220.0, 680.0, 0.0140, 0.00025, 400),
+        (330.0, 1050.0, 0.0100, 0.00015, 430),
+        (520.0, 1500.0, 0.0068, 0.00008, 440),
+    )
+    rng = np.random.default_rng(160419)
+    global_best = _normalize(seed)
+    global_score = _score(global_best)
+    multipliers = np.array([1.0, 0.55, 0.28, 0.12], dtype=float)
+
+    for start_beta, end_beta, start_step, end_step, iterations in branches:
+        points = global_best.copy()
+        value = global_score
+
+        for step in range(iterations):
+            progress = step / float(iterations - 1)
+            beta = start_beta * (end_beta / start_beta) ** progress
+            step_size = start_step * (end_step / start_step) ** progress
+            direction = _contact_direction(points, beta)
+
+            trials = points[None, :, :] + (
+                step_size * multipliers[:, None, None] * direction[None, :, :]
+            )
+
+            if step % 29 == 0:
+                noise = rng.standard_normal((2, _N_POINTS, 3))
+                noise -= noise.mean(axis=1, keepdims=True)
+                norms = np.sqrt(np.mean(np.sum(noise * noise, axis=2), axis=1))
+                noise /= norms[:, None, None]
+                trials = np.concatenate(
+                    (trials, points[None, :, :] + 0.16 * step_size * noise),
+                    axis=0,
+                )
+
+            trials = np.asarray([_normalize(candidate) for candidate in trials])
+            scores = _batch_scores(trials)
+            choice = int(np.argmax(scores))
+
+            if scores[choice] > value + 1.0e-15:
+                points = trials[choice]
+                value = float(scores[choice])
+
+        if value > global_score:
+            global_best = points
+            global_score = value
+
+    return global_best
+
+
+def _layer_seed(radius: float, height: float, twist: float, pole: float) -> np.ndarray:
+    angles = np.arange(6, dtype=float) * (np.pi / 3.0)
+    lower = np.column_stack(
+        (radius * np.cos(angles), radius * np.sin(angles), -height * np.ones(6))
+    )
+    upper = np.column_stack(
+        (
+            radius * np.cos(angles + twist),
+            radius * np.sin(angles + twist),
+            height * np.ones(6),
+        )
+    )
+    return np.vstack((lower, upper, [[0.0, 0.0, -pole], [0.0, 0.0, pole]]))
+
+
+def _initializers() -> list:
+    seeds = [
+        _layer_seed(0.946, 0.405, np.pi / 6.0, 1.000),
+        _layer_seed(0.920, 0.385, np.pi / 6.0, 0.980),
+        _layer_seed(0.975, 0.430, np.pi / 6.0, 1.030),
+        _layer_seed(0.950, 0.415, 0.455, 1.000),
+        _layer_seed(0.955, 0.400, 0.585, 1.000),
+    ]
+
+    cube = np.array(
+        [[x, y, z] for x in (-1.0, 1.0)
+         for y in (-1.0, 1.0)
+         for z in (-1.0, 1.0)],
+        dtype=float,
+    )
+    axes = np.array(
+        [
+            [1.55, 0.0, 0.0], [-1.55, 0.0, 0.0],
+            [0.0, 1.67, 0.0], [0.0, -1.67, 0.0],
+            [0.0, 0.0, 1.60], [0.0, 0.0, -1.60],
+        ],
+        dtype=float,
+    )
+    seeds.append(np.vstack((cube, axes)))
+
+    rng = np.random.default_rng(482917)
+    starts = [seed + 0.015 * rng.standard_normal(seed.shape) for seed in seeds]
+    starts.extend(rng.standard_normal((_N_POINTS, 3)) for _ in range(4))
+    return starts
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """Return exactly fourteen finite three-dimensional points."""
+    finalists = []
+    best_score = -np.inf
+
+    for seed in _initializers():
+        for schedule in range(3):
+            candidate = _refine(seed, schedule)
+            value = _score(candidate)
+            finalists.append((value, candidate))
+            if value > best_score:
+                best_score = value
+
+    finalists.sort(key=lambda item: item[0], reverse=True)
+    best_points = finalists[0][1]
+
+    # Polish several leading basins rather than relying on one surrogate path.
+    for _, candidate in finalists[:3]:
+        polished = _polish(candidate)
+        value = _score(polished)
+        if value > best_score:
+            best_score = value
+            best_points = polished
+
+    return np.asarray(best_points, dtype=np.float64)
+
+
+# EVOLVE-BLOCK-END

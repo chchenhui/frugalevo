@@ -1,0 +1,35 @@
+<NAME>
+cap_and_spread_replica_counts</NAME>
+<DESCRIPTION>
+The expert balancedness score is stuck at 0.25 across all prior programs, while GPU balancedness reaches 0.66. The diagnosis in the recommendation is that the greedy replication loop in `replicate_experts` concentrates all redundant replicas on a handful of hottest experts (argmax of `weight/logcnt` repeatedly picks the same experts until their per-replica load drops), producing extreme replica-count variance: a few experts hold many replicas while the `maxlogcnt` headroom is wasted. Packing cannot compensate for that variance since a single hot expert with 1 replica dominates its GPU.
+
+The fix: cap each logical expert's replica count at `maxcnt = num_redundant // 2 + 1` and force the greedy loop to spread extra replicas to the next-highest per-replica-load experts that are still below the cap. This keeps the exact same bookkeeping invariants (`phy2log`, `rank = logcnt[...]` before increment, `logcnt` increment), so the downstream `phy2log * maxlogcnt + phyrank` scatter never goes out of bounds (the invariant Gen 6 broke), because `maxcnt <= num_redundant + 1 = maxlogcnt` always holds. The capacity argument is safe: `num_log * (maxcnt - 1) >= num_redundant` whenever `num_log >= 2`, so there is always at least one eligible expert and the masked argmax never picks an excluded entry. Execution cost is identical to the current loop (same number of vectorized iterations), and better balance also reduces inference time.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+=======
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    # Cap the replica count per logical expert so redundant replicas are
+    # spread over more experts instead of piling onto the hottest few.
+    # maxcnt is always <= num_redundant + 1, so the downstream
+    # `phy2log * maxlogcnt + phyrank` scatter stays in bounds.
+    maxcnt = num_redundant // 2 + 1 if num_redundant > 0 else 1
+    neg_inf = -1.0
+    for i in range(num_log, num_phy):
+        per_replica = weight / logcnt
+        # only experts below the cap may receive another replica
+        per_replica = torch.where(logcnt < maxcnt, per_replica,
+                                  torch.full_like(per_replica, neg_inf))
+        redundant_indices = per_replica.max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+>>>>>>> REPLACE
+</DIFF>

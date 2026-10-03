@@ -1,0 +1,253 @@
+--- a/original.py
++++ b/original.py
+@@ -1,207 +1,200 @@
+ # EVOLVE-BLOCK-START
+ """Constructor-based circle packing for n=26 circles"""
+ import numpy as np
+ 
+ 
+ def construct_packing():
+     """
+     Construct a specific arrangement of 26 circles in a unit square
+     that attempts to maximize the sum of their radii.
+ 
+     Returns:
+         Tuple of (centers, radii, sum_of_radii)
+     """
+     n = 26
+ 
+     def hex_layout(rows, scale=1.0):
+         R = len(rows)
+         k = np.sqrt(3.0) / 2.0
+         s_h = 1.0 / ((R - 1) * k + 1.0)
+         s_w = 1.0 / max(rows)
+         s = min(s_h, s_w) * scale
+         r0 = s / 2.0
+         g = s * k
+         pts = []
+         for ri, count in enumerate(rows):
+             y = r0 + ri * g
+             for c in range(count):
+                 x = 0.5 + (c - (count - 1) / 2.0) * s
+                 x = min(max(x, 0.005), 0.995)
+                 pts.append([x, y])
+         return np.array(pts)
+ 
+     def lp_radii(centers):
+         """Exact optimal radii at fixed centers via sparse LP."""
+         radii = compute_max_radii(centers)
+         try:
+             from scipy.optimize import linprog
+             from scipy.sparse import csr_matrix
+ 
+             ii, jj = np.triu_indices(n, 1)
+             d = np.linalg.norm(centers[ii] - centers[jj], axis=1)
+             keep = d > 1e-9
+             ii, jj, d = ii[keep], jj[keep], d[keep]
+             data = np.concatenate([np.ones(len(d)), np.ones(len(d))])
+             rows_ = np.concatenate([np.arange(len(d))] * 2)
+             cols_ = np.concatenate([ii, jj])
+             bd = np.minimum.reduce([centers[:, 0], centers[:, 1],
+                                     1.0 - centers[:, 0], 1.0 - centers[:, 1]])
+             rows_b = len(d) + np.arange(n)
+             data = np.concatenate([data, np.ones(n)])
+             rows_ = np.concatenate([rows_, rows_b])
+             cols_ = np.concatenate([cols_, np.arange(n)])
+             A_ub = csr_matrix((data, (rows_, cols_)), shape=(len(d) + n, n))
+             b_ub = np.concatenate([d, bd])
+             res = linprog(c=-np.ones(n), A_ub=A_ub, b_ub=b_ub,
+                           bounds=[(0, None)] * n, method="highs")
+             if res.success and np.sum(res.x) > np.sum(radii):
+                 radii = res.x
+         except Exception:
+             pass
+         return radii
+ 
+     candidates = [
+         [5, 4, 5, 4, 5, 3],
+         [4, 5, 4, 5, 4, 4],
+         [3, 5, 4, 5, 4, 5],
+         [5, 5, 4, 4, 4, 4],
+         [4, 4, 5, 5, 4, 4],
++        [4, 5, 5, 4, 5, 3],
++        [5, 4, 4, 5, 4, 4],
+     ]
+ 
+     # Seed: best lattice candidate
+     best = None
+     for rows in candidates:
+         centers_c = hex_layout(rows)
+         radii_c = lp_radii(centers_c)
+         total = np.sum(radii_c)
+         if best is None or total > best[2]:
+             best = (centers_c, radii_c, total)
+ 
+     centers, radii, sum_radii = best
+ 
+-    # ---- Simulated annealing with reheating ----
++    # ---- Multi-start jittered greedy hill-climb ----
++    # Each start begins from the best lattice candidate perturbed with a
++    # distinct small +/-0.01 jitter, and gets a shrinking share of the
++    # remaining time: (deadline - now) / (n_starts - start).
+     try:
+         import time
+-        rng = np.random.default_rng(12345)
+         deadline = time.time() + 2.2
+-
+-        T0 = 0.01
+-        cool = 0.995
+-        T = T0
+-        step = 0.02
+-        no_improve = 0
+-        reheat_budget = 3
+-
+-        cur = centers.copy()
+-        cur_radii, cur_score = radii, sum_radii
+-
+-        while time.time() < deadline:
+-            trial = cur.copy()
+-            k_move = rng.integers(1, 4)
+-            for idx in rng.choice(n, size=k_move, replace=False):
+-                trial[idx] += rng.normal(0.0, step, size=2)
+-            trial = np.clip(trial, 0.01, 0.99)
+-            radii_t = lp_radii(trial)
+-            total_t = np.sum(radii_t)
+-
+-            delta = total_t - cur_score
+-            # SA acceptance: always accept improvements, sometimes accept worse
+-            if delta > 1e-9 or rng.random() < np.exp(delta / T):
+-                cur, cur_radii, cur_score = trial, radii_t, total_t
+-                if delta > 1e-9:
+-                    no_improve = 0
++        n_starts = 4
++
++        for start in range(n_starts):
++            rng = np.random.default_rng(1000 + start)
++            cur = centers + rng.normal(0.0, 0.01, size=centers.shape)
++            cur = np.clip(cur, 0.01, 0.99)
++            cur_radii = lp_radii(cur)
++            cur_score = np.sum(cur_radii)
++            if cur_score > sum_radii:
++                centers, radii, sum_radii = cur.copy(), cur_radii, cur_score
++
++            start_deadline = time.time() + max(
++                (deadline - time.time()) / (n_starts - start), 0.1)
++            step = 0.02
++
++            while time.time() < start_deadline:
++                trial = cur.copy()
++                k_move = rng.integers(1, 4)
++                for idx in rng.choice(n, size=k_move, replace=False):
++                    trial[idx] += rng.normal(0.0, step, size=2)
++                trial = np.clip(trial, 0.01, 0.99)
++                radii_t = lp_radii(trial)
++                total_t = np.sum(radii_t)
++
++                if total_t > cur_score + 1e-9:
++                    cur, cur_radii, cur_score = trial, radii_t, total_t
+                     if total_t > sum_radii:
+-                        centers, radii, sum_radii = trial, radii_t, total_t
+-            else:
+-                no_improve += 1
+-
+-            # Adaptive step size
+-            if rng.random() < 0.7:
+-                step = max(step * 0.95, 0.002)
+-            else:
+-                step = min(step * 1.3, 0.05)
+-
+-            # Cool
+-            T = max(T * cool, 1e-4)
+-
+-            # Reheat if stuck
+-            if no_improve >= 50 and reheat_budget > 0:
+-                T = T0
+-                step = 0.03
+-                no_improve = 0
+-                reheat_budget -= 1
+-                # Restart current state from the best found so far
+-                cur = centers.copy()
+-                cur_radii, cur_score = radii, sum_radii
++                        centers, radii, sum_radii = trial.copy(), radii_t, total_t
++                    step = min(step * 1.1, 0.05)
++                else:
++                    # Adaptive step: mostly shrink when stuck, occasionally grow
++                    if rng.random() < 0.7:
++                        step = max(step * 0.92, 0.002)
++                    else:
++                        step = min(step * 1.4, 0.05)
++
++            if time.time() >= deadline:
++                break
+     except Exception:
+         pass
+ 
+     return centers, radii, sum_radii
+ 
+ 
+ def compute_max_radii(centers):
+     """
+     Compute valid radii for each circle position such that they don't
+     overlap and stay within the unit square (fast fallback).
+     """
+     n = centers.shape[0]
+     radii = np.ones(n)
+     for i in range(n):
+         x, y = centers[i]
+         radii[i] = min(x, y, 1 - x, 1 - y)
+     for i in range(n):
+         for j in range(i + 1, n):
+             dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+             if radii[i] + radii[j] > dist:
+                 scale = dist / (radii[i] + radii[j])
+                 radii[i] *= scale
+                 radii[j] *= scale
+     return radii
+ 
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ # This part remains fixed (not evolved)
+ def run_packing():
+     """Run the circle packing constructor for n=26"""
+     centers, radii, sum_radii = construct_packing()
+     return centers, radii, sum_radii
+ 
+ 
+ def visualize(centers, radii):
+     """
+     Visualize the circle packing
+ 
+     Args:
+         centers: np.array of shape (n, 2) with (x, y) coordinates
+         radii: np.array of shape (n) with radius of each circle
+     """
+     import matplotlib.pyplot as plt
+     from matplotlib.patches import Circle
+ 
+     fig, ax = plt.subplots(figsize=(8, 8))
+ 
+     # Draw unit square
+     ax.set_xlim(0, 1)
+     ax.set_ylim(0, 1)
+     ax.set_aspect("equal")
+     ax.grid(True)
+ 
+     # Draw circles
+     for i, (center, radius) in enumerate(zip(centers, radii)):
+         circle = Circle(center, radius, alpha=0.5)
+         ax.add_patch(circle)
+         ax.text(center[0], center[1], str(i), ha="center", va="center")
+ 
+     plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+     plt.show()
+ 
+ 
+ if __name__ == "__main__":
+     centers, radii, sum_radii = run_packing()
+     print(f"Sum of radii: {sum_radii}")
+     # AlphaEvolve improved this to 2.635
+ 
+     # Uncomment to visualize:
+     visualize(centers, radii)

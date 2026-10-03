@@ -1,0 +1,253 @@
+<NAME>
+nonagon_core_anneal
+</NAME>
+
+<DESCRIPTION>
+The current program fixes a three-vertex triangular hull, uses 8 restarts × 18,000 iterations, a 16-triangle lower-tail surrogate, Gaussian moves with initial scale 0.100, 18% paired moves, and temperature `0.0017*(1-progress)^2+8e-6`. Its triangular-hull restriction prevents exploration of the empirically stronger circular nine-point hull structure.
+
+The new algorithm uses a fixed regular nine-point convex hull and optimizes four interior points. This preserves feasibility without repeated hull projection while directly exploiting the recommended circular-hull prior. The search uses 14 deterministic complementary starts, 7,500 annealing iterations per start, a tighter active set that decreases from 24 to 8 constraints, directed gradients for bottleneck triangles, occasional coordinated two-point moves, and a final strict greedy refinement. The hull is fixed, so normalized area is computed efficiently as determinant divided by the nonagon's twice-area.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+_N = 13
+_HULL_COUNT = 9
+_INTERIOR_START = 9
+_TRIPLES = np.asarray(
+    [(i, j, k) for i in range(_N) for j in range(i + 1, _N)
+     for k in range(j + 1, _N)],
+    dtype=np.intp,
+)
+_INCIDENT = tuple(
+    np.flatnonzero(np.any(_TRIPLES == i, axis=1))
+    for i in range(_N)
+)
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct a deterministic thirteen-point configuration using a circular
+    nine-point hull and four optimized interior points.
+
+    A regular nonagon is retained as a broad convex boundary.  This makes
+    every proposed interior point feasible and avoids the restrictive
+    three-corner triangular prior used by earlier searches.
+    """
+    rng = np.random.default_rng(13031957)
+
+    # A phase placing one hull point on the positive x axis is immaterial to
+    # the objective but makes the returned arrangement reproducible.
+    angles = 2.0 * np.pi * np.arange(_HULL_COUNT) / _HULL_COUNT
+    hull = np.column_stack((np.cos(angles), np.sin(angles)))
+
+    # Twice the area of the regular nonagon.  Every determinant below is a
+    # twice-area, so their ratio is exactly the reported normalized metric.
+    hull_twice_area = float(
+        np.sum(
+            hull[:, 0] * np.roll(hull[:, 1], -1)
+            - hull[:, 1] * np.roll(hull[:, 0], -1)
+        )
+    )
+
+    def determinants(points: np.ndarray) -> np.ndarray:
+        t = points[_TRIPLES]
+        return np.abs(
+            (t[:, 1, 0] - t[:, 0, 0]) * (t[:, 2, 1] - t[:, 0, 1])
+            - (t[:, 1, 1] - t[:, 0, 1]) * (t[:, 2, 0] - t[:, 0, 0])
+        )
+
+    def value_from_areas(areas: np.ndarray) -> float:
+        return float(np.min(areas) / hull_twice_area)
+
+    def quality(areas: np.ndarray, active_size: int) -> float:
+        # The strict minimum remains dominant, but the tail term prevents
+        # repeated exchanges among nearly equal bottleneck triangles.
+        tail = np.partition(areas, active_size - 1)[:active_size]
+        weights = np.linspace(3.5, 1.0, active_size)
+        return float(
+            (0.72 * tail[0] + 0.28 * np.dot(tail, weights) / weights.sum())
+            / hull_twice_area
+        )
+
+    def project_inside_nonagon(p: np.ndarray) -> np.ndarray:
+        """
+        Radial projection into the nonagon, leaving a small boundary margin.
+        The exact radial boundary for direction theta is cos(pi/9)/cos(delta).
+        """
+        r = float(np.hypot(p[0], p[1]))
+        if r < 1.0e-15:
+            return p.copy()
+        theta = float(np.arctan2(p[1], p[0]))
+        sector = (theta + np.pi / _HULL_COUNT) % (
+            2.0 * np.pi / _HULL_COUNT
+        ) - np.pi / _HULL_COUNT
+        limit = 0.992 * np.cos(np.pi / _HULL_COUNT) / np.cos(sector)
+        if r > limit:
+            return p * (limit / r)
+        return p
+
+    def random_inner_point(radius: float = 0.72) -> np.ndarray:
+        theta = rng.random() * 2.0 * np.pi
+        # sqrt gives uniform area sampling in a disk, safely contained in hull.
+        r = radius * np.sqrt(rng.random())
+        return np.array((r * np.cos(theta), r * np.sin(theta)))
+
+    def gradient_for_vertex(points: np.ndarray, triple_index: int,
+                            vertex: int) -> np.ndarray:
+        i, j, k = _TRIPLES[triple_index]
+        a, b, c = points[i], points[j], points[k]
+        signed = (b[0] - a[0]) * (c[1] - a[1]) - (
+            b[1] - a[1]
+        ) * (c[0] - a[0])
+        sign = 1.0 if signed >= 0.0 else -1.0
+
+        if vertex == i:
+            edge = c - b
+        elif vertex == j:
+            edge = a - c
+        else:
+            edge = b - a
+
+        direction = sign * np.array((-edge[1], edge[0]))
+        norm = float(np.hypot(direction[0], direction[1]))
+        return direction / norm if norm > 1.0e-14 else np.zeros(2)
+
+    best_points = None
+    best_value = -np.inf
+
+    try:
+        # Complementary starts include rotationally structured cores as well
+        # as random cores; four points need not be forced to fourfold symmetry.
+        for restart in range(14):
+            points = np.empty((_N, 2), dtype=float)
+            points[:_HULL_COUNT] = hull
+
+            if restart % 4 == 0:
+                phase = 2.0 * np.pi * rng.random()
+                radii = np.array((0.20, 0.39, 0.54, 0.68))
+                points[_INTERIOR_START:] = np.column_stack((
+                    radii * np.cos(phase + np.array((0.0, 1.55, 3.10, 4.72))),
+                    radii * np.sin(phase + np.array((0.0, 1.55, 3.10, 4.72))),
+                ))
+            elif restart % 4 == 1:
+                phase = 2.0 * np.pi * rng.random()
+                points[_INTERIOR_START:] = np.array([
+                    [0.0, 0.0],
+                    [0.49 * np.cos(phase), 0.49 * np.sin(phase)],
+                    [0.49 * np.cos(phase + 2.1), 0.49 * np.sin(phase + 2.1)],
+                    [0.49 * np.cos(phase + 4.2), 0.49 * np.sin(phase + 4.2)],
+                ])
+            else:
+                points[_INTERIOR_START:] = np.array(
+                    [random_inner_point() for _ in range(4)]
+                )
+
+            areas = determinants(points)
+            current_value = value_from_areas(areas)
+            current_quality = quality(areas, 24)
+
+            for iteration in range(7500):
+                progress = iteration / 7499.0
+                cooling = (1.0 - progress) ** 1.55
+                active_size = 24 if progress < 0.45 else (
+                    14 if progress < 0.82 else 8
+                )
+                active = np.argpartition(areas, active_size - 1)[:active_size]
+                active_triples = _TRIPLES[active]
+                pool = np.unique(active_triples[active_triples >= _INTERIOR_START])
+
+                trial = points.copy()
+                scale = 0.072 * cooling + 0.00065
+
+                if rng.random() < 0.16 and len(pool) >= 2:
+                    # Coordinated move helps escape configurations where two
+                    # active constraints require simultaneous displacement.
+                    chosen = rng.choice(pool, size=2, replace=False)
+                    for index in chosen:
+                        tri_index = int(active[rng.integers(active_size)])
+                        direction = gradient_for_vertex(trial, tri_index, int(index))
+                        noise = rng.normal(size=2)
+                        noise /= max(float(np.hypot(noise[0], noise[1])), 1e-15)
+                        move = 0.58 * direction + 0.42 * noise
+                        move /= max(float(np.hypot(move[0], move[1])), 1e-15)
+                        trial[index] = project_inside_nonagon(
+                            trial[index] + 0.62 * scale * move
+                        )
+                else:
+                    tri_index = int(active[rng.integers(active_size)])
+                    triple = _TRIPLES[tri_index]
+                    movable = triple[triple >= _INTERIOR_START]
+                    index = int(movable[rng.integers(len(movable))])
+
+                    direction = gradient_for_vertex(trial, tri_index, index)
+                    noise = rng.normal(size=2)
+                    noise /= max(float(np.hypot(noise[0], noise[1])), 1e-15)
+                    guided = 0.54 + 0.30 * progress
+                    move = guided * direction + (1.0 - guided) * noise
+                    move /= max(float(np.hypot(move[0], move[1])), 1e-15)
+                    trial[index] = project_inside_nonagon(
+                        trial[index] + scale * move
+                    )
+
+                trial_areas = determinants(trial)
+                trial_quality = quality(trial_areas, active_size)
+                temperature = 0.00125 * cooling * cooling + 0.0000025
+                delta = trial_quality - current_quality
+
+                if delta >= 0.0 or rng.random() < np.exp(delta / temperature):
+                    points = trial
+                    areas = trial_areas
+                    current_quality = trial_quality
+                    current_value = value_from_areas(areas)
+
+                if current_value > best_value:
+                    best_value = current_value
+                    best_points = points.copy()
+
+        # Small strict max-min polish after the tail-based annealing phase.
+        points = best_points.copy()
+        areas = determinants(points)
+        current_value = value_from_areas(areas)
+
+        for iteration in range(5000):
+            progress = iteration / 4999.0
+            active = np.argpartition(areas, 7)[:8]
+            tri_index = int(active[rng.integers(8)])
+            triple = _TRIPLES[tri_index]
+            movable = triple[triple >= _INTERIOR_START]
+            index = int(movable[rng.integers(len(movable))])
+
+            direction = gradient_for_vertex(points, tri_index, index)
+            noise = rng.normal(size=2)
+            noise /= max(float(np.hypot(noise[0], noise[1])), 1e-15)
+            move = 0.86 * direction + 0.14 * noise
+            move /= max(float(np.hypot(move[0], move[1])), 1e-15)
+
+            trial = points.copy()
+            trial[index] = project_inside_nonagon(
+                trial[index] + (0.010 * (1.0 - progress) + 0.00018) * move
+            )
+            trial_areas = determinants(trial)
+            trial_value = value_from_areas(trial_areas)
+
+            if trial_value >= current_value:
+                points, areas, current_value = trial, trial_areas, trial_value
+
+        return points
+
+    except (FloatingPointError, ValueError, RuntimeError):
+        # Deterministic valid fallback.
+        fallback = np.empty((_N, 2), dtype=float)
+        fallback[:_HULL_COUNT] = hull
+        fallback[_INTERIOR_START:] = np.array([
+            [0.0, 0.0], [0.42, 0.0], [-0.21, 0.36], [-0.21, -0.36]
+        ])
+        return fallback
+
+
+# EVOLVE-BLOCK-END
+```

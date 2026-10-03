@@ -1,0 +1,189 @@
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles"""
+import numpy as np
+
+
+def construct_packing():
+    """
+    Construct and refine a layered 26-circle packing in the unit square.
+
+    The alternating five/six-circle rows are a useful boundary-aware
+    approximation to a hexagonal packing, while allowing the crowded rows
+    to have smaller radii than their neighbours.
+    """
+    n = 26
+
+    # A feasible, deliberately non-uniform layered starting packing.
+    # Rows with six circles must be narrower; their smaller radii leave room
+    # for the larger circles in the adjacent five- and four-circle rows.
+    row_counts = (5, 6, 5, 6, 4)
+    row_y = (0.10, 0.28, 0.46, 0.64, 0.90)
+    row_r = (0.10, 0.08, 0.10, 0.08, 0.10)
+    points = []
+    start_radii = []
+    for count, y, radius in zip(row_counts, row_y, row_r):
+        if count == 5:
+            xs = np.linspace(0.10, 0.90, 5)
+        elif count == 6:
+            xs = np.linspace(0.08, 0.92, 6)
+        else:
+            xs = np.linspace(0.20, 0.80, 4)
+        points.extend((x, y) for x in xs)
+        start_radii.extend([radius] * count)
+
+    centers0 = np.asarray(points, dtype=float)
+    radii0 = np.asarray(start_radii, dtype=float)
+    z0 = np.concatenate((centers0.ravel(), radii0))
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+
+    def constraints(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        wall = np.column_stack((c[:, 0] - r, c[:, 1] - r,
+                                1.0 - c[:, 0] - r, 1.0 - c[:, 1] - r))
+        pair = np.empty(len(pairs))
+        for k, (i, j) in enumerate(pairs):
+            delta = c[i] - c[j]
+            pair[k] = np.dot(delta, delta) - (r[i] + r[j]) ** 2
+        return np.concatenate((wall.ravel(), pair))
+
+    def constraint_jacobian(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        jac = np.zeros((4 * n + len(pairs), 3 * n))
+        for i in range(n):
+            base = 4 * i
+            xi, yi, ri = 2 * i, 2 * i + 1, 2 * n + i
+            jac[base, xi], jac[base, ri] = 1.0, -1.0
+            jac[base + 1, yi], jac[base + 1, ri] = 1.0, -1.0
+            jac[base + 2, xi], jac[base + 2, ri] = -1.0, -1.0
+            jac[base + 3, yi], jac[base + 3, ri] = -1.0, -1.0
+        for k, (i, j) in enumerate(pairs):
+            row = 4 * n + k
+            delta = c[i] - c[j]
+            jac[row, 2 * i:2 * i + 2] = 2.0 * delta
+            jac[row, 2 * j:2 * j + 2] = -2.0 * delta
+            jac[row, 2 * n + i] = -2.0 * (r[i] + r[j])
+            jac[row, 2 * n + j] = -2.0 * (r[i] + r[j])
+        return jac
+
+    z = z0
+    try:
+        from scipy.optimize import minimize
+        objective_jacobian = np.zeros(3 * n)
+        objective_jacobian[2 * n:] = -1.0
+        result = minimize(
+            lambda v: -np.sum(v[2 * n:]), z0, jac=lambda v: objective_jacobian,
+            method="SLSQP",
+            bounds=[(0.0, 1.0)] * (2 * n) + [(1.e-5, 0.5)] * n,
+            constraints={"type": "ineq", "fun": constraints,
+                         "jac": constraint_jacobian},
+            options={"maxiter": 1800, "ftol": 1.e-11, "disp": False},
+        )
+        if result.success and np.sum(result.x[2 * n:]) > np.sum(radii0):
+            z = result.x
+    except Exception:
+        # The explicit layered arrangement remains a valid portable fallback.
+        z = z0
+
+    centers = z[:2 * n].reshape(n, 2)
+    radii = z[2 * n:].copy()
+
+    # Make validity independent of optimizer stopping tolerances.
+    scale = 1.0
+    for i in range(n):
+        scale = min(scale, centers[i, 0] / radii[i],
+                    centers[i, 1] / radii[i],
+                    (1.0 - centers[i, 0]) / radii[i],
+                    (1.0 - centers[i, 1]) / radii[i])
+    for i, j in pairs:
+        scale = min(scale, np.linalg.norm(centers[i] - centers[j]) /
+                    (radii[i] + radii[j]))
+    radii *= min(1.0, scale * (1.0 - 1.e-10))
+
+    return centers, radii, float(np.sum(radii))
+
+
+def compute_max_radii(centers):
+    """
+    Compute the maximum possible radii for each circle position
+    such that they don't overlap and stay within the unit square.
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+
+    Returns:
+        np.array of shape (n) with radius of each circle
+    """
+    n = centers.shape[0]
+    radii = np.ones(n)
+
+    # First, limit by distance to square borders
+    for i in range(n):
+        x, y = centers[i]
+        # Distance to borders
+        radii[i] = min(x, y, 1 - x, 1 - y)
+
+    # Then, limit by distance to other circles
+    # Each pair of circles with centers at distance d can have
+    # sum of radii at most d to avoid overlap
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+
+            # If current radii would cause overlap
+            if radii[i] + radii[j] > dist:
+                # Scale both radii proportionally
+                scale = dist / (radii[i] + radii[j])
+                radii[i] *= scale
+                radii[j] *= scale
+
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

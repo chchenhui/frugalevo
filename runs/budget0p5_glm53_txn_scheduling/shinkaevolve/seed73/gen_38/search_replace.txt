@@ -1,0 +1,126 @@
+<NAME>
+add_lns_and_cost_clustered_seeds</NAME>
+<DESCRIPTION>
+The current program regressed (3584 vs the best 3787.88). Two targeted fixes based on what worked in prior generations:
+
+1. **Cost-clustered seed selection for beam search**: Prior generations showed the top-2 cheapest single-txn seeds plus random seeds beat always using txn 0. Instead of always seeding with txn 0, group transactions by cost quantile and pick one seed per quantile bucket, rotating across restarts. This systematically covers different seed basins rather than repeatedly concentrating on the same seed.
+
+2. **Add a Large Neighborhood Search (LNS) ruin-and-recreate phase**: The generation that achieved 3745 used LNS after SA, removing a contiguous block of transactions and greedily reinserting each at its best position. This is a powerful escape from local optima that single insertion/swap SA moves cannot reach, and directly evaluates real makespan via `get_opt_seq_cost`. Adding it back on top of the current SA phase should recover and improve on the best known score.
+
+Reasoning step-by-step:
+- Construction phase (greedy + diverse beam) yields good starting schedules.
+- SA with insertion intensification refines them locally.
+- LNS then perturbs structurally (removes 2-6 consecutive txns and optimally reinserts each), which explores a much larger neighborhood per evaluation and often finds improving moves SA misses. Sideways acceptance (30% on equal cost) adds diversification.
+- Budget: LNS gets the remaining time up to the 28s wall clock, which was previously wasted or underused.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    num_restarts = max(1, min(6, 150 // max(1, n)))
+    max_beam_width = max(4, min(8, 600 // max(1, n)))
+
+    for restart in range(num_restarts):
+        if time.time() - start_time >= time_budget * 0.5:
+            break
+        seeds = {0, random.randrange(n)}
+        if n > 1:
+            seeds.add(random.randrange(n))
+=======
+    num_restarts = max(1, min(6, 150 // max(1, n)))
+    max_beam_width = max(4, min(8, 600 // max(1, n)))
+
+    # cost-clustered seeding: group txns by standalone cost quantile and
+    # pick one seed per quantile bucket, rotating across restarts so
+    # different restarts explore different seed basins
+    txn_costs = sorted(range(n), key=lambda t: workload.get_opt_seq_cost([t]))
+    num_buckets = min(4, n)
+    bucket_size = max(1, (n + num_buckets - 1) // num_buckets)
+    buckets = [txn_costs[b * bucket_size:(b + 1) * bucket_size]
+               for b in range(num_buckets) if txn_costs[b * bucket_size:(b + 1) * bucket_size]]
+    bucket_cycle = 0
+
+    for restart in range(num_restarts):
+        if time.time() - start_time >= time_budget * 0.5:
+            break
+        seeds = set()
+        for bi in range(len(buckets)):
+            b = buckets[(bucket_cycle + bi) % len(buckets)]
+            seeds.add(b[restart % len(b)])
+        bucket_cycle += 1
+        if len(seeds) < 2 and n > 1:
+            seeds.add(random.randrange(n))
+        if not seeds:
+            seeds.add(0)
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        if local_best_cost < best_cost:
+            best_cost, best_seq = local_best_cost, local_best_seq
+
+    assert best_seq is not None and len(set(best_seq)) == n
+    return best_cost, best_seq
+=======
+        if local_best_cost < best_cost:
+            best_cost, best_seq = local_best_cost, local_best_seq
+        candidates.append((local_best_cost, local_best_seq))
+
+    # ---------- Phase 3: LNS ruin-and-recreate on incumbent ----------
+    candidates.sort(key=lambda x: x[0])
+    inc_cost, inc_seq = candidates[0][0], candidates[0][1][:]
+    if best_cost < inc_cost:
+        inc_cost, inc_seq = best_cost, best_seq[:]
+
+    def lns_insertion_sweep(seq, cost, deadline):
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            for i in range(len(seq)):
+                if time.time() >= deadline:
+                    return seq, cost
+                txn = seq[i]
+                rest = seq[:i] + seq[i+1:]
+                bc, bpos = cost, None
+                for j in range(len(seq)):
+                    cand = rest[:j] + [txn] + rest[j:]
+                    tc = workload.get_opt_seq_cost(cand)
+                    if tc < bc:
+                        bc, bpos = tc, j
+                if bpos is not None:
+                    seq = rest[:bpos] + [txn] + rest[bpos:]
+                    cost = bc
+                    improved = True
+        return seq, cost
+
+    while time.time() - start_time < time_budget:
+        # ruin: remove a contiguous block of k transactions
+        k = rng.randint(2, max(2, min(6, n // 4)))
+        i = rng.randrange(0, n - k + 1)
+        block = inc_seq[i:i+k]
+        rest = inc_seq[:i] + inc_seq[i+k:]
+        # recreate: greedily reinsert each removed txn at best position
+        new_seq = rest
+        for t in block:
+            bc, bpos = None, None
+            for j in range(len(new_seq) + 1):
+                cand = new_seq[:j] + [t] + new_seq[j:]
+                tc = workload.get_opt_seq_cost(cand)
+                if bc is None or tc < bc:
+                    bc, bpos = tc, j
+            new_seq = new_seq[:bpos] + [t] + new_seq[bpos:]
+        c = workload.get_opt_seq_cost(new_seq)
+        if c < inc_cost:
+            inc_cost, inc_seq = c, new_seq
+            # intensify with a short insertion sweep
+            inc_seq, inc_cost = lns_insertion_sweep(inc_seq[:], inc_cost,
+                                                    time.time() + 1.0)
+        elif c == inc_cost and rng.random() < 0.3:
+            # sideways move for diversification
+            inc_seq = new_seq
+
+    if inc_cost < best_cost:
+        best_cost, best_seq = inc_cost, inc_seq
+
+    assert best_seq is not None and len(set(best_seq)) == n
+    return best_cost, best_seq
+>>>>>>> REPLACE
+</DIFF>

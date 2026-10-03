@@ -1,0 +1,110 @@
+<NAME>
+add_antipodal_symmetry_polish</NAME>
+<DESCRIPTION>
+The best known configurations for 14 points in 3D (the Tammes/packing problem) are conjectured/known to have a high degree of symmetry, and one of the most effective symmetry reductions is the antipodal one: the 14 points split into 7 pairs {v_i, -v_i}. This halves the number of free variables from 42 to 21, removes all translational freedom, and dramatically smooths the constrained optimization landscape for SLSQP (fewer variables, symmetric structure automatically satisfies many constraints with equality, so the soft-min objective has many tied active pairs and the reduced parameterization lets SLSQP balance them jointly rather than coordinate-wise).
+
+I add an `_antipodal` helper that (a) detects the antipodal pairing in the incumbent, (b) reparameterizes to 7 free vectors, and (c) runs escalating SLSQP passes on the reduced problem under the diameter<=1 constraint, keeping the best feasible result. It is inserted as a final polish stage after the incumbent re-polish, guarded with try/except and finite checks so it can never degrade the incumbent. Because the metric is squared ratio (dmin/dmax)^2, any symmetric configuration achieving a slightly larger dmin directly raises combined_score above the current plateau at 1.00. The added cost is small (7-variable SLSQP passes) so eval time stays within budget.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _structured_inits():
+=======
+def _antipodal(P0, passes=((300, 1e-13), (300, 1e-16))):
+    """Reparameterize as 7 antipodal pairs {v_i, -v_i}; optimize 7 free
+    vectors under diameter <= 1. Returns None if no antipodal pairing found."""
+    if not HAVE_SCIPY:
+        return None
+    P = np.asarray(P0, dtype=float)
+    if P.shape != (N, D) or not np.all(np.isfinite(P)):
+        return None
+    P = P - P.mean(axis=0)
+    dm = np.linalg.norm(P[PI_] - P[PJ], axis=1).max()
+    if not np.isfinite(dm) or dm <= 0:
+        return None
+    P = P / dm
+
+    # detect antipodal pairing: partner[i] = j minimizing |p_i + p_j|
+    cost = np.linalg.norm(P[:, None, :] + P[None, :, :], axis=2)
+    np.fill_diagonal(cost, np.inf)
+    partner = np.argmin(cost, axis=1)
+    if not np.all(partner[partner] == np.arange(N)):
+        return None
+    reps, seen = [], set()
+    for i in range(N):
+        if i not in seen and partner[i] not in seen:
+            reps.append(P[i] - P[partner[i]])
+            seen.add(i); seen.add(partner[i])
+    if len(reps) != N // 2:
+        return None
+    V = np.array(reps, dtype=float)
+
+    def build(v):
+        Vm = v.reshape(N // 2, D)
+        return np.vstack([Vm, -Vm])
+
+    def pds(v):
+        Pm = build(v)
+        return np.linalg.norm(Pm[PI_] - Pm[PJ], axis=1)
+
+    best_v, best_cfg, best_r = V.copy(), build(V.ravel()), _true_score(build(V.ravel()))
+    cur = V.copy()
+    for maxiter, ftol in passes:
+        try:
+            res = minimize(lambda v: -pds(v).min(), cur.ravel(),
+                           method='SLSQP',
+                           constraints={'type': 'ineq',
+                                        'fun': lambda v: 1.0 - pds(v).max()},
+                           options={'maxiter': maxiter, 'ftol': ftol})
+        except Exception:
+            break
+        if res.x.size != (N // 2) * D or not np.all(np.isfinite(res.x)):
+            break
+        out = res.x
+        cfg = build(out)
+        dcur = pds(out).max()
+        if np.isfinite(dcur) and dcur > 1e-12:
+            cfg = cfg / dcur
+        r = _true_score(cfg)
+        if r > best_r:
+            best_r, best_v, best_cfg = r, out, cfg
+        cur = out.reshape(N // 2, D)
+    return best_cfg, best_r
+
+
+def _structured_inits():
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # final incumbent re-polish
+    if best_pts is not None:
+        out = _slsqp_packing(best_pts, maxiter=800)
+        if out is not None:
+            P, s = out
+            if s > best:
+                best_pts = P
+=======
+    # final incumbent re-polish
+    if best_pts is not None:
+        out = _slsqp_packing(best_pts, maxiter=800)
+        if out is not None:
+            P, s = out
+            if s > best:
+                best_pts = P
+
+    # antipodal symmetry polish: reparameterize as 7 pairs {v, -v}
+    if best_pts is not None:
+        try:
+            out = _antipodal(best_pts)
+        except Exception:
+            out = None
+        if out is not None:
+            P, s = out
+            if s > best:
+                best, best_pts = s, P
+            # one more exact SLSQP pass from the symmetric configuration
+            out2 = _slsqp_packing(best_pts, maxiter=600)
+            if out2 is not None:
+                P2, s2 = out2
+                if s2 > best:
+                    best, best_pts = s2, P2
+>>>>>>> REPLACE
+</DIFF>

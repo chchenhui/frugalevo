@@ -1,0 +1,178 @@
+# EVOLVE-BLOCK-START
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+
+
+# ---------------- Route selection module ----------------
+
+def _edge_cost(graph, u, v):
+    """Safely read edge cost; missing costs are treated as prohibitive."""
+    c = graph[u][v].get("cost") if graph.has_edge(u, v) else None
+    return c if c is not None else 1e9
+
+
+def _path_cost(graph, path):
+    """Total cost of traversing a node path."""
+    return sum(_edge_cost(graph, path[i], path[i + 1]) for i in range(len(path) - 1))
+
+
+class CandidateRouter:
+    """Routes each destination greedily: adopt an alternative path only
+    if it is strictly cheaper than the Dijkstra baseline."""
+
+    K_PATHS = 4  # number of candidate alternatives per destination
+
+    def __init__(self, graph):
+        # Sanitized graph: drop in-edges of src and self loops once.
+        self.graph = graph
+        self._cache = {}  # dst -> chosen baseline path (avoids recompute)
+
+    def prepare(self, src):
+        self.h = self.graph.copy()
+        self.h.remove_edges_from(
+            list(self.h.in_edges(src)) + list(nx.selfloop_edges(self.h))
+        )
+        self.src = src
+        self._cache = {}
+
+    def baseline_path(self, dst):
+        if dst not in self._cache:
+            self._cache[dst] = nx.dijkstra_path(self.h, self.src, dst, weight="cost")
+        return self._cache[dst]
+
+    def candidate_paths(self, dst):
+        """Yield a few simple-path alternatives (may be empty on failure)."""
+        cands = []
+        try:
+            for i, path in enumerate(
+                nx.shortest_simple_paths(self.h, self.src, dst, weight="cost")
+            ):
+                cands.append(path)
+                if i + 1 >= self.K_PATHS:
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            pass
+        return cands
+
+    def route(self, dst):
+        """Return the cheapest validated path for dst (Dijkstra fallback)."""
+        base = self.baseline_path(dst)
+        best_path, best_cost = base, _path_cost(self.graph, base)
+        for cand in self.candidate_paths(dst):
+            c = _path_cost(self.graph, cand)
+            if c < best_cost:  # strictly cheaper: one-sided improvement
+                best_path, best_cost = cand, c
+        return best_path
+
+
+# ---------------- Broadcast builder ----------------
+
+class BroadcastPlanner:
+    """Builds the BroadCastTopology by routing each destination and
+    replicating the chosen route for every partition."""
+
+    def __init__(self, src, dsts, G, num_partitions):
+        self.src = src
+        self.dsts = dsts
+        self.G = G
+        self.num_partitions = num_partitions
+
+    def plan(self):
+        topo = BroadCastTopology(self.src, self.dsts, self.num_partitions)
+        router = CandidateRouter(self.G)
+        router.prepare(self.src)
+        for dst in self.dsts:
+            if dst == self.src:
+                continue
+            try:
+                path = router.route(dst)
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+            for i in range(len(path) - 1):
+                s, t = path[i], path[i + 1]
+                for j in range(self.num_partitions):
+                    topo.append_dst_partition_path(dst, j, [s, t, self.G[s][t]])
+        return topo
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    return BroadcastPlanner(src, dsts, G, num_partitions).plan()
+
+
+# ---------------- Topology data structures ----------------
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]  # [[src, dst, edge data]]
+
+
+class BroadCastTopology:
+    def __init__(self, src: str, dsts: List[str], num_partitions: int = 4, paths: Dict[str, SingleDstPath] = None):
+        self.src = src  # single str
+        self.dsts = dsts  # list of strs
+        self.num_partitions = num_partitions
+
+        # dict(dst) --> dict(partition) --> list(nx.edges)
+        if paths is not None:
+            self.paths = paths
+            self.set_graph()
+        else:
+            self.paths = {dst: {str(i): None for i in range(num_partitions)} for dst in dsts}
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        partition = str(partition)
+        self.paths[dst][partition] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+    def set_graph(self):
+        pass
+
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if cost_path is None:
+        cost = pd.read_csv(os.path.join(current_dir, "profiles/cost.csv"))
+    else:
+        cost = pd.read_csv(cost_path)
+
+    if throughput_path is None:
+        throughput = pd.read_csv(os.path.join(current_dir, "profiles/throughput.csv"))
+    else:
+        throughput = pd.read_csv(throughput_path)
+
+    G = nx.DiGraph()
+    for _, row in throughput.iterrows():
+        if row["src_region"] == row["dst_region"]:
+            continue
+        G.add_edge(row["src_region"], row["dst_region"], cost=None, throughput=num_vms * row["throughput_sent"] / 1e9)
+
+    for _, row in cost.iterrows():
+        if row["src"] in G and row["dest"] in G[row["src"]]:
+            G[row["src"]][row["dest"]]["cost"] = row["cost"]
+
+    no_cost_pairs = []
+    for edge in G.edges.data():
+        src, dst = edge[0], edge[1]
+        if edge[-1]["cost"] is None:
+            no_cost_pairs.append((src, dst))
+    print("Unable to get costs for: ", no_cost_pairs)
+
+    return G
+
+# EVOLVE-BLOCK-END

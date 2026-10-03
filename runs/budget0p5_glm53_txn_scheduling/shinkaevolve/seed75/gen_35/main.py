@@ -1,0 +1,170 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using randomized regret-greedy construction
+    plus hybrid swap/insertion local search with annealing acceptance.
+    """
+    n_txns = workload.num_txns
+    all_txns = list(range(n_txns))
+
+    def build_sequence(sample_rate=0.85, k_samples=6):
+        # Randomized greedy construction with candidate sampling.
+        start = random.choice(all_txns)
+        seq = [start]
+        remaining = [t for t in all_txns if t != start]
+        base_cost = workload.get_opt_seq_cost(seq)
+        while remaining:
+            k = min(k_samples, len(remaining))
+            # sample k distinct candidates
+            cand_idx = random.sample(range(len(remaining)), k)
+            scored = []
+            for idx in cand_idx:
+                t = remaining[idx]
+                c = workload.get_opt_seq_cost(seq + [t])
+                scored.append((c, t))
+            if random.random() < sample_rate:
+                # pick the best candidate (exploit)
+                scored.sort()
+                pick = scored[0][1]
+            else:
+                # occasionally pick a random candidate (explore)
+                pick = scored[random.randrange(len(scored))][1]
+            seq.append(pick)
+            remaining.remove(pick)
+            base_cost = workload.get_opt_seq_cost(seq)
+        return workload.get_opt_seq_cost(seq), seq
+
+    def swap_move(seq, i, j):
+        cand = seq.copy()
+        cand[i], cand[j] = cand[j], cand[i]
+        return cand
+
+    def reinsert_move(seq, i, j):
+        cand = seq.copy()
+        t = cand.pop(i)
+        cand.insert(j, t)
+        return cand
+
+    def hybrid_local_search(seq, cost, deadline, anneal=True):
+        # Alternate swap and insertion neighborhoods with
+        # annealing acceptance (small chance of accepting equal
+        # or slightly worse moves early), then greedy polish.
+        n = len(seq)
+        T0 = max(1.0, cost * 0.002)
+        cur_cost, cur = cost, seq.copy()
+        best_cost, best = cost, seq.copy()
+        stall_limit = 4
+        stall = 0
+        while time.time() < deadline:
+            T = T0
+            for round_i in range(6):
+                if time.time() > deadline:
+                    break
+                improved_best = False
+                order = list(range(n))
+                random.shuffle(order)
+                for i in order:
+                    # pick a partner position at random or nearby
+                    for _ in range(4):
+                        if time.time() > deadline:
+                            break
+                        j = random.randrange(n)
+                        if j == i:
+                            continue
+                        # alternate move type
+                        if random.random() < 0.5:
+                            cand = swap_move(cur, i, j)
+                        else:
+                            cand = reinsert_move(cur, i, j)
+                        c = workload.get_opt_seq_cost(cand)
+                        delta = c - cur_cost
+                        if delta < 0:
+                            cur_cost, cur = c, cand
+                            if c < best_cost:
+                                best_cost, best = c, cand.copy()
+                                improved_best = True
+                        elif anneal and delta == 0:
+                            cur_cost, cur = c, cand  # plateau move
+                        elif anneal and delta > 0 and random.random() < pow(2.718, -delta / max(T, 1e-9)):
+                            cur_cost, cur = c, cand
+                    if time.time() > deadline:
+                        break
+                T *= 0.6  # cool
+            if not improved_best:
+                stall += 1
+                if stall >= stall_limit:
+                    break
+            else:
+                stall = 0
+        # Final greedy best-improvement polish on best solution
+        if time.time() < deadline:
+            improved = True
+            while improved and time.time() < deadline:
+                improved = False
+                n_ = len(best)
+                order = list(range(n_))
+                random.shuffle(order)
+                for i in order:
+                    best_delta = 0
+                    best_cand = None
+                    for j in range(n_):
+                        if i == j:
+                            continue
+                        cand = reinsert_move(best, i, j)
+                        c = workload.get_opt_seq_cost(cand)
+                        if c - best_cost < best_delta:
+                            best_delta = c - best_cost
+                            best_cand = cand
+                    if best_cand is not None:
+                        best = best_cand
+                        best_cost += best_delta
+                        improved = True
+        return best_cost, best
+
+    deadline = time.time() + 100
+    best_cost = float('inf')
+    best_seq = None
+    restart = 0
+    while time.time() < deadline:
+        restart += 1
+        # per-restart slice of the remaining budget
+        slice_end = min(deadline, time.time() + max(3.0, (deadline - time.time()) / 3.0))
+        cost, seq = build_sequence()
+        cost, seq = hybrid_local_search(seq, cost, slice_end)
+        if cost < best_cost:
+            best_cost = cost
+            best_seq = seq
+        if restart >= 30:
+            break
+
+    return best_cost, best_seq
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

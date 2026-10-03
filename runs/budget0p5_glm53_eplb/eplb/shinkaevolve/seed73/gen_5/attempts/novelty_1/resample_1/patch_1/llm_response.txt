@@ -1,0 +1,119 @@
+<NAME>
+vectorized_packing_with_local_search_refinement
+
+</NAME>
+<DESCRIPTION>
+The current `balanced_packing` runs a pure-Python double loop (one iteration per layer × per expert group) with a Python `min(...)` over packs for every single item, which dominates the algorithm's runtime (times_algorithm score 0.56, speed_score 0.00). It also produces unbalanced packs because it never revisits its greedy decisions.
+
+Two changes, both inside `balanced_packing`:
+
+1. **Vectorized greedy best-fit across layers**: instead of looping over layers and items in Python (O(num_layers × num_groups) Python iterations, each doing a Python `min` over packs), we loop only over the item-step `t` (num_groups iterations) and process all layers at once with `masked_fill`/`argmin`/`scatter_add`. This removes the per-layer Python loop entirely and turns the inner pack-selection into one vectorized op per step.
+
+2. **Local-search refinement for better balance**: after the greedy pass, run a bounded (8 rounds) vectorized refinement that swaps the heaviest item of the currently-heaviest pack with the lightest item of the currently-lightest pack whenever it strictly reduces the pack-weight spread (`2*(w_heavy - w_light) > spread`). Since packs always hold an equal number of items, swapping preserves the cardinality constraint while reducing the makespan. Ranks are recomputed at the end via a stable sort (each pack occupies exactly `groups_per_pack` consecutive sorted positions, so ranks follow arithmetically).
+
+This improves both goals: pack weights are measurably more balanced (better balancedness of per-GPU loads, since both Step 1 group-packing and Step 3 physical-expert-packing call this function), and execution is much faster (no per-item Python work, no `.cpu()` sync, no Python `min` scans).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    device = weight.device
+    w = weight.float()
+    order = w.argsort(-1, descending=True)
+    sorted_w = w.gather(-1, order)
+
+    pack_weights = torch.zeros(num_layers, num_packs, device=device)
+    pack_counts = torch.zeros(num_layers,
+                              num_packs,
+                              dtype=torch.int64,
+                              device=device)
+    pack_index = torch.empty(num_layers,
+                             num_groups,
+                             dtype=torch.int64,
+                             device=device)
+    rank_in_pack = torch.empty(num_layers,
+                               num_groups,
+                               dtype=torch.int64,
+                               device=device)
+    one_w = torch.ones(num_layers, 1, device=device)
+    one_c = torch.ones(num_layers, 1, dtype=torch.int64, device=device)
+
+    # Greedy best-fit, vectorized over layers: at each step, every layer
+    # places its next-heaviest remaining group into its least-loaded pack
+    # that is not yet full.
+    for t in range(num_groups):
+        masked = pack_weights.masked_fill(pack_counts >= groups_per_pack,
+                                          float("inf"))
+        pack = masked.argmin(-1, keepdim=True)  # [num_layers, 1]
+        item = order[:, t:t + 1]
+        pack_index.scatter_(1, item, pack)
+        rank_in_pack.scatter_(1, item, pack_counts.gather(1, pack))
+        pack_weights.scatter_add_(1, pack, sorted_w[:, t:t + 1])
+        pack_counts.scatter_add_(1, pack, one_c)
+
+    # Local search refinement: swap the heaviest item of the heaviest pack
+    # with the lightest item of the lightest pack while it strictly reduces
+    # the spread between them. Swaps preserve the per-pack item counts.
+    for _ in range(8):
+        max_pack = pack_weights.argmax(-1, keepdim=True)
+        min_pack = pack_weights.argmin(-1, keepdim=True)
+        heavy_item = w.masked_fill(
+            pack_index != max_pack, -float("inf")).argmax(-1, keepdim=True)
+        light_item = w.masked_fill(
+            pack_index != min_pack, float("inf")).argmin(-1, keepdim=True)
+        w_heavy = w.gather(1, heavy_item)
+        w_light = w.gather(1, light_item)
+        spread = (pack_weights.gather(1, max_pack) -
+                  pack_weights.gather(1, min_pack))
+        improve = (2 * (w_heavy - w_light) > spread) & (w_heavy > w_light)
+        if not improve.any():
+            break
+        # Only modify entries where the swap improves; elsewhere keep the
+        # item's current pack so nothing is corrupted.
+        pack_index.scatter_(
+            1, heavy_item,
+            torch.where(improve, min_pack, pack_index.gather(1, heavy_item)))
+        pack_index.scatter_(
+            1, light_item,
+            torch.where(improve, max_pack, pack_index.gather(1, light_item)))
+        zero = torch.zeros_like(w_heavy)
+        pack_weights.scatter_add_(1, max_pack,
+                                  torch.where(improve, w_light - w_heavy,
+                                              zero))
+        pack_weights.scatter_add_(1, min_pack,
+                                  torch.where(improve, w_heavy - w_light,
+                                              zero))
+
+    # Recompute ranks: every pack holds exactly `groups_per_pack` items and
+    # packs appear in sorted order, so the rank within the pack follows
+    # arithmetically from the position after a stable sort by pack id.
+    sorted_items = pack_index.argsort(-1, stable=True)
+    sorted_packs = pack_index.gather(-1, sorted_items)
+    positions = torch.arange(num_groups, device=device).expand(
+        num_layers, -1)
+    ranks_sorted = positions - sorted_packs * groups_per_pack
+    rank_in_pack = torch.empty_like(pack_index)
+    rank_in_pack.scatter_(1, sorted_items, ranks_sorted)
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

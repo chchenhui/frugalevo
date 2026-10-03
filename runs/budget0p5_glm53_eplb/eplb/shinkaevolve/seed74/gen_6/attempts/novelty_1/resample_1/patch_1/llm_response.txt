@@ -1,0 +1,64 @@
+<NAME>
+vectorize_balanced_packing
+
+<DESCRIPTION>
+The dominant cost of the algorithm is `balanced_packing`: it sorts indices to CPU and then runs a pure-Python double loop over `num_layers × num_groups` items, doing a Python `min` over packs each iteration. This makes execution time scale with layers × experts and forces repeated small tensor indexing (very slow in Python).
+
+Key observation: after sorting each layer's weights in descending order, the greedy LPT assignment is sequential only across items *within* a layer — it is independent across layers. So we can process item step `j` for **all layers simultaneously** with vectorized tensor ops: keep `pack_weights` and `pack_items` as `[num_layers, num_packs]` tensors, mask full packs with `inf`, take a batched `argmin`, and scatter-add. The Python loop shrinks from `num_layers * num_groups` iterations to just `num_groups` iterations of vectorized torch ops, each doing O(num_layers × num_packs) work in C.
+
+Tie-breaking is preserved (argmin picks the lowest pack index, matching the previous `min(..., key=pack_weights.__getitem__)` behavior since packs were appended in index order), so the produced assignment is identical to the original algorithm — no change in balancedness, only a large drop in runtime (which directly lifts `times_algorithm` / `speed_score`, currently the weakest component of the combined score at 0.00).
+
+Additionally, this removes the `.cpu()` sync per layer and the per-item `.item()`-style indexing overhead entirely.
+
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    indices = weight.float().sort(-1, descending=True).indices
+    pack_index = torch.full((num_layers, num_groups),
+                            fill_value=-1,
+                            dtype=torch.int64,
+                            device=weight.device)
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    # Vectorized greedy (LPT) packing: process the j-th heaviest item of
+    # every layer simultaneously. Identical result to the original
+    # per-item Python loop, but with only `num_groups` vectorized steps.
+    pack_weights = weight.new_zeros((num_layers, num_packs))
+    pack_items = torch.zeros((num_layers, num_packs),
+                             dtype=torch.int64,
+                             device=weight.device)
+    layer_ids = torch.arange(num_layers, device=weight.device)
+    for j in range(num_groups):
+        group = indices[:, j]
+        # Packs that are already full are masked out with +inf.
+        masked_weights = pack_weights.masked_fill(
+            pack_items >= groups_per_pack, float("inf"))
+        pack = masked_weights.argmin(-1)
+        pack_index[layer_ids, group] = pack
+        rank_in_pack[layer_ids, group] = pack_items[layer_ids, pack]
+        pack_weights[layer_ids, pack] += weight[layer_ids, group]
+        pack_items[layer_ids, pack] += 1
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+
+</DIFF>

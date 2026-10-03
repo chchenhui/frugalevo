@@ -1,0 +1,234 @@
+# EVOLVE-BLOCK-START
+import time
+import numpy as np
+from itertools import combinations
+
+_N = 13
+_TRI = np.array(list(combinations(range(_N), 3)))
+_T0 = _TRI[:, 0]
+_T1 = _TRI[:, 1]
+_T2 = _TRI[:, 2]
+
+
+def _hull_area(pts):
+    """Monotone chain convex hull area (0 if degenerate)."""
+    P = sorted(map(tuple, np.round(pts, 12)))
+    P = list(dict.fromkeys(P))
+    if len(P) < 3:
+        return 0.0
+
+    def cross(o, a, b):
+        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+
+    lo, up = [], []
+    for p in P:
+        while len(lo) >= 2 and cross(lo[-2], lo[-1], p) <= 0:
+            lo.pop()
+        lo.append(p)
+    for p in reversed(P):
+        while len(up) >= 2 and cross(up[-2], up[-1], p) <= 0:
+            up.pop()
+        up.append(p)
+    hull = lo[:-1] + up[:-1]
+    if len(hull) < 3:
+        return 0.0
+    H = np.array(hull)
+    x, y = H[:, 0], H[:, 1]
+    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def _min_area_row(pts):
+    """(min triangle area, argmin row) over all 286 triangles."""
+    A = pts[_T0]
+    u = pts[_T1] - A
+    v = pts[_T2] - A
+    c = np.abs(u[:, 0]*v[:, 1] - u[:, 1]*v[:, 0])
+    k = int(np.argmin(c))
+    return 0.5 * c[k], k
+
+
+def _score(pts):
+    ha = _hull_area(pts)
+    if ha <= 1e-12:
+        return 0.0
+    m, _ = _min_area_row(pts)
+    return m / ha
+
+
+def _candidate(x, rng, sigma, cur_row):
+    """Generate a move proposal (mostly bottleneck-directed pushes)."""
+    cand = x.copy()
+    if rng.random() < 0.15:
+        i = int(rng.integers(_N))
+        cand[i] = cand[i] + rng.normal(0.0, sigma, 2)
+        return cand
+    tri = _TRI[cur_row]
+    i = int(rng.choice(tri))
+    j, k = [int(t) for t in tri if t != i]
+    d = x[k] - x[j]
+    nd = np.linalg.norm(d)
+    if nd < 1e-9:
+        cand[i] = cand[i] + rng.normal(0.0, sigma, 2)
+        return cand
+    perp = np.array([-d[1], d[0]]) / nd
+    v = x[i] - x[j]
+    if np.dot(perp, v) < 0:
+        perp = -perp
+    step = abs(rng.normal(0.0, sigma))
+    cand[i] = x[i] + perp * step + rng.normal(0.0, 0.25 * sigma, 2)
+    return cand
+
+
+def _anneal(x, rng, deadline, T0=1e-3, sig0=0.04):
+    """Simulated annealing with bottleneck-directed proposals."""
+    x = np.asarray(x, dtype=float).copy()
+    m, row = _min_area_row(x)
+    ha = _hull_area(x)
+    sc = m / ha if ha > 1e-12 else 0.0
+    best, best_sc = x.copy(), sc
+    T = T0
+    sigma = sig0
+    stall = 0
+    while time.time() < deadline:
+        for _ in range(200):
+            cand = _candidate(x, rng, sigma, row)
+            cha = _hull_area(cand)
+            if cha <= 1e-12:
+                continue
+            cm, crow = _min_area_row(cand)
+            csc = cm / cha
+            d = csc - sc
+            if d > 0 or rng.random() < np.exp(d / max(T, 1e-12)):
+                x, sc, row = cand, csc, crow
+                if sc > best_sc + 1e-15:
+                    best, best_sc = cand.copy(), sc
+                    stall = 0
+        stall += 1
+        T = max(T * 0.90, 1e-7)
+        if stall > 3:
+            sigma = max(sigma * 0.7, 1e-4)
+            stall = 0
+        else:
+            sigma = min(sigma * 1.1, 0.05)
+    return best, best_sc
+
+
+def _polish(x, deadline, rng):
+    """Deterministic greedy polish: small axis + perpendicular moves on
+    bottleneck-triangle vertices, shrinking step until convergence."""
+    x = np.asarray(x, dtype=float).copy()
+    sc = _score(x)
+    m, row = _min_area_row(x)
+    sigma = 2e-3
+    while sigma > 1e-6 and time.time() < deadline:
+        improved = False
+        for _ in range(60):
+            if time.time() >= deadline:
+                break
+            tri = _TRI[row]
+            i = int(tri[rng.integers(3)])
+            for dvec in (np.array([sigma, 0.0]), np.array([-sigma, 0.0]),
+                         np.array([0.0, sigma]), np.array([0.0, -sigma]),
+                         np.array([sigma, sigma]), np.array([-sigma, -sigma]),
+                         np.array([sigma, -sigma]), np.array([-sigma, sigma])):
+                cand = x.copy()
+                cand[i] = cand[i] + dvec
+                csc = _score(cand)
+                if csc > sc + 1e-14:
+                    x, sc = cand, csc
+                    _, row = _min_area_row(x)
+                    improved = True
+                    break
+        if not improved:
+            sigma *= 0.5
+    return x, sc
+
+
+def _seeds(rng):
+    t = np.linspace(0, 2*np.pi, _N, endpoint=False)
+    seeds = []
+    # regular 13-gon
+    seeds.append(np.column_stack([np.cos(t), np.sin(t)]))
+    # ellipse
+    seeds.append(np.column_stack([1.3*np.cos(t), 0.75*np.sin(t)]))
+    # perturbed 13-gon
+    s = np.column_stack([np.cos(t), np.sin(t)]) + rng.normal(0, 0.08, (_N, 2))
+    seeds.append(s)
+    # two-arc cluster 7 + 6
+    tA = np.linspace(-0.6*np.pi, 0.4*np.pi, 7)
+    tB = np.linspace(0.4*np.pi, 1.4*np.pi, 6)
+    seeds.append(np.vstack([np.column_stack([np.cos(tA), np.sin(tA)]),
+                            0.9*np.column_stack([np.cos(tB), np.sin(tB)])]))
+    # rounded-square superellipse
+    seeds.append(np.column_stack(
+        [np.sign(np.cos(t))*np.abs(np.cos(t))**0.5,
+         np.sign(np.sin(t))*np.abs(np.sin(t))**0.5]))
+    # spiral
+    kk = np.arange(_N)
+    rad = 0.15 + 0.85*kk/(_N-1)
+    ang = 2.4*kk
+    seeds.append(np.column_stack([rad*np.cos(ang), rad*np.sin(ang)]))
+    # 7 outer + 6 inner
+    t7 = np.linspace(0, 2*np.pi, 7, endpoint=False)
+    t6 = np.linspace(0, 2*np.pi, 6, endpoint=False) + np.pi/6
+    seeds.append(np.vstack([np.column_stack([np.cos(t7), np.sin(t7)]),
+                            0.45*np.column_stack([np.cos(t6), np.sin(t6)])]))
+    # 12-ring + center
+    t12 = np.linspace(0, 2*np.pi, 12, endpoint=False)
+    seeds.append(np.vstack([np.column_stack([np.cos(t12), np.sin(t12)]),
+                            [[0.0, 0.0]]]))
+    # random disk
+    ang = rng.uniform(0, 2*np.pi, _N)
+    r = np.sqrt(rng.uniform(0.1, 1.0, _N))
+    seeds.append(np.column_stack([r*np.cos(ang), r*np.sin(ang)]))
+    return seeds
+
+
+def _fallback():
+    t = np.linspace(0, 2*np.pi, _N, endpoint=False)
+    return np.column_stack([np.cos(t), np.sin(t)])
+
+
+def heilbronn_convex13() -> np.ndarray:
+    try:
+        rng = np.random.default_rng(seed=42)
+        t_start = time.time()
+        budget = 8.0
+
+        seeds = _seeds(rng)
+        n_seeds = len(seeds)
+        best_pts, best_sc = _fallback(), _score(_fallback())
+
+        # Phase 1: anneal each seed with an equal share of ~70% of budget
+        p1 = t_start + 0.70 * budget
+        per = 0.70 * budget / n_seeds
+        for k, s in enumerate(seeds):
+            deadline = min(t_start + (k + 1) * per, p1)
+            if time.time() >= deadline:
+                break
+            pts, sc = _anneal(np.asarray(s, dtype=float), rng, deadline)
+            if sc > best_sc:
+                best_sc, best_pts = sc, pts.copy()
+
+        # Phase 2: kick-restart annealing from incumbent
+        while time.time() - t_start < budget - 0.6:
+            kick = best_pts + rng.normal(0, 0.06, best_pts.shape)
+            deadline = min(time.time() + 0.4, t_start + budget - 0.5)
+            pts, sc = _anneal(kick, rng, deadline, T0=2e-4, sig0=0.02)
+            if sc > best_sc:
+                best_sc, best_pts = sc, pts.copy()
+
+        # Phase 3: deterministic greedy polish
+        pts, sc = _polish(best_pts.copy(), t_start + budget, rng)
+        if sc > best_sc:
+            best_sc, best_pts = sc, pts.copy()
+
+        best_pts = np.asarray(best_pts, dtype=float)
+        if (not np.all(np.isfinite(best_pts))) or best_pts.shape != (_N, 2):
+            return _fallback()
+        return best_pts
+    except Exception:
+        return _fallback()
+
+
+# EVOLVE-BLOCK-END

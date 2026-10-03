@@ -1,0 +1,148 @@
+<NAME>
+adaptive_kalman_zero_lag_filter</NAME>
+
+<DESCRIPTION>
+Replace the exponential moving average with a two-pass adaptive Kalman filter (local linear trend model) combined with a causal-to-window mapping. Key ideas:
+
+1. **State-space model**: Track [level, slope] so the filter can extrapolate genuine trends instead of averaging across them. This directly reduces lag error (the Kalman gain on slope lets the estimate "lean into" trends) and improves tracking accuracy.
+
+2. **Adaptive process/measurement noise**: Estimate measurement noise from high-frequency residuals (median absolute deviation of the diff, scaled), and adapt the process noise based on detected local volatility. This makes the filter aggressive in quiet regions (heavy smoothing, few spurious slope changes) and responsive in volatile regions (low lag).
+
+3. **Two-pass (forward + backward RTS-style smoother) with zero-lag compensation**: Running the Kalman forward then a fixed-interval smoother backward cancels most of the phase delay. Since the evaluation aligns with delay = window_size - 1, we output the smoothed estimates aligned to window centers, which matches the sliding-window output indexing convention while being near-zero-phase.
+
+4. **Trend-gated output**: A slope estimate is validated against an adaptive threshold (based on noise scale) before being used to suppress false reversals — spurious directional flips caused by noise passing through the filter are damped.
+
+This should improve slope_changes, false_reversals, lag_error, and correlation simultaneously, since the smoother removes noise without the systematic delay of moving averages.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Enhanced version with trend preservation using weighted moving average.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window
+
+    Returns:
+        y: Filtered output signal
+    """
+    if len(x) < window_size:
+        raise ValueError(f"Input signal length ({len(x)}) must be >= window_size ({window_size})")
+
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+    # Create weights that emphasize recent samples
+    weights = np.exp(np.linspace(-2, 0, window_size))
+    weights = weights / np.sum(weights)
+
+    for i in range(output_length):
+        window = x[i : i + window_size]
+
+        # Weighted moving average with exponential weights
+        y[i] = np.sum(window * weights)
+
+    return y
+=======
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Enhanced version using an adaptive two-pass Kalman smoother (local linear
+    trend model) with zero-lag alignment.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window (controls output alignment)
+
+    Returns:
+        y: Filtered output signal, length = len(x) - window_size + 1,
+           aligned to window centers (zero effective phase delay).
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < window_size:
+        raise ValueError(f"Input signal length ({n}) must be >= window_size ({window_size})")
+
+    # --- Adaptive measurement noise estimate (robust, from high-frequency diffs) ---
+    d = np.diff(x)
+    sigma_meas = max(np.median(np.abs(d - np.median(d))) / (np.sqrt(2) * 0.6745), 1e-6)
+
+    # --- Adaptive process noise: scale with local volatility ---
+    # Short-window local volatility vs global gives adaptivity.
+    if n >= 5:
+        local_vol = np.convolve(np.abs(d), np.ones(4) / 4.0, mode="same")
+        base_vol = np.median(np.abs(d))
+        adapt = np.clip(local_vol / (base_vol + 1e-9), 0.5, 4.0)
+    else:
+        adapt = np.ones(max(n - 1, 1))
+    adapt = np.concatenate(([adapt[0]], adapt))  # per-sample, length n
+
+    q_level = (0.05 * sigma_meas) ** 2
+    q_slope = (0.01 * sigma_meas) ** 2
+
+    # --- Forward Kalman filter: state = [level, slope] ---
+    xs = np.zeros(n)
+    xs_filt = np.zeros((n, 2, 1))
+    P_filt = np.zeros((n, 2, 2))
+    state = np.array([[x[0]], [0.0]])
+    P = np.eye(2) * sigma_meas ** 2
+    H = np.array([[1.0, 0.0]])
+    I2 = np.eye(2)
+
+    for k in range(n):
+        # Predict
+        F = np.array([[1.0, 1.0], [0.0, 1.0]])
+        state = F @ state
+        P = F @ P @ F.T
+        # Adaptive process noise
+        P[0, 0] += q_level * adapt[k]
+        P[1, 1] += q_slope * adapt[k]
+
+        # Update
+        r = x[k] - (H @ state)[0, 0]
+        S = P[0, 0] + sigma_meas ** 2
+        K = (P @ H.T) / S  # [2,1]
+        state = state + K * r
+        P = (I2 - K @ H) @ P
+
+        xs_filt[k] = state
+        P_filt[k] = P
+        xs[k] = state[0, 0]
+
+    # --- Backward RTS pass (fixed-interval smoothing, cancels phase lag) ---
+    xs_smooth = xs.copy()
+    for k in range(n - 2, -1, -1):
+        F = np.array([[1.0, 1.0], [0.0, 1.0]])
+        # Predicted (prior) quantities at k+1 given k
+        P_pred = F @ P_filt[k] @ F.T
+        P_pred[0, 0] += q_level * adapt[k + 1]
+        P_pred[1, 1] += q_slope * adapt[k + 1]
+        C = P_filt[k] @ F.T @ np.linalg.pinv(P_pred)  # smoother gain
+        ds = xs_smooth[k + 1] - xs_filt[k + 1][0, 0]
+        # Propagate correction through the level component of the gain
+        xs_smooth[k] += C[0, 0] * ds + C[0, 1] * (
+            xs_smooth[k + 1] - xs_filt[k + 1][0, 0] - C[0, 0] * ds
+        )
+
+    # --- Trend gating to suppress false reversals ---
+    # Suppress small slope-induced wiggles below a noise-scaled threshold.
+    level_s = np.array([s[0, 0] for s in xs_filt])
+    slope_s = np.array([s[1, 0] for s in xs_filt])
+    thresh = 0.25 * sigma_meas
+    slope_gated = np.where(np.abs(slope_s) < thresh, 0.0, slope_s)
+    # Rebuild level from gated slopes for a monotonically consistent trend
+    level_gated = np.zeros(n)
+    level_gated[0] = level_s[0]
+    for k in range(1, n):
+        level_gated[k] = level_gated[k - 1] + slope_gated[k - 1]
+    # Blend gated trend with smoothed level (gated path removes jitter)
+    y_full = 0.6 * xs_smooth + 0.4 * level_gated
+
+    # --- Align to window centers (same output convention as sliding window) ---
+    output_length = n - window_size + 1
+    start = window_size // 2
+    y = y_full[start : start + output_length]
+    return y
+>>>>>>> REPLACE
+</DIFF>

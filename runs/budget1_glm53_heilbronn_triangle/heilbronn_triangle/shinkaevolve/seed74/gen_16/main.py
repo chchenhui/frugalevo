@@ -1,0 +1,139 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+
+def _in_triangle(pts):
+    """Project points back inside the equilateral triangle (barycentric clamp)."""
+    A = np.array([0.0, 0.0])
+    B = np.array([1.0, 0.0])
+    C = np.array([0.5, np.sqrt(3.0) / 2.0])
+    out = np.empty_like(pts)
+    for i, p in enumerate(pts):
+        best = None
+        best_d = np.inf
+        # vertices
+        for v in (A, B, C):
+            d = np.dot(p - v, p - v)
+            if d < best_d:
+                best_d, best = d, v
+        out[i] = p
+        # clamp to each edge
+        for U, V in ((A, B), (B, C), (C, A)):
+            e = V - U
+            t = np.dot(p - U, e) / np.dot(e, e)
+            t = max(0.0, min(1.0, t))
+            q = U + t * e
+            d = np.dot(p - q, p - q)
+            if d < best_d and d > 0:
+                best_d, best = d, q
+        # if inside triangle, keep as is; else take closest boundary point
+        # check inside via barycentric
+        v0, v1, v2 = B - A, C - A, p - A
+        d00 = np.dot(v0, v0); d01 = np.dot(v0, v1); d11 = np.dot(v1, v1)
+        d20 = np.dot(v2, v0); d21 = np.dot(v2, v1)
+        den = d00 * d11 - d01 * d01
+        u = (d11 * d20 - d01 * d21) / den
+        v = (d00 * d21 - d01 * d20) / den
+        if u >= 0 and v >= 0 and u + v <= 1:
+            out[i] = p
+        else:
+            out[i] = best
+    return out
+
+
+def _min_area(pts):
+    """Vectorized minimum absolute triangle area over all triplets."""
+    tri = np.array(list(combinations(range(len(pts)), 3)))
+    a = pts[tri[:, 0]]
+    b = pts[tri[:, 1]]
+    c = pts[tri[:, 2]]
+    areas = 0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+                         (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+    return areas.min()
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    n = 11
+    h = np.sqrt(3.0) / 2.0
+
+    # Structured initial layout: 3 vertices + ring of points inside
+    pts = [np.array([0.0, 0.0]), np.array([1.0, 0.0]), np.array([0.5, h])]
+    # add interior points on two concentric hexagonal-ish rings
+    for r, k in ((0.45, 3), (0.22, 5)):
+        for j in range(k):
+            ang = 2.0 * np.pi * j / k + (0.3 if r < 0.4 else 0.0)
+            x = 0.5 + r * np.cos(ang) * 0.6
+            y = h / 3.0 + r * np.sin(ang) * 0.6
+            pts.append(np.array([x, y]))
+    pts = _in_triangle(np.array(pts))
+
+    rng = np.random.default_rng(20240611)
+    cur = _min_area(pts)
+    T = 0.01
+    best_pts = pts.copy()
+    best = cur
+    for it in range(20000):
+        T = 0.01 * (1.0 - it / 20000.0) + 1e-5
+        i = rng.integers(0, n)
+        step = T * rng.normal(0, 1, 2)
+        cand = pts.copy()
+        cand[i] += step
+        cand = _in_triangle(cand)
+        val = _min_area(cand)
+        if val >= cur or rng.random() < np.exp((val - cur) / (T * 1e-3)):
+            pts, cur = cand, val
+            if val > best:
+                best, best_pts = val, pts.copy()
+    # Global coordinated-move + local-refine cycles to escape single-point local optima
+    pts = best_pts.copy()
+    cur = best
+    SIGMAS = (0.02, 0.01, 0.005)
+    for sigma in SIGMAS:
+        improved_any = True
+        rounds = 0
+        while improved_any and rounds < 30:
+            improved_any = False
+            rounds += 1
+            # global shake: move ALL points at once
+            for _ in range(60):
+                cand = _in_triangle(pts + rng.normal(0, sigma, pts.shape))
+                val = _min_area(cand)
+                if val > cur:
+                    pts, cur = cand, val
+                    improved_any = True
+            # local single-point refinement after each shake batch
+            for _ in range(1500):
+                i = rng.integers(0, n)
+                cand = pts.copy()
+                cand[i] += rng.normal(0, sigma * 0.2, 2)
+                cand = _in_triangle(cand)
+                val = _min_area(cand)
+                if val > cur:
+                    pts, cur = cand, val
+                    improved_any = True
+
+    # Deterministic pattern polish: try axis + diagonal moves per point
+    dirs = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+    steps = [0.004, 0.002, 0.001, 0.0005, 0.0002]
+    improved = True
+    while improved:
+        improved = False
+        for i in range(n):
+            for d in dirs:
+                for s in steps:
+                    cand = pts.copy()
+                    cand[i] = cand[i] + np.array(d) * s
+                    cand = _in_triangle(cand)
+                    val = _min_area(cand)
+                    if val > cur + 1e-15:
+                        pts, cur = cand, val
+                        improved = True
+                        break
+                else:
+                    continue
+                break
+    return pts
+
+
+# EVOLVE-BLOCK-END

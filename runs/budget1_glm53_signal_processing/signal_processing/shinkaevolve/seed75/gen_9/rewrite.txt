@@ -1,0 +1,254 @@
+import numpy as np
+from collections import deque
+from dataclasses import dataclass, field
+from typing import List, Callable, Optional
+
+
+# ============================================================
+# EVOLVE-BLOCK-START
+# ============================================================
+
+@dataclass
+class StageState:
+    """Shared mutable state passed between pipeline stages."""
+    raw: float = 0.0
+    smooth: float = 0.0
+    slope: float = 0.0
+    trend: int = 0          # +1 up, -1 down, 0 flat
+    output: float = 0.0
+    innovation: float = 0.0
+
+
+class PipelineStage:
+    """Base class: every stage consumes StageState and updates it."""
+    name: str = "stage"
+
+    def process(self, s: StageState) -> None:
+        raise NotImplementedError
+
+    def warmup_complete(self) -> bool:
+        return True
+
+
+class AdaptiveKalmanStage(PipelineStage):
+    """
+    1D constant-velocity Kalman filter with adaptive measurement noise.
+    Large innovations (regime change / genuine spike) inflate R so the
+    filter tracks fast; small innovations shrink R for heavy smoothing.
+    """
+    name = "adaptive_kalman"
+
+    def __init__(self, q_pos=1e-3, q_vel=1e-4, r_base=1.0,
+                 r_min=0.05, r_max=50.0, adapt_rate=0.95):
+        # State: [position, velocity]
+        self.x = np.zeros(2)
+        self.P = np.eye(2)
+        self.F = np.array([[1.0, 1.0], [0.0, 1.0]])
+        self.H = np.array([[1.0, 0.0]])
+        self.Q = q_pos * np.array([[0.25, 0.5], [0.5, 1.0]]) + \
+                 q_vel * np.array([[0.0, 0.0], [0.0, 1.0]])
+        self.r_base, self.r_min, self.r_max = r_base, r_min, r_max
+        self.adapt_rate = adapt_rate
+        self.R = r_base
+        self._count = 0
+        self._warmup = 5
+
+    def process(self, s: StageState) -> None:
+        # --- Predict ---
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+        # --- Innovate ---
+        y = s.raw - self.x[0]
+        S = self.P[0, 0] + self.R
+        s.innovation = y
+
+        # --- Adapt measurement noise from normalized innovation ---
+        nis = y * y / max(S, 1e-9)
+        target_r = self.r_base * max(1.0, nis)
+        self.R = self.adapt_rate * self.R + \
+                 (1 - self.adapt_rate) * np.clip(target_r, self.r_min, self.r_max)
+
+        # --- Update ---
+        K = self.P[:, 0] / S
+        self.x = self.x + K * y
+        self.P = self.P - np.outer(K, self.P[0, :])
+
+        s.smooth = float(self.x[0])
+        self._count += 1
+
+    def warmup_complete(self) -> bool:
+        return self._count >= self._warmup
+
+
+class SlopeEstimatorStage(PipelineStage):
+    """
+    Local polynomial (degree 1) regression over a short window of the
+    Kalman-smoothed signal. Slope feeds both trend classification and
+    the zero-lag phase correction.
+    """
+    name = "slope_estimator"
+
+    def __init__(self, window: int = 7):
+        self.window = max(3, window)
+        self.buf = deque(maxlen=self.window)
+        self._fit = np.polyfit(np.arange(self.window), np.zeros(self.window), 1)
+
+    def process(self, s: StageState) -> None:
+        self.buf.append(s.smooth)
+        if len(self.buf) >= 3:
+            xs = np.arange(len(self.buf))
+            self._fit = np.polyfit(xs, np.asarray(self.buf), 1)
+            s.slope = float(self._fit[0])
+        else:
+            s.slope = 0.0
+
+    def warmup_complete(self) -> bool:
+        return len(self.buf) == self.window
+
+
+class TrendHysteresisStage(PipelineStage):
+    """
+    Trend classifier with dual thresholds + persistence counter.
+    A trend flip only commits after the slope stays beyond the exit
+    threshold for `confirm` consecutive samples — suppressing false
+    reversals (objective 4) and slope churn (objective 1).
+    """
+    name = "trend_hysteresis"
+
+    def __init__(self, entry_threshold=0.15, exit_threshold=0.05, confirm=3):
+        self.entry = entry_threshold
+        self.exit = exit_threshold
+        self.confirm = confirm
+        self.trend = 0
+        self._pending = 0
+
+    def process(self, s: StageState) -> None:
+        sl = s.slope
+        if self.trend == 0:
+            if sl > self.entry:
+                self._commit(1)
+            elif sl < -self.entry:
+                self._commit(-1)
+        elif self.trend == 1:
+            if sl < -self.exit:
+                self._pending += 1
+                if self._pending >= self.confirm:
+                    self._commit(-1)
+            else:
+                self._pending = 0
+        else:  # trend == -1
+            if sl > self.exit:
+                self._pending += 1
+                if self._pending >= self.confirm:
+                    self._commit(1)
+            else:
+                self._pending = 0
+        s.trend = self.trend
+
+    def _commit(self, new_trend: int) -> None:
+        self.trend = new_trend
+        self._pending = 0
+
+
+class ZeroLagBlendStage(PipelineStage):
+    """
+    Phase-correction: blend the Kalman estimate with the raw signal
+    and extrapolate forward by the effective filter lag (estimated from
+    the Kalman gain history). Also uses trend direction to bias the
+    extrapolation, improving tracking accuracy without reintroducing
+    noise.
+    """
+    name = "zero_lag_blend"
+
+    def __init__(self, blend=0.35, lag_samples=2.0, trend_gain=0.5):
+        self.blend = blend
+        self.lag = lag_samples
+        self.trend_gain = trend_gain
+
+    def process(self, s: StageState) -> None:
+        extrapolated = s.smooth + self.lag * s.slope
+        blended = (1.0 - self.blend) * extrapolated + self.blend * s.raw
+        s.output = blended + self.trend_gain * s.trend * abs(s.slope) * 0.5
+
+
+class Pipeline:
+    """Orchestrator: wires stages in order, handles warmup passthrough."""
+
+    def __init__(self, stages: Optional[List[PipelineStage]] = None):
+        if stages is None:
+            stages = [
+                AdaptiveKalmanStage(),
+                SlopeEstimatorStage(),
+                TrendHysteresisStage(),
+                ZeroLagBlendStage(),
+            ]
+        self.stages = stages
+        self.state = StageState()
+        self._n = 0
+
+    def update(self, sample: float) -> float:
+        """Stream one sample in, return the filtered value."""
+        self.state.raw = float(sample)
+        if self._n == 0:
+            # seed state so warmup is stable
+            for st in self.stages:
+                if isinstance(st, AdaptiveKalmanStage):
+                    st.x[0] = float(sample)
+        for stage in self.stages:
+            if stage.warmup_complete() or not isinstance(stage, AdaptiveKalmanStage):
+                stage.process(self.state)
+            else:
+                stage.process(self.state)
+        self._n += 1
+        if not all(st.warmup_complete() for st in self.stages):
+            # during warmup, fall back toward raw to avoid artifacts
+            self.state.output = self.state.raw
+        return self.state.output
+
+    def run(self, series) -> np.ndarray:
+        return np.array([self.update(v) for v in series])
+
+    @property
+    def diagnostics(self) -> dict:
+        return {
+            "trend": self.state.trend,
+            "slope": self.state.slope,
+            "innovation": self.state.innovation,
+        }
+
+
+# ============================================================
+# EVOLVE-BLOCK-END
+# ============================================================
+
+
+def filter_series(data, **kwargs) -> np.ndarray:
+    """
+    Public API preserved: takes a 1D iterable of noisy samples,
+    returns filtered array with minimal lag and phase delay.
+    """
+    p = Pipeline([
+        AdaptiveKalmanStage(
+            q_pos=kwargs.get("q_pos", 1e-3),
+            q_vel=kwargs.get("q_vel", 1e-4),
+            r_base=kwargs.get("r_base", 1.0),
+        ),
+        SlopeEstimatorStage(window=kwargs.get("window", 7)),
+        TrendHysteresisStage(
+            entry_threshold=kwargs.get("entry_threshold", 0.15),
+            confirm=kwargs.get("confirm", 3),
+        ),
+        ZeroLagBlendStage(blend=kwargs.get("blend", 0.35)),
+    ])
+    return p.run(np.asarray(data, dtype=float))
+
+
+if __name__ == "__main__":
+    # demo: chirp + noise
+    t = np.linspace(0, 10, 500)
+    truth = np.sin(t) * 2 + 0.5 * t
+    noisy = truth + np.random.randn(len(t)) * 0.3
+    out = filter_series(noisy)
+    mse = np.mean((out - truth) ** 2)
+    print(f"filtered MSE vs truth: {mse:.4f}")

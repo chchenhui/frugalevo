@@ -1,0 +1,177 @@
+<NAME>
+multi_ordering_lambda_binary_search
+</NAME>
+<DESCRIPTION>
+Replace greedy+local search with a λ-feasibility binary search: for a candidate max-KVPR λ, pack models via first-fit with constraint load_i + w ≤ λ * (free_i - s). Feasibility is monotone in λ, so binary search finds the minimum λ. Run the same search over multiple candidate orderings (density desc, size desc, w desc, s+w desc) and keep the best feasible placement.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # --- Construction: best-fit decreasing by load density ---
+    # Sort by req_rate/slo descending (heaviest pressure first), tie-break by size
+    sorted_models = sorted(
+        models, key=lambda m: (m.req_rate / m.slo, m.model_size), reverse=True
+    )
+
+    for model in sorted_models:
+        best_gpu = None
+        best_kvpr = float('inf')
+        for g in range(gpu_num):
+            if gpu_mem(g) + model.model_size <= GPU_MEM_SIZE:
+                # KVPR of this GPU after placing model
+                remaining = GPU_MEM_SIZE - gpu_mem(g) - model.model_size
+                if remaining <= 0:
+                    continue
+                new_kvpr = (gpu_load(g) + model.req_rate / m.slo) / remaining
+                if new_kvpr < best_kvpr:
+                    best_kvpr = new_kvpr
+                    best_gpu = g
+        if best_gpu is None:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on any GPU."
+            )
+        placement[best_gpu].append(model)
+
+    # --- Local search: rebalance to reduce max KVPR ---
+    improved = True
+    max_iters = 200
+    iters = 0
+    while improved and iters < max_iters:
+        improved = False
+        iters += 1
+        worst, worst_gpus = max_kvpr_gpus()
+
+        for src in worst_gpus:
+            moved = False
+            # Try moving each model from the worst GPU elsewhere
+            for model in placement[src]:
+                for dst in range(gpu_num):
+                    if dst == src:
+                        continue
+                    if gpu_mem(dst) + model.model_size > GPU_MEM_SIZE:
+                        continue
+                    # remove from src
+                    placement[src].remove(model)
+                    placement[dst].append(model)
+                    new_worst = max(kvpr(g) for g in range(gpu_num))
+                    if new_worst < worst:
+                        moved = True
+                        improved = True
+                        break
+                    # revert
+                    placement[dst].remove(model)
+                    placement[src].append(model)
+                if moved:
+                    break
+            if moved:
+                break
+
+            # Try swapping a model from src with a (set of) model(s) on another GPU
+            if not moved:
+                for model in placement[src]:
+                    for dst in range(gpu_num):
+                        if dst == src:
+                            continue
+                        for other in placement[dst]:
+                            # swap sizes must fit both GPUs
+                            src_mem_after = gpu_mem(src) - model.model_size + other.model_size
+                            dst_mem_after = gpu_mem(dst) - other.model_size + model.model_size
+                            if src_mem_after > GPU_MEM_SIZE or dst_mem_after > GPU_MEM_SIZE:
+                                continue
+                            if src_mem_after >= GPU_MEM_SIZE or dst_mem_after >= GPU_MEM_SIZE:
+                                continue
+                            # perform swap
+                            placement[src].remove(model)
+                            placement[dst].remove(other)
+                            placement[src].append(other)
+                            placement[dst].append(model)
+                            new_worst = max(kvpr(g) for g in range(gpu_num))
+                            if new_worst < worst:
+                                moved = True
+                                improved = True
+                                break
+                            # revert
+                            placement[dst].remove(model)
+                            placement[src].remove(other)
+                            placement[src].append(model)
+                            placement[dst].append(other)
+                        if moved:
+                            break
+                    if moved:
+                        break
+            if moved:
+                break
+
+    return placement
+=======
+    # --- λ-feasibility packing with binary search over multiple orderings ---
+    w = [m.req_rate / m.slo for m in models]
+
+    def pack(order, lam):
+        """First-fit packing under max-KVPR constraint lam. Returns placement or None."""
+        pl = {g: [] for g in range(gpu_num)}
+        mem = [0.0] * gpu_num
+        load = [0.0] * gpu_num
+        for idx in order:
+            m = models[idx]
+            placed = False
+            for g in range(gpu_num):
+                new_mem = mem[g] + m.model_size
+                if new_mem >= GPU_MEM_SIZE:
+                    continue
+                free = GPU_MEM_SIZE - new_mem
+                if load[g] + w[idx] <= lam * free + 1e-12:
+                    pl[g].append(m)
+                    mem[g] = new_mem
+                    load[g] += w[idx]
+                    placed = True
+                    break
+            if not placed:
+                return None
+        return pl
+
+    def true_max(pl):
+        worst = 0.0
+        for g in range(gpu_num):
+            mem = sum(m.model_size for m in pl[g])
+            free = GPU_MEM_SIZE - mem
+            if free <= 1e-12:
+                return float('inf')
+            worst = max(worst, sum(m.req_rate / m.slo for m in pl[g]) / free)
+        return worst
+
+    orderings = [
+        sorted(range(len(models)), key=lambda i: w[i] / models[i].model_size, reverse=True),
+        sorted(range(len(models)), key=lambda i: models[i].model_size, reverse=True),
+        sorted(range(len(models)), key=lambda i: w[i], reverse=True),
+        sorted(range(len(models)), key=lambda i: w[i] + models[i].model_size, reverse=True),
+    ]
+
+    best_placement = None
+    best_val = float('inf')
+    for order in orderings:
+        # quick check feasibility at very large lam
+        hi = 1e9
+        probe = pack(order, hi)
+        if probe is None:
+            continue
+        lo = 0.0
+        # binary search on lam
+        for _ in range(60):
+            mid = (lo + hi) / 2.0
+            if pack(order, mid) is not None:
+                hi = mid
+            else:
+                lo = mid
+        pl = pack(order, hi * (1 + 1e-9))
+        if pl is not None:
+            val = true_max(pl)
+            if val < best_val:
+                best_val = val
+                best_placement = pl
+
+    if best_placement is None:
+        raise ValueError("Unable to place models on any GPU.")
+
+    return best_placement
+>>>>>>> REPLACE
+</DIFF>

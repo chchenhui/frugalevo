@@ -1,0 +1,329 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List, Dict, Optional
+
+
+class Evolved(Algorithm):
+    """
+    Character-Trie-aware column reordering via diverse candidate constructions.
+
+    Builds a small bounded set of deterministic candidate per-row column
+    orderings spanning two statistics families:
+      A. global order ranked by sum(len(v) * count(v) * (count(v)-1))
+      B. global order ranked by sum(len(v) * (count(v)-1))  (edge savings)
+      C. conditional partition tree using edge-savings gain
+      D. conditional partition tree using length-weighted repetition
+      E. flat two-level clustering: split once on the highest-repetition
+         column, then rank remaining columns per group by statistic A.
+    Each candidate is scored with the exact ideal Trie reuse objective
+    (sum of adjacent LCPs over sorted serialized rows), and the best wins.
+    All original cells are preserved; only per-row column placement changes.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------
+    # Serialization helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _serialize_value(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, float) and np.isnan(v):
+            return ""
+        if v is pd.NA or v is pd.NaT:
+            return ""
+        try:
+            if v != v:
+                return ""
+        except Exception:
+            pass
+        if isinstance(v, bool):
+            return "True" if v else "False"
+        return str(v)
+
+    def _serialize_column(self, col_series) -> np.ndarray:
+        out = [self._serialize_value(v) for v in col_series.tolist()]
+        return np.array(out, dtype=object)
+
+    # ------------------------------------------------------------------
+    # Exact Trie objective
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        if a == b:
+            return len(a)
+        lo, hi = 0, min(len(a), len(b))
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_score(self, strings: List[str]) -> int:
+        if len(strings) <= 1:
+            return 0
+        arr = sorted(set(strings)) if len(strings) < 4000 else sorted(strings)
+        total = 0
+        prev = arr[0]
+        for s in arr[1:]:
+            if s != prev:
+                total += self._lcp(prev, s)
+                prev = s
+        return total
+
+    # ------------------------------------------------------------------
+    # Column merge blocks
+    # ------------------------------------------------------------------
+    def _build_blocks(self, columns: List[str], col_merge: List[List[str]]) -> List[List[str]]:
+        merged = {}
+        colset = set(columns)
+        for group in col_merge:
+            present = [c for c in group if c in colset]
+            if len(present) >= 2:
+                for c in present:
+                    merged[c] = present
+        blocks, seen = [], set()
+        for c in columns:
+            if c in merged:
+                if c in seen:
+                    continue
+                blocks.append(list(merged[c]))
+                seen.update(merged[c])
+            else:
+                blocks.append([c])
+        return blocks
+
+    # ------------------------------------------------------------------
+    # Statistics
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _stat_freq(ser: np.ndarray) -> float:
+        uniq, counts = np.unique(ser, return_counts=True)
+        lens = np.fromiter((len(u) for u in uniq), dtype=np.int64, count=len(uniq))
+        cnt = counts.astype(np.int64)
+        return float(np.sum(lens * cnt * (cnt - 1)))
+
+    @staticmethod
+    def _stat_edgesave(ser: np.ndarray) -> float:
+        uniq, counts = np.unique(ser, return_counts=True)
+        lens = np.fromiter((len(u) for u in uniq), dtype=np.int64, count=len(uniq))
+        cnt = counts.astype(np.int64)
+        return float(np.sum(lens * (cnt - 1)))
+
+    # ------------------------------------------------------------------
+    # Global order by a statistic
+    # ------------------------------------------------------------------
+    def _global_order(self, blocks, block_sers, stat) -> List[str]:
+        weights = []
+        for block in blocks:
+            ser = np.concatenate([block_sers[c] for c in block]) if len(block) > 1 else block_sers[block[0]]
+            weights.append(stat(ser))
+        order_idx = sorted(range(len(blocks)), key=lambda i: (-weights[i], i))
+        return [c for i in order_idx for c in blocks[i]]
+
+    # ------------------------------------------------------------------
+    # Conditional tree with selectable statistic
+    # ------------------------------------------------------------------
+    def _tree_orders(self, blocks, block_sers, n_rows, stat) -> List[List[str]]:
+        orders: List[List[str]] = [[] for _ in range(n_rows)]
+        all_blocks = list(range(len(blocks)))
+        max_depth = 40
+        min_group = 2
+
+        def block_ser(b, row_indices):
+            block = blocks[b]
+            if len(block) > 1:
+                return np.concatenate([block_sers[c][row_indices] for c in block])
+            return block_sers[block[0]][row_indices]
+
+        def assign(row_indices, remaining, depth):
+            if not remaining:
+                return
+            if len(remaining) == 1 or len(row_indices) <= min_group or depth >= max_depth:
+                tail = [c for b in remaining for c in blocks[b]]
+                for r in row_indices:
+                    orders[r].extend(tail)
+                return
+            best_b, best_w = None, -1.0
+            for b in remaining:
+                w = stat(block_ser(b, row_indices))
+                if w > best_w:
+                    best_w, best_b = w, b
+            if best_w <= 0:
+                tail = [c for b in remaining for c in blocks[b]]
+                for r in row_indices:
+                    orders[r].extend(tail)
+                return
+            block = blocks[best_b]
+            rest = [b for b in remaining if b != best_b]
+            ser = block_ser(best_b, row_indices)
+            uniq, inv = np.unique(ser, return_inverse=True)
+            for r in row_indices:
+                orders[r].extend(block)
+            groups: Dict[int, List[int]] = {}
+            inv_list = inv.tolist() if hasattr(inv, "tolist") else list(inv)
+            for pos, r in enumerate(row_indices):
+                groups.setdefault(int(inv_list[pos]), []).append(r)
+            for g_rows in groups.values():
+                assign(g_rows, rest, depth + 1)
+
+        try:
+            assign(list(range(n_rows)), all_blocks, 0)
+        except RecursionError:
+            fallback = [c for b in all_blocks for c in blocks[b]]
+            return [list(fallback) for _ in range(n_rows)]
+
+        fallback = [c for b in all_blocks for c in blocks[b]]
+        for r in range(n_rows):
+            if len(orders[r]) != len(fallback):
+                orders[r] = list(fallback)
+        return orders
+
+    # ------------------------------------------------------------------
+    # Flat clustering: one split on highest-repetition column,
+    # independent per-group global frequency ranking
+    # ------------------------------------------------------------------
+    def _cluster_orders(self, blocks, block_sers, n_rows) -> List[List[str]]:
+        if len(blocks) <= 1 or n_rows <= 2:
+            base = self._global_order(blocks, block_sers, self._stat_freq)
+            return [list(base) for _ in range(n_rows)]
+
+        best_b, best_w = None, -1.0
+        for b in range(len(blocks)):
+            block = blocks[b]
+            ser = np.concatenate([block_sers[c] for c in block]) if len(block) > 1 else block_sers[block[0]]
+            w = self._stat_freq(ser)
+            if w > best_w:
+                best_w, best_b = w, b
+        if best_b is None or best_w <= 0:
+            base = self._global_order(blocks, block_sers, self._stat_freq)
+            return [list(base) for _ in range(n_rows)]
+
+        block = blocks[best_b]
+        ser = np.concatenate([block_sers[c] for c in block]) if len(block) > 1 else block_sers[block[0]]
+        uniq, inv = np.unique(ser, return_inverse=True)
+        groups: Dict[int, List[int]] = {}
+        inv_list = inv.tolist() if hasattr(inv, "tolist") else list(inv)
+        for r in range(n_rows):
+            groups.setdefault(int(inv_list[r]), []).append(r)
+
+        base_order = self._global_order(blocks, block_sers, self._stat_freq)
+        orders: List[Optional[List[str]]] = [None] * n_rows
+        rest_blocks = [b for b in range(len(blocks)) if b != best_b]
+
+        for g_rows in groups.values():
+            if len(g_rows) <= 1 or len(rest_blocks) <= 1:
+                for r in g_rows:
+                    orders[r] = list(base_order)
+                continue
+            weights = []
+            gidx = np.array(g_rows, dtype=np.int64)
+            for b in rest_blocks:
+                blk = blocks[b]
+                s = np.concatenate([block_sers[c][gidx] for c in blk]) if len(blk) > 1 else block_sers[blk[0]][gidx]
+                weights.append(self._stat_freq(s))
+            order_idx = sorted(range(len(rest_blocks)), key=lambda i: (-weights[i], i))
+            group_order = list(block) + [c for i in order_idx for c in blocks[rest_blocks[i]]]
+            for r in g_rows:
+                orders[r] = list(group_order)
+
+        for r in range(n_rows):
+            if orders[r] is None or sorted(orders[r]) != sorted(base_order):
+                orders[r] = list(base_order)
+        return orders
+
+    # ------------------------------------------------------------------
+    # Row strings for a candidate
+    # ------------------------------------------------------------------
+    def _row_strings(self, orders, block_sers, n_rows) -> List[str]:
+        return ["".join([block_sers[c][r] for c in orders[r]]) for r in range(n_rows)]
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: Optional[int] = None,
+        col_stop: Optional[int] = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        original_columns = list(df.columns)
+        n_rows, n_cols = df.shape
+
+        if n_cols == 0 or n_rows == 0:
+            return df.copy(), []
+
+        block_sers: Dict[str, np.ndarray] = {
+            c: self._serialize_column(df[c]) for c in original_columns
+        }
+        blocks = self._build_blocks(original_columns, col_merge)
+
+        candidates: List[List[List[str]]] = []
+
+        # Candidate A: global frequency-ranked order
+        order_a = self._global_order(blocks, block_sers, self._stat_freq)
+        candidates.append([list(order_a) for _ in range(n_rows)])
+
+        # Candidate B: global edge-savings order (length/frequency tradeoff)
+        order_b = self._global_order(blocks, block_sers, self._stat_edgesave)
+        if order_b != order_a:
+            candidates.append([list(order_b) for _ in range(n_rows)])
+
+        # Conditional trees (bounded width)
+        if n_cols <= 64:
+            try:
+                cand_e = self._tree_orders(blocks, block_sers, n_rows, self._stat_edgesave)
+                if all(sorted(o) == sorted(original_columns) for o in cand_e):
+                    candidates.append(cand_e)
+            except Exception:
+                pass
+            try:
+                cand_f = self._tree_orders(blocks, block_sers, n_rows, self._stat_freq)
+                if all(sorted(o) == sorted(original_columns) for o in cand_f):
+                    if not any(cand_f == c for c in candidates):
+                        candidates.append(cand_f)
+            except Exception:
+                pass
+
+        # Flat clustering candidate
+        try:
+            cand_c = self._cluster_orders(blocks, block_sers, n_rows)
+            if all(sorted(o) == sorted(original_columns) for o in cand_c):
+                candidates.append(cand_c)
+        except Exception:
+            pass
+
+        # Score with exact ideal trie objective, keep the best
+        best_orders = candidates[0]
+        best_score = -1
+        for cand in candidates:
+            strings = self._row_strings(cand, block_sers, n_rows)
+            sc = self._trie_score(strings)
+            if sc > best_score:
+                best_score = sc
+                best_orders = cand
+
+        # Build output preserving all values with per-row column orders
+        raw_vals = {c: df[c].tolist() for c in original_columns}
+        out_arr = np.empty((n_rows, n_cols), dtype=object)
+        for r in range(n_rows):
+            o = best_orders[r]
+            for j, c in enumerate(o):
+                out_arr[r, j] = raw_vals[c][r]
+
+        out_df = pd.DataFrame(out_arr, columns=original_columns, index=df.index)
+        out_df = out_df.astype(object)
+        column_orderings = [list(o) for o in best_orders]
+        return out_df, column_orderings
+# EVOLVE-BLOCK-END

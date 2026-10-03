@@ -1,0 +1,233 @@
+<NAME>
+sparse_lp_multistart_prescreen
+</NAME>
+<DESCRIPTION>
+The current program regressed (2.38) because it uses the slow dense-matrix LP assembly (O(n²) Python loops building a dense A_ub) and only a single-start hill climb that tracks only the current state, so a temporarily bad accepted move can erase progress. The best prior program (2.41, score 0.92) combined the vectorized sparse-CSR LP with a multi-start slack-directed climb and best-ever tracking. I restore that combination and add the recommended cheap geometric pre-screen: before each exact LP call, evaluate the greedy `compute_max_radii` sum (microseconds for n=26); if it falls more than 0.01 below the current basin's sum, reject the trial without solving the LP, since greedy rarely underestimates the LP optimum by more than that margin for small perturbations. This roughly halves the LP calls per iteration, letting each start basin perform many more moves within the same ~1.9s budget, while the row-shift/block-shift collective moves are retained for better exploration of lattice-type packings.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    def lp_radii(centers):
+        radii = compute_max_radii(centers)
+        try:
+            from scipy.optimize import linprog
+
+            A_ub = []
+            b_ub = []
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                    if d < 1e-9:
+                        continue
+                    row = np.zeros(n)
+                    row[i] = 1.0
+                    row[j] = 1.0
+                    A_ub.append(row)
+                    b_ub.append(d)
+            for i in range(n):
+                x, y = centers[i]
+                row = np.zeros(n)
+                row[i] = 1.0
+                A_ub.append(row)
+                b_ub.append(min(x, y, 1 - x, 1 - y))
+            res = linprog(c=-np.ones(n), A_ub=np.array(A_ub),
+                          b_ub=np.array(b_ub), bounds=[(0, None)] * n,
+                          method="highs")
+            if res.success and np.sum(res.x) > np.sum(radii):
+                radii = res.x
+        except Exception:
+            pass
+        return radii
+=======
+    def lp_radii(centers):
+        """Exact optimal radii at fixed centers via vectorized sparse LP:
+        maximize sum(r) s.t. r_i + r_j <= d_ij, r_i <= border distance.
+        Sparse CSR assembly avoids O(n^2) Python loops and dense matrices,
+        so each LP solve is much faster during the search."""
+        radii = compute_max_radii(centers)
+        try:
+            from scipy.optimize import linprog
+            from scipy.sparse import csr_matrix
+
+            ii, jj = np.triu_indices(n, 1)
+            d = np.linalg.norm(centers[ii] - centers[jj], axis=1)
+            keep = d > 1e-9
+            ii, jj, d = ii[keep], jj[keep], d[keep]
+            m = len(d)
+            data = np.ones(2 * m + n)
+            rows_ = np.concatenate([np.arange(m), np.arange(m), m + np.arange(n)])
+            cols_ = np.concatenate([ii, jj, np.arange(n)])
+            A_ub = csr_matrix((data, (rows_, cols_)), shape=(m + n, n))
+            bd = np.minimum.reduce([centers[:, 0], centers[:, 1],
+                                    1.0 - centers[:, 0], 1.0 - centers[:, 1]])
+            b_ub = np.concatenate([d, bd])
+            res = linprog(c=-np.ones(n), A_ub=A_ub, b_ub=b_ub,
+                          bounds=[(0, None)] * n, method="highs")
+            if res.success and np.sum(res.x) > np.sum(radii):
+                radii = res.x
+        except Exception:
+            pass
+        return radii
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    best = None
+    for rows, wide in candidates:
+        for scale in (0.96, 1.0):
+            centers_c = hex_layout(rows, scale=scale, wide_ends=wide)
+            radii_c = lp_radii(centers_c)
+            total_c = np.sum(radii_c)
+            if best is None or total_c > best[2]:
+                best = (centers_c, radii_c, total_c)
+
+    centers, radii, sum_radii = best
+=======
+    # Score all candidate layouts so several can serve as hill-climb starts
+    scored = []
+    for rows, wide in candidates:
+        for scale in (0.96, 1.0):
+            centers_c = hex_layout(rows, scale=scale, wide_ends=wide)
+            radii_c = lp_radii(centers_c)
+            scored.append((np.sum(radii_c), centers_c, radii_c))
+    scored.sort(key=lambda t: -t[0])
+
+    centers, radii, sum_radii = scored[0][1], scored[0][2], scored[0][0]
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    try:
+        import time
+        rng = np.random.default_rng(0)
+        deadline = time.time() + 1.6
+        step = 0.02
+        while time.time() < deadline:
+            u = rng.random()
+            trial = centers.copy()
+            if u < 0.10:
+                # Row-shift: translate all centers in a horizontal band
+                # (within sqrt(3)/2 * spacing tolerance of a chosen y-level)
+                # by a small common delta. Preserves intra-row spacing and
+                # lets rows slide toward better wall alignment.
+                anchor = int(rng.integers(n))
+                band = 0.055
+                mask = np.abs(centers[:, 1] - centers[anchor, 1]) < band
+                delta = rng.uniform(-1.0, 1.0) * max(0.005, step * 0.5)
+                trial[mask, 0] += delta
+                trial = np.clip(trial, 0.005, 0.995)
+                if np.allclose(trial, centers):
+                    continue
+            elif u < 0.20:
+                # Block-shift: move a spatially coherent cluster (all
+                # centers within 0.25 of a chosen circle) by a common delta.
+                anchor = int(rng.integers(n))
+                d = np.linalg.norm(centers - centers[anchor], axis=1)
+                mask = d < 0.25
+                delta = rng.normal(size=2) * max(0.005, step * 0.5)
+                trial[mask] += delta
+                trial = np.clip(trial, 0.005, 0.995)
+                if np.allclose(trial, centers):
+                    continue
+            else:
+                # Original single-circle slack-directed move
+                dirs, scores = slack_dirs_and_scores(centers, radii)
+                w = np.maximum(-scores, 0.01)
+                w = w / w.sum()
+                idx = int(rng.choice(n, p=w))
+                trial[idx] += (0.7 * dirs[idx] + 0.3 * rng.normal(size=2)) * step
+                trial = np.clip(trial, 0.005, 0.995)
+                if np.allclose(trial[idx], centers[idx]):
+                    continue
+            radii_t = lp_radii(trial)
+            total_t = np.sum(radii_t)
+            if total_t > sum_radii + 1e-9:
+                centers, radii, sum_radii = trial, radii_t, total_t
+                step = min(step * 1.15, 0.05)
+            else:
+                if rng.random() < 0.7:
+                    step = max(step * 0.92, 0.002)
+                else:
+                    step = min(step * 1.4, 0.05)
+    except Exception:
+        pass
+=======
+    try:
+        import time
+        overall_deadline = time.time() + 1.9
+        n_starts = min(4, len(scored))
+        best_global = (centers, radii, sum_radii)
+        for start in range(n_starts):
+            c, r, tot = scored[start][1], scored[start][2], scored[start][0]
+            rng = np.random.default_rng(1000 + start)
+            start_time = time.time()
+            budget = (overall_deadline - time.time()) / max(n_starts - start, 1)
+            step = 0.02
+            # Track best-ever configuration per basin separately from
+            # the current state so exploration can never lose progress.
+            bc, br, bt = c.copy(), r.copy(), tot
+            while time.time() < min(start_time + budget, overall_deadline):
+                u = rng.random()
+                trial = c.copy()
+                if u < 0.15:
+                    # Row-shift: translate all centers in a horizontal band
+                    # by a small common delta. Preserves intra-row spacing
+                    # and lets rows slide toward better wall alignment.
+                    anchor = int(rng.integers(n))
+                    band = 0.055
+                    mask = np.abs(c[:, 1] - c[anchor, 1]) < band
+                    delta = rng.uniform(-1.0, 1.0) * max(0.005, step * 0.5)
+                    trial[mask, 0] += delta
+                    trial = np.clip(trial, 0.005, 0.995)
+                    if np.allclose(trial, c):
+                        continue
+                elif u < 0.30:
+                    # Block-shift: move a spatially coherent cluster (all
+                    # centers within 0.25 of a chosen circle) by a common delta.
+                    anchor = int(rng.integers(n))
+                    d = np.linalg.norm(c - c[anchor], axis=1)
+                    mask = d < 0.25
+                    delta = rng.normal(size=2) * max(0.005, step * 0.5)
+                    trial[mask] += delta
+                    trial = np.clip(trial, 0.005, 0.995)
+                    if np.allclose(trial, c):
+                        continue
+                else:
+                    # Single-circle slack-directed move
+                    dirs, scores = slack_dirs_and_scores(c, r)
+                    w = np.maximum(-scores, 0.01)
+                    w = w / w.sum()
+                    idx = int(rng.choice(n, p=w))
+                    trial[idx] += (0.7 * dirs[idx] + 0.3 * rng.normal(size=2)) * step
+                    trial = np.clip(trial, 0.005, 0.995)
+                    if np.allclose(trial[idx], c[idx]):
+                        continue
+                # Cheap greedy pre-screen: skip the exact LP when the fast
+                # greedy radii sum is already clearly below the current
+                # basin value (greedy rarely underestimates LP by > 0.01
+                # for small perturbations of a good layout).
+                g = np.sum(compute_max_radii(trial))
+                if g < tot - 0.01:
+                    if rng.random() < 0.7:
+                        step = max(step * 0.92, 0.002)
+                    else:
+                        step = min(step * 1.4, 0.05)
+                    continue
+                radii_t = lp_radii(trial)
+                total_t = np.sum(radii_t)
+                if total_t > tot + 1e-9:
+                    c, r, tot = trial, radii_t, total_t
+                    if total_t > bt + 1e-9:
+                        bc, br, bt = trial.copy(), radii_t.copy(), total_t
+                    step = min(step * 1.15, 0.05)
+                else:
+                    if rng.random() < 0.7:
+                        step = max(step * 0.92, 0.002)
+                    else:
+                        step = min(step * 1.4, 0.05)
+                if time.time() > overall_deadline:
+                    break
+            if bt > best_global[2]:
+                best_global = (bc, br, bt)
+        centers, radii, sum_radii = best_global
+    except Exception:
+        pass
+>>>>>>> REPLACE
+</DIFF>

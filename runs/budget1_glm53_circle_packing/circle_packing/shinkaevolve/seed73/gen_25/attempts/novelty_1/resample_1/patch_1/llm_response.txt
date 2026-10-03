@@ -1,0 +1,152 @@
+<NAME>
+slsqp_polish_optimizer</NAME>
+<DESCRIPTION>
+The current program's weakness is its crude relaxation heuristic — the "contact_relax" step only moves centers based on a single nearest neighbor and the proportional-scaling radius assignment does not jointly optimize centers and radii. The gap to 2.635 requires a proper joint nonlinear optimization: treat all 26 centers and radii as decision variables (78 dims), maximize sum(r) subject to pairwise non-overlap constraints r_i + r_j <= d_ij and wall constraints r_i <= min(x_i, y_i, 1-x_i, 1-y_i). SLSQP handles this well from a feasible lattice seed. Additionally, since SLSQP may end slightly infeasible, we add a guaranteed repair step (shrink radii until feasible), then re-run SLSQP a second "polish" pass from the repaired point so fine-grained contact adjustments can be made. This replaces the ad-hoc contact relaxation with a principled optimizer while remaining deterministic.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Contact relaxation: move each center to equalize its gap to the two
+    # nearest constraints (nearest neighbor or wall), maximizing its own
+    # grown radius. Repeat a few sweeps; keep the best feasible result.
+    def contact_relax(pts, n_iters=60):
+        pts = pts.copy()
+        for _ in range(n_iters):
+            moved = 0.0
+            for i in range(n):
+                diff = pts - pts[i]
+                dist = np.sqrt((diff ** 2).sum(-1))
+                dist[i] = 1e9
+                # candidate gaps if circle i grows: to neighbors r_i = d/2
+                # (shared), to walls
+                j = int(np.argmin(dist))
+                d_n = dist[j]
+                # wall-limited radius
+                r_w = min(pts[i, 0], 1 - pts[i, 0],
+                          pts[i, 1], 1 - pts[i, 1])
+                # gradient step: grow towards more room
+                r_n = d_n / 2.0
+                g = r_n - r_w
+                if abs(g) < 1e-9:
+                    continue
+                if r_n > r_w:
+                    # move away from nearest neighbor, towards wall room
+                    u = diff[j] / d_n
+                    # also consider the tighter wall
+                    walls = np.array([-pts[i, 0], 1 - pts[i, 0]])
+                    wall_dir = np.argmax(walls)
+                    step = 0.1 * g
+                    if wall_dir == 0:
+                        pts[i, 0] -= step
+                    else:
+                        pts[i, 0] += step
+                    pts[i, 0] = np.clip(pts[i, 0], 0.01, 0.99)
+                    pts[i] -= 0.5 * step * u * 0.0  # neighbor handled below
+                    pts[i] = np.clip(pts[i], 0.01, 0.99)
+                else:
+                    # wall-limited: move toward center of square side gaps
+                    if pts[i, 0] < 0.5:
+                        pts[i, 0] += 0.1 * g
+                    else:
+                        pts[i, 0] -= 0.1 * g
+                    if pts[i, 1] < 0.5:
+                        pts[i, 1] += 0.1 * g
+                    else:
+                        pts[i, 1] -= 0.1 * g
+                    moved = max(moved, abs(0.1 * g))
+                moved = max(moved, abs(0.1 * g))
+            if moved < 1e-9:
+                break
+        return pts
+
+    pts2 = contact_relax(centers)
+    radii2 = compute_max_radii(pts2)
+    if radii2.sum() > best[2]:
+        centers = pts2
+=======
+    # Joint SLSQP refinement over centers AND radii (78 variables):
+    # maximize sum(r) s.t. r_i + r_j <= d_ij and wall constraints.
+    from scipy.optimize import minimize
+
+    pairs = np.array(iu).T  # list of (i, j) index pairs
+
+    def unpack(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        return c, r
+
+    def neg_obj(z):
+        return -z[2 * n:].sum()
+
+    def neg_obj_grad(z):
+        g = np.zeros_like(z)
+        g[2 * n:] = -1.0
+        return g
+
+    def constraints_vec(z):
+        c, r = unpack(z)
+        diff = c[:, None, :] - c[None, :, :]
+        d = np.sqrt((diff ** 2).sum(-1))
+        cons = []
+        # pairwise: d_ij - r_i - r_j >= 0
+        for (i, j) in pairs:
+            cons.append(d[i, j] - r[i] - r[j])
+        # walls: x - r >= 0, 1 - x - r >= 0, same for y
+        cons.extend((c[:, 0] - r).tolist())
+        cons.extend((1.0 - c[:, 0] - r).tolist())
+        cons.extend((c[:, 1] - r).tolist())
+        cons.extend((1.0 - c[:, 1] - r).tolist())
+        return np.array(cons)
+
+    def repair(z):
+        """Project z to feasibility: shrink radii until no violation."""
+        c, r = unpack(z)
+        r = np.minimum(
+            np.minimum(c[:, 0], 1 - c[:, 0]),
+            np.minimum(c[:, 1], 1 - c[:, 1]),
+        )
+        for _ in range(200):
+            changed = False
+            for (i, j) in pairs:
+                d = np.sqrt(np.sum((c[i] - c[j]) ** 2))
+                if r[i] + r[j] > d:
+                    sc = d / (r[i] + r[j])
+                    r[i] *= sc
+                    r[j] *= sc
+                    changed = True
+            if not changed:
+                break
+        z2 = z.copy()
+        z2[:2 * n] = c.ravel()
+        z2[2 * n:] = r
+        return z2
+
+    def slsqp_pass(z0, maxiter):
+        res = minimize(
+            neg_obj, z0, jac=neg_obj_grad,
+            method="SLSQP",
+            constraints=[{"type": "ineq", "fun": constraints_vec}],
+            options={"maxiter": maxiter, "ftol": 1e-10},
+        )
+        z = repair(res.x)
+        return z, z[2 * n:].sum()
+
+    # Build initial feasible z from the best lattice candidate.
+    centers0 = centers
+    radii0 = compute_max_radii(centers0)
+    z0 = np.concatenate([centers0.ravel(), radii0])
+
+    # First SLSQP pass from the lattice seed, then a polish pass from the
+    # repaired endpoint: restarting from a feasible, nearly-optimal point
+    # lets SLSQP make fine-grained contact adjustments.
+    z1, s1 = slsqp_pass(z0, 200)
+    z2, s2 = slsqp_pass(z1, 500)
+    z_best, s_best = (z2, s2) if s2 > s1 else (z1, s1)
+
+    if s_best > best[2]:
+        centers, radii_final = unpack(z_best)
+        radii = repair(z_best)[2 * n:]
+        centers = unpack(z_best)[0]
+        sum_radii = radii.sum()
+        return centers, radii, sum_radii
+>>>>>>> REPLACE
+</DIFF>

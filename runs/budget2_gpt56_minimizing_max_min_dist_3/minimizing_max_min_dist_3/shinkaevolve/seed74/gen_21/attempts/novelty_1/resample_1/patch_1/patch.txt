@@ -1,0 +1,255 @@
+--- a/original.py
++++ b/original.py
+@@ -1,93 +1,190 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def min_max_dist_dim3_14() -> np.ndarray:
+     """
+-    Construct fourteen points by deterministic multi-start maximin relaxation.
++    Construct 14 three-dimensional points maximizing the minimum squared
++    pairwise distance divided by the maximum squared pairwise distance.
+ 
+-    The optimization uses a smooth approximation to the minimum and
+-    maximum squared pairwise distances.  Translation and scale are removed
+-    after every step, since neither changes the requested ratio.
++    A deterministic portfolio is used:
++      * a projective/spherical search over seven antipodal line pairs;
++      * a general rank-contact force search over all fourteen points.
+     """
+     n, d = 14, 3
+-    pair_i, pair_j = np.triu_indices(n, 1)
+-    rng = np.random.default_rng(20240517)
++    pi, pj = np.triu_indices(n, 1)
++    rng = np.random.default_rng(731942)
+ 
+-    def normalize(x: np.ndarray) -> np.ndarray:
++    def normalize(x):
+         x = x - x.mean(axis=0, keepdims=True)
+-        return x / np.sqrt(np.mean(np.sum(x * x, axis=1)))
++        scale = np.sqrt(np.mean(np.sum(x * x, axis=1)))
++        return x / max(scale, 1e-15)
+ 
+-    def exact_ratio(x: np.ndarray) -> float:
+-        delta = x[pair_i] - x[pair_j]
+-        squared = np.einsum("ij,ij->i", delta, delta)
+-        return float(squared.min() / squared.max())
++    def ratio(x):
++        z = x[pi] - x[pj]
++        q = np.einsum("ij,ij->i", z, z)
++        return float(q.min() / q.max())
+ 
+-    best_points = None
+-    best_ratio = -np.inf
++    def unit_rows(x):
++        return x / np.sqrt(np.sum(x * x, axis=1, keepdims=True) + 1e-15)
+ 
+-    # First locate several unrelated basins.  The later starts are small
+-    # perturbations of the incumbent, which is substantially more useful
+-    # than random restarts once a nearly feasible packing has been found.
+-    for restart in range(24):
+-        if restart < 16:
++    best = None
++    best_value = -1.0
++
++    # ------------------------------------------------------------------
++    # Projective search: seven lines represent fourteen antipodal points.
++    # For unit lines the diameter is exactly 2, and the objective is
++    # (1 - max |u_i dot u_j|) / 2.
++    # ------------------------------------------------------------------
++    anti_best = None
++    anti_value = -1.0
++    li, lj = np.triu_indices(7, 1)
++    sharpness_stages = (4.0, 11.0, 30.0, 85.0, 240.0)
++
++    for restart in range(42):
++        if restart < 28 or anti_best is None:
++            lines = unit_rows(rng.standard_normal((7, 3)))
++        else:
++            lines = unit_rows(
++                anti_best + 0.16 * rng.standard_normal((7, 3))
++            )
++
++        # Independent tangent-space Adam states at each continuation level
++        # avoid carrying broad-stage momentum into a contact-stage solve.
++        for stage, beta in enumerate(sharpness_stages):
++            m = np.zeros_like(lines)
++            v = np.zeros_like(lines)
++            count = 230
++
++            for it in range(count):
++                dots = lines @ lines.T
++                values = dots[li, lj] ** 2
++
++                # Soft active-set average of squared correlations.
++                shift = values.max()
++                weights = np.exp(beta * (values - shift))
++                weights /= weights.sum()
++
++                wmat = np.zeros((7, 7))
++                deriv = 2.0 * weights * dots[li, lj]
++                wmat[li, lj] = deriv
++                wmat[lj, li] = deriv
++
++                # Euclidean gradient of the weighted correlation energy.
++                grad = wmat @ lines
++
++                # Riemannian projection to the tangent planes of S^2.
++                grad -= np.sum(grad * lines, axis=1, keepdims=True) * lines
++
++                m = 0.88 * m + 0.12 * grad
++                v = 0.985 * v + 0.015 * (grad * grad)
++                direction = m / (np.sqrt(v) + 1e-8)
++
++                # Minimize coherence; later stages take smaller steps.
++                frac = it / max(count - 1, 1)
++                step = (0.060 / (1.0 + 0.22 * stage)) * (1.0 - 0.58 * frac)
++                lines = unit_rows(lines - step * direction)
++
++                if it % 40 == 0 or it == count - 1:
++                    coherence = np.max(np.abs((lines @ lines.T)[li, lj]))
++                    value = 0.5 * (1.0 - coherence)
++                    if value > anti_value:
++                        anti_value = value
++                        anti_best = lines.copy()
++
++        candidate = np.vstack((lines, -lines))
++        value = ratio(candidate)
++        if value > best_value:
++            best_value = value
++            best = candidate.copy()
++
++    if anti_best is not None:
++        candidate = np.vstack((anti_best, -anti_best))
++        value = ratio(candidate)
++        if value > best_value:
++            best_value = value
++            best = candidate.copy()
++
++    # ------------------------------------------------------------------
++    # General search: rank-weighted nearest/farthest contact dynamics.
++    # Rank forces make this distinct from a direct soft-min/soft-max
++    # objective and allow contact graphs to exchange during optimization.
++    # ------------------------------------------------------------------
++    general_best = best.copy()
++
++    for restart in range(26):
++        if restart < 17:
+             points = normalize(rng.standard_normal((n, d)))
+         else:
+             points = normalize(
+-                best_points + 0.10 * rng.standard_normal((n, d))
++                general_best + 0.105 * rng.standard_normal((n, d))
+             )
+ 
+-        for iteration in range(1500):
+-            delta = points[pair_i] - points[pair_j]
+-            squared = np.einsum("ij,ij->i", delta, delta)
++        velocity = np.zeros_like(points)
+ 
+-            # Anneal from a broad force field to an increasingly accurate
+-            # approximation of the active closest and farthest pairs.
+-            temperature = 0.09 * (0.008 / 0.09) ** (iteration / 1499.0)
++        for it in range(1550):
++            delta = points[pi] - points[pj]
++            q = np.einsum("ij,ij->i", delta, delta)
+ 
+-            low_shift = squared.min()
+-            low_weight = np.exp(-(squared - low_shift) / temperature)
+-            low_weight /= low_weight.sum()
+-            smooth_min = low_shift - temperature * np.log(
+-                np.exp(-(squared - low_shift) / temperature).sum()
++            order = np.argsort(q)
++            ranks = np.empty_like(order)
++            ranks[order] = np.arange(order.size)
++
++            progress = it / 1549.0
++
++            # Broad rank neighborhoods initially establish a balanced
++            # framework; narrow neighborhoods later polish active contacts.
++            low_width = 18.0 - 14.8 * progress
++            high_width = 16.0 - 13.2 * progress
++
++            low = np.exp(-ranks / low_width)
++            high = np.exp(-(order.size - 1 - ranks) / high_width)
++            low /= low.sum()
++            high /= high.sum()
++
++            # Normalize each side by its current characteristic distance.
++            # This approximates a scale-free ratio force while retaining
++            # rank-only contact selection.
++            low_scale = float(np.dot(low, q))
++            high_scale = float(np.dot(high, q))
++            pair_force = low / max(low_scale, 1e-14) - high / max(high_scale, 1e-14)
++
++            matrix = np.zeros((n, n))
++            matrix[pi, pj] = pair_force
++            matrix[pj, pi] = pair_force
++
++            grad = 2.0 * (
++                matrix.sum(axis=1)[:, None] * points - matrix @ points
+             )
++            grad -= grad.mean(axis=0, keepdims=True)
+ 
+-            high_shift = squared.max()
+-            high_weight = np.exp((squared - high_shift) / temperature)
+-            high_weight /= high_weight.sum()
+-            smooth_max = high_shift + temperature * np.log(
+-                np.exp((squared - high_shift) / temperature).sum()
+-            )
++            gnorm = np.sqrt(np.mean(np.sum(grad * grad, axis=1)))
++            grad /= max(gnorm, 1e-14)
+ 
+-            # Gradient of log(smooth_min / smooth_max) with respect to
+-            # each squared pair distance.
+-            pair_weight = low_weight / smooth_min - high_weight / smooth_max
+-            weights = np.zeros((n, n), dtype=float)
+-            weights[pair_i, pair_j] = pair_weight
+-            weights[pair_j, pair_i] = pair_weight
++            # Heavy momentum during framework formation, reduced during
++            # late contact polishing.
++            momentum = 0.82 - 0.30 * progress
++            velocity = momentum * velocity + (1.0 - momentum) * grad
++            vnorm = np.sqrt(np.mean(np.sum(velocity * velocity, axis=1)))
++            velocity /= max(vnorm, 1e-14)
+ 
+-            gradient = 2.0 * (
+-                weights.sum(axis=1)[:, None] * points - weights @ points
+-            )
+-            gradient -= gradient.mean(axis=0, keepdims=True)
++            step = 0.050 * (1.0 - 0.72 * progress)
++            points = normalize(points + step * velocity)
+ 
+-            # A normalized step makes the schedule stable across starts.
+-            gradient_norm = np.sqrt(np.mean(np.sum(gradient * gradient, axis=1)))
+-            step = 0.045 * (1.0 - 0.70 * iteration / 1499.0)
+-            points = normalize(points + step * gradient / (gradient_norm + 1e-12))
++            if it % 31 == 0 or it == 1549:
++                value = ratio(points)
++                if value > best_value:
++                    best_value = value
++                    best = points.copy()
++                    general_best = points.copy()
+ 
+-            if iteration % 50 == 0:
+-                ratio = exact_ratio(points)
+-                if ratio > best_ratio:
+-                    best_ratio = ratio
+-                    best_points = points.copy()
++        value = ratio(points)
++        if value > best_value:
++            best_value = value
++            best = points.copy()
++            general_best = points.copy()
+ 
+-        ratio = exact_ratio(points)
+-        if ratio > best_ratio:
+-            best_ratio = ratio
+-            best_points = points.copy()
+-
+-    return best_points
++    return np.asarray(best, dtype=float)
+ 
+ 
+ # EVOLVE-BLOCK-END

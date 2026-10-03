@@ -1,0 +1,95 @@
+<NAME>
+despike_and_trendlock_stages</NAME>
+
+<DESCRIPTION>
+The current program's weakest metrics are noise_reduction (0.33) and slope_changes/false_reversals (41.0/36.4). The champion's successful history shows that structural *additions* to the cascade — not slope-domain rewrites — are what improve these metrics while keeping the 100% success rate. I propose two low-risk, fully vectorized, defensively-clamped stages added to the existing Kalman + Savitzky-Golay cascade:
+
+1. **ImpulseDespike (new Stage 0, before the Kalman filter):** A 5-tap running median with robust MAD-based thresholding removes impulse-like outliers before the Kalman filter sees them. This directly improves noise_reduction (outliers inflate the MAD noise estimate and inject process noise through the NIS adaptation), and it costs O(n) with edge-clamped padding so short/edge inputs remain safe.
+
+2. **TrendLock slope damping (new Stage 3, after the existing median-snap pass):** The Kalman's velocity estimate gives us a smoothed slope proxy; EMA-smoothing the first difference of the output and nudging sub-noise steps toward it suppresses spurious directional reversals (targeting slope_changes and false_reversals) without adding group delay, since the nudge is proportional to slope disagreement, not a shift of the level.
+
+Both stages are pure additions: they preserve the existing Kalman/SG convolution math, keep the output length convention (`n - W + 1`), and carry explicit small-input guards (`n < 5`, `len < 3`) mirroring the champion's defensive-clamp discipline. No slope-domain rewriting, no endpoint evaluation changes, no parameter mutation of existing stages.</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Initialize output array
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+=======
+    # Initialize output array
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+
+def _impulse_despike(xf, strength=0.5, factor=2.0):
+    """
+    Stage 0: remove impulse-like, noise-sized outliers via a 5-tap running
+    median with robust MAD thresholding. Purely additive preprocessing;
+    edge-clamped padding keeps short inputs safe.
+    """
+    n = len(xf)
+    if n < 5:
+        return xf
+    dx = np.diff(xf)
+    sig_x = 1.4826 * np.median(np.abs(dx - np.median(dx))) + 1e-12
+    pad = np.concatenate((xf[:2][::-1], xf, xf[-2:][::-1]))
+    stacked = np.stack([pad[0:n], pad[1:n + 1], pad[2:n + 2],
+                        pad[3:n + 3], pad[4:n + 4]])
+    med5 = np.median(stacked, axis=0)
+    dev = np.abs(xf - med5)
+    snap_mask = dev < factor * sig_x
+    out = xf.copy()
+    out[snap_mask] = (1 - strength) * out[snap_mask] + strength * med5[snap_mask]
+    return out
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 1: adaptive Kalman filtering
+    x_kalman = _adaptive_kalman_filter(np.asarray(x, dtype=float))
+=======
+    # Stage 0: impulse despiking (defensive, additive)
+    x_arr = _impulse_despike(np.asarray(x, dtype=float))
+
+    # Stage 1: adaptive Kalman filtering
+    x_kalman = _adaptive_kalman_filter(x_arr)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        small = steps < 0.5 * sigma
+        y = np.where(small, 0.5 * y + 0.5 * med, y)
+
+    return y
+=======
+        small = steps < 0.5 * sigma
+        y = np.where(small, 0.5 * y + 0.5 * med, y)
+
+    # --- Stage 3: trend-lock slope damping ---
+    # EMA-smooth the output's local slope; samples whose step disagrees
+    # with the locked slope by less than the noise sigma get nudged toward
+    # it. Suppresses spurious directional reversals without group delay.
+    m = len(y)
+    if m >= 3:
+        beta = 0.55
+        d = np.diff(y)
+        locked = np.empty(len(d))
+        ls = d[0]
+        for i in range(len(d)):
+            if i > 0:
+                ls = beta * ls + (1.0 - beta) * d[i]
+            locked[i] = ls
+        # Vectorized nudge: extend locked slope per-sample
+        lock_level = np.empty(m)
+        lock_level[0] = y[0]
+        lock_level[1:] = y[:-1] + locked
+        thresh = 1.0 * sigma
+        small_lock = np.abs(y - lock_level) < thresh
+        y = np.where(small_lock, 0.65 * y + 0.35 * lock_level, y)
+
+    return y
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

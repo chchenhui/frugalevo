@@ -1,0 +1,316 @@
+--- a/original.py
++++ b/original.py
+@@ -1,87 +1,236 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
++_CACHED_POINTS = None
++
++
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+-    Construct a reproducible maximin arrangement for eleven points.
+-
+-    The internal coordinates (u, v) represent u*(1,0) + v*(.5,sqrt(3)/2).
+-    Thus u >= 0, v >= 0, u + v <= 1, and a 2-by-2 determinant is
+-    precisely the corresponding area normalized by the outer triangle area.
++    Construct a deterministic high-quality maximin arrangement of eleven
++    points in the unit-side equilateral triangle.
++
++    Internal coordinates are barycentric pairs (u, v), representing
++    u * (1, 0) + v * (0.5, sqrt(3)/2).  Consequently u >= 0, v >= 0,
++    u + v <= 1, and every 2D determinant equals the corresponding
++    triangle area normalized by the containing triangle area.
+     """
+-    rng = np.random.default_rng(11031991)
+-    triples = np.array(
+-        [(i, j, k) for i in range(11) for j in range(i + 1, 11)
+-         for k in range(j + 1, 11)],
+-        dtype=np.intp,
+-    )
+-
+-    def areas(p: np.ndarray) -> np.ndarray:
+-        a = p[triples[:, 1]] - p[triples[:, 0]]
+-        b = p[triples[:, 2]] - p[triples[:, 0]]
+-        return np.abs(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0])
+-
+-    def merit(p: np.ndarray) -> tuple[float, float]:
+-        values = areas(p)
+-        # The tail term gives useful motion when several constraints tie for
+-        # the current minimum, while the first component remains dominant.
+-        tail = np.partition(values, 11)[:12]
+-        return float(values.min()), float(values.min() + 0.075 * tail.mean())
+-
+-    # The outer vertices are useful extremal points; the other points are
+-    # optimized in barycentric coordinates.
+-    best = np.array(
+-        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]] +
+-        [[1.0 / 3.0, 1.0 / 3.0]] * 8,
+-        dtype=float,
+-    )
+-    best_min = -1.0
+-
+-    for restart in range(9):
+-        bary = rng.dirichlet((1.15, 1.15, 1.15), size=8)
+-        current = np.empty((11, 2), dtype=float)
+-        current[:3] = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
+-        current[3:, 0] = bary[:, 1]
+-        current[3:, 1] = bary[:, 2]
+-        current_min, current_merit = merit(current)
+-
+-        for iteration in range(18000):
+-            fraction = iteration / 17999.0
+-            # Large moves establish global structure; fine moves resolve the
+-            # many nearly active determinant constraints near the end.
+-            step = 0.105 * (1.0 - fraction) ** 1.65 + 0.0012
+-            thermal = 0.006 * (1.0 - fraction) ** 2 + 0.000015
+-            index = int(rng.integers(3, 11))
+-
+-            candidate = current.copy()
+-            weights = np.array(
+-                [1.0 - candidate[index, 0] - candidate[index, 1],
+-                 candidate[index, 0], candidate[index, 1]]
+-            )
+-            weights += rng.normal(0.0, step, size=3)
+-            # Projection through nonnegative barycentric weights guarantees
+-            # every proposed point remains inside the closed triangle.
+-            weights = np.maximum(weights, 1.0e-7)
+-            weights /= weights.sum()
+-            candidate[index] = weights[1:]
+-
+-            candidate_min, candidate_merit = merit(candidate)
+-            delta = candidate_merit - current_merit
+-            if delta >= 0.0 or rng.random() < np.exp(delta / thermal):
+-                current = candidate
+-                current_min, current_merit = candidate_min, candidate_merit
+-
+-            if current_min > best_min:
+-                best_min = current_min
+-                best = current.copy()
+-
+-    # Affine conversion from normalized barycentric coordinates to the
+-    # requested Cartesian equilateral triangle.
+-    points = np.empty((11, 2), dtype=float)
+-    points[:, 0] = best[:, 0] + 0.5 * best[:, 1]
+-    points[:, 1] = (np.sqrt(3.0) / 2.0) * best[:, 1]
+-    return points
++    global _CACHED_POINTS
++    if _CACHED_POINTS is not None:
++        return _CACHED_POINTS.copy()
++
++    try:
++        rng = np.random.default_rng(11031997)
++
++        n = 11
++        free_n = 8
++        dims = 2 * free_n
++        fixed = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=float)
++        triples = np.array(
++            [(i, j, k) for i in range(n - 2)
++             for j in range(i + 1, n - 1)
++             for k in range(j + 1, n)],
++            dtype=np.intp,
++        )
++
++        def project_simplex(x: np.ndarray) -> np.ndarray:
++            """Project barycentric coordinate pairs into the closed triangle."""
++            y = np.maximum(x, 0.0)
++            total = y[..., 0] + y[..., 1]
++            mask = total > 1.0
++            if np.any(mask):
++                y[mask] /= total[mask, None]
++            return y
++
++        def all_areas(points: np.ndarray) -> np.ndarray:
++            a = points[triples[:, 1]] - points[triples[:, 0]]
++            b = points[triples[:, 2]] - points[triples[:, 0]]
++            return np.abs(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0])
++
++        def quality(points: np.ndarray) -> tuple:
++            values = all_areas(points)
++            minimum = float(values.min())
++            # The low tail rewards arrangements which resolve multiple
++            # competing active constraints rather than only one of them.
++            tail = np.partition(values, 17)[:18]
++            return minimum, minimum + 0.042 * float(tail.mean())
++
++        def population_quality(pop: np.ndarray) -> tuple:
++            """Return minimum score and low-tail merit for an entire population."""
++            m = pop.shape[0]
++            p = np.empty((m, n, 2), dtype=float)
++            p[:, :3] = fixed
++            p[:, 3:] = pop.reshape(m, free_n, 2)
++
++            a = p[:, triples[:, 1]] - p[:, triples[:, 0]]
++            b = p[:, triples[:, 2]] - p[:, triples[:, 0]]
++            values = np.abs(a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0])
++            minima = values.min(axis=1)
++            tail = np.partition(values, 17, axis=1)[:, :18].mean(axis=1)
++            return minima, minima + 0.042 * tail
++
++        # ------------------------------------------------------------------
++        # Global differential-evolution stage.
++        # ------------------------------------------------------------------
++        population_size = 72
++        generations = 720
++        elite_keep = 6
++
++        raw = rng.dirichlet((1.22, 1.22, 1.22),
++                            size=(population_size, free_n))
++        population = raw[:, :, 1:3].reshape(population_size, dims)
++
++        # Add several broadly spread lattice-like starts.  They provide useful
++        # alternatives to purely random Dirichlet configurations.
++        lattice = np.array([
++            [0.14, 0.15], [0.43, 0.10], [0.73, 0.10], [0.13, 0.45],
++            [0.42, 0.35], [0.69, 0.22], [0.22, 0.69], [0.48, 0.48],
++        ])
++        for i in range(10):
++            trial = lattice + rng.normal(0.0, 0.065, size=lattice.shape)
++            population[i] = project_simplex(trial).reshape(-1)
++
++        min_scores, merits = population_quality(population)
++
++        for generation in range(generations):
++            ranking = np.lexsort((merits, min_scores))
++            best_index = ranking[-1]
++            best_vector = population[best_index].copy()
++
++            choices = np.empty((population_size, 3), dtype=np.intp)
++            for i in range(population_size):
++                pool = np.delete(np.arange(population_size), i)
++                choices[i] = rng.choice(pool, size=3, replace=False)
++
++            aa = population[choices[:, 0]]
++            bb = population[choices[:, 1]]
++            cc = population[choices[:, 2]]
++
++            # Gradually shift from exploratory DE/rand/1 to a best-directed
++            # mutation suitable for resolving active constraints.
++            progress = generation / max(1, generations - 1)
++            scale = 0.70 - 0.27 * progress + rng.random(population_size) * 0.08
++            mutant = aa + scale[:, None] * (bb - cc)
++            if generation % 3 != 0:
++                pull = 0.14 + 0.24 * progress
++                mutant = mutant + pull * (best_vector - mutant)
++
++            crossover_rate = 0.83 - 0.15 * progress
++            cross = rng.random((population_size, dims)) < crossover_rate
++            cross[np.arange(population_size), rng.integers(dims, size=population_size)] = True
++            trials = np.where(cross, mutant, population)
++            trials = project_simplex(trials.reshape(-1, free_n, 2)).reshape(population_size, dims)
++
++            trial_min, trial_merit = population_quality(trials)
++            accept = ((trial_min > min_scores + 1e-14) |
++                      ((np.abs(trial_min - min_scores) <= 1e-14) &
++                       (trial_merit > merits)))
++            population[accept] = trials[accept]
++            min_scores[accept] = trial_min[accept]
++            merits[accept] = trial_merit[accept]
++
++            # Explicit elitism prevents a good basin being lost by replacement.
++            if generation % 24 == 23:
++                order = np.lexsort((merits, min_scores))
++                elite = population[order[-elite_keep:]].copy()
++                elite_min = min_scores[order[-elite_keep:]].copy()
++                elite_merit = merits[order[-elite_keep:]].copy()
++                worst = order[:elite_keep]
++                population[worst] = elite
++                min_scores[worst] = elite_min
++                merits[worst] = elite_merit
++
++        order = np.lexsort((merits, min_scores))
++        elite_vectors = population[order[-elite_keep:]][::-1].copy()
++
++        # ------------------------------------------------------------------
++        # Elite active-constraint refinement stage.
++        # ------------------------------------------------------------------
++        global_best = None
++        global_min = -1.0
++        polish_iterations = 10500
++
++        for seed_vector in elite_vectors:
++            current = np.empty((n, 2), dtype=float)
++            current[:3] = fixed
++            current[3:] = seed_vector.reshape(free_n, 2)
++            current_min, current_merit = quality(current)
++
++            local_best = current.copy()
++            local_best_min = current_min
++
++            for iteration in range(polish_iterations):
++                fraction = iteration / max(1, polish_iterations - 1)
++                values = all_areas(current)
++
++                # Select a movable point from the active low-area constraints.
++                active_count = 5 + int(20 * (1.0 - fraction))
++                active_ids = np.argpartition(values, active_count - 1)[:active_count]
++                chosen_triangle = triples[active_ids[rng.integers(active_count)]]
++                movable = chosen_triangle[chosen_triangle >= 3]
++
++                if len(movable) and rng.random() < 0.86:
++                    point_id = int(movable[rng.integers(len(movable))])
++                else:
++                    point_id = int(rng.integers(3, n))
++
++                candidate = current.copy()
++                # Fine late moves are critical because the final arrangement
++                # typically has many determinants nearly tied at the minimum.
++                radius = 0.050 * (1.0 - fraction) ** 1.72 + 0.00016
++                old = candidate[point_id]
++                weights = np.array([1.0 - old[0] - old[1], old[0], old[1]])
++                weights += rng.normal(0.0, radius, size=3)
++                weights = np.maximum(weights, 1.0e-9)
++                weights /= weights.sum()
++                candidate[point_id] = weights[1:]
++
++                candidate_min, candidate_merit = quality(candidate)
++
++                # A small annealing allowance early on permits basin changes;
++                # the final phase is nearly greedy in the true maximin score.
++                temperature = 0.0018 * (1.0 - fraction) ** 2.4 + 2.0e-7
++                delta = candidate_merit - current_merit
++                lex_improvement = (
++                    candidate_min > current_min + 1.0e-13 or
++                    (abs(candidate_min - current_min) <= 1.0e-13 and
++                     candidate_merit >= current_merit)
++                )
++
++                if lex_improvement or rng.random() < np.exp(
++                    np.clip(delta / temperature, -60.0, 0.0)
++                ):
++                    current = candidate
++                    current_min = candidate_min
++                    current_merit = candidate_merit
++
++                if current_min > local_best_min:
++                    local_best = current.copy()
++                    local_best_min = current_min
++
++            if local_best_min > global_min:
++                global_best = local_best
++                global_min = local_best_min
++
++        points = np.empty((n, 2), dtype=float)
++        points[:, 0] = global_best[:, 0] + 0.5 * global_best[:, 1]
++        points[:, 1] = (np.sqrt(3.0) / 2.0) * global_best[:, 1]
++
++        _CACHED_POINTS = points
++        return points.copy()
++
++    except Exception:
++        # Deterministic nondegenerate fallback.
++        h = np.sqrt(3.0) / 2.0
++        bary = np.array([
++            [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
++            [0.14, 0.15], [0.43, 0.10], [0.73, 0.10],
++            [0.13, 0.45], [0.42, 0.35], [0.69, 0.22],
++            [0.22, 0.69], [0.48, 0.48],
++        ], dtype=float)
++        points = np.column_stack((bary[:, 0] + 0.5 * bary[:, 1], h * bary[:, 1]))
++        _CACHED_POINTS = points
++        return points.copy()
+ 
+ 
+ # EVOLVE-BLOCK-END

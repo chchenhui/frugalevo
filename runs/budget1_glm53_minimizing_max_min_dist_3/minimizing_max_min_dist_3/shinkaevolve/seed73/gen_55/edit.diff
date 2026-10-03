@@ -1,0 +1,307 @@
+--- a/original.py
++++ b/original.py
+@@ -1,195 +1,161 @@
+ # EVOLVE-BLOCK-START
++import time
+ import numpy as np
+-from scipy.optimize import minimize
++from scipy.optimize import minimize, differential_evolution
+ 
+ N, D = 14, 3
++H = N // 2  # 7 antipodal generators
+ PAIRS_I, PAIRS_J = np.triu_indices(N, k=1)
++TARGET_RATIO = 0.4899
++TIME_BUDGET = 40.0
++
++
++def _expand(g):
++    """7 generator vectors -> 14 antipodally symmetric points."""
++    G = g.reshape(H, D)
++    return np.vstack([G, -G])
+ 
+ 
+ def _pair_dists(P):
+     return np.linalg.norm(P[PAIRS_I] - P[PAIRS_J], axis=1)
+ 
+ 
+-def _ratio(pts):
+-    ds = _pair_dists(pts)
++def _ratio(P):
++    ds = _pair_dists(P)
+     dmax = ds.max()
+     if dmax <= 0:
+         return -1.0
+     return ds.min() / dmax
+ 
+ 
+-def _repulsion_stage(pts, iters=500, step=0.03):
+-    """Diameter-normalized repulsion to spread close pairs apart."""
+-    pts = pts.copy()
+-    for _ in range(iters):
+-        diff = pts[PAIRS_I] - pts[PAIRS_J]
+-        dist = np.linalg.norm(diff, axis=1)
+-        dmax = dist.max()
+-        if dmax <= 0:
+-            break
+-        pts /= dmax
+-        diff = pts[PAIRS_I] - pts[PAIRS_J]
+-        dist = np.sqrt(np.maximum((diff * diff).sum(-1), 1e-18))
+-        w = 1.0 / dist ** 12
+-        forces = (w[:, None] * diff) / dist[:, None]
+-        grad = np.zeros_like(pts)
+-        np.add.at(grad, PAIRS_I, forces)
+-        np.add.at(grad, PAIRS_J, -forces)
+-        norm = np.linalg.norm(grad, axis=1, keepdims=True)
+-        norm[norm == 0] = 1.0
+-        pts += step * grad / norm
+-        step *= 0.997
+-    return pts
++def _softmin_obj(g, beta=60.0):
++    """Smooth surrogate: minimize soft-min of normalized distances."""
++    ds = _pair_dists(_expand(g))
++    dmax = ds.max()
++    if dmax <= 1e-12:
++        return 0.0
++    dn = ds / dmax
++    return np.log(np.sum(np.exp(-beta * dn))) / beta
+ 
+ 
+-def _slsqp_stage(pts, maxiter=500):
+-    """Polish: maximize dmin subject to dmax <= 1."""
+-    def objective(flat):
++def _slsqp_polish(P, maxiter=300):
++    """Exact polish: maximize dmin subject to dmax <= 1."""
++    P = np.asarray(P, dtype=float)
++    if P.shape != (N, D) or not np.all(np.isfinite(P)):
++        return np.zeros((N, D)) + 1e-3
++    ds = _pair_dists(P)
++    if ds.max() > 0:
++        P = P / ds.max()
++    r0 = _ratio(P)
++
++    def obj(flat):
+         return -_pair_dists(flat.reshape(N, D)).min()
+ 
+-    def constraint(flat):
++    def con(flat):
+         return 1.0 - _pair_dists(flat.reshape(N, D)).max()
+ 
+-    ds = _pair_dists(pts)
+-    if ds.max() > 0:
+-        pts = pts / ds.max()
+-    res = minimize(
+-        objective,
+-        pts.ravel(),
+-        method='SLSQP',
+-        constraints={'type': 'ineq', 'fun': constraint},
+-        options={'maxiter': maxiter, 'ftol': 1e-12},
+-    )
++    res = minimize(obj, P.ravel(), method='SLSQP',
++                   constraints={'type': 'ineq', 'fun': con},
++                   options={'maxiter': maxiter, 'ftol': 1e-14})
++    if not np.all(np.isfinite(res.x)):
++        return P
+     out = res.x.reshape(N, D)
+-    if not np.all(np.isfinite(out)) or _ratio(out) <= _ratio(pts):
+-        return pts
+-    return out
++    return out if _ratio(out) >= r0 else P
+ 
+ 
+ def _unit(v):
+-    return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
++    v = np.asarray(v, dtype=float)
++    return v / max(np.linalg.norm(v), 1e-12)
+ 
+ 
+-def _icosahedron():
++def _ico_seed():
++    """Icosahedron (6 antipodal generators) + one pole generator."""
+     phi = (1.0 + np.sqrt(5.0)) / 2.0
+     ico = np.array([
+         [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+         [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+         [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+     ], dtype=float)
+-    return _unit(ico)
++    ico /= np.linalg.norm(ico, axis=1, keepdims=True)
++    gens = ico[::2]  # every other vertex: 6 generators (antipode is skipped)
++    return np.vstack([gens, [0.0, 0.0, 1.0]])
+ 
+ 
+-def _fibonacci_sphere(offset=0.0):
+-    k = np.arange(N) + 0.5
+-    ph = np.arccos(1.0 - 2.0 * k / N)
+-    th = np.pi * (1.0 + 5.0 ** 0.5) * k + offset
+-    return np.stack([np.cos(th) * np.sin(ph),
+-                     np.sin(th) * np.sin(ph),
+-                     np.cos(ph)], axis=1)
+-
+-
+-def _seeds(rng):
+-    seeds = []
+-    # Icosahedron + 2 perturbed poles
+-    ico = _icosahedron()
+-    assert ico.shape == (12, 3)
+-    for _ in range(3):
+-        extra = np.array([[0, 0, 1], [0, 0, -1]]) + 0.05 * rng.standard_normal((2, 3))
+-        s = np.vstack([ico, _unit(extra)])
+-        assert s.shape == (N, D)
+-        seeds.append(s)
+-    # Fibonacci variants
+-    for off in (0.0, 0.7, 1.9):
+-        s = _fibonacci_sphere(off)
+-        assert s.shape == (N, D)
+-        seeds.append(s)
+-    # Random on sphere and in ball
+-    for _ in range(5):
+-        seeds.append(_unit(rng.standard_normal((N, D))))
+-        seeds.append(rng.uniform(-1.0, 1.0, (N, D)))
+-    return seeds
++def _ring_seed(theta, jitter=0.0, rng=None):
++    """Pole + 6 generators on a ring at polar angle theta."""
++    az = np.arange(6) * (np.pi / 3.0)
++    if jitter and rng is not None:
++        az = az + jitter * rng.standard_normal(6)
++    ring = np.stack([np.sin(theta) * np.cos(az),
++                     np.sin(theta) * np.sin(az),
++                     np.full(6, np.cos(theta))], axis=1)
++    return np.vstack([[[0.0, 0.0, 1.0]], ring])
+ 
+ 
+ def min_max_dist_dim3_14() -> np.ndarray:
+     """
+-    Creates 14 points in 3 dimensions in order to maximize the ratio of
+-    minimum to maximum pairwise distance.
++    Creates 14 points in 3D maximizing min/max pairwise distance.
+ 
+-    Returns
+-        points: np.ndarray of shape (14, 3)
++    Approach: antipodal parameterization (7 generators) optimized
++    globally with differential evolution on a softmin surrogate,
++    followed by exact SLSQP polish. Guarded fallback included.
+     """
++    t0 = time.time()
+     rng = np.random.default_rng(42)
+     best_pts, best_ratio = None, -1.0
+ 
+-    TARGET_RATIO = 0.489  # just below the known optimum dmin/dmax (~0.4899)
+-    for init in _seeds(rng):
+-        pre = _repulsion_stage(init)
+-        hit_target = False
+-        for cand in (pre, init):
+-            polished = _slsqp_stage(cand)
+-            assert polished.shape == (N, D)
+-            r = _ratio(polished)
+-            if r > best_ratio:
+-                best_ratio, best_pts = r, polished
+-            if best_ratio >= TARGET_RATIO:
+-                hit_target = True
+-        if hit_target:
++    # --- Quick deterministic candidates (guaranteed quality) ---
++    quick = [_ico_seed()]
++    for th in np.linspace(0.5, 1.1, 7):
++        quick.append(_ring_seed(th))
++    for g in quick:
++        if best_ratio >= TARGET_RATIO:
+             break
++        P = _slsqp_polish(_expand(g), maxiter=400)
++        r = _ratio(P)
++        if r > best_ratio:
++            best_ratio, best_pts = r, P.copy()
++
++    # --- Global search: differential evolution on generators ---
++    def de_obj(g):
++        return _softmin_obj(g, beta=60.0)
++
++    remaining = TIME_BUDGET - (time.time() - t0)
++    if remaining > 8 and best_ratio < TARGET_RATIO:
++        try:
++            res = differential_evolution(
++                de_obj,
++                bounds=[(-1.0, 1.0)] * (H * D),
++                seed=42,
++                maxiter=40,
++                popsize=18,
++                tol=1e-10,
++                polish=False,
++                init='sobol',
++            )
++            if np.all(np.isfinite(res.x)):
++                P = _slsqp_polish(_expand(res.x), maxiter=400)
++                r = _ratio(P)
++                if r > best_ratio:
++                    best_ratio, best_pts = r, P.copy()
++        except Exception:
++            pass
++
++    # --- Random restarts while time remains ---
++    while time.time() - t0 < TIME_BUDGET and best_ratio < TARGET_RATIO:
++        g = rng.standard_normal((H, D))
++        P = _slsqp_polish(_expand(g), maxiter=300)
++        r = _ratio(P)
++        if r > best_ratio:
++            best_ratio, best_pts = r, P.copy()
+ 
+     if best_pts is None:
+-        np.random.seed(42)
+-        best_pts = np.random.randn(N, D)
+-
+-    # Antipodal-symmetry refinement pass
+-    best_pts = _symmetrize_polish(best_pts)
+-
+-    return np.asarray(best_pts, dtype=float)
+-
+-
+-def _symmetrize_polish(pts):
+-    """Enforce antipodal symmetry and polish with a tight SLSQP pass."""
+-    pts = pts - pts.mean(0)
+-    # Match each point with its best antipodal partner
+-    cost = np.linalg.norm(pts[:, None, :] + pts[None, :, :], axis=2)
+-    np.fill_diagonal(cost, np.inf)
+-    partner = np.argmin(cost, axis=1)
+-    # Only symmetrize if pairing is a valid involution (mutual matches)
+-    mutual = partner[partner] == np.arange(N)
+-    if not np.all(mutual):
+-        return pts
+-    sym = (pts - pts[partner]) / 2.0  # x_i and -x_j averaged -> (x_i - x_j)/2
+-    if _ratio(sym) <= 0:
+-        return pts
+-    out = _slsqp_tight(sym)
+-    if _ratio(out) > _ratio(pts):
+-        return out
+-    return pts
+-
+-
+-def _slsqp_tight(pts, maxiter=200):
+-    """Short, tight SLSQP polish from a symmetrized configuration."""
+-    ds = _pair_dists(pts)
+-    if ds.max() > 0:
+-        pts = pts / ds.max()
+-
+-    def objective(flat):
+-        return -_pair_dists(flat.reshape(N, D)).min()
+-
+-    def constraint(flat):
+-        return 1.0 - _pair_dists(flat.reshape(N, D)).max()
+-
+-    res = minimize(
+-        objective,
+-        pts.ravel(),
+-        method='SLSQP',
+-        constraints={'type': 'ineq', 'fun': constraint},
+-        options={'maxiter': maxiter, 'ftol': 1e-16},
+-    )
+-    out = res.x.reshape(N, D)
+-    if not np.all(np.isfinite(out)):
+-        return pts
++        best_pts = rng.standard_normal((N, D))
++    out = np.asarray(best_pts, dtype=float)
++    if out.shape != (N, D) or not np.all(np.isfinite(out)):
++        out = np.zeros((N, D)) + 1e-3
++    if _pair_dists(out).max() <= 0:
++        out = np.zeros((N, D)) + 1e-3
+     return out
+ 
+-
+ # EVOLVE-BLOCK-END

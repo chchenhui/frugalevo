@@ -1,0 +1,76 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
+
+    Returns
+        points: np.ndarray of shape (14,3) containing the (x,y) coordinates of the 14 points.
+
+    """
+
+    # Use seven antipodal directions.  Every returned point has norm one and
+    # each direction has its negative present, so the diameter is exactly 2.
+    # Hence maximizing the requested ratio is equivalent to minimizing the
+    # largest absolute inner product between the seven directions.
+    rng = np.random.default_rng(18473)
+    starts = 48
+    axes = rng.normal(size=(starts, 7, 3))
+    axes /= np.linalg.norm(axes, axis=2, keepdims=True)
+
+    def full_configuration(a):
+        return np.concatenate((a, -a), axis=1)
+
+    def exact_quality(a):
+        gram = np.abs(np.einsum("sik,sjk->sij", a, a))
+        idx = np.arange(7)
+        gram[:, idx, idx] = 0.0
+        # For antipodal unit points, dmin^2 / dmax^2 = (1-mu)/2.
+        return (1.0 - gram.max(axis=(1, 2))) * 0.5
+
+    # A continuation in the Riesz exponent gives a smooth global search at
+    # first and progressively concentrates force on the closest contacts.
+    for power, iterations in ((2, 180), (4, 220), (8, 260), (16, 300), (32, 360)):
+        for _ in range(iterations):
+            x = full_configuration(axes)
+            delta = x[:, :, None, :] - x[:, None, :, :]
+            dist2 = np.sum(delta * delta, axis=-1)
+            dist2[:, np.arange(14), np.arange(14)] = np.inf
+            weights = dist2 ** (-(power + 2) * 0.5)
+            force = np.einsum("sij,sijk->sik", weights, delta)[:, :7]
+            # Only tangent motion changes a direction on the sphere.
+            force -= np.sum(force * axes, axis=2, keepdims=True) * axes
+            scale = np.linalg.norm(force, axis=2, keepdims=True).mean(axis=1, keepdims=True)
+            axes += (0.075 / power) * force / (scale + 1e-12)
+            axes /= np.linalg.norm(axes, axis=2, keepdims=True)
+
+    # Spend the more expensive exact local search only on promising starts.
+    keep = np.argsort(exact_quality(axes))[-8:]
+    axes = axes[keep]
+
+    for step in range(6000):
+        candidate = axes.copy()
+        which = rng.integers(0, 7, size=len(axes))
+        noise = rng.normal(size=(len(axes), 3))
+        old = candidate[np.arange(len(axes)), which]
+        noise -= np.sum(noise * old, axis=1, keepdims=True) * old
+        noise /= np.linalg.norm(noise, axis=1, keepdims=True)
+        # Gradually reduce the exploratory tangent displacement.
+        amount = 0.055 * (1.0 - step / 6000.0) + 0.0015
+        proposed = old + amount * noise
+        proposed /= np.linalg.norm(proposed, axis=1, keepdims=True)
+        candidate[np.arange(len(axes)), which] = proposed
+
+        old_score = exact_quality(axes)
+        new_score = exact_quality(candidate)
+        accept = new_score > old_score
+        axes[accept] = candidate[accept]
+
+    best = axes[np.argmax(exact_quality(axes))]
+    points = full_configuration(best)[0]
+    return points
+
+
+# EVOLVE-BLOCK-END

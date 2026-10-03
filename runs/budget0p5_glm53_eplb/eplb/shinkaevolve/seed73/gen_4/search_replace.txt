@@ -1,0 +1,72 @@
+<NAME>
+heap_based_balanced_packing_speedup
+</NAME>
+<DESCRIPTION>
+The main bottleneck of the algorithm (times_algorithm = 0.56) is `balanced_packing`: it uses a pure-Python O(n · num_packs) scan per layer to find the least-loaded pack with remaining capacity. Replace this linear scan with a min-heap keyed by (load, pack_id): each item assignment costs O(log num_packs) instead of O(num_packs), and the heap automatically enforces the "exactly n/m objects per pack" capacity constraint (a pack is simply not pushed back once full). Additionally, the per-element tensor writes from Python are very slow; we buffer the (group, pack) assignments per layer in Python lists and perform a single vectorized indexed write into the tensors per layer. This keeps the same greedy LPT-with-cardinality-constraint packing quality (so balancedness is unchanged) while dramatically cutting the Python-side execution time, which improves the speed score and hence the combined score.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    weight_list = weight.tolist()
+    indices_list = indices.tolist()
+    arange_packs = torch.arange(num_packs, dtype=torch.int64)
+    for i in range(num_layers):
+        pack_weights = [0.0] * num_packs
+        pack_items = [0] * num_packs
+        # min-heap of (current load, pack id) for packs with remaining capacity
+        heap = [(0.0, p) for p in range(num_packs)]
+        heapq.heapify(heap)
+        cols = []
+        pvals = []
+        rvals = []
+        for group in indices_list[i]:
+            pw, pack = heapq.heappop(heap)
+            cols.append(group)
+            pvals.append(pack)
+            rvals.append(pack_items[pack])
+            pack_items[pack] += 1
+            pw += weight_list[i][group]
+            pack_weights[pack] = pw
+            if pack_items[pack] < groups_per_pack:
+                heapq.heappush(heap, (pw, pack))
+        cols_t = torch.tensor(cols, dtype=torch.int64)
+        pack_index[i, cols_t] = torch.tensor(pvals, dtype=torch.int64)
+        rank_in_pack[i, cols_t] = torch.tensor(rvals, dtype=torch.int64)
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+import torch
+=======
+import heapq
+
+import torch
+>>>>>>> REPLACE
+</DIFF>

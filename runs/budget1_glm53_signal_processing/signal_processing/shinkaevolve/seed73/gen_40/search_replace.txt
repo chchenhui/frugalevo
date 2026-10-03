@@ -1,0 +1,55 @@
+<NAME>
+trend_prediction_lag_compensation
+</NAME>
+<DESCRIPTION>
+The metrics plateau at 0.62 across many filter tweaks: lag_error stuck at 0.41, responsiveness at 0.71, while noise metrics barely move. The bottleneck is the structural phase/group delay of the SG + convolution pipeline, not the post-hoc snapping. A principled fix is predictive lag compensation: after smoothing, extrapolate the local quadratic trend forward by roughly the effective group delay (half the SG window + half the convolution window ≈ window_size samples). This is a classic zero-phase-lag technique (equivalent to "smoothed prediction" / forward-stepping the SG polynomial fit). It directly targets lag_error and responsiveness without adding noise, since extrapolation uses the already-denoised, curvature-aware quadratic fit rather than raw data. Compute the slope (first difference) and half-acceleration (second difference) of x_smooth via vectorized gradients, then step y forward: y_pred = y + delay*(dy + 0.5*delay*d2y). Clip the correction by the local noise sigma to avoid over-shooting in flat noisy regions (safety cap), preserving reversal performance. This is O(n), adds negligible execution time, and leaves all proven snapping machinery intact.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    w = np.exp(np.linspace(-1.5, 0.0, window_size))
+    w = w / np.sum(w)
+    y = np.convolve(x_smooth, w[::-1], mode="valid")  # length = n - W + 1
+
+    # --- Locally adaptive noise scale (rolling MAD of diffs) ---
+=======
+    w = np.exp(np.linspace(-1.5, 0.0, window_size))
+    w = w / np.sum(w)
+    y = np.convolve(x_smooth, w[::-1], mode="valid")  # length = n - W + 1
+
+    # --- Predictive lag compensation (forward-stepped quadratic trend) ---
+    # The SG window (2W+3) plus the convolution window (W) impose a group
+    # delay of roughly `window_size` samples. Extrapolate the denoised
+    # local quadratic trend forward by that delay to cancel the lag:
+    #   y_pred = y + L*(dy + 0.5*L*d2y)
+    # The correction is capped by the local noise scale so flat, noisy
+    # regions are not over-extrapolated (protects reversal performance).
+    L = float(window_size)
+    dy = np.gradient(x_smooth)
+    d2y = np.gradient(dy)
+    d = np.diff(x_smooth)
+    block = 51  # +/- 25 samples
+
+    if len(d) >= block:
+        swv = np.lib.stride_tricks.sliding_window_view(d, block)
+        local_mad = np.median(np.abs(swv - np.median(swv, axis=1, keepdims=True)),
+                              axis=1) / 0.6745
+        pad_len = (block - 1) // 2
+        local_mad = np.concatenate([
+            local_mad[:1] * np.ones(pad_len), local_mad, local_mad[-1:] * np.ones(pad_len)
+        ])
+    else:
+        med_d = np.median(d)
+        local_mad = np.full(len(d), np.median(np.abs(d - med_d)) / 0.6745)
+    sigma_local_pred = np.maximum(local_mad / np.sqrt(2.0), 1e-12)
+
+    if len(y) > 2:
+        # Align slope/curvature estimates with the valid-convolution output.
+        off = window_size - 1
+        corr_raw = L * (dy[off:off + len(y)] + 0.5 * L * d2y[off:off + len(y)])
+        # Safety cap: limit the correction magnitude per sample.
+        cap = 2.0 * np.concatenate([sigma_local_pred[:1], sigma_local_pred])[:len(y)]
+        y = y + np.clip(corr_raw, -cap, cap)
+
+    # --- Locally adaptive noise scale (rolling MAD of diffs) ---
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,255 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Find a low-makespan transaction order using exact search for small
+    workloads, beam search for larger workloads, and variable-neighborhood
+    descent on several diverse elite schedules.
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    n = workload.num_txns
+    if n == 0:
+        return 0, []
+
+    cost_cache = {}
+
+    def cost(sequence):
+        key = tuple(sequence)
+        if key not in cost_cache:
+            cost_cache[key] = workload.get_opt_seq_cost(sequence)
+        return cost_cache[key]
+
+    # Small transaction sets can be solved exactly.  This is useful for
+    # workloads where heuristic choices are unnecessary and an optimal order
+    # can be returned directly.
+    if n <= 8:
+        best_cost = float("inf")
+        best_schedule = None
+
+        def exhaustive(prefix, remaining):
+            nonlocal best_cost, best_schedule
+
+            prefix_cost = cost(prefix)
+            if prefix_cost >= best_cost:
+                return
+
+            if not remaining:
+                best_cost = prefix_cost
+                best_schedule = prefix[:]
+                return
+
+            ranked = []
+            for txn in remaining:
+                candidate = prefix + [txn]
+                ranked.append((cost(candidate), txn))
+
+            ranked.sort()
+            for _, txn in ranked:
+                next_remaining = remaining[:]
+                next_remaining.remove(txn)
+                exhaustive(prefix + [txn], next_remaining)
+
+        exhaustive([], list(range(n)))
+        return best_cost, best_schedule
+
+    # A beam retains multiple partial orders.  Unlike a single greedy path,
+    # this preserves different conflict orientations until their downstream
+    # effects become visible in the makespan calculation.
+    beam_width = max(24, min(96, max(1, int(num_seqs)) * 10))
+    beam = [(0, tuple(), (1 << n) - 1)]
+
+    for _ in range(n):
+        expanded = []
+        for _, prefix, remaining_mask in beam:
+            candidates = []
+            mask = remaining_mask
+
+            while mask:
+                low_bit = mask & -mask
+                txn = low_bit.bit_length() - 1
+                next_prefix = prefix + (txn,)
+                candidates.append((cost(next_prefix), next_prefix,
+                                   remaining_mask ^ low_bit))
+                mask ^= low_bit
+
+            # Randomizing equal-cost candidate order avoids transaction-id
+            # bias while retaining exact makespan ranking.
+            random.shuffle(candidates)
+            expanded.extend(candidates)
+
+        expanded.sort(key=lambda entry: entry[0])
+
+        # Prefixes are unique by construction, but retaining only beam_width
+        # lowest exact prefix costs keeps search controlled on large workloads.
+        beam = expanded[:beam_width]
+
+    completed = [(entry[0], list(entry[1])) for entry in beam]
+    completed.sort(key=lambda entry: entry[0])
+
+    # Select strong but structurally diverse local-search starts.  Two orders
+    # with the same makespan may lead to very different local optima.
+    elite_limit = min(len(completed), max(4, min(10, int(num_seqs) + 2)))
+    elite = [completed[0]]
+
+    while len(elite) < elite_limit:
+        selected_orders = [schedule for _, schedule in elite]
+        best_candidate = None
+        best_key = None
+
+        for candidate_cost, candidate_schedule in completed:
+            if candidate_schedule in selected_orders:
+                continue
+
+            diversity = min(
+                sum(a != b for a, b in zip(candidate_schedule, chosen))
+                for chosen in selected_orders
+            )
+            key = (diversity, -candidate_cost)
+
+            if best_key is None or key > best_key:
+                best_key = key
+                best_candidate = (candidate_cost, candidate_schedule)
+
+        if best_candidate is None:
+            break
+        elite.append(best_candidate)
+
+    def best_relocation(schedule, current_cost):
+        best_cost = current_cost
+        best_schedule = schedule
+
+        for source in range(n):
+            txn = schedule[source]
+            reduced = schedule[:source] + schedule[source + 1:]
+
+            for destination in range(n):
+                if destination == source:
+                    continue
+
+                candidate = reduced[:destination] + [txn] + reduced[destination:]
+                candidate_cost = cost(candidate)
+
+                if candidate_cost < best_cost:
+                    best_cost = candidate_cost
+                    best_schedule = candidate
+
+        return best_cost, best_schedule
+
+    def best_swap(schedule, current_cost):
+        best_cost = current_cost
+        best_schedule = schedule
+
+        for left in range(n - 1):
+            for right in range(left + 1, n):
+                candidate = schedule[:]
+                candidate[left], candidate[right] = candidate[right], candidate[left]
+                candidate_cost = cost(candidate)
+
+                if candidate_cost < best_cost:
+                    best_cost = candidate_cost
+                    best_schedule = candidate
+
+        return best_cost, best_schedule
+
+    def best_reverse(schedule, current_cost):
+        """
+        Reversing a contiguous region changes several conflict relationships
+        simultaneously, which can escape a local minimum where single moves
+        are insufficient.
+        """
+        best_cost = current_cost
+        best_schedule = schedule
+
+        for left in range(n - 1):
+            for right in range(left + 2, n + 1):
+                candidate = (
+                    schedule[:left]
+                    + list(reversed(schedule[left:right]))
+                    + schedule[right:]
+                )
+                candidate_cost = cost(candidate)
+
+                if candidate_cost < best_cost:
+                    best_cost = candidate_cost
+                    best_schedule = candidate
+
+        return best_cost, best_schedule
+
+    def descend(initial_cost, initial_schedule):
+        current_cost = initial_cost
+        current_schedule = initial_schedule
+
+        # Each successful move strictly reduces makespan, so no cycle is
+        # possible.  The bound protects runtime for unusually large inputs.
+        passes = max(3, min(8, n))
+
+        for _ in range(passes):
+            moved_cost, moved_schedule = best_relocation(
+                current_schedule, current_cost
+            )
+            if moved_cost < current_cost:
+                current_cost, current_schedule = moved_cost, moved_schedule
+                continue
+
+            swapped_cost, swapped_schedule = best_swap(
+                current_schedule, current_cost
+            )
+            if swapped_cost < current_cost:
+                current_cost, current_schedule = swapped_cost, swapped_schedule
+                continue
+
+            reversed_cost, reversed_schedule = best_reverse(
+                current_schedule, current_cost
+            )
+            if reversed_cost < current_cost:
+                current_cost, current_schedule = reversed_cost, reversed_schedule
+                continue
+
+            break
+
+        return current_cost, current_schedule
+
+    best_cost = float("inf")
+    best_schedule = None
+
+    for initial_cost, initial_schedule in elite:
+        improved_cost, improved_schedule = descend(
+            initial_cost, initial_schedule
+        )
+
+        if improved_cost < best_cost:
+            best_cost = improved_cost
+            best_schedule = improved_schedule
+
+    return cost(best_schedule), best_schedule
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

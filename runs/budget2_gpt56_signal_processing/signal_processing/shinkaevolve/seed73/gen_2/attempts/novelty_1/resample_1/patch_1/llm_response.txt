@@ -1,0 +1,115 @@
+<NAME>
+adaptive_kalman_trend_filter
+</NAME>
+
+<DESCRIPTION>
+Replace the exponentially weighted moving average with a causal adaptive constant-velocity Kalman filter. Unlike a window average, the state explicitly models both level and local slope, allowing it to follow genuine directional motion with substantially less phase lag. The measurement-noise estimate is updated from clipped innovations, preventing transient outliers from causing spurious slope reversals. Process uncertainty is adapted from persistent innovation magnitude so the filter becomes responsive during real regime changes while remaining smooth in quiet periods.
+
+The returned samples remain aligned with the last sample of each original sliding window (`window_size - 1:`), preserving the existing public output-length contract and downstream alignment logic. The filter is O(N), has constant memory, and avoids expensive multi-scale transforms or non-causal processing.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Enhanced version with trend preservation using weighted moving average.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window
+
+    Returns:
+        y: Filtered output signal
+    """
+    if len(x) < window_size:
+        raise ValueError(f"Input signal length ({len(x)}) must be >= window_size ({window_size})")
+
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+    # Create weights that emphasize recent samples
+    weights = np.exp(np.linspace(-2, 0, window_size))
+    weights = weights / np.sum(weights)
+
+    for i in range(output_length):
+        window = x[i : i + window_size]
+
+        # Weighted moving average with exponential weights
+        y[i] = np.sum(window * weights)
+
+    return y
+=======
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Causal adaptive constant-velocity Kalman filter.
+
+    The state contains both signal level and slope, which removes the systematic
+    delay of a moving average. Innovation-based noise adaptation supplies strong
+    smoothing during noisy stationary intervals and automatically increases
+    responsiveness when the underlying signal starts moving.
+    """
+    x = np.asarray(x, dtype=float)
+    if x.ndim != 1:
+        raise ValueError("Input signal must be a 1D array")
+    if len(x) < window_size:
+        raise ValueError(f"Input signal length ({len(x)}) must be >= window_size ({window_size})")
+
+    n = len(x)
+    filtered = np.empty(n)
+    level = x[0]
+    velocity = 0.0
+    filtered[0] = level
+
+    # Estimate the initial measurement variance robustly from sample increments.
+    # The median estimate is resistant to the occasional sharp genuine transition.
+    if n > 2:
+        increment_scale = np.median(np.abs(np.diff(x) - np.median(np.diff(x)))) * 1.4826
+        measurement_var = max((increment_scale ** 2) * 0.5, 1e-8)
+    else:
+        measurement_var = 1e-8
+
+    covariance = np.array([[measurement_var, 0.0],
+                           [0.0, measurement_var]], dtype=float)
+    innovation_var = measurement_var
+    process_var = max(measurement_var * 0.01, 1e-10)
+
+    for i in range(1, n):
+        # Constant-velocity prediction, with white-acceleration process noise.
+        predicted_level = level + velocity
+        predicted_velocity = velocity
+        q = process_var
+        predicted_covariance = covariance + np.array(
+            [[covariance[0, 1] + covariance[1, 0] + covariance[1, 1] + 0.25 * q,
+              covariance[0, 1] + covariance[1, 1] + 0.5 * q],
+             [covariance[1, 0] + covariance[1, 1] + 0.5 * q,
+              covariance[1, 1] + q]]
+        )
+
+        innovation = x[i] - predicted_level
+        # Clip only variance updates, not the measurement itself: isolated spikes
+        # cannot inflate the gain and trigger a sequence of false reversals.
+        innovation_limit = 3.0 * np.sqrt(max(innovation_var, 1e-10))
+        bounded_innovation = np.clip(innovation, -innovation_limit, innovation_limit)
+        innovation_var = 0.94 * innovation_var + 0.06 * bounded_innovation ** 2
+        measurement_var = max(innovation_var, 1e-8)
+
+        residual_var = predicted_covariance[0, 0] + measurement_var
+        gain = predicted_covariance[:, 0] / residual_var
+        level = predicted_level + gain[0] * innovation
+        velocity = predicted_velocity + gain[1] * innovation
+
+        # Joseph-form equivalent for this scalar observation, symmetrized to
+        # control numerical drift in long real-time streams.
+        covariance = predicted_covariance - np.outer(gain, predicted_covariance[0, :])
+        covariance = 0.5 * (covariance + covariance.T)
+
+        # Persistent innovations indicate a changing local trend; allow the next
+        # predictions to adapt faster, while retaining a conservative noise floor.
+        process_var = max(1e-10, 0.97 * process_var + 0.03 * bounded_innovation ** 2 * 0.08)
+        filtered[i] = level
+
+    # Match the historical sliding-window API: each output corresponds to the
+    # newest sample in its window, with no additional averaging delay.
+    return filtered[window_size - 1:]
+>>>>>>> REPLACE
+</DIFF>

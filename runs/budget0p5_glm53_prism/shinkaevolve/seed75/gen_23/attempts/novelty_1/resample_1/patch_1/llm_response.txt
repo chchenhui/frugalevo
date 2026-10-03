@@ -1,0 +1,154 @@
+<NAME>
+randomized_restarts</NAME>
+<DESCRIPTION>
+Add a seed-perturbation restart loop: refactor the greedy + local search into an inner routine, run it multiple times (e.g., 12 restarts), where each restart perturbs the greedy tie-breaking among near-equal best-fit GPUs (choosing randomly among GPUs whose resulting KVPR is within a small epsilon of the best), and keep the placement with the lowest final max KVPR. This diversifies beyond the deterministic greedy, which can get stuck in greedy lockstep, and was a pattern in perfect-scoring variants.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        A placement of models to GPUs
+    """
+=======
+import random
+
+def _kvpr_of(load, free):
+    if free <= 0:
+        return float('inf')
+    return load / free
+
+def _run_attempt(gpu_num, sorted_models, seed):
+    """One greedy + local-search attempt with randomized tie-breaking."""
+    rng = random.Random(seed)
+
+    placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+    shared_kv = [GPU_MEM_SIZE for _ in range(gpu_num)]
+    weighted_req_rate = [0.0 for _ in range(gpu_num)]
+
+    for model in sorted_models:
+        best_idx = None
+        best_ratio = float('inf')
+        near_best = []
+
+        model_weight = model.req_rate / model.slo
+        for gpu_id in range(gpu_num):
+            remaining = shared_kv[gpu_id] - model.model_size
+            if remaining > 0:
+                resulting_ratio = (weighted_req_rate[gpu_id] + model_weight) / remaining
+                if resulting_ratio < best_ratio - 1e-12:
+                    best_ratio = resulting_ratio
+                    near_best = [gpu_id]
+                elif resulting_ratio < best_ratio + 1e-12:
+                    near_best.append(gpu_id)
+
+        if not near_best:
+            return None, float('inf')
+
+        best_idx = rng.choice(near_best) if len(near_best) > 1 else near_best[0]
+
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model_weight
+        shared_kv[best_idx] -= model.model_size
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Greedy KVPR-minimizing placement based on Algorithm 1 (without τ check)
+    # 1) Sort models by r_j / s_j in descending order
+    sorted_models = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
+
+    # 2) Initialize per-GPU states
+    placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+    shared_kv = [GPU_MEM_SIZE for _ in range(gpu_num)]  # remaining memory per GPU
+    weighted_req_rate = [0.0 for _ in range(gpu_num)]   # sum of r_j / s_j per GPU
+
+    # 3) Assign each model to the GPU that minimizes current KVPR while fitting in memory
+    for model in sorted_models:
+        best_idx = None
+        best_ratio = float('inf')
+
+        model_weight = model.req_rate / model.slo
+        for gpu_id in range(gpu_num):
+            remaining = shared_kv[gpu_id] - model.model_size
+            if remaining > 0:
+                # KVPR of this GPU after placing the model
+                resulting_ratio = (weighted_req_rate[gpu_id] + model_weight) / remaining
+                if resulting_ratio < best_ratio:
+                    best_ratio = resulting_ratio
+                    best_idx = gpu_id
+
+        # Failure: if no GPU can fit, raise an error instead of overcommitting
+        if best_idx is None:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on any GPU. "
+                f"Remaining per-GPU memory: {shared_kv}"
+            )
+
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+=======
+    # Local search + swap on this attempt's placement
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+            if improved:
+                break
+
+    return placement
+=======
+            if improved:
+                break
+
+    final_max = max(kvpr(g) for g in range(gpu_num))
+    return placement, final_max
+
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        A placement of models to GPUs
+    """
+    if gpu_num <= 0:
+        raise ValueError("gpu_num must be positive")
+
+    # 1) Sort models by r_j / s_j in descending order
+    sorted_models = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
+
+    best_placement = None
+    best_score = float('inf')
+    last_error = None
+
+    # 2) Multi-restart with seed-perturbed randomized tie-breaking; keep the best
+    for seed in range(12):
+        placement, score = _run_attempt(gpu_num, sorted_models, seed)
+        if placement is None:
+            last_error = ValueError(
+                "Unable to place all models on the available GPUs."
+            )
+            continue
+        if score < best_score:
+            best_score = score
+            best_placement = placement
+
+    if best_placement is None:
+        raise last_error if last_error is not None else ValueError("Placement failed.")
+
+    return best_placement
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

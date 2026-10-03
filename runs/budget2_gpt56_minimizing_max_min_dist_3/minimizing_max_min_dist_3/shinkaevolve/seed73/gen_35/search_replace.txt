@@ -1,0 +1,103 @@
+<NAME>
+constrained_diameter_polish
+</NAME>
+
+<DESCRIPTION>
+Add a final deterministic constrained optimization pass specialized for the hard packing formulation.  Normalize the incumbent so its closest squared distance is one, then minimize an explicit diameter variable subject to every pairwise squared distance being at least one and at most that diameter.  This is the direct epigraph formulation of the evaluator objective, unlike the earlier softmin/softmax surrogate.
+
+The analytic constraint Jacobian makes SLSQP practical despite the 91 pair constraints.  Two passes are used: the first permits a minute lower-bound relaxation to settle the active contact graph, while the second uses the exact lower bound and tighter termination.  The result is accepted only if it is numerically feasible and improves the exact ratio, retaining the robust stochastic incumbent otherwise.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+import numpy as np
+=======
+import numpy as np
+from scipy.optimize import minimize
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    return best_points
+=======
+    # Direct hard-constraint polish.  After scaling so that the shortest
+    # squared distance is one, maximizing the ratio is exactly equivalent to
+    # minimizing an epigraph variable D with 1 <= q_ij <= D for every pair.
+    # This also resolves the small discrepancy between a finite-beta surrogate
+    # and the evaluator's actual nonsmooth minimum/maximum ratio.
+    initial_delta = best_points[iu] - best_points[ju]
+    initial_q = np.einsum("ij,ij->i", initial_delta, initial_delta)
+    constrained_points = best_points / np.sqrt(initial_q.min())
+    initial_delta = constrained_points[iu] - constrained_points[ju]
+    initial_q = np.einsum("ij,ij->i", initial_delta, initial_delta)
+    initial_state = np.concatenate(
+        (constrained_points.ravel(), [float(initial_q.max())])
+    )
+
+    def diameter_constraints(state: np.ndarray, lower: float) -> np.ndarray:
+        coordinates = state[:-1].reshape(n, d)
+        delta = coordinates[iu] - coordinates[ju]
+        q = np.einsum("ij,ij->i", delta, delta)
+        return np.concatenate((q - lower, state[-1] - q))
+
+    def diameter_constraint_jacobian(
+        state: np.ndarray, lower: float
+    ) -> np.ndarray:
+        del lower
+        coordinates = state[:-1].reshape(n, d)
+        delta = coordinates[iu] - coordinates[ju]
+        count = iu.size
+        jacobian = np.zeros((2 * count, n * d + 1), dtype=np.float64)
+        rows = np.arange(count)[:, None]
+        axes = np.arange(d)[None, :]
+        first_columns = d * iu[:, None] + axes
+        second_columns = d * ju[:, None] + axes
+        derivative = 2.0 * delta
+        jacobian[rows, first_columns] = derivative
+        jacobian[rows, second_columns] = -derivative
+        jacobian[count + rows, first_columns] = -derivative
+        jacobian[count + rows, second_columns] = derivative
+        jacobian[count:, -1] = 1.0
+        return jacobian
+
+    objective_jacobian = np.zeros(n * d + 1, dtype=np.float64)
+    objective_jacobian[-1] = 1.0
+    polished_state = initial_state
+    for lower_bound, tolerance, iterations in (
+        (1.0 - 1.0e-8, 2.0e-11, 500),
+        (1.0, 2.0e-13, 800),
+    ):
+        result = minimize(
+            fun=lambda state: state[-1],
+            x0=polished_state,
+            jac=lambda state: objective_jacobian,
+            method="SLSQP",
+            constraints={
+                "type": "ineq",
+                "fun": lambda state, bound=lower_bound: diameter_constraints(
+                    state, bound
+                ),
+                "jac": lambda state, bound=lower_bound: diameter_constraint_jacobian(
+                    state, bound
+                ),
+            },
+            options={"maxiter": iterations, "ftol": tolerance, "disp": False},
+        )
+        if np.all(np.isfinite(result.x)):
+            polished_state = result.x
+
+    polished_points = polished_state[:-1].reshape(n, d)
+    polished_delta = polished_points[iu] - polished_points[ju]
+    polished_q = np.einsum("ij,ij->i", polished_delta, polished_delta)
+    # Reject a merely approximate/infeasible optimizer endpoint.  Rescaling is
+    # harmless and gives exact-score comparison independent of its scale.
+    if polished_q.min() >= 1.0 - 2.0e-7 and polished_q.max() > 0.0:
+        polished_points /= np.sqrt(polished_q.min())
+        polished_ratio = exact_ratio(polished_points)
+        if polished_ratio > best_ratio:
+            best_points = polished_points
+
+    return np.asarray(best_points, dtype=np.float64)
+>>>>>>> REPLACE
+</DIFF>

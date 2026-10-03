@@ -1,0 +1,117 @@
+<NAME>
+zerophase_sg_trendgate</NAME>
+<DESCRIPTION>
+The current weighted moving average introduces lag (weighting recent samples shifts the effective center) and leaves substantial noise and false reversals (slope_changes ≈ 223, false_reversals ≈ 175). I propose replacing it with a zero-phase Savitzky-Golay (local quadratic polynomial) smoother: a windowed degree-2 polynomial fit preserves signal dynamics (amplitude/trend of low- and mid-frequency components) far better than a weighted average, and applying the filter forward and again on the reversed signal cancels the phase delay entirely, minimizing lag error. On top of that, I add a noise-scaled trend gate: slopes below a robust noise threshold (estimated via MAD of first differences) are zeroed and the level is rebuilt from gated slopes, which drastically cuts spurious directional reversals while preserving genuine trends. All operations are vectorized convolutions for O(n) execution time.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Enhanced version with trend preservation using weighted moving average.
+
+    Args:
+        x: Input signal (1D array of real values)
+        window_size: Size of sliding window
+
+    Returns:
+        y: Filtered output signal
+    """
+    if len(x) < window_size:
+        raise ValueError(f"Input signal length ({len(x)}) must be >= window_size ({window_size})")
+
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+    # Create weights that emphasize recent samples
+    weights = np.exp(np.linspace(-2, 0, window_size))
+    weights = weights / np.sum(weights)
+
+    for i in range(output_length):
+        window = x[i : i + window_size]
+
+        # Weighted moving average with exponential weights
+        y[i] = np.sum(window * weights)
+
+    return y
+=======
+def _savitzky_golay_coeffs(window_size, poly_order=2):
+    """
+    Compute Savitzky-Golay smoothing coefficients (least-squares local
+    polynomial fit over a window).
+    """
+    half = (window_size - 1) // 2
+    # Design matrix of local polynomial basis at offsets -half..half
+    t = np.arange(-half, window_size - half, dtype=float)
+    A = np.vander(t, poly_order + 1, increasing=True)  # [1, t, t^2, ...]
+    # Least-squares fit coefficients: value at center = row 0 of pinv(A)
+    coeffs, _, _, _ = np.linalg.lstsq(A, np.eye(window_size)[: , 0] * 0 + A @ np.linalg.pinv(A), rcond=None)
+    # Smoothing weights: project onto the constant term (window center value)
+    pinv = np.linalg.pinv(A)
+    return pinv[0, :]
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Zero-phase Savitzky-Golay smoother with noise-scaled trend gating.
+
+    Applies a windowed local quadratic-polynomial fit (excellent trend /
+    dynamics preservation) forward and backward to cancel phase delay, then
+    gates small slopes below a robust noise threshold to suppress spurious
+    directional reversals.
+
+    Args:
+        x: Input signal (1D array of real values)
+        window_size: Size of sliding window
+
+    Returns:
+        y: Filtered output signal
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < window_size:
+        raise ValueError(f"Input signal length ({n}) must be >= window_size ({window_size})")
+
+    # --- Robust noise estimate from first differences (MAD-based) ---
+    d = np.diff(x)
+    sigma_noise = max(np.median(np.abs(d - np.median(d))) / (np.sqrt(2) * 0.6745), 1e-9)
+
+    # --- Savitzky-Golay coefficients (local quadratic fit) ---
+    w = window_size if window_size % 2 == 1 else window_size - 1
+    if w < 3:
+        w = 3
+    half = (w - 1) // 2
+    t = np.arange(-half, w - half, dtype=float)
+    A = np.vander(t, 3, increasing=True)  # [1, t, t^2]
+    pinv = np.linalg.pinv(A)
+    sg = pinv[0, :]  # smoother weights (value at window center)
+
+    # --- Zero-phase smoothing: forward pass, then reverse pass ---
+    # Pad by reflection to keep edges clean
+    pad = half
+    xp = np.concatenate((x[pad:0:-1], x, x[-2 : n - pad - 2 if n - pad - 2 >= 0 else None]))
+    y_fwd = np.convolve(xp, sg[::-1], mode="valid")[:n]  # forward pass
+    # Second (reverse) pass cancels the phase delay of the first pass
+    y_rev = np.convolve(xp[::-1], sg[::-1], mode="valid")[::-1][:n]
+    y_smooth = 0.5 * (y_fwd + y_rev)
+    # Fine tune: the two passes combined -> apply on smoothed once more lightly
+    y_smooth = np.convolve(
+        np.concatenate((y_smooth[pad:0:-1], y_smooth, y_smooth[-2 : n - pad - 2 if n - pad - 2 >= 0 else None])),
+        sg[::-1], mode="valid"
+    )[:n]
+
+    # --- Noise-scaled trend gating to suppress false reversals ---
+    slope = np.gradient(y_smooth)
+    thresh = 0.3 * sigma_noise
+    slope_gated = np.where(np.abs(slope) < thresh, 0.0, slope)
+    level_gated = np.zeros(n)
+    level_gated[0] = y_smooth[0]
+    level_gated[1:] = y_smooth[0] + np.cumsum(slope_gated[:-1])
+    # Blend gated (monotone-consistent) path with smoother for accuracy
+    y_full = 0.5 * y_smooth + 0.5 * level_gated
+
+    # --- Align to sliding-window output convention ---
+    output_length = n - window_size + 1
+    start = window_size // 2
+    return y_full[start : start + output_length]
+>>>>>>> REPLACE
+</DIFF>

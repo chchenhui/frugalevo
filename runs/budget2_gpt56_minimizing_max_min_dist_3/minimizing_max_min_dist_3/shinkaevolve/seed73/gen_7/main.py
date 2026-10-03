@@ -1,0 +1,119 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """Construct a reproducible diameter-normalized 14 point packing in R^3."""
+    n, d = 14, 3
+    pair_i, pair_j = np.triu_indices(n, 1)
+    rng = np.random.default_rng(42014)
+
+    def normalize_diameter(x: np.ndarray) -> np.ndarray:
+        x = x - x.mean(axis=0, keepdims=True)
+        delta = x[pair_i] - x[pair_j]
+        diameter = np.sqrt(np.sum(delta * delta, axis=1)).max()
+        return x / diameter
+
+    def true_score(x: np.ndarray) -> float:
+        delta = x[pair_i] - x[pair_j]
+        distances = np.sqrt(np.sum(delta * delta, axis=1))
+        return float((distances.min() / distances.max()) ** 2)
+
+    def normalize_rows(x: np.ndarray) -> np.ndarray:
+        return x / np.linalg.norm(x, axis=1, keepdims=True)
+
+    def line_seed() -> np.ndarray:
+        """A short deterministic Grassmannian-style relaxation for a diverse seed."""
+        m = 7
+        upper = np.triu_indices(m, 1)
+        v = normalize_rows(rng.normal(size=(m, 3)))
+
+        for beta in (5.0, 16.0, 50.0):
+            for _ in range(90):
+                dots = v @ v.T
+                q = dots[upper]
+                weights = np.exp(beta * (np.abs(q) - np.max(np.abs(q))))
+                weights /= weights.sum()
+
+                signed = weights * np.sign(q)
+                coupling = np.zeros((m, m))
+                coupling[upper] = signed
+                coupling[(upper[1], upper[0])] = signed
+
+                grad = coupling @ v
+                grad -= np.sum(grad * v, axis=1, keepdims=True) * v
+                v = normalize_rows(v - 0.10 * grad)
+
+        # A small deterministic asymmetry lets the unrestricted packing
+        # optimization improve on the antipodal subfamily.
+        seed = np.vstack((v, -v))
+        seed += 0.025 * rng.normal(size=seed.shape)
+        return normalize_diameter(seed)
+
+    def optimize(points: np.ndarray, iterations: int, start_temp: float,
+                 end_temp: float, step_scale: float) -> np.ndarray:
+        nonlocal best_points, best_score
+
+        velocity = np.zeros_like(points)
+        for iteration in range(iterations):
+            fraction = iteration / max(1, iterations - 1)
+
+            # A slightly convex cooling schedule spends more iterations in the
+            # useful medium-temperature regime before resolving active pairs.
+            temperature = start_temp * (1.0 - fraction) ** 1.35 + end_temp
+
+            delta = points[pair_i] - points[pair_j]
+            distances = np.sqrt(np.sum(delta * delta, axis=1)) + 1e-12
+
+            short_logits = -distances / temperature
+            short_weights = np.exp(short_logits - short_logits.max())
+            short_weights /= short_weights.sum()
+
+            long_logits = distances / temperature
+            long_weights = np.exp(long_logits - long_logits.max())
+            long_weights /= long_weights.sum()
+
+            pair_force = (short_weights - long_weights)[:, None] * delta
+            pair_force /= distances[:, None]
+
+            gradient = np.zeros_like(points)
+            np.add.at(gradient, pair_i, pair_force)
+            np.add.at(gradient, pair_j, -pair_force)
+
+            step = step_scale * (1.0 - 0.60 * fraction)
+            velocity = 0.70 * velocity + step * gradient
+            points = normalize_diameter(points + velocity)
+
+            if iteration % 32 == 0 or iteration == iterations - 1:
+                score = true_score(points)
+                if score > best_score:
+                    best_score = score
+                    best_points = points.copy()
+
+        return points
+
+    best_points = None
+    best_score = -np.inf
+
+    # Generic volumetric starts explore unrestricted configurations.
+    for _ in range(15):
+        directions = normalize_rows(rng.normal(size=(n, d)))
+        radii = rng.random(n) ** (1.0 / d)
+        start = normalize_diameter(directions * radii[:, None])
+        optimize(start, 1850, 0.034, 0.0055, 0.056)
+
+    # Structured line-packing starts provide a complementary family of basins.
+    for _ in range(3):
+        optimize(line_seed(), 1850, 0.032, 0.0050, 0.054)
+
+    # Focused local restarts preserve the best discovered contact structure
+    # while allowing it to exchange active pairs and improve the exact score.
+    for noise, iterations in ((0.018, 1500), (0.010, 1800), (0.004, 2200)):
+        candidate = best_points + noise * rng.normal(size=(n, d))
+        candidate = normalize_diameter(candidate)
+        optimize(candidate, iterations, 0.018, 0.0038, 0.042)
+
+    return np.asarray(best_points, dtype=float)
+
+
+# EVOLVE-BLOCK-END

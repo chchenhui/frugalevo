@@ -1,0 +1,194 @@
+<NAME>
+softmin_gradient_heilbronn_13</NAME>
+<DESCRIPTION>
+The previous SEARCH block did not match the file exactly. Using the actual file text (visible in the editable region: `rng = np.random.default_rng(seed=42)`), replace the simple random-seed placeholder with a deterministic multi-start optimizer for the Heilbronn problem:
+
+1. **Surrogate objective**: smooth soft-min (LogSumExp of negative squared signed areas) over all 286 triangles, annealed via temperature tau.
+2. **Analytic gradients**: exact per-vertex gradients of signed cross products, vectorized with NumPy; projected gradient ascent with clipping to the unit square.
+3. **Deterministic restarts**: triangular-lattice seed, perimeter-distributed seeds (boundary-heavy placements are strong for Heilbronn), and fixed-seed random seeds.
+4. **Exact-min polish**: per-point stochastic local search maximizing the true minimum triangle area, with only C(12,2) triples affected per move and geometric step decay.
+5. **Selection & normalization**: best candidate chosen by min_area/hull_area, then isotropically rescaled so the convex hull has exactly unit area, guaranteeing a valid unit-area convex region containing all points.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+import numpy as np
+
+
+def generate_points(n=13):
+    """Generate n points within a unit area convex region."""
+    rng = np.random.default_rng(seed=42)
+    points = rng.random((n, 2))
+    return points
+=======
+import numpy as np
+from itertools import combinations
+
+
+def generate_points(n=13):
+    """Deterministic multi-start soft-min gradient optimizer for the
+    Heilbronn triangle problem (maximize the smallest triangle area
+    among all C(n,3) triples, normalized by convex hull area)."""
+
+    rng = np.random.default_rng(20240517)
+    trip = np.array(list(combinations(range(n), 3)), dtype=int)
+    I, J, K = trip[:, 0], trip[:, 1], trip[:, 2]
+
+    # ---------- geometry helpers ----------
+    def tri_cross(pts):
+        ax, ay = pts[I, 0], pts[I, 1]
+        bx, by = pts[J, 0], pts[J, 1]
+        cx, cy = pts[K, 0], pts[K, 1]
+        return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+
+    def min_area(pts):
+        return 0.5 * np.abs(tri_cross(pts)).min()
+
+    def hull_area(pts):
+        P = sorted(set(map(tuple, np.round(pts, 10))))
+        if len(P) < 3:
+            return 1e-9
+
+        def cr(o, a, b):
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+        lower = []
+        for p in P:
+            while len(lower) >= 2 and cr(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+        upper = []
+        for p in reversed(P):
+            while len(upper) >= 2 and cr(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+        H = np.array(lower[:-1] + upper[:-1], dtype=float)
+        x, y = H[:, 0], H[:, 1]
+        return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+    def score(pts):
+        ha = hull_area(pts)
+        if ha < 1e-6:
+            return 0.0
+        return min_area(pts) / ha
+
+    # ---------- smooth surrogate refinement ----------
+    def refine(pts, rounds=70, tau=3e-4, lr=0.05):
+        pts = pts.copy()
+        for it in range(rounds):
+            t = max(tau * (1.0 - it / rounds), 1e-6)
+            c = tri_cross(pts)
+            a = 0.5 * c
+            z = -(a * a) / t
+            z -= z.max()
+            w = np.exp(z)
+            w /= w.sum()
+            coef = w * a
+            g = np.zeros_like(pts)
+            ax, ay = pts[I, 0], pts[I, 1]
+            bx, by = pts[J, 0], pts[J, 1]
+            cx, cy = pts[K, 0], pts[K, 1]
+            np.add.at(g, I, coef[:, None] * np.stack([by - cy, cx - bx], 1))
+            np.add.at(g, J, coef[:, None] * np.stack([cy - ay, ax - cx], 1))
+            np.add.at(g, K, coef[:, None] * np.stack([ay - by, bx - ax], 1))
+            m = np.abs(g).max()
+            if m < 1e-12:
+                break
+            pts = np.clip(pts + lr * (g / m), 0.0, 1.0)
+        return pts
+
+    # ---------- exact-min local polish ----------
+    def polish(pts, rounds=4, tries=30):
+        pts = pts.copy()
+        bv = min_area(pts)
+        rad = 0.02
+        for _ in range(rounds):
+            for i in range(n):
+                for _ in range(tries):
+                    cand = np.clip(pts[i] + rng.normal(0.0, rad, 2), 0.0, 1.0)
+                    old = pts[i].copy()
+                    pts[i] = cand
+                    v = min_area(pts)
+                    if v > bv + 1e-12:
+                        bv = v
+                    else:
+                        pts[i] = old
+            rad *= 0.5
+        return pts
+
+    # ---------- deterministic start configurations ----------
+    def lattice_seed():
+        cols = [5, 4, 4]
+        pts = []
+        y = 0.08
+        for k, nc in enumerate(cols):
+            xs = np.linspace(0.08, 0.92, nc)
+            for x in xs:
+                pts.append((x + 0.02 * (k % 2), y))
+            y += 0.42
+        pts = np.array(pts[:n])
+        while len(pts) < n:
+            pts = np.vstack([pts, [0.5, 0.96]])
+        return np.clip(pts, 0, 1)
+
+    def perimeter_seed():
+        t = np.sort(rng.random(n)) * 4.0
+        pts = np.empty((n, 2))
+        for i, u in enumerate(t):
+            if u < 1.0:
+                pts[i] = [u, 0.0]
+            elif u < 2.0:
+                pts[i] = [1.0, u - 1.0]
+            elif u < 3.0:
+                pts[i] = [3.0 - u, 1.0]
+            else:
+                pts[i] = [0.0, 4.0 - u]
+        return pts
+
+    def stretch(pts):
+        lo, hi = pts.min(0), pts.max(0)
+        d = hi - lo
+        if np.all(d > 1e-9):
+            pts = (pts - lo) / d
+        return pts
+
+    # ---------- multi-start search ----------
+    best_pts, best_val = None, -1.0
+    for trial in range(22):
+        if trial == 0:
+            pts = lattice_seed()
+        elif trial < 10:
+            pts = perimeter_seed()
+        else:
+            pts = rng.random((n, 2))
+        try:
+            pts = refine(pts)
+            pts = stretch(pts)
+            pts = refine(pts, rounds=40, tau=1e-4)
+            pts = polish(pts)
+            pts = stretch(pts)
+        except Exception:
+            continue
+        v = score(pts)
+        if np.isfinite(v) and v > best_val:
+            best_val, best_pts = v, pts.copy()
+
+    if best_pts is None:
+        best_pts = perimeter_seed()
+
+    # remove near-duplicates (safety)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if np.linalg.norm(best_pts[i] - best_pts[j]) < 1e-7:
+                best_pts[j] = np.clip(
+                    best_pts[j] + np.array([1e-4, 7e-5]), 0.0, 1.0
+                )
+
+    # isotropic normalization: make convex hull area exactly 1
+    ha = hull_area(best_pts)
+    if ha > 1e-9:
+        centroid = best_pts.mean(axis=0)
+        best_pts = centroid + (best_pts - centroid) / np.sqrt(ha)
+
+    return np.asarray(best_pts, dtype=float)
+>>>>>>> REPLACE
+</DIFF>

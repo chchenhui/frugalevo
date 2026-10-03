@@ -1,0 +1,148 @@
+<NAME>
+terminal_aware_multicast_growth
+</NAME>
+
+<DESCRIPTION>
+Replace the nearest-destination multicast-tree growth rule with a terminal-aware shared-path rule. The existing algorithm selects the lowest-cost connector to one destination, even when a slightly more expensive connector would traverse and satisfy several remaining destinations. This can create unnecessary branches and duplicate upstream transfers.
+
+The revised selection evaluates every currently reachable destination connector and scores it by marginal network cost per newly covered destination on that connector. It therefore favors low-cost trunk paths that deliver the broadcast to multiple clouds before branching, while still using `multi_source_dijkstra` to attach each new route at the cheapest already-receiving node. Marginal edge cost is calculated only for edges not already present in the multicast tree, preventing shared edges from being charged again during route selection. Deterministic tie-breaking preserves reproducible topologies.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Build a shared multicast tree instead of independently routing every
+    destination from the source.  Every new destination is attached through
+    the cheapest path from any node that already receives the broadcast.
+    """
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    remaining = set(dsts)
+    remaining.discard(src)
+    tree_nodes = {src}
+    root_paths = {src: [src]}
+
+    while remaining:
+        distances, paths = nx.multi_source_dijkstra(h, tree_nodes, weight="cost")
+        reachable = [dst for dst in remaining if dst in distances]
+        if not reachable:
+            raise nx.NetworkXNoPath(
+                "No broadcast path from %s to destinations %s"
+                % (src, sorted(remaining))
+            )
+
+        dst = min(reachable, key=lambda node: distances[node])
+        connector = paths[dst]
+        attachment = connector[0]
+        full_path = root_paths[attachment] + connector[1:]
+
+        # A connector may pass through other requested destinations.  They
+        # already receive the same broadcast and therefore need no separate
+        # upstream transfer.
+        for index, node in enumerate(connector):
+            node_path = root_paths[attachment] + connector[1:index + 1]
+            if node not in root_paths:
+                root_paths[node] = node_path
+            tree_nodes.add(node)
+
+            if node in remaining:
+                remaining.remove(node)
+                for partition in range(bc_topology.num_partitions):
+                    for edge_index in range(len(node_path) - 1):
+                        s, t = node_path[edge_index], node_path[edge_index + 1]
+                        bc_topology.append_dst_partition_path(
+                            node, partition, [s, t, G[s][t]]
+                        )
+
+        root_paths[dst] = full_path
+
+    # A destination colocated with the source has no network edges, but its
+    # partition paths should still be represented as completed routes.
+    if src in dsts:
+        for partition in range(bc_topology.num_partitions):
+            bc_topology.set_dst_partition_paths(src, partition, [])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Grow a shared multicast tree.  A connector is selected by its marginal
+    cost per destination it reaches, so inexpensive shared trunks are chosen
+    before destination-specific branches.
+    """
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    remaining = set(dsts)
+    remaining.discard(src)
+    tree_nodes = {src}
+    tree_edges = set()
+    root_paths = {src: [src]}
+
+    while remaining:
+        distances, paths = nx.multi_source_dijkstra(h, tree_nodes, weight="cost")
+        reachable = [dst for dst in remaining if dst in distances]
+        if not reachable:
+            raise nx.NetworkXNoPath(
+                "No broadcast path from %s to destinations %s"
+                % (src, sorted(remaining))
+            )
+
+        # A path that passes through several pending destinations amortizes
+        # its upstream transfer over all of them.  Count only edges that are
+        # not already part of the multicast tree as new transfer cost.
+        candidates = []
+        for dst in reachable:
+            connector = paths[dst]
+            covered = [node for node in connector if node in remaining]
+            marginal_cost = sum(
+                G[s][t]["cost"]
+                for s, t in zip(connector, connector[1:])
+                if (s, t) not in tree_edges
+            )
+            candidates.append((
+                marginal_cost / len(covered),
+                marginal_cost,
+                distances[dst],
+                str(dst),
+                dst,
+                connector,
+            ))
+
+        _, _, _, _, dst, connector = min(candidates)
+        attachment = connector[0]
+
+        # A connector may pass through other requested destinations.  They
+        # already receive the same broadcast and therefore need no separate
+        # upstream transfer.
+        for index, node in enumerate(connector):
+            node_path = root_paths[attachment] + connector[1:index + 1]
+            if node not in root_paths:
+                root_paths[node] = node_path
+            tree_nodes.add(node)
+
+            if index:
+                tree_edges.add((connector[index - 1], node))
+
+            if node in remaining:
+                remaining.remove(node)
+                for partition in range(bc_topology.num_partitions):
+                    for edge_index in range(len(node_path) - 1):
+                        s, t = node_path[edge_index], node_path[edge_index + 1]
+                        bc_topology.append_dst_partition_path(
+                            node, partition, [s, t, G[s][t]]
+                        )
+
+    # A destination colocated with the source has no network edges, but its
+    # partition paths should still be represented as completed routes.
+    if src in dsts:
+        for partition in range(bc_topology.num_partitions):
+            bc_topology.set_dst_partition_paths(src, partition, [])
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

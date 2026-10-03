@@ -1,0 +1,217 @@
+<NAME>
+sphere_repulsion_anneal_14</NAME>
+<DESCRIPTION>
+Structural redesign: replace the annealed-softmin L-BFGS seed loop with a physics-style sphere-repulsion engine. Points are placed on the unit sphere and relaxed under inverse-power repulsion with an annealed exponent (2→32), which naturally approximates a Tammes-type spread where the min-distance-to-diameter ratio is high (dmax is bounded by 2 on the sphere, so good Tammes-like spreads beat the reference ratio). The engine is pure vectorized numpy (fast, no per-seed scipy cost), runs many random seeds plus structured seeds (cube+octahedron, antipodal cube), and only the top candidates are polished with the existing analytic-gradient softmin L-BFGS stage, now wrapped with pre-validation (shape/finiteness guards) so a malformed candidate can never crash or zero out the run. Best configuration is selected by true score and normalized before return.</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+try:
+    from scipy.optimize import minimize
+    HAVE_SCIPY = True
+except Exception:
+    HAVE_SCIPY = False
+
+
+def _true_score(P):
+    n = len(P)
+    d2 = np.sum((P[:, None, :] - P[None, :, :]) ** 2, axis=-1)
+    iu = np.triu_indices(n, 1)
+    dm2 = d2[iu].min()
+    dx2 = d2[iu].max()
+    if dx2 <= 0:
+        return 0.0
+    return dm2 / dx2
+
+
+# ---------------- repulsion engine (vectorized numpy) ----------------
+
+def _repulsion_stage(P, power, steps, lr0=2e-3):
+    """Relax points on the unit sphere under sum d^{-power} repulsion."""
+    P = P.copy()
+    n = len(P)
+    idx_i, idx_j = np.triu_indices(n, 1)
+    lr = lr0
+    prev = None
+    for _ in range(steps):
+        diff = P[idx_i] - P[idx_j]                 # (m,3)
+        d2 = np.sum(diff * diff, axis=1) + 1e-12   # (m,)
+        w = power * d2 ** (-(power / 2.0 + 1.0))  # d E/d diff factor
+        contrib = (w[:, None] * diff) / d2[:, None] ** 0.0  # keep shape
+        # force on i along diff scaled by w (gradient of d^{-power})
+        grad = np.zeros_like(P)
+        np.add.at(grad, idx_i, w[:, None] * diff)
+        np.add.at(grad, idx_j, -w[:, None] * diff)
+        # normalize gradient magnitude for stability
+        gn = np.linalg.norm(grad)
+        if gn > 0:
+            grad *= 1.0 / gn
+        P = P - lr * grad * n
+        # project to unit sphere
+        P = P / np.maximum(np.linalg.norm(P, axis=1, keepdims=True), 1e-12)
+        cur = np.sum(d2 ** (-(power / 2.0)))
+        if prev is not None and cur > prev:
+            lr *= 0.6
+        prev = cur
+    return P
+
+
+def _seed_points(seed, n):
+    rng = np.random.RandomState(seed)
+    if seed == 0:
+        cube = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1)
+                         for z in (-1, 1)], dtype=float)
+        cube = cube / np.linalg.norm(cube[0])
+        octa = np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0],
+                         [0, -1, 0], [0, 0, 1], [0, 0, -1]], dtype=float)
+        return np.vstack([cube, octa])
+    if seed == 1:
+        cube = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1)
+                         for z in (-1, 1)], dtype=float)
+        cube = cube / np.linalg.norm(cube[0])
+        return np.vstack([cube[:7], -cube[:7]])
+    v = rng.randn(n, 3)
+    while True:
+        norms = np.linalg.norm(v, axis=1)
+        if norms.min() > 1e-6:
+            break
+        v = rng.randn(n, 3)
+    return v / norms[:, None]
+
+
+# ---------------- softmin L-BFGS polish (guarded) ----------------
+
+def _neg_obj(flat, n, beta, sphere):
+    pts = flat.reshape(n, 3).copy()
+    diff = pts[:, None, :] - pts[None, :, :]
+    d2 = np.sum(diff * diff, axis=-1)
+    iu = np.triu_indices(n, 1)
+    dij2 = d2[iu]
+    dij = diff[iu]
+
+    a = -beta * dij2
+    amax = a.max()
+    soft_min = -(amax + np.log(np.sum(np.exp(a - amax)))) / beta
+
+    b = beta * dij2
+    bmax = b.max()
+    soft_max = (bmax + np.log(np.sum(np.exp(b - bmax)))) / beta
+
+    obj = -(soft_min - soft_max)
+
+    w_min = np.exp(a - amax); w_min /= w_min.sum()
+    w_max = np.exp(b - bmax); w_max /= w_max.sum()
+
+    g_dij2 = -w_min - w_max
+    grad_pts = np.zeros((n, 3))
+    idx_i, idx_j = iu
+    contrib = 2.0 * g_dij2[:, None] * dij
+    np.add.at(grad_pts, idx_i, contrib)
+    np.add.at(grad_pts, idx_j, -contrib)
+
+    if sphere:
+        norms = np.maximum(np.linalg.norm(pts, axis=1, keepdims=True), 1e-12)
+        u = pts / norms
+        grad_pts = grad_pts - np.sum(grad_pts * u, axis=1, keepdims=True) * u
+
+    return obj, grad_pts.ravel()
+
+
+def _opt(P, n, beta, sphere, maxiter):
+    # pre-validation: never feed a malformed vector to the optimizer
+    if not isinstance(P, np.ndarray):
+        P = np.asarray(P, dtype=float)
+    if P.shape != (n, 3) or not np.all(np.isfinite(P)):
+        rng = np.random.RandomState(0)
+        P = rng.standard_normal((n, 3))
+        P /= np.linalg.norm(P, axis=1, keepdims=True)
+    if HAVE_SCIPY:
+        try:
+            res = minimize(_neg_obj, P.ravel().copy(),
+                           args=(n, beta, sphere),
+                           jac=True, method="L-BFGS-B",
+                           options={"maxiter": maxiter, "maxfun": 4 * maxiter})
+            Q = res.x.reshape(n, 3)
+            if Q.shape == (n, 3) and np.all(np.isfinite(Q)):
+                return Q
+        except Exception:
+            pass
+    return P
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    n = 14
+    best_pts = None
+    best = -1.0
+    cands = []
+
+    def note(P):
+        if P is None or P.shape != (n, 3) or not np.all(np.isfinite(P)):
+            return 0.0
+        s = _true_score(P)
+        cands.append((s, P))
+        nonlocal best, best_pts
+        if s > best:
+            best = s
+            best_pts = P
+        return s
+
+    # --- stage 1: many cheap sphere-repulsion relaxations ---
+    for seed in range(48):
+        P = _seed_points(seed, n)
+        for power in (2.0, 4.0, 8.0, 16.0, 32.0):
+            P = _repulsion_stage(P, power, 120)
+        note(P)
+
+    # --- stage 2: softmin polish on the top candidates ---
+    cands.sort(key=lambda t: -t[0])
+    for s0, P0 in cands[:4]:
+        cand = P0.copy()
+        for beta in (20.0, 60.0, 150.0, 400.0):
+            cand = _opt(cand, n, beta, False, 300)
+            cand = cand - cand.mean(axis=0)
+            note(cand)
+
+    # --- stage 3: perturb-and-reoptimize on the global best ---
+    rng = np.random.RandomState(123)
+    for _ in range(10):
+        cand = best_pts + 0.02 * rng.randn(n, 3)
+        for beta in (150.0, 400.0):
+            cand = _opt(cand, n, beta, False, 250)
+            cand = cand - cand.mean(axis=0)
+        note(cand)
+
+    # --- stage 4: bottleneck-pair micro-polish on top-2 ---
+    cands.sort(key=lambda t: -t[0])
+    for s0, P0 in cands[:2]:
+        d2 = np.sum((P0[:, None, :] - P0[None, :, :]) ** 2, axis=-1)
+        iu = np.triu_indices(n, 1)
+        k = np.argmin(d2[iu])
+        i, j = iu[0][k], iu[1][k]
+        u = P0[i] - P0[j]
+        nu = np.linalg.norm(u)
+        if nu < 1e-12:
+            continue
+        u = u / nu
+        cand = P0.copy()
+        cand[i] += 1e-4 * u
+        cand[j] -= 1e-4 * u
+        cand = _opt(cand, n, 400.0, False, 200)
+        cand = cand - cand.mean(axis=0)
+        note(cand)
+
+    if best_pts is None:
+        np.random.seed(42)
+        best_pts = np.random.randn(n, 3)
+
+    best_pts = np.asarray(best_pts, dtype=float)
+    best_pts = best_pts - best_pts.mean(axis=0)
+    scale = np.max(np.abs(best_pts))
+    if scale > 0:
+        best_pts = best_pts / scale
+    return best_pts
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

@@ -1,0 +1,79 @@
+<NAME>
+multicloud_broadcast_optimization
+</NAME>
+<DESCRIPTION>
+The current implementation naively computes the same single shortest path for every partition of every destination, causing redundant transfers over identical edges and overloading shared bottleneck links. To reduce total cost, we should:
+
+1. For each (dst, partition) pair, use edge-disjoint (or at least diverse) shortest paths via `nx.shortest_simple_paths`, so partitions of the same destination can be spread across different networks/clouds rather than duplicating the same path 4 times.
+2. Avoid having all destinations route through the same cheap edges: when many flows already use an edge, artificially inflate its cost so subsequent searches are pushed to parallel paths, balancing load and exploiting the multi-network topology.
+3. Use a working copy of the graph with dynamically adjusted costs so overlapping transfers get penalized, reducing redundant transfers across destinations.
+
+This yields lower overall data transfer cost by spreading broadcast traffic across parallel, diverse routes instead of stacking everything onto a single cheapest path.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    # Drop edges that have no cost info so they don't skew routing
+    for u, v in list(h.edges()):
+        if h[u][v].get("cost") is None:
+            h.remove_edge(u, v)
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Track edge usage to penalize over-used links (load balancing across networks)
+    edge_usage = {}
+
+    def edge_weight(u, v, data):
+        base = data.get("cost")
+        if base is None:
+            base = 0.0
+        # Penalize edges already carrying flows so later transfers
+        # are pushed onto parallel, diverse networks instead of stacking.
+        return base * (1.0 + 0.5 * edge_usage.get((u, v), 0))
+
+    for dst in dsts:
+        try:
+            # Enumerate multiple diverse simple paths so partitions can
+            # be spread across disjoint low-cost routes.
+            path_generator = nx.shortest_simple_paths(h, src, dst, weight=edge_weight)
+            candidate_paths = []
+            max_candidates = num_partitions * 2
+            for path in path_generator:
+                candidate_paths.append(path)
+                if len(candidate_paths) >= max_candidates:
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+
+        if not candidate_paths:
+            continue
+
+        for j in range(num_partitions):
+            # Pick a path for this partition: rotate through diverse candidates
+            # to avoid duplicating the same route for every partition.
+            path = candidate_paths[j % len(candidate_paths)]
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+                edge_usage[(s, t)] = edge_usage.get((s, t), 0) + 1
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

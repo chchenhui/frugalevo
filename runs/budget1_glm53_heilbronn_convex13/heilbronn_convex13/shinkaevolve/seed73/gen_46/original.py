@@ -1,0 +1,263 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+
+def _tri_areas(P: np.ndarray) -> np.ndarray:
+    idx = np.array(list(combinations(range(len(P)), 3)))
+    A = P[idx[:, 0]]
+    B = P[idx[:, 1]]
+    C = P[idx[:, 2]]
+    return 0.5 * np.abs(
+        (B[:, 0] - A[:, 0]) * (C[:, 1] - A[:, 1])
+        - (B[:, 1] - A[:, 1]) * (C[:, 0] - A[:, 0])
+    )
+
+
+def _hull_area(P: np.ndarray) -> float:
+    pts = P[np.lexsort((P[:, 1], P[:, 0]))]
+    if len(pts) < 3:
+        return 1e-12
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = lower[:-1] + upper[:-1]
+    if len(hull) < 3:
+        return 1e-12
+    s = 0.0
+    for i in range(len(hull)):
+        x1, y1 = hull[i]
+        x2, y2 = hull[(i + 1) % len(hull)]
+        s += x1 * y2 - x2 * y1
+    return abs(s) / 2.0
+
+
+def heilbronn_convex13() -> np.ndarray:
+    n = 13
+    rng = np.random.default_rng(seed=42)
+
+    th = 2.0 * np.pi / 3.0
+    c, s = np.cos(th), np.sin(th)
+    R = np.array([[c, -s], [s, c]])       # rotate by +120 deg
+    R2 = R @ R
+
+    def expand(B: np.ndarray) -> np.ndarray:
+        # 4 base points -> 12 points by 3-fold rotation, plus center at origin
+        return np.vstack([B, B @ R.T, B @ R2.T, [[0.0, 0.0]]])
+
+    def score(P: np.ndarray) -> float:
+        a = _tri_areas(P)
+        h = _hull_area(P)
+        if h <= 1e-12:
+            return 0.0
+        # smooth-ish objective: blend min with mean of smallest few
+        k = np.partition(a, 4)[:5]
+        return (0.6 * a.min() + 0.4 * k.mean()) / h
+
+    def true_score(P: np.ndarray) -> float:
+        a = _tri_areas(P)
+        h = _hull_area(P)
+        return a.min() / h if h > 1e-12 else 0.0
+
+    def hill_climb(P: np.ndarray, steps_max: int = 24) -> np.ndarray:
+        step = 0.05
+        best = score(P)
+        for _ in range(steps_max):
+            improved = False
+            for i in range(len(P)):
+                for j in range(2):
+                    for d in (+1, -1):
+                        Q = P.copy()
+                        Q[i, j] += d * step
+                        sc = score(Q)
+                        if sc > best + 1e-12:
+                            best = sc
+                            P = Q
+                            improved = True
+            if not improved:
+                step *= 0.5
+                if step < 2e-4:
+                    break
+        return P
+
+    def grad_ascent(P: np.ndarray, iters: int = 25, lr: float = 0.01) -> np.ndarray:
+        # finite-difference ascent on the smooth blended score; small move cap
+        for _ in range(iters):
+            base = score(P)
+            G = np.zeros_like(P)
+            for i in range(len(P)):
+                for j in range(2):
+                    E = P.copy()
+                    E[i, j] += 1e-5
+                    G[i, j] = (score(E) - base) / 1e-5
+            gn = np.linalg.norm(G)
+            if gn < 1e-12:
+                break
+            step = lr * G / gn * np.sqrt(len(P))
+            Q = P + step
+            if score(Q) > base:
+                P = Q
+            else:
+                lr *= 0.5
+                if lr < 1e-4:
+                    break
+        return P
+
+    # ---- Build seeds for the 4 base points (sector-free, rotation handles symmetry)
+    seeds = []
+    ang = np.pi / 2.0
+    # vertex ring + inner rings, classic triangular-lattice-like starts
+    for r4 in ([1.0, 0.72, 0.45, 0.2], [1.0, 0.8, 0.55, 0.3],
+               [1.0, 0.85, 0.6, 0.35], [1.0, 0.75, 0.5, 0.25]):
+        B = []
+        for k, r in enumerate(r4):
+            a = ang - k * np.pi / 9.0
+            B.append([r * np.cos(a), r * np.sin(a)])
+        seeds.append(np.array(B))
+    # spread along one edge direction
+    for spread in (0.9, 0.6, 0.3):
+        B = np.array([[spread, 0.0],
+                      [spread * 0.5, spread * 0.85],
+                      [0.0, spread],
+                      [spread * 0.4, spread * 0.3]])
+        seeds.append(B)
+    # triangle-boundary seeds: put base points on/near the hull of an
+    # equilateral triangle (optimal configs tend to be hull-heavy)
+    tv = np.array([[0.0, 1.0],
+                   [np.sqrt(3.0) / 2.0, -0.5],
+                   [-np.sqrt(3.0) / 2.0, -0.5]])
+    for tfrac in ((0.0, 0.5, 0.9, 0.25), (0.0, 0.35, 0.8, 0.6),
+                  (0.1, 0.45, 0.85, 0.3), (0.15, 0.55, 0.75, 0.95)):
+        B = []
+        for k, f in enumerate(tfrac):
+            e0, e1 = tv[k % 3], tv[(k + 1) % 3]
+            B.append(e0 + f * (e1 - e0))
+        B.append(0.15 * tv[np.argmin([p[0] for p in B])])
+        seeds.append(np.array(B[:4]))
+    # random seeds
+    for _ in range(40):
+        r = rng.uniform(0.1, 1.0, 4)
+        a = rng.uniform(0, 2 * np.pi, 4)
+        seeds.append(np.column_stack([r * np.cos(a), r * np.sin(a)]))
+
+    # track top-3 elites across all seeds
+    elites = []  # list of (true_score, P)
+    for B0 in seeds:
+        try:
+            P = expand(B0)
+            P = hill_climb(P)                    # symmetric search (12+1)
+            P = hill_climb(P, steps_max=10)      # symmetry-breaking polish
+            ts = true_score(P)
+            elites.append((ts, P.copy()))
+            elites.sort(key=lambda e: -e[0])
+            del elites[3:]
+        except Exception:
+            continue
+
+    if not elites:
+        t = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        elites = [(0.0, np.column_stack([np.cos(t), np.sin(t)]))]
+
+    best_ts, best_P = elites[0]
+
+    # ---- deterministic multi-perturbation basin hopping around all elites
+    amp_schedule = [0.01, 0.015, 0.02, 0.03, 0.04, 0.055, 0.07, 0.08]
+    perturb_rng = np.random.default_rng(seed=123)
+    for elite_P in [e[1].copy() for e in elites]:
+        for amp in amp_schedule:
+            Q = elite_P + perturb_rng.normal(0.0, amp, elite_P.shape)
+            try:
+                Q = grad_ascent(Q, iters=15, lr=0.01)
+                Q = hill_climb(Q, steps_max=12)
+                ts = true_score(Q)
+                if ts > best_ts + 1e-12:
+                    best_ts = ts
+                    best_P = Q.copy()
+            except Exception:
+                continue
+        # targeted re-seed: jiggle only the smallest-triangle vertices harder
+        try:
+            a = _tri_areas(elite_P)
+            idx = np.array(list(combinations(range(n), 3)))
+            kmin = int(np.argmin(a))
+            hot = set(idx[kmin].tolist())
+            for amp in (0.03, 0.06):
+                Q = elite_P.copy()
+                for i in hot:
+                    Q[i] += perturb_rng.normal(0.0, amp, 2)
+                Q = grad_ascent(Q, iters=15, lr=0.01)
+                Q = hill_climb(Q, steps_max=12)
+                ts = true_score(Q)
+                if ts > best_ts + 1e-12:
+                    best_ts = ts
+                    best_P = Q.copy()
+        except Exception:
+            pass
+
+    # ---- final intensive fine-grained polish on the overall best
+    def fine_polish(P: np.ndarray, steps_max: int = 60) -> np.ndarray:
+        step = 0.02
+        best = score(P)
+        for _ in range(steps_max):
+            improved = False
+            # single-coordinate moves
+            for i in range(len(P)):
+                for j in range(2):
+                    for d in (+1, -1):
+                        Q = P.copy()
+                        Q[i, j] += d * step
+                        sc = score(Q)
+                        if sc > best + 1e-12:
+                            best = sc
+                            P = Q
+                            improved = True
+            # diagonal moves (helps escape 45-degree ridge directions)
+            for i in range(len(P)):
+                for dx, dy in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+                    Q = P.copy()
+                    Q[i, 0] += dx * step * 0.7
+                    Q[i, 1] += dy * step * 0.7
+                    sc = score(Q)
+                    if sc > best + 1e-12:
+                        best = sc
+                        P = Q
+                        improved = True
+            if not improved:
+                step *= 0.5
+                if step < 5e-4:
+                    break
+        return P
+
+    try:
+        Q = fine_polish(best_P.copy())
+        ts = true_score(Q)
+        if ts > best_ts + 1e-12:
+            best_ts = ts
+            best_P = Q.copy()
+    except Exception:
+        pass
+
+    if best_P is None:
+        t = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        best_P = np.column_stack([np.cos(t), np.sin(t)])
+
+    # numerical safety: no duplicates
+    for i in range(n):
+        for j in range(i + 1, n):
+            if np.linalg.norm(best_P[i] - best_P[j]) < 1e-9:
+                best_P[j, 0] += 1e-6 * (j + 1)
+    return best_P
+
+
+# EVOLVE-BLOCK-END

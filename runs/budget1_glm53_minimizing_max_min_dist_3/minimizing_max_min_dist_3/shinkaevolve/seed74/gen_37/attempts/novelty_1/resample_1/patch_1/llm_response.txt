@@ -1,0 +1,125 @@
+<NAME>
+slsqp_constrained_polish_top3
+</NAME>
+
+<DESCRIPTION>
+The theoretical optimum for n=14 in 3D is a well-studied Tammes/packing-type problem; the soft-min annealing converges to ≈0.24 squared ratio but the unconstrained L-BFGS-B polish on the exact ratio is weak because dmin is non-smooth (only one active pair at a time). Following the recommendation, I add a constrained SLSQP polish that maximizes t subject to d²ᵢⱼ ≤ 1 (fixing scale) and d²ᵢⱼ ≥ t², applied to the top-3 candidates after annealing with symmetry-breaking perturbations. The constraint Jacobian is filled per-pair in a plain loop (the vectorized fancy-index version crashed in Gen 21 due to a shape mismatch). Since the constraint set keeps dmax ≤ 1 and pushes dmin up, this directly maximizes the true metric. To save time, the SLSQP polish replaces the per-seed L-BFGS-B exact-ratio polish for all but the ranking stage: we rank seeds by soft-annealed ratio, keep top 3, then SLSQP each (plus perturbed restarts). Eval budget stays small (~2-3s).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    for s in starts:
+        pts = refine(s.copy())
+        val = _ratio_sq(pts)
+        if val > best_val:
+            best_val = val
+            best_pts = pts.copy()
+=======
+    results = []
+    for s in starts:
+        pts = refine(s.copy())
+        val = _ratio_sq(pts)
+        results.append((val, pts))
+        if val > best_val:
+            best_val = val
+            best_pts = pts.copy()
+    results.sort(key=lambda t: -t[0])
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Perturbation restarts around the best solution
+    if best_pts is not None:
+        for scale in (0.02, 0.05, 0.10):
+            for _ in range(2):
+                pts = refine(_recentre(best_pts + scale * rng.standard_normal((n, 3))))
+                val = _ratio_sq(pts)
+                if val > best_val:
+                    best_val = val
+                    best_pts = pts.copy()
+=======
+    def slsqp_polish(P):
+        """Maximize t s.t. t^2 <= d^2_ij <= 1 for all pairs (exact ratio)."""
+        if not HAVE_SCIPY:
+            return P, _ratio_sq(P)
+        P = P - P.mean(axis=0)
+        dd = np.linalg.norm(P[:, None, :] - P[None, :, :], axis=-1)
+        iu = np.triu_indices(n, 1)
+        dmax = dd[iu].max()
+        if dmax <= 1e-12:
+            return P, _ratio_sq(P)
+        P = P / dmax
+        t0 = np.linalg.norm(P[:, None, :] - P[None, :, :], axis=-1)[iu].min()
+        x0 = np.concatenate([P.ravel(), [t0]])
+        I, J = iu
+        m = len(I)
+
+        def fobj(x):
+            return -x[-1]
+
+        def fjack(x):
+            g = np.zeros(3 * n + 1)
+            g[-1] = -1.0
+            return g
+
+        def cons(x):
+            P2 = x[:3 * n].reshape(n, 3)
+            dv = np.sum((P2[I] - P2[J]) ** 2, axis=1)
+            return np.concatenate([1.0 - dv, dv - x[-1] ** 2])
+
+        def cjack(x):
+            P2 = x[:3 * n].reshape(n, 3)
+            Jc = np.zeros((2 * m, 3 * n + 1))
+            for k in range(m):  # per-pair loop (vectorized fill unreliable)
+                a, b = int(I[k]), int(J[k])
+                diff = P2[a] - P2[b]
+                # d^2_ab <= 1 : grad wrt pa = 2*diff, pb = -2*diff
+                for c3 in range(3):
+                    Jc[k, 3 * a + c3] = -2.0 * diff[c3]
+                    Jc[k, 3 * b + c3] = 2.0 * diff[c3]
+                    Jc[m + k, 3 * a + c3] = 2.0 * diff[c3]
+                    Jc[m + k, 3 * b + c3] = -2.0 * diff[c3]
+                Jc[m + k, -1] = -2.0 * x[-1]
+            return Jc
+
+        try:
+            res = minimize(fobj, x0, method="SLSQP",
+                           constraints=[{"type": "ineq", "fun": cons,
+                                         "jac": cjack}],
+                           options={"maxiter": 400, "ftol": 1e-14})
+            P2 = res.x[:3 * n].reshape(n, 3)
+            if np.all(np.isfinite(P2)):
+                P2 = P2 - P2.mean(axis=0)
+                return P2, _ratio_sq(P2)
+        except Exception:
+            pass
+        return P, _ratio_sq(P)
+
+    # Constrained SLSQP polish on the top-3 candidates with
+    # symmetry-breaking perturbations.
+    for val0, P0 in results[:3]:
+        Pp, vp = slsqp_polish(P0)
+        if vp > best_val:
+            best_val = vp
+            best_pts = Pp.copy()
+        for scale in (0.05, 0.15, 0.3):
+            for _ in range(2):
+                Pc = _recentre(Pp + scale * rng.standard_normal((n, 3)))
+                Pc, vc = slsqp_polish(Pc)
+                if vc > best_val:
+                    best_val = vc
+                    best_pts = Pc.copy()
+
+    # Perturbation restarts around the best solution
+    if best_pts is not None:
+        for scale in (0.02, 0.05, 0.10):
+            for _ in range(2):
+                pts = refine(_recentre(best_pts + scale * rng.standard_normal((n, 3))))
+                val = _ratio_sq(pts)
+                if val > best_val:
+                    best_val = val
+                    best_pts = pts.copy()
+>>>>>>> REPLACE
+</DIFF>
+</DUMMY>

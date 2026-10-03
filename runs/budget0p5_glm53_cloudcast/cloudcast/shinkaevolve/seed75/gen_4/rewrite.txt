@@ -1,0 +1,303 @@
+# EVOLVE-BLOCK-START
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+import heapq
+
+
+# ---------------------------------------------------------------------------
+# Layer 1: Graph sanitization
+# ---------------------------------------------------------------------------
+class GraphSanitizer:
+    """Prepares the raw network graph for multicast planning."""
+
+    @staticmethod
+    def sanitize(G, src):
+        h = G.copy()
+        # Remove inbound edges to the source (source never receives) and self loops
+        h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+        # Drop edges with unusable cost so Dijkstra never sees None weights
+        dead_edges = [
+            (u, v) for u, v, d in h.edges(data=True) if d.get("cost") is None
+        ]
+        h.remove_edges_from(dead_edges)
+        return h
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: Distance index (one Dijkstra pass, reused for all destinations)
+# ---------------------------------------------------------------------------
+class DistanceIndex:
+    """Caches single-source shortest path distances and predecessor chains."""
+
+    def __init__(self, G, src):
+        self.G = G
+        self.src = src
+        self.dist, self.pred = nx.dijkstra_predecessor_and_distance(
+            G, src, weight="cost"
+        )
+
+    def distance(self, node):
+        return self.dist.get(node, float("inf"))
+
+    def path_to(self, node):
+        """Reconstruct the src->node path by walking the predecessor chain."""
+        if node not in self.pred and node != self.src:
+            return None
+        chain = [node]
+        while chain[-1] != self.src:
+            preds = self.pred.get(chain[-1])
+            if not preds:
+                return None
+            chain.append(preds[0])
+        return list(reversed(chain))
+
+    def pairwise_distance_and_path(self, a, b):
+        """Shortest a->b path via local Dijkstra on the cached graph."""
+        try:
+            dist = nx.dijkstra_path_length(self.G, a, b, weight="cost")
+            path = nx.dijkstra_path(self.G, a, b, weight="cost")
+            return dist, path
+        except nx.NetworkXNoPath:
+            return float("inf"), None
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: Steiner-tree multicast builder (shortest-path heuristic)
+# ---------------------------------------------------------------------------
+class SteinerTreeBuilder:
+    """Builds a shared multicast tree so overlapping transfers ride common links."""
+
+    def __init__(self, G, index: DistanceIndex):
+        self.G = G
+        self.index = index
+        # Cache pairwise terminal paths to avoid recomputation
+        self._pair_cache: Dict[tuple, tuple] = {}
+
+    def _pair(self, a, b):
+        key = (a, b)
+        if key not in self._pair_cache:
+            self._pair_cache[key] = self.index.pairwise_distance_and_path(a, b)
+        return self._pair_cache[key]
+
+    def build(self, src, dsts):
+        """Shortest-path heuristic: metric closure MST over terminals -> union paths."""
+        terminals = [src] + [d for d in dsts if d != src]
+
+        if len(terminals) <= 1:
+            t = nx.DiGraph()
+            t.add_node(src)
+            return t
+
+        # Build metric closure (complete graph on terminals with shortest dists)
+        closure = nx.Graph()
+        for i, a in enumerate(terminals):
+            for b in terminals[i + 1:]:
+                if a == b:
+                    continue
+                dist, path = self._pair(a, b)
+                if path is not None:
+                    closure.add_edge(a, b, weight=dist)
+
+        if closure.number_of_edges() == 0:
+            # Fall back: no shared tree possible, use individual shortest paths
+            t = nx.DiGraph()
+            t.add_node(src)
+            for d in terminals:
+                p = self.index.path_to(d)
+                if p:
+                    nx.add_path(t, p)
+            return t
+
+        mst = nx.minimum_spanning_tree(closure, weight="weight")
+
+        # Map MST edges back to real paths, union all edges into the tree
+        tree = nx.DiGraph()
+        tree.add_node(src)
+        for a, b, data in mst.edges(data=True):
+            # Use cached best direction
+            d_ab, p_ab = self._pair(a, b)
+            d_ba, p_ba = self._pair(b, a)
+            if p_ab is not None and (p_ba is None or d_ab <= d_ba):
+                path = p_ab
+            elif p_ba is not None:
+                path = p_ba
+            else:
+                continue
+            for i in range(len(path) - 1):
+                s, t_node = path[i], path[i + 1]
+                if tree.has_edge(s, t_node):
+                    continue
+                tree.add_edge(s, t_node, cost=self.G[s][t_node].get("cost"))
+
+        # Ensure every destination is actually reachable from src in the tree;
+        # if not, splice in its direct shortest path.
+        for d in dsts:
+            if d == src:
+                continue
+            if not nx.has_path(tree, src, d):
+                p = self.index.path_to(d)
+                if p:
+                    for i in range(len(p) - 1):
+                        s, t_node = p[i], p[i + 1]
+                        if not tree.has_edge(s, t_node):
+                            tree.add_edge(
+                                s, t_node, cost=self.G[s][t_node].get("cost")
+                            )
+        return tree
+
+
+# ---------------------------------------------------------------------------
+# Layer 4: Topology assembler
+# ---------------------------------------------------------------------------
+class MulticastTopologyAssembler:
+    """Populates the BroadCastTopology from the shared multicast tree."""
+
+    def __init__(self, G, num_partitions):
+        self.G = G
+        self.num_partitions = num_partitions
+
+    def assemble(self, src, dsts, tree) -> "BroadCastTopology":
+        bc_topology = BroadCastTopology(src, dsts, self.num_partitions)
+
+        # Precompute each destination's unique route inside the shared tree
+        routes: Dict[str, List] = {}
+        for dst in dsts:
+            if dst == src:
+                routes[dst] = [src]
+                continue
+            if nx.has_path(tree, src, dst):
+                routes[dst] = nx.shortest_path(tree, src, dst)
+            else:
+                # Safety fallback: direct shortest path in the full graph
+                routes[dst] = nx.dijkstra_path(self.G, src, dst, weight="cost")
+
+        # Emit edge lists per (dst, partition). Overlapping links are shared
+        # by construction, so the backbone carries each partition only once.
+        for dst, path in routes.items():
+            edges = []
+            for i in range(len(path) - 1):
+                s, t = path[i], path[i + 1]
+                edges.append([s, t, self.G[s][t]])
+            for j in range(self.num_partitions):
+                for e in edges:
+                    bc_topology.append_dst_partition_path(dst, j, e)
+
+        return bc_topology
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator: same signature/behavior as the original search_algorithm
+# ---------------------------------------------------------------------------
+def search_algorithm(src, dsts, G, num_partitions):
+    # Stage 1: sanitize graph
+    h = GraphSanitizer.sanitize(G, src)
+
+    # Stage 2: single-source distance index (one Dijkstra pass, reused)
+    index = DistanceIndex(h, src)
+
+    # Stage 3: shared multicast tree (reduces redundant overlapping transfers)
+    builder = SteinerTreeBuilder(h, index)
+    tree = builder.build(src, dsts)
+
+    # Stage 4: assemble broadcast topology in the original output format
+    assembler = MulticastTopologyAssembler(G, num_partitions)
+    return assembler.assemble(src, dsts, tree)
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]  # [[src, dst, edge data]]
+
+
+class BroadCastTopology:
+    def __init__(self, src: str, dsts: List[str], num_partitions: int = 4, paths: Dict[str, SingleDstPath] = None):
+        self.src = src  # single str
+        self.dsts = dsts  # list of strs
+        self.num_partitions = num_partitions
+
+        # dict(dst) --> dict(partition) --> list(nx.edges)
+        # example: {dst1: {partition1: [src->node1, node1->dst1], partition 2: [src->dst1]}}
+        if paths is not None:
+            self.paths = paths
+            self.set_graph()
+        else:
+            self.paths = {dst: {str(i): None for i in range(num_partitions)} for dst in dsts}
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        """
+        Set paths for partition = partition to reach dst
+        """
+        partition = str(partition)
+        self.paths[dst][partition] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        """
+        Append path for partition = partition to reach dst
+        """
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    """
+    Default graph with capacity constraints and cost info
+    nodes: regions, edges: links
+    per edge:
+        throughput: max tput achievable (gbps)
+        cost: $/GB
+        flow: actual flow (gbps), must be < throughput, default = 0
+    """
+    # Use relative path from this file's location
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if cost_path is None:
+        cost = pd.read_csv(os.path.join(current_dir, "profiles/cost.csv"))
+    else:
+        cost = pd.read_csv(cost_path)
+
+    if throughput_path is None:
+        throughput = pd.read_csv(os.path.join(current_dir, "profiles/throughput.csv"))
+    else:
+        throughput = pd.read_csv(throughput_path)
+
+    G = nx.DiGraph()
+    for _, row in throughput.iterrows():
+        if row["src_region"] == row["dst_region"]:
+            continue
+        G.add_edge(row["src_region"], row["dst_region"], cost=None, throughput=num_vms * row["throughput_sent"] / 1e9)
+
+    for _, row in cost.iterrows():
+        if row["src"] in G and row["dest"] in G[row["src"]]:
+            G[row["src"]][row["dest"]]["cost"] = row["cost"]
+
+    # some pairs not in the cost grid
+    no_cost_pairs = []
+    for edge in G.edges.data():
+        src, dst = edge[0], edge[1]
+        if edge[-1]["cost"] is None:
+            no_cost_pairs.append((src, dst))
+    print("Unable to get costs for: ", no_cost_pairs)
+
+    return G
+
+# EVOLVE-BLOCK-END
+
+# Helper functions that won't be evolved
+def create_broadcast_topology(src: str, dsts: List[str], num_partitions: int = 4):
+    """Create a broadcast topology instance"""
+    return BroadCastTopology(src, dsts, num_partitions)
+
+def run_search_algorithm(src: str, dsts: List[str], G, num_partitions: int):
+    """Run the search algorithm and return the topology"""
+    return search_algorithm(src, dsts, G, num_partitions)

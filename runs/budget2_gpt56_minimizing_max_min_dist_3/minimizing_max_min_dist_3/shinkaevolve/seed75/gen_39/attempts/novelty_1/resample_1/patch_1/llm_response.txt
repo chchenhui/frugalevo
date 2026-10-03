@@ -1,0 +1,106 @@
+<NAME>
+exact_slsqp_polish
+</NAME>
+
+<DESCRIPTION>
+Add a final constrained maximin polishing pass on the best multistart result. The existing smooth-force stages are effective at locating a strong contact graph, but they only approximate the nonsmooth ratio objective. This pass fixes the diameter to at most one and directly maximizes an auxiliary minimum squared-distance variable subject to every pairwise constraint \(t \leq d_{ij}^2 \leq 1\). It supplies analytic constraint Jacobians, avoids relying on finite differences, and retains the original point set whenever the constrained solver does not produce an exact-score improvement. The import is local with a fallback, preserving operation in environments without SciPy.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _cube_octahedron_seed() -> np.ndarray:
+=======
+def _exact_constrained_polish(
+    initial_points: np.ndarray,
+    upper: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """
+    Directly maximize the minimum squared distance after setting the current
+    diameter to one.  The smooth continuation is a basin finder; this is an
+    exact epigraph formulation of its final local problem.
+    """
+    try:
+        from scipy.optimize import minimize
+    except ImportError:
+        return initial_points, _true_ratio_score(initial_points, upper)
+
+    count = initial_points.shape[0]
+    squared = _pairwise_squared_distances(initial_points)
+    values = squared[upper]
+    diameter = max(float(np.max(values)), 1e-12)
+    points = initial_points / np.sqrt(diameter)
+    values = values / diameter
+    start_score = float(np.min(values))
+    start = np.concatenate((points.ravel(), np.array([start_score])))
+
+    def constraints(vector: np.ndarray) -> np.ndarray:
+        candidate = vector[:-1].reshape(count, 3)
+        minimum = vector[-1]
+        delta = candidate[upper[0]] - candidate[upper[1]]
+        pair_squared = np.sum(delta * delta, axis=1)
+        return np.concatenate((pair_squared - minimum, 1.0 - pair_squared))
+
+    def constraint_jacobian(vector: np.ndarray) -> np.ndarray:
+        candidate = vector[:-1].reshape(count, 3)
+        delta = candidate[upper[0]] - candidate[upper[1]]
+        pairs = len(upper[0])
+        jacobian = np.zeros((2 * pairs, 3 * count + 1), dtype=float)
+        rows = np.arange(pairs)
+        for coordinate in range(3):
+            jacobian[rows, 3 * upper[0] + coordinate] = 2.0 * delta[:, coordinate]
+            jacobian[rows, 3 * upper[1] + coordinate] = -2.0 * delta[:, coordinate]
+        jacobian[:pairs, -1] = -1.0
+        jacobian[pairs:, :-1] = -jacobian[:pairs, :-1]
+        return jacobian
+
+    result = minimize(
+        lambda vector: -vector[-1],
+        start,
+        jac=lambda vector: np.r_[np.zeros(3 * count), -1.0],
+        constraints={"type": "ineq", "fun": constraints, "jac": constraint_jacobian},
+        method="SLSQP",
+        options={"maxiter": 700, "ftol": 2e-12, "disp": False},
+    )
+
+    if not np.all(np.isfinite(result.x)):
+        return initial_points, _true_ratio_score(initial_points, upper)
+
+    candidate = result.x[:-1].reshape(count, 3)
+    candidate = _normalize_rows(candidate)
+    candidate_score = _true_ratio_score(candidate, upper)
+    original_score = _true_ratio_score(initial_points, upper)
+    if candidate_score > original_score + 1e-12:
+        return candidate, candidate_score
+    return initial_points, original_score
+
+
+def _cube_octahedron_seed() -> np.ndarray:
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    for seed in seeds:
+        candidate, score = _optimize_seed(seed, upper)
+        if score > best_score:
+            best_points = candidate
+            best_score = score
+
+    return np.asarray(best_points, dtype=float)
+=======
+    for seed in seeds:
+        candidate, score = _optimize_seed(seed, upper)
+        if score > best_score:
+            best_points = candidate
+            best_score = score
+
+    # Use the expensive exact constrained solve once, only after multistart
+    # continuation has identified the most promising contact-graph basin.
+    polished_points, polished_score = _exact_constrained_polish(best_points, upper)
+    if polished_score > best_score:
+        best_points = polished_points
+        best_score = polished_score
+
+    return np.asarray(best_points, dtype=float)
+>>>>>>> REPLACE
+</DIFF>

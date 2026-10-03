@@ -1,0 +1,139 @@
+<NAME>
+multistart_jittered_greedy_climb</NAME>
+
+<DESCRIPTION>
+The recommendation targets the key weakness observed across generations: all search effort concentrates on a single basin (the best lattice layout explored by one SA trajectory), and longer runtimes did not translate into better radii (the 2.56s multi-start run scored no better than the 0.56s constructor, while the short 0.9s greedy climb reached 2.40 — the best so far). Combined score also rewards low eval_time, so the budget should be modest (~1.4s), not 2.2–2.7s.
+
+Changes:
+1. Enrich the seeding pass with scale variants (0.98, 1.0) so the "best basin" is chosen from a wider lattice family — more diverse basins to jitter around.
+2. Replace the simulated annealing block with the recommended multi-start jittered greedy hill-climb: each of 4 starts perturbs the winning lattice with its own ±0.01 Gaussian jitter (distinct seed per start, decorrelating the basins per the Gen-8 lesson), uses the proven adaptive-step move set (1–3 circles per move, shrink-when-stuck / occasional-grow), and receives a shrinking per-start time share `(deadline − now)/(n_starts − start)` so early starts explore broadly while the last start does fine polish. Total budget is capped at 1.4s to keep eval_time near the regime that scored 0.91, while the multi-start jitter gives more independent chances to escape local optima that a single greedy or SA trajectory cannot.
+
+This directly combines the two mechanisms that individually produced the best results (multi-start jitter diversity from program 2, short-budget adaptive greedy from program 4) while avoiding the time-bloat that hurt programs 2 and 3.</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    best = None
+    for rows in candidates:
+        centers_c = hex_layout(rows)
+        radii_c = lp_radii(centers_c)
+        total = np.sum(radii_c)
+        if best is None or total > best[2]:
+            best = (centers_c, radii_c, total)
+=======
+    best = None
+    for rows in candidates:
+        for scale in (0.98, 1.0):
+            centers_c = hex_layout(rows, scale=scale)
+            radii_c = lp_radii(centers_c)
+            total = np.sum(radii_c)
+            if best is None or total > best[2]:
+                best = (centers_c, radii_c, total)
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    # ---- Simulated annealing with reheating ----
+    try:
+        import time
+        rng = np.random.default_rng(12345)
+        deadline = time.time() + 2.2
+
+        T0 = 0.01
+        cool = 0.995
+        T = T0
+        step = 0.02
+        no_improve = 0
+        reheat_budget = 3
+
+        cur = centers.copy()
+        cur_radii, cur_score = radii, sum_radii
+
+        while time.time() < deadline:
+            trial = cur.copy()
+            k_move = rng.integers(1, 4)
+            for idx in rng.choice(n, size=k_move, replace=False):
+                trial[idx] += rng.normal(0.0, step, size=2)
+            trial = np.clip(trial, 0.01, 0.99)
+            radii_t = lp_radii(trial)
+            total_t = np.sum(radii_t)
+
+            delta = total_t - cur_score
+            # SA acceptance: always accept improvements, sometimes accept worse
+            if delta > 1e-9 or rng.random() < np.exp(delta / T):
+                cur, cur_radii, cur_score = trial, radii_t, total_t
+                if delta > 1e-9:
+                    no_improve = 0
+                    if total_t > sum_radii:
+                        centers, radii, sum_radii = trial, radii_t, total_t
+            else:
+                no_improve += 1
+
+            # Adaptive step size
+            if rng.random() < 0.7:
+                step = max(step * 0.95, 0.002)
+            else:
+                step = min(step * 1.3, 0.05)
+
+            # Cool
+            T = max(T * cool, 1e-4)
+
+            # Reheat if stuck
+            if no_improve >= 50 and reheat_budget > 0:
+                T = T0
+                step = 0.03
+                no_improve = 0
+                reheat_budget -= 1
+                # Restart current state from the best found so far
+                cur = centers.copy()
+                cur_radii, cur_score = radii, sum_radii
+    except Exception:
+        pass
+=======
+    # ---- Multi-start jittered greedy hill-climb ----
+    # Each start begins from the best lattice candidate perturbed with a
+    # distinct small +/-0.01 jitter (decorrelates basins), and gets a
+    # shrinking share of the remaining time: (deadline - now)/(n_starts - start).
+    try:
+        import time
+        deadline = time.time() + 1.4
+        n_starts = 4
+
+        for start in range(n_starts):
+            rng = np.random.default_rng(1000 + start)
+            cur = centers + rng.normal(0.0, 0.01, size=centers.shape)
+            cur = np.clip(cur, 0.01, 0.99)
+            cur_radii = lp_radii(cur)
+            cur_score = np.sum(cur_radii)
+            if cur_score > sum_radii:
+                centers, radii, sum_radii = cur.copy(), cur_radii, cur_score
+
+            start_deadline = time.time() + max(
+                (deadline - time.time()) / (n_starts - start), 0.1)
+            step = 0.02
+
+            while time.time() < start_deadline:
+                trial = cur.copy()
+                k_move = rng.integers(1, 4)
+                for idx in rng.choice(n, size=k_move, replace=False):
+                    trial[idx] += rng.normal(0.0, step, size=2)
+                trial = np.clip(trial, 0.01, 0.99)
+                radii_t = lp_radii(trial)
+                total_t = np.sum(radii_t)
+
+                if total_t > cur_score + 1e-9:
+                    cur, cur_radii, cur_score = trial, radii_t, total_t
+                    if total_t > sum_radii:
+                        centers, radii, sum_radii = trial.copy(), radii_t, total_t
+                    step = min(step * 1.1, 0.05)
+                else:
+                    # Adaptive step: mostly shrink when stuck, occasionally grow
+                    if rng.random() < 0.7:
+                        step = max(step * 0.92, 0.002)
+                    else:
+                        step = min(step * 1.4, 0.05)
+
+            if time.time() >= deadline:
+                break
+    except Exception:
+        pass
+>>>>>>> REPLACE
+</DIFF>

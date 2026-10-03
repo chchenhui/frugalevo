@@ -1,0 +1,122 @@
+<NAME>
+softmin_annealing_with_antiprism_seeds</NAME>
+<DESCRIPTION>
+The current SLSQP formulation uses a hard min-max constraint (t² ≤ d² for all pairs), which is highly non-smooth and frequently stalls at poor local optima (score 0.07). Replace it with a smooth annealed objective: minimize `τ·logsumexp(-d²/τ) + τ·logsumexp(d²/τ)` over the raw coordinates with L-BFGS-B. The first term is a smooth approximation of `-min(d²)` (push smallest distances up) and the second a smooth approximation of `max(d²)` (acts as a soft scale normalization, keeping the diameter in check). Annealing τ from coarse to fine gradually sharpens both terms toward the true min/max objective, which is far more robust than the cold-started hard constraint solve. Keep the original SLSQP as a cheap final polish on the annealed point.
+
+Additionally, add structured seeds known to be near-optimal geometries for 14 points: the heptagonal antiprism (two staggered 7-rings at several heights/radii — this family is a strong candidate for the 14-point optimum, analogous to how anti-prisms are optimal/competitive in related Tammes-type problems), plus a hexagonal-close-packed-like layered seed. Annealing from these structured starts plus the existing icosahedron+poles seeds gives much better chances of reaching the reference squared ratio ≈ 0.24.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+from itertools import combinations
+from scipy.optimize import minimize
+=======
+from itertools import combinations
+from scipy.optimize import minimize
+from scipy.special import logsumexp
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    # small cubic-lattice-based start
+    g = np.array(np.meshgrid([-1, 0, 1], [-1, 0, 1], [-1, 0, 1])).reshape(3, -1).T
+    cands.append(g[rng.choice(len(g), size=N, replace=False)])
+    return [normalize(c) for c in cands]
+=======
+    # small cubic-lattice-based start
+    g = np.array(np.meshgrid([-1, 0, 1], [-1, 0, 1], [-1, 0, 1])).reshape(3, -1).T
+    cands.append(g[rng.choice(len(g), size=N, replace=False)])
+    # heptagonal antiprism seeds (two staggered 7-rings) at several geometries
+    ang = 2 * np.pi / 7
+    for R in (0.7, 0.9, 1.1):
+        for h in (0.35, 0.55, 0.75, 0.95):
+            th = np.arange(7) * ang
+            ring1 = np.stack([R * np.cos(th), R * np.sin(th), np.full(7, h)], axis=1)
+            ring2 = np.stack([R * np.cos(th + ang / 2), R * np.sin(th + ang / 2), np.full(7, -h)], axis=1)
+            cands.append(np.vstack([ring1, ring2]))
+    # layered hexagonal-packing-like seed
+    hex_pts = []
+    for z, k in ((-0.8, 3), (0.0, 7), (0.8, 3), (1.6, 1)):
+        m = k
+        rr = 0.55 if m > 1 else 0.0
+        for i in range(m):
+            a = 2 * np.pi * i / m if m > 1 else 0.0
+            hex_pts.append([rr * np.cos(a), rr * np.sin(a), z])
+    cands.append(np.array(hex_pts, dtype=float))
+    return [normalize(c) for c in cands]
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+def solve(X0, IJ):
+    X0 = normalize(X0)
+    d2 = pairwise_sq_dists(X0, IJ)
+    t0 = np.sqrt(d2.min())
+    z0 = np.concatenate([X0.ravel(), [t0]])
+=======
+def solve(X0, IJ):
+    # Smooth annealed relaxation: soft-min pushes smallest distances up,
+    # soft-max acts as a smooth diameter normalization.
+    x = normalize(X0).ravel().copy()
+    for tau in (0.2, 0.08, 0.03, 0.012, 0.005, 0.002, 0.0008):
+        def obj(z, tau=tau):
+            X = z.reshape(N, D)
+            d2 = pairwise_sq_dists(X, IJ)
+            return tau * logsumexp(-d2 / tau) + tau * logsumexp(d2 / tau)
+        res = minimize(obj, x, method="L-BFGS-B",
+                       options={"maxiter": 250, "ftol": 1e-12, "gtol": 1e-10})
+        if np.isfinite(res.x).all():
+            x = res.x
+    # Final hard polish with the original SLSQP min-max formulation
+    X0 = normalize(x.reshape(N, D))
+    d2 = pairwise_sq_dists(X0, IJ)
+    t0 = np.sqrt(d2.min())
+    z0 = np.concatenate([X0.ravel(), [t0]])
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    res = minimize(obj, z0, method="SLSQP",
+                   constraints=[{"type": "ineq", "fun": cons_f}],
+                   options={"maxiter": 300, "ftol": 1e-12})
+    X = res.x[:N * D].reshape(N, D)
+    return X
+=======
+    res = minimize(obj, z0, method="SLSQP",
+                   constraints=[{"type": "ineq", "fun": cons_f}],
+                   options={"maxiter": 200, "ftol": 1e-12})
+    Xa = res.x[:N * D].reshape(N, D)
+    if score(Xa) >= score(X0):
+        return Xa
+    return X0
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    for cand in seed_candidates():
+        for rep in range(3):
+            X = solve(cand, IJ)
+            s = score(X)
+            if s > best_s:
+                best_s, best = s, X
+            cand = normalize(X)
+            if best_s > 0.2395:
+                break
+=======
+    for cand in seed_candidates():
+        for rep in range(2):
+            X = solve(cand, IJ)
+            s = score(X)
+            if s > best_s:
+                best_s, best = s, X
+            cand = normalize(X)
+            if best_s > 0.2395:
+                break
+        if best_s > 0.2395:
+            break
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    best = normalize(best)
+    assert np.isfinite(best).all() and best.shape == (N, D)
+    return best
+=======
+    best = normalize(best)
+    assert np.isfinite(best).all() and best.shape == (N, D)
+    return best
+>>>>>>> REPLACE

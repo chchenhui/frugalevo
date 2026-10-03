@@ -1,0 +1,415 @@
+<NAME>
+multistart_pairlocal
+</NAME>
+
+<DESCRIPTION>
+This version combines multi-start memory-aware greedy construction with strict best-improvement local search. It preserves the current program’s useful four ordering strategies, efficient affected-GPU objective evaluation, relocations, swaps, and limited plateau exploration.
+
+The crossover improvement adds memory-safe two-model relocations. These moves can escape local minima where neither a single relocation nor a one-for-one swap can reduce the maximum KVPR, while still maintaining valid GPU memory usage. The best solution across all construction orders and plateau attempts is retained.
+</DESCRIPTION>
+
+<CODE>
+```python
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """Place models to minimize the maximum memory-aware KV cache pressure."""
+
+    if gpu_num <= 0:
+        if models:
+            raise ValueError("Unable to place models without GPUs.")
+        return {}
+
+    def pressure(model):
+        return model.req_rate / model.slo
+
+    def ratio(load, remaining):
+        if remaining > 0:
+            return load / remaining
+        return float("inf") if load > 0 else 0.0
+
+    def objective(loads, remaining):
+        return max(ratio(loads[gpu], remaining[gpu]) for gpu in range(gpu_num))
+
+    def changed_objective(loads, remaining, changes):
+        value = 0.0
+        for gpu in range(gpu_num):
+            if gpu in changes:
+                load, memory = changes[gpu]
+            else:
+                load, memory = loads[gpu], remaining[gpu]
+            value = max(value, ratio(load, memory))
+        return value
+
+    def build_greedy(ordered_models):
+        placement = {gpu: [] for gpu in range(gpu_num)}
+        loads = [0.0] * gpu_num
+        remaining = [GPU_MEM_SIZE] * gpu_num
+
+        for model in ordered_models:
+            model_pressure = pressure(model)
+            current = [ratio(loads[gpu], remaining[gpu]) for gpu in range(gpu_num)]
+            best_gpu = None
+            best_score = None
+
+            for gpu in range(gpu_num):
+                if model.model_size > remaining[gpu]:
+                    continue
+
+                new_load = loads[gpu] + model_pressure
+                new_remaining = remaining[gpu] - model.model_size
+                new_ratio = ratio(new_load, new_remaining)
+                candidate_max = new_ratio
+
+                for other in range(gpu_num):
+                    if other != gpu:
+                        candidate_max = max(candidate_max, current[other])
+
+                score = (candidate_max, new_ratio, -new_remaining)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_gpu = gpu
+
+            if best_gpu is None:
+                return None
+
+            placement[best_gpu].append(model)
+            loads[best_gpu] += model_pressure
+            remaining[best_gpu] -= model.model_size
+
+        return placement, loads, remaining
+
+    def improve(placement, loads, remaining):
+        """Apply strict best-improving moves, swaps, and pair relocations."""
+        epsilon = 1e-12
+
+        while True:
+            current_value = objective(loads, remaining)
+            best_value = current_value
+            best_action = None
+
+            # Single-model relocations.
+            for source in range(gpu_num):
+                for index, model in enumerate(placement[source]):
+                    model_pressure = pressure(model)
+
+                    for target in range(gpu_num):
+                        if source == target or model.model_size > remaining[target]:
+                            continue
+
+                        source_load = loads[source] - model_pressure
+                        source_remaining = remaining[source] + model.model_size
+                        target_load = loads[target] + model_pressure
+                        target_remaining = remaining[target] - model.model_size
+
+                        value = changed_objective(
+                            loads,
+                            remaining,
+                            {
+                                source: (source_load, source_remaining),
+                                target: (target_load, target_remaining),
+                            },
+                        )
+
+                        if value < best_value - epsilon:
+                            best_value = value
+                            best_action = (
+                                "move", source, index, target,
+                                source_load, source_remaining,
+                                target_load, target_remaining,
+                            )
+
+            # Swaps can resolve memory fragmentation.
+            for left in range(gpu_num):
+                for right in range(left + 1, gpu_num):
+                    for left_index, left_model in enumerate(placement[left]):
+                        left_pressure = pressure(left_model)
+
+                        for right_index, right_model in enumerate(placement[right]):
+                            right_pressure = pressure(right_model)
+                            left_remaining = (
+                                remaining[left]
+                                + left_model.model_size
+                                - right_model.model_size
+                            )
+                            right_remaining = (
+                                remaining[right]
+                                + right_model.model_size
+                                - left_model.model_size
+                            )
+
+                            if left_remaining < 0 or right_remaining < 0:
+                                continue
+
+                            left_load = loads[left] - left_pressure + right_pressure
+                            right_load = loads[right] - right_pressure + left_pressure
+
+                            value = changed_objective(
+                                loads,
+                                remaining,
+                                {
+                                    left: (left_load, left_remaining),
+                                    right: (right_load, right_remaining),
+                                },
+                            )
+
+                            if value < best_value - epsilon:
+                                best_value = value
+                                best_action = (
+                                    "swap", left, left_index, right, right_index,
+                                    left_load, left_remaining,
+                                    right_load, right_remaining,
+                                )
+
+            # Relocating two models together can escape single-move local minima.
+            for source in range(gpu_num):
+                source_models = placement[source]
+
+                for first_index in range(len(source_models)):
+                    first = source_models[first_index]
+                    first_pressure = pressure(first)
+
+                    for second_index in range(first_index + 1, len(source_models)):
+                        second = source_models[second_index]
+                        pair_size = first.model_size + second.model_size
+                        pair_pressure = first_pressure + pressure(second)
+
+                        for target in range(gpu_num):
+                            if source == target or pair_size > remaining[target]:
+                                continue
+
+                            source_load = loads[source] - pair_pressure
+                            source_remaining = remaining[source] + pair_size
+                            target_load = loads[target] + pair_pressure
+                            target_remaining = remaining[target] - pair_size
+
+                            value = changed_objective(
+                                loads,
+                                remaining,
+                                {
+                                    source: (source_load, source_remaining),
+                                    target: (target_load, target_remaining),
+                                },
+                            )
+
+                            if value < best_value - epsilon:
+                                best_value = value
+                                best_action = (
+                                    "pair", source, first_index, second_index, target,
+                                    source_load, source_remaining,
+                                    target_load, target_remaining,
+                                )
+
+            if best_action is None:
+                break
+
+            action = best_action[0]
+
+            if action == "move":
+                _, source, index, target, source_load, source_remaining, target_load, target_remaining = best_action
+                placement[target].append(placement[source].pop(index))
+                loads[source] = source_load
+                remaining[source] = source_remaining
+                loads[target] = target_load
+                remaining[target] = target_remaining
+
+            elif action == "swap":
+                _, left, left_index, right, right_index, left_load, left_remaining, right_load, right_remaining = best_action
+                placement[left][left_index], placement[right][right_index] = (
+                    placement[right][right_index],
+                    placement[left][left_index],
+                )
+                loads[left] = left_load
+                remaining[left] = left_remaining
+                loads[right] = right_load
+                remaining[right] = right_remaining
+
+            else:
+                _, source, first_index, second_index, target, source_load, source_remaining, target_load, target_remaining = best_action
+                second = placement[source].pop(second_index)
+                first = placement[source].pop(first_index)
+                placement[target].extend((first, second))
+                loads[source] = source_load
+                remaining[source] = source_remaining
+                loads[target] = target_load
+                remaining[target] = target_remaining
+
+        return placement, loads, remaining
+
+    def plateau_move(placement, loads, remaining):
+        """Take one non-worsening move or swap with a better secondary balance."""
+        epsilon = 1e-12
+        current_value = objective(loads, remaining)
+        best_score = None
+        best_action = None
+
+        def score(test_loads, test_remaining):
+            values = sorted(
+                ratio(test_loads[gpu], test_remaining[gpu])
+                for gpu in range(gpu_num)
+            )
+            return (
+                objective(test_loads, test_remaining),
+                sum(value * value for value in values),
+            )
+
+        for source in range(gpu_num):
+            for index, model in enumerate(placement[source]):
+                model_pressure = pressure(model)
+
+                for target in range(gpu_num):
+                    if source == target or model.model_size > remaining[target]:
+                        continue
+
+                    test_loads = loads[:]
+                    test_remaining = remaining[:]
+                    test_loads[source] -= model_pressure
+                    test_remaining[source] += model.model_size
+                    test_loads[target] += model_pressure
+                    test_remaining[target] -= model.model_size
+
+                    value = objective(test_loads, test_remaining)
+                    candidate_score = score(test_loads, test_remaining)
+
+                    if value <= current_value + epsilon and (
+                        best_score is None or candidate_score < best_score
+                    ):
+                        best_score = candidate_score
+                        best_action = (
+                            "move", source, index, target,
+                            test_loads, test_remaining,
+                        )
+
+        for left in range(gpu_num):
+            for right in range(left + 1, gpu_num):
+                for left_index, left_model in enumerate(placement[left]):
+                    for right_index, right_model in enumerate(placement[right]):
+                        left_remaining = (
+                            remaining[left]
+                            + left_model.model_size
+                            - right_model.model_size
+                        )
+                        right_remaining = (
+                            remaining[right]
+                            + right_model.model_size
+                            - left_model.model_size
+                        )
+
+                        if left_remaining < 0 or right_remaining < 0:
+                            continue
+
+                        test_loads = loads[:]
+                        test_remaining = remaining[:]
+                        test_loads[left] += pressure(right_model) - pressure(left_model)
+                        test_loads[right] += pressure(left_model) - pressure(right_model)
+                        test_remaining[left] = left_remaining
+                        test_remaining[right] = right_remaining
+
+                        value = objective(test_loads, test_remaining)
+                        candidate_score = score(test_loads, test_remaining)
+
+                        if value <= current_value + epsilon and (
+                            best_score is None or candidate_score < best_score
+                        ):
+                            best_score = candidate_score
+                            best_action = (
+                                "swap", left, left_index, right, right_index,
+                                test_loads, test_remaining,
+                            )
+
+        if best_action is None:
+            return None
+
+        if best_action[0] == "move":
+            _, source, index, target, loads, remaining = best_action
+            placement[target].append(placement[source].pop(index))
+        else:
+            _, left, left_index, right, right_index, loads, remaining = best_action
+            placement[left][left_index], placement[right][right_index] = (
+                placement[right][right_index],
+                placement[left][left_index],
+            )
+
+        return placement, loads, remaining
+
+    ordered_sets = [
+        sorted(models, key=lambda m: (pressure(m), m.model_size), reverse=True),
+        sorted(models, key=lambda m: (m.model_size, pressure(m)), reverse=True),
+        sorted(
+            models,
+            key=lambda m: (pressure(m) / max(m.model_size, 1e-12), pressure(m)),
+            reverse=True,
+        ),
+        sorted(
+            models,
+            key=lambda m: (pressure(m) * m.model_size, m.model_size),
+            reverse=True,
+        ),
+    ]
+
+    best_result = None
+    best_value = float("inf")
+
+    for ordered_models in ordered_sets:
+        result = build_greedy(ordered_models)
+        if result is None:
+            continue
+
+        placement, loads, remaining = improve(*result)
+        value = objective(loads, remaining)
+
+        if value < best_value:
+            best_value = value
+            best_result = (placement, loads, remaining)
+
+    if best_result is None:
+        largest = max(models, key=lambda model: model.model_size)
+        raise ValueError(
+            f"Unable to place model of size {largest.model_size} GB on any GPU."
+        )
+
+    placement, loads, remaining = best_result
+
+    for _ in range(2):
+        moved = plateau_move(placement, loads, remaining)
+        if moved is None:
+            break
+
+        placement, loads, remaining = improve(*moved)
+        value = objective(loads, remaining)
+
+        if value < best_value:
+            best_value = value
+            best_result = (placement, loads, remaining)
+
+    return best_result[0]
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")
+``` 
+</CODE>

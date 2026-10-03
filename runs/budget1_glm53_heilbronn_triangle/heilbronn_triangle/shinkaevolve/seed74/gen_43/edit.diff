@@ -1,0 +1,232 @@
+--- a/original.py
++++ b/original.py
+@@ -1,162 +1,215 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ from itertools import combinations
+ 
+ _V0 = np.array([0.0, 0.0])
+ _V1 = np.array([1.0, 0.0])
+ _V2 = np.array([0.5, np.sqrt(3.0) / 2.0])
+ _TRI_AREA = 0.5 * np.sqrt(3.0) / 2.0
+ 
+ # Precompute all triplet indices once.
+ _TRIP = np.array(list(combinations(range(11), 3)), dtype=int)
+ 
+ 
+ def _min_area(pts):
+     """Minimum (normalized) triangle area over all triplets of points."""
+     a = pts[_TRIP[:, 0]]
+     b = pts[_TRIP[:, 1]]
+     c = pts[_TRIP[:, 2]]
+     cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+     return np.min(np.abs(cross)) / (2.0 * _TRI_AREA)
+ 
+ 
+ def _clip(pts):
+     """Project points back into the equilateral triangle via barycentric clipping."""
+     out = pts.copy()
+     for i in range(out.shape[0]):
+         p = out[i]
+         # barycentric coordinates w.r.t. V0, V1, V2
+         v2v = _V2 - _V0
+         u = p - _V0
+         b1 = (u[0] * v2v[1] - u[1] * v2v[0]) / (v2v[0] * 0.0 - v2v[0] * v2v[1] + v2v[1] * v2v[0])
+         # solve properly: use explicit formulas
+         y = p[1]
+         x = p[0]
+         h = np.sqrt(3.0) / 2.0
+         l2 = y / h
+         l1 = x - 0.5 * l2
+         l0 = 1.0 - l1 - l2
+         if l0 >= 0 and l1 >= 0 and l2 >= 0:
+             continue
+         # clamp lambdas and renormalize
+         lam = np.array([l0, l1, l2])
+         lam = np.maximum(lam, 0.0)
+         lam /= lam.sum()
+         out[i] = lam[0] * _V0 + lam[1] * _V1 + lam[2] * _V2
+     return out
+ 
+ 
+ def _initial(seed):
+     """Perturbed triangular lattice (order-3 grid + centroid), perturbed to break collinearity."""
+     rng = np.random.default_rng(seed)
+     pts = []
+     k = 3
+     for i in range(k + 1):
+         for j in range(k + 1 - i):
+             l = k - i - j
+             pts.append((i * _V0 + j * _V1 + l * _V2) / k)
+     pts.append(np.array([0.5, h := np.sqrt(3.0) / 6.0]))
+     pts = np.array(pts)
+     return _clip(pts + rng.normal(0.0, 0.02, pts.shape))
+ 
+ 
+ def _bottleneck_move(pts, rng, step):
+     """Move one vertex of the current bottleneck triangle along the gradient of
+     its (signed, made-increasing) area, plus a small random tangential jitter."""
+     a = pts[_TRIP[:, 0]]
+     b = pts[_TRIP[:, 1]]
+     c = pts[_TRIP[:, 2]]
+     cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+     t = int(np.argmin(np.abs(cross)))
+     i, j, k = _TRIP[t]
+     p, q, r = pts[i], pts[j], pts[k]
+     sgn = 1.0 if cross[t] >= 0 else -1.0
+     g = sgn * np.array([r[1] - q[1], q[0] - r[0]])  # gradient wrt vertex p (i)
+     nrm = np.hypot(*g)
+     if nrm < 1e-15:
+         g = rng.normal(0.0, 1.0, 2)
+         nrm = np.hypot(*g)
+     cand = pts.copy()
+     # move the chosen vertex; occasionally move j or k instead (explore)
+     who = rng.choice([i, j, k]) if rng.random() < 0.5 else i
+     idx = who
+     if who == j:
+         g = sgn * np.array([p[1] - r[1], r[0] - p[0]])
+     elif who == k:
+         g = sgn * np.array([q[1] - p[1], p[0] - q[0]])
+     g = g / np.hypot(*g) if np.hypot(*g) > 1e-15 else rng.normal(0.0, 1.0, 2)
+     g = g + 0.3 * rng.normal(0.0, 1.0, 2)
+     cand[idx] += step * g
+     return _clip(cand)
+ 
+ 
+ def _anneal(pts, rng, iters=4000, T0=0.012):
+     """Simulated annealing maximizing min area, with best-so-far memory."""
+     cur = _clip(pts)
+     cur_v = _min_area(cur)
+     best, best_v = cur.copy(), cur_v
+     T = T0
+     for it in range(iters):
+         T = T0 * (1.0 - it / iters) + 1e-6
+         step = max(0.002, 0.05 * T / T0 + 0.002)
+         cand = _bottleneck_move(cur, rng, step)
+         v = _min_area(cand)
+         if v >= cur_v or rng.random() < np.exp((v - cur_v) / max(T * 0.05, 1e-9)):
+             cur, cur_v = cand, v
+             if v > best_v:
+                 best_v, best = v, cand.copy()
+     return best, best_v
+ 
+ 
++def _polish(best, best_v):
++    """Greedy structured polish: move the points involved in the top-2
++    bottleneck triangles, individually AND simultaneously in pairs, along 12
++    fixed directions (with opposites). Pair moves escape coordinated
++    constraints that single-point moves cannot."""
++    n_dirs = 12
++    ang = 2.0 * np.pi * np.arange(n_dirs) / n_dirs
++    dirs = np.stack([np.cos(ang), np.sin(ang)], axis=1)
++    # full direction set includes opposites for backward moves
++    full_dirs = np.concatenate([dirs, -dirs], axis=0)
++
++    def bottlenecks(pts, m):
++        a = pts[_TRIP[:, 0]]
++        b = pts[_TRIP[:, 1]]
++        c = pts[_TRIP[:, 2]]
++        cross = np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
++                       - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
++        order = np.argsort(cross)[:m]
++        idxs = set()
++        for t in order:
++            idxs.update(int(x) for x in _TRIP[t])
++        return sorted(idxs)
++
++    step = 0.002
++    while step > 1e-5:
++        improved = False
++        # candidate points: those in the top-2 (usually 3-4) bottleneck triangles
++        cand_idx = bottlenecks(best, 2)
++        ni = len(cand_idx)
++        for ai in range(ni):
++            i = cand_idx[ai]
++            for d in full_dirs:
++                cand = best.copy()
++                cand[i] += step * d
++                cand = _clip(cand)
++                v = _min_area(cand)
++                if v > best_v + 1e-12:
++                    best_v, best, improved = v, cand, True
++            # simultaneous pair moves (same direction) with the other candidates
++            for bi in range(ai + 1, ni):
++                j = cand_idx[bi]
++                for d in full_dirs:
++                    cand = best.copy()
++                    cand[i] += step * d
++                    cand[j] += step * d
++                    cand = _clip(cand)
++                    v = _min_area(cand)
++                    if v > best_v + 1e-12:
++                        best_v, best, improved = v, cand, True
++                # opposite-direction pair move (separating move)
++                for d in dirs:
++                    cand = best.copy()
++                    cand[i] += step * d
++                    cand[j] -= step * d
++                    cand = _clip(cand)
++                    v = _min_area(cand)
++                    if v > best_v + 1e-12:
++                        best_v, best, improved = v, cand, True
++        if not improved:
++            step *= 0.5
++        # re-accept: on improvement keep same step and re-identify bottlenecks
++    return best, best_v
++
++
+ def _refine(pts, rng):
+     """Anneal, then basin-hop: reheat from best up to 3 times, then polish."""
+     best, best_v = _anneal(pts, rng)
+     for cycle in range(3):
+         if best_v >= 0.034:
+             break
+         # restart from best with fresh perturbation, reheat at half T0
+         start = _clip(best + rng.normal(0.0, 0.008, best.shape))
+         b2, v2 = _anneal(start, rng, iters=2000, T0=0.006)
+         if v2 > best_v:
+             best_v, best = v2, b2
+-    # final greedy polish: small coordinated moves accepted only if improving
+-    step = 0.002
+-    cur_v = best_v
+-    while step > 1e-5:
+-        improved = False
+-        for _ in range(200):
+-            cand = _clip(best + rng.normal(0.0, step, best.shape))
+-            v = _min_area(cand)
+-            if v > cur_v + 1e-12:
+-                best, cur_v = cand, v
+-                improved = True
+-        if not improved:
+-            step *= 0.5
+-    return best, cur_v
++    # structured greedy polish on bottleneck points (singles + pairs)
++    best, best_v = _polish(best, best_v)
++    return best, best_v
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+     Construct an arrangement of 11 points on or inside the equilateral triangle with
+     vertices (0,0), (1,0), (0.5, sqrt(3)/2), maximizing the minimum triangle area.
+ 
+     Deterministic multi-start local search over a perturbed triangular lattice.
+     Falls back to the initial configuration if refinement fails.
+     """
+     best_pts = None
+     best_val = -1.0
+     try:
+         for seed in range(8):
+             rng = np.random.default_rng(1234 + seed)
+             init = _initial(1234 + seed)
+             pts, val = _refine(init, rng)
+             if val > best_val:
+                 best_val = val
+                 best_pts = pts
+     except Exception:
+         if best_pts is None:
+             best_pts = _initial(1234)
+     return np.asarray(best_pts, dtype=float)
+ 
+ 
+ # EVOLVE-BLOCK-END

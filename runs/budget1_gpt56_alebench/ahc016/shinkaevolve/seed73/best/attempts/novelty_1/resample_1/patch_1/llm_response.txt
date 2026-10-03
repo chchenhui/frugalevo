@@ -1,0 +1,248 @@
+<NAME>
+clique_partition_codebook
+</NAME>
+
+<DESCRIPTION>
+This version replaces the small-graph GED / random-density approach with a structured invariant codebook.
+
+Each message graph is a disjoint union of two cliques and isolated vertices. Its sorted degree sequence is preserved by vertex shuffling and remains informative after edge-flip noise. A greedy maximin selection chooses clique partitions with widely separated sorted degree profiles. During decoding, it uses both:
+
+- total edge count likelihood, and
+- centered sorted-degree-profile likelihood.
+
+This provides substantially more shuffle-invariant information than edge count alone while avoiding expensive graph-isomorphism matching. The vertex count is selected from the noise level and increased only enough to provide at least `M` distinct structural codewords.
+</DESCRIPTION>
+
+<CODE>
+```cpp
+// EVOLVE-BLOCK-START
+#include <bits/stdc++.h>
+using namespace std;
+
+struct Candidate {
+    int a, b;
+    int edges;
+    vector<int> deg;
+};
+
+static vector<Candidate> make_candidates(int N) {
+    vector<Candidate> res;
+    set<vector<int>> seen;
+
+    for (int a = 0; a <= N; ++a) {
+        for (int b = 0; b <= a && a + b <= N; ++b) {
+            // A clique of size 1 is indistinguishable from an isolated vertex.
+            int aa = (a == 1 ? 0 : a);
+            int bb = (b == 1 ? 0 : b);
+            if (aa < bb) swap(aa, bb);
+
+            vector<int> d;
+            for (int i = 0; i < N - aa - bb; ++i) d.push_back(0);
+            for (int i = 0; i < bb; ++i) d.push_back(bb - 1);
+            for (int i = 0; i < aa; ++i) d.push_back(aa - 1);
+            sort(d.begin(), d.end());
+
+            if (!seen.insert(d).second) continue;
+
+            Candidate c;
+            c.a = aa;
+            c.b = bb;
+            c.deg = d;
+            c.edges = aa * (aa - 1) / 2 + bb * (bb - 1) / 2;
+            res.push_back(c);
+        }
+    }
+    return res;
+}
+
+static double degree_distance_sq(const vector<int>& x, const vector<int>& y) {
+    double z = 0;
+    for (int i = 0; i < (int)x.size(); ++i) {
+        double d = x[i] - y[i];
+        z += d * d;
+    }
+    return z;
+}
+
+static string build_graph_string(int N, int a, int b) {
+    vector<vector<char>> adj(N, vector<char>(N, 0));
+
+    // First clique: [0, a)
+    for (int i = 0; i < a; ++i) {
+        for (int j = i + 1; j < a; ++j) {
+            adj[i][j] = adj[j][i] = 1;
+        }
+    }
+
+    // Second clique: [a, a+b)
+    for (int i = a; i < a + b; ++i) {
+        for (int j = i + 1; j < a + b; ++j) {
+            adj[i][j] = adj[j][i] = 1;
+        }
+    }
+
+    string s;
+    s.reserve(N * (N - 1) / 2);
+    for (int i = 0; i < N; ++i) {
+        for (int j = i + 1; j < N; ++j) {
+            s.push_back(adj[i][j] ? '1' : '0');
+        }
+    }
+    return s;
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int M;
+    double eps;
+    cin >> M >> eps;
+
+    // Estimate a useful edge-statistics size, but structural coding permits
+    // considerably smaller graphs for low-noise cases.
+    const double signal = 1.0 - 2.0 * eps;
+    double idealL = 0.0;
+    if (fabs(signal) > 1e-12) {
+        idealL = 5.5 * (M - 1.0) * (M - 1.0) * eps * (1.0 - eps)
+               / (signal * signal);
+    }
+
+    int N = 4;
+    if (idealL > 1.0) {
+        N = max(N, (int)ceil((1.0 + sqrt(1.0 + 8.0 * idealL)) / 2.0));
+    }
+
+    // For exact / low-noise cases, avoid paying for an unnecessarily large N.
+    int structuralFloor = (int)ceil(2.0 * sqrt((double)M)) + 1;
+    N = max(N, structuralFloor);
+    N = min(N, 100);
+
+    vector<Candidate> candidates = make_candidates(N);
+    while ((int)candidates.size() < M && N < 100) {
+        ++N;
+        candidates = make_candidates(N);
+    }
+
+    const int L = N * (N - 1) / 2;
+
+    // Greedy maximin codebook in sorted-degree-sequence space.
+    vector<int> chosen;
+    vector<double> nearest(candidates.size(), 1e100);
+    vector<char> used(candidates.size(), 0);
+
+    // Start with the empty graph, if available.
+    int first = 0;
+    for (int i = 0; i < (int)candidates.size(); ++i) {
+        if (candidates[i].edges == 0) {
+            first = i;
+            break;
+        }
+    }
+
+    chosen.push_back(first);
+    used[first] = 1;
+    for (int i = 0; i < (int)candidates.size(); ++i) {
+        nearest[i] = degree_distance_sq(candidates[i].deg, candidates[first].deg);
+    }
+
+    while ((int)chosen.size() < M) {
+        int best = -1;
+        double bestValue = -1.0;
+
+        for (int i = 0; i < (int)candidates.size(); ++i) {
+            if (used[i]) continue;
+
+            // Slightly reward a different edge count as it is an especially
+            // reliable invariant under independent edge flips.
+            double value = nearest[i] + 0.025 * candidates[i].edges;
+            if (value > bestValue) {
+                bestValue = value;
+                best = i;
+            }
+        }
+
+        if (best < 0) break;
+        chosen.push_back(best);
+        used[best] = 1;
+
+        for (int i = 0; i < (int)candidates.size(); ++i) {
+            if (!used[i]) {
+                nearest[i] = min(nearest[i],
+                    degree_distance_sq(candidates[i].deg, candidates[best].deg));
+            }
+        }
+    }
+
+    // Safety fallback; candidate count is normally much larger than M.
+    while ((int)chosen.size() < M) chosen.push_back(first);
+
+    vector<Candidate> code(M);
+    cout << N << '\n';
+    for (int k = 0; k < M; ++k) {
+        code[k] = candidates[chosen[k]];
+        cout << build_graph_string(N, code[k].a, code[k].b) << '\n';
+    }
+    cout.flush();
+
+    const double q = max(1e-7, eps * (1.0 - eps));
+    const double edgeVar = max(1e-7, L * q);
+    const double degreeVar = max(1e-7, max(1, N - 2) * q);
+
+    for (int query = 0; query < 100; ++query) {
+        string h;
+        cin >> h;
+
+        vector<int> deg(N, 0);
+        int edgeCount = 0;
+        int p = 0;
+        for (int i = 0; i < N; ++i) {
+            for (int j = i + 1; j < N; ++j, ++p) {
+                if (h[p] == '1') {
+                    ++edgeCount;
+                    ++deg[i];
+                    ++deg[j];
+                }
+            }
+        }
+        sort(deg.begin(), deg.end());
+
+        double observedMean = 2.0 * edgeCount / N;
+        int answer = 0;
+        double bestScore = 1e300;
+
+        for (int k = 0; k < M; ++k) {
+            const Candidate& c = code[k];
+
+            double expectedEdges = eps * L + signal * c.edges;
+            double edgeDiff = edgeCount - expectedEdges;
+            double score = edgeDiff * edgeDiff / edgeVar;
+
+            double templateMean = 2.0 * c.edges / N;
+            double profileError = 0.0;
+
+            for (int v = 0; v < N; ++v) {
+                double expectedCentered = signal * (c.deg[v] - templateMean);
+                double observedCentered = deg[v] - observedMean;
+                double d = observedCentered - expectedCentered;
+                profileError += d * d;
+            }
+
+            // Centered degrees carry graph-shape information beyond total edges.
+            score += profileError / (2.0 * degreeVar);
+
+            if (score < bestScore) {
+                bestScore = score;
+                answer = k;
+            }
+        }
+
+        cout << answer << '\n';
+        cout.flush();
+    }
+
+    return 0;
+}
+// EVOLVE-BLOCK-END
+```
+</CODE>

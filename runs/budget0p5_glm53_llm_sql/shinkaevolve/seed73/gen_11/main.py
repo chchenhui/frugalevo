@@ -1,0 +1,306 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List, Dict, Optional
+
+
+class Evolved(Algorithm):
+    """
+    Serial character-Trie aware reordering.
+
+    The evaluator serializes each output row as "".join(row.fillna("").astype(str)),
+    shares prefixes across ALL inserted rows via a character Trie, and the reward is
+    total matched characters (= sum of adjacent LCPs of the sorted row strings).
+    We build a few cheap candidate row/column orderings, measure their exact Trie
+    reuse with the sorted-string LCP sum, and return the best one.
+    """
+
+    # Budget on total serialized characters for exact scoring of candidates.
+    SCORE_CHAR_BUDGET = 40_000_000
+    MAX_PART_DEPTH = 6       # max conditional-partition depth
+    MIN_GROUP_BRANCH = 4     # don't branch groups smaller than this
+    MAX_PART_CANDIDATES = 24 # candidate columns considered at each partition node
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ---------------- serialization helpers ----------------
+
+    @staticmethod
+    def _cell_str(v) -> str:
+        # Mirrors fillna("") then astype(str) for scoring only.
+        if v is None:
+            return ""
+        if isinstance(v, float) and np.isnan(v):
+            return ""
+        try:
+            if v != v:  # NaN-like (e.g. pd.NaT)
+                return ""
+        except Exception:
+            pass
+        return str(v)
+
+    def _serialize(self, values: np.ndarray) -> List[str]:
+        return ["".join(self._cell_str(v) for v in row) for row in values]
+
+    # ---------------- exact Trie reuse (sorted adjacent LCP) ----------------
+
+    @classmethod
+    def _lcp_score(cls, strings: List[str]) -> int:
+        if len(strings) < 2:
+            return 0
+        ss = sorted(strings)
+        total = 0
+        prev = ss[0]
+        for cur in ss[1:]:
+            if cur == prev:
+                total += len(cur)
+            else:
+                lo = 0
+                hi = min(len(prev), len(cur))
+                while lo < hi:
+                    mid = (lo + hi + 1) >> 1
+                    if prev[:mid] == cur[:mid]:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                total += lo
+            prev = cur
+        return total
+
+    # ---------------- candidate orderings ----------------
+
+    def _col_pair_scores(self, df: pd.DataFrame, mode: str = "lenfreq"):
+        """Per-column score used for ranking; also returns factorized codes."""
+        codes = {}
+        uniques = {}
+        counts = {}
+        lens = {}
+        scores = {}
+        for col in df.columns:
+            c, uniq = pd.factorize(df[col].to_numpy(), sort=False)
+            codes[col] = c
+            uniques[col] = uniq
+            cnt = np.bincount(c, minlength=len(uniq)) if len(uniq) else np.zeros(0, dtype=int)
+            counts[col] = cnt
+            ls = np.array([len(self._cell_str(u)) for u in uniq], dtype=np.int64)
+            lens[col] = ls
+            if mode == "lenfreq":
+                s = int(np.sum(ls * cnt * np.maximum(cnt - 1, 0)))
+            else:  # "count" mode: ignore length weighting
+                s = int(np.sum(cnt * np.maximum(cnt - 1, 0)))
+            scores[col] = s
+        return codes, uniques, counts, lens, scores
+
+    def _freq_order(self, df: pd.DataFrame, scores: Dict, dep_pairs: List[Tuple[str, str]]) -> List[str]:
+        cols = list(df.columns)
+        order = sorted(cols, key=lambda c: (-scores[c], str(c)))
+        # keep one-way dependency pairs adjacent (source immediately before dependent)
+        for src, dst in dep_pairs:
+            if src in order and dst in order:
+                i, j = order.index(src), order.index(dst)
+                if j != i + 1:
+                    item = order.pop(j)
+                    order.insert(order.index(src) + 1, item)
+        return order
+
+    def _partition_order(
+        self,
+        df: pd.DataFrame,
+        codes: Dict,
+        counts: Dict,
+        lens: Dict,
+        scores: Dict,
+        dep_pairs: List[Tuple[str, str]],
+    ) -> List[List[str]]:
+        """
+        Conditional prefix partition tree (bounded): pick a leading field inside the
+        current group by pair repetition saving, split rows by its value, and choose
+        suffix orders per group. Returns per-row column orderings.
+        """
+        n = len(df)
+        base_order = self._freq_order(df, scores, dep_pairs)
+        col_list = list(df.columns)
+        row_orders: List[Optional[List[str]]] = [None] * n
+
+        remaining_cols = {c: i for i, c in enumerate(col_list)}
+        # groups: list of (row_indices ndarray, remaining column name list)
+        groups = [(np.arange(n), list(col_list))]
+        depth = 0
+        while groups and depth < self.MAX_PART_DEPTH:
+            new_groups = []
+            for row_idx, rem_cols in groups:
+                if len(row_idx) < self.MIN_GROUP_BRANCH or len(rem_cols) <= 1:
+                    continue
+                # candidate columns by pair-saving restricted to this group
+                cand = sorted(rem_cols, key=lambda c: (-scores[c], str(c)))[: self.MAX_PART_CANDIDATES]
+                best_col, best_save = None, 0
+                for col in cand:
+                    c = codes[col][row_idx]
+                    if len(c) == 0:
+                        continue
+                    cnt = np.bincount(c, minlength=len(counts[col]))
+                    ls = lens[col]
+                    save = int(np.sum(ls * cnt * np.maximum(cnt - 1, 0)))
+                    if save > best_save:
+                        best_save, best_col = save, col
+                if best_col is None or best_save <= 0:
+                    continue
+                # partition rows on best_col value
+                c = codes[best_col][row_idx]
+                uniq_vals = np.unique(c)
+                if len(uniq_vals) <= 1:
+                    continue
+                rest = [x for x in rem_cols if x != best_col]
+                for uv in uniq_vals:
+                    sub_rows = row_idx[c == uv]
+                    if len(sub_rows) == 0:
+                        continue
+                    for r in sub_rows:
+                        row_orders[int(r)] = [best_col] + list(rest)
+                    new_groups.append((sub_rows, rest))
+            groups = new_groups
+            depth += 1
+
+        # rows never assigned get the base frequency order
+        for i in range(n):
+            if row_orders[i] is None:
+                row_orders[i] = base_order
+        return row_orders
+
+    def _rows_for_orders(self, values: np.ndarray, columns: List[str], row_orders: List[List[str]]) -> List[List]:
+        """Materialize each row's values according to its own column order."""
+        pos = {c: i for i, c in enumerate(columns)}
+        # cache position arrays per distinct order signature
+        cache: Dict[Tuple[str, ...], List[int]] = {}
+        out = []
+        for order in row_orders:
+            key = tuple(order)
+            arr = cache.get(key)
+            if arr is None:
+                arr = [pos[c] for c in order]
+                cache[key] = arr
+            out.append(arr)
+        # build per-row value lists via numpy fancy indexing
+        row_vals = []
+        for i, arr in enumerate(out):
+            row_vals.append(values[i, arr].tolist())
+        return row_vals
+
+    # ---------------- public API ----------------
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        # Preserve original data; operate on a copy.
+        initial_df = df.copy()
+        n_rows, n_cols = initial_df.shape
+
+        # Empty / trivial cases
+        if n_rows == 0:
+            return initial_df.copy(), []
+        if n_cols == 0:
+            return initial_df.copy(), [[] for _ in range(n_rows)]
+
+        # Honor column merges using the existing base-class semantics.
+        work = initial_df
+        if col_merge:
+            merger = getattr(self, "merging_columns", None)
+            if callable(merger):
+                for col_group in col_merge:
+                    ordered_group = [c for c in work.columns if c in col_group]
+                    if len(ordered_group) > 1:
+                        try:
+                            work = merger(work, ordered_group, prepended=False)
+                        except Exception:
+                            pass
+
+        columns = list(work.columns)
+        values = work.to_numpy(dtype=object) if n_cols else np.empty((n_rows, 0), dtype=object)
+
+        # Normalize one-way dependencies to actual column names (keep pairs adjacent).
+        dep_pairs: List[Tuple[str, str]] = []
+        for dep in (one_way_dep or []):
+            c1 = [c for c in columns if dep[0] in str(c)]
+            c2 = [c for c in columns if dep[1] in str(c)]
+            if len(c1) == 1 and len(c2) == 1:
+                dep_pairs.append((c1[0], c2[0]))
+
+        # Column statistics shared by all candidates.
+        codes, uniques, counts, lens, scores_len = self._col_pair_scores(work, mode="lenfreq")
+        _, _, _, _, scores_cnt = self._col_pair_scores(work, mode="count")
+
+        # Candidate A: global frequency-ranked order (length-weighted pairs).
+        order_a = self._freq_order(work, scores_len, dep_pairs)
+        orders_a = [order_a] * n_rows
+
+        # Candidate B: recursive conditional partition (pair repetition, length-weighted).
+        orders_b = self._partition_order(work, codes, counts, lens, scores_len, dep_pairs)
+
+        # Candidate C: count-only ranking (different length/frequency tradeoff).
+        order_c = self._freq_order(work, scores_cnt, dep_pairs)
+        orders_c = [order_c] * n_rows
+
+        # Exact scoring against the real character-Trie objective, under a budget.
+        total_chars_per_cand = sum(sum(lens[c]) * 0 for c in columns)  # placeholder, computed below
+        candidate_values = {
+            "a": (order_a, orders_a),
+            "b": (order_b if len(orders_b) == n_rows else order_a, orders_b if len(orders_b) == n_rows else orders_a),
+            "c": (order_c, orders_c),
+        }
+
+        best_key = "a"
+        best_orders = orders_a
+        best_cols = order_a
+        best_score = None
+
+        try:
+            sizes = []
+            for key, (gcols, gorders) in candidate_values.items():
+                s = 0
+                for col in gcols:
+                    s += int(lens[col].sum())
+                sizes.append(s * n_rows)
+            budget = min(sizes) if sizes else 0
+        except Exception:
+            budget = self.SCORE_CHAR_BUDGET + 1
+
+        if budget <= self.SCORE_CHAR_BUDGET:
+            for key, (gcols, gorders) in candidate_values.items():
+                try:
+                    vals = self._rows_for_orders(values, columns, gorders)
+                    strings = self._serialize(vals)
+                    sc = self._lcp_score(strings)
+                    if best_score is None or sc > best_score:
+                        best_score = sc
+                        best_key = key
+                        best_orders = gorders
+                        best_cols = gcols
+                except Exception:
+                    continue
+        else:
+            # Too large to score exactly: use the deterministic global heuristic.
+            best_orders, best_cols = orders_a, order_a
+
+        # Build the output DataFrame in the winning global column layout with
+        # per-row value permutation applied.
+        out_values = self._rows_for_orders(values, columns, best_orders)
+        result = pd.DataFrame(out_values, columns=best_cols)
+        result = result.astype(object)
+
+        # Re-index columns to match a deterministic layout; per-row orderings are
+        # expressed as lists of column names from result.columns.
+        assert result.shape == (n_rows, n_cols), "shape mismatch after reorder"
+        return result, [list(o) for o in best_orders]
+
+
+# EVOLVE-BLOCK-END

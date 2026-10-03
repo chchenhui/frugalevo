@@ -1,0 +1,147 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+VERTS = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, np.sqrt(3) / 2.0]])
+
+
+def _all_triples(n):
+    return np.array(list(combinations(range(n), 3)), dtype=int)
+
+
+def _areas_all(points, triples):
+    p = points[triples]
+    a = p[:, 1] - p[:, 0]
+    b = p[:, 2] - p[:, 0]
+    return 0.5 * np.abs(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0])
+
+
+def _min_area(points, triples):
+    areas = _areas_all(points, triples)
+    idx = int(np.argmin(areas))
+    return areas[idx], idx
+
+
+def _min_area_batch(batch, triples):
+    p = batch[:, triples]  # (K, T, 3, 2)
+    a = p[:, :, 1] - p[:, :, 0]
+    b = p[:, :, 2] - p[:, :, 0]
+    areas = 0.5 * np.abs(a[:, :, 0] * b[:, :, 1] - a[:, :, 1] * b[:, :, 0])
+    return areas.min(axis=1)
+
+
+def _project(pts):
+    """Barycentric clipping back into the unit equilateral triangle (any shape)."""
+    orig_shape = pts.shape
+    flat = pts.reshape(-1, 2)
+    A, B, C = VERTS
+    v1 = B - A
+    v2 = C - A
+    det = v1[0] * v2[1] - v1[1] * v2[0]
+    rel = flat - A
+    b1 = (rel[:, 0] * v2[1] - rel[:, 1] * v2[0]) / det
+    b2 = (v1[0] * rel[:, 1] - v1[1] * rel[:, 0]) / det
+    b3 = 1.0 - b1 - b2
+    b = np.stack([b3, b1, b2], axis=1)
+    b = np.clip(b, 0.0, 1.0)
+    b /= b.sum(axis=1, keepdims=True)
+    return (b @ VERTS).reshape(orig_shape)
+
+
+def _init_random(rng, n):
+    u = rng.random((n, 2))
+    su = np.sqrt(u[:, 0])
+    b = np.stack([1 - su, su * (1 - u[:, 1]), su * u[:, 1]], axis=1)
+    return b @ VERTS
+
+
+def _ring_layout():
+    """Symmetric seed: centroid + two staggered concentric rings of 5 points."""
+    cx, cy = 0.5, np.sqrt(3) / 6.0
+    pts = [[cx, cy]]
+    for r, rot in ((0.30, 0.0), (0.20, np.pi / 5.0)):
+        for t in np.linspace(0, 2 * np.pi, 5, endpoint=False) + rot:
+            pts.append([cx + r * np.cos(t), cy + r * np.sin(t)])
+    return _project(np.array(pts))
+
+
+def _local_search(pts, triples, rng, step0=0.05, min_step=1e-7):
+    cur_val, _ = _min_area(pts, triples)
+    K = 24
+    KWORST = 6
+    step = step0
+    while step > min_step:
+        improved = False
+        areas = _areas_all(pts, triples)
+        worst_order = np.argsort(areas)[:KWORST]
+        movers = sorted(set(triples[worst_order].ravel().tolist()))
+        # occasionally allow any point to move (escape local optima)
+        for pi in movers:
+            cands = np.repeat(pts[None], K, axis=0)
+            cands[:, pi, :] += rng.normal(0.0, step, size=(K, 2))
+            cands = _project(cands)
+            vals = _min_area_batch(cands, triples)
+            j = int(np.argmax(vals))
+            if vals[j] > cur_val + 1e-12:
+                pts = cands[j]
+                cur_val = float(vals[j])
+                improved = True
+        if not improved:
+            # one global sweep: try moving every point
+            any_imp = False
+            for pi in range(len(pts)):
+                cands = np.repeat(pts[None], K, axis=0)
+                cands[:, pi, :] += rng.normal(0.0, step, size=(K, 2))
+                cands = _project(cands)
+                vals = _min_area_batch(cands, triples)
+                j = int(np.argmax(vals))
+                if vals[j] > cur_val + 1e-12:
+                    pts = cands[j]
+                    cur_val = float(vals[j])
+                    any_imp = True
+            if not any_imp:
+                step *= 0.6
+    return pts, cur_val
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct 11 points inside the unit equilateral triangle maximizing the
+    smallest triangle area over all point triplets (Heilbronn problem, n=11).
+
+    Deterministic hybrid optimizer: a structured symmetric ring warm start plus
+    uniform random restarts, each refined by vectorized best-of-K local search
+    with barycentric projection for feasibility.
+
+    Returns:
+        points: np.ndarray of shape (11,2) with the x,y coordinates of the points.
+    """
+    n = 11
+    triples = _all_triples(n)
+    rng = np.random.default_rng(12345)
+
+    best_pts = None
+    best_val = -1.0
+
+    try:
+        # Warm start from symmetric ring layout
+        pts, val = _local_search(_ring_layout(), triples, rng)
+        if val > best_val:
+            best_val, best_pts = val, pts.copy()
+
+        # Random restarts, skipping hopeless basins
+        for restart in range(25):
+            start = _init_random(rng, n)
+            v0, _ = _min_area(start, triples)
+            if best_val > 0 and v0 < 0.3 * best_val:
+                continue
+            pts, val = _local_search(start, triples, rng)
+            if val > best_val:
+                best_val, best_pts = val, pts.copy()
+
+        if best_pts is None or best_pts.shape != (n, 2) or not np.all(np.isfinite(best_pts)):
+            raise RuntimeError("bad result")
+        return np.asarray(best_pts, dtype=float)
+    except Exception:
+        return np.asarray(_ring_layout(), dtype=float)
+# EVOLVE-BLOCK-END

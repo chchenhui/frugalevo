@@ -1,0 +1,91 @@
+<NAME>
+softmin_then_hard_polish
+</NAME>
+
+<DESCRIPTION>
+Two improvements inspired by the Heilbronn optimization landscape:
+
+1. **Precompute triplet indices at module level.** The current `_min_area` rebuilds the 165-combination index array on *every* call (40k+ times), which dominates the 3.87s runtime. Hoisting it to module level (as Gen 3/6 did) cuts per-iteration cost substantially, letting us afford more optimization within the same time.
+
+2. **Soft-min coarse phase, then hard-min polish.** The hard `min` objective is extremely rugged — a single-point perturbation often leaves the argmin triangle unchanged (flat plateau) or jumps discontinuously, so greedy descent stalls (Gen 2, current program plateau at ~0.66). Gen 3 showed a log-sum-exp soft-min over the smallest ~15% of triangles smooths the landscape and guides points toward balanced configurations. We add a coarse phase minimizing `logsumexp(-k*a)/k` over the smallest triangles with simulated-annealing acceptance, then keep the existing (cheapened) hard-min annealing + fine polish to sharpen the actual minimum.
+
+This combines Gen 3's smoothing with the current program's better schedule and clipping.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+import numpy as np
+import itertools
+=======
+import numpy as np
+import itertools
+
+# Precompute all 165 triplet index combinations once at module level.
+_TRIPLETS = np.array(list(itertools.combinations(range(11), 3)), dtype=int)
+_TRI_AREA = np.sqrt(3.0) / 4.0
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def _min_area(pts: np.ndarray) -> float:
+    """Vectorized area of the smallest triangle among all triplets (doubled area)."""
+    idx = np.array(list(itertools.combinations(range(len(pts)), 3)))
+    p = pts[idx]  # (C(n,3), 3, 2)
+    cross = (p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) - \
+            (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0])
+    return np.abs(cross).min()
+=======
+def _all_areas(pts: np.ndarray) -> np.ndarray:
+    """Vectorized (doubled) areas of all 165 triplets, precomputed indices."""
+    p = pts[_TRIPLETS]  # (165, 3, 2)
+    cross = (p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) - \
+            (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0])
+    return np.abs(cross)
+
+
+def _min_area(pts: np.ndarray) -> float:
+    """Doubled area of the smallest triangle among all triplets."""
+    return _all_areas(pts).min()
+
+
+def _softmin(pts: np.ndarray, k: float = 60.0) -> float:
+    """Smoothed (soft) minimum over the smallest ~15% of doubled areas.
+    log( sum_{sel} exp(-k*a) ) / (-k): a smooth lower-bound surrogate
+    that gradients the whole near-minimal set of triangles upward."""
+    a = _all_areas(pts)
+    m = a.min()
+    sel = a <= m + 0.05 * _TRI_AREA * 2.0
+    return m - np.log(np.exp(-k * (a[sel] - m)).sum()) / k
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    cur = best.copy()
+    cur_val = best_val
+
+    # Deterministic local search with annealing-style shrinking steps
+    step0 = 0.05
+    iters = 30000
+=======
+    cur = best.copy()
+    cur_val = best_val
+
+    # ---- Phase 1: soft-min coarse exploration (smoothed landscape) ----
+    soft_cur = _softmin(cur)
+    for it in range(15000):
+        step = 0.05 * (1.0 - it / 15000) + 1e-3
+        i = rng.integers(n)
+        trial = cur.copy()
+        trial[i] += rng.normal(0.0, step, size=2)
+        trial = _clip_to_triangle(trial)
+        s_new = _softmin(trial)
+        if s_new >= soft_cur or rng.random() < np.exp((s_new - soft_cur) * 40.0):
+            cur, soft_cur = trial, s_new
+            v = _min_area(cur)
+            if v > best_val:
+                best, best_val = cur.copy(), v
+
+    # Restart hard phase from the soft-phase result
+    cur, cur_val = best.copy(), best_val
+
+    # Deterministic local search with annealing-style shrinking steps
+    step0 = 0.05
+    iters = 30000
+>>>>>>> REPLACE
+</DIFF>

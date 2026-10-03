@@ -1,0 +1,147 @@
+<NAME>
+expand_exact_steiner_limit
+</NAME>
+
+<DESCRIPTION>
+Increase the exact directed-Steiner planning limit modestly. The exact subset DP explicitly prices shared relay edges only once, making it substantially better than destination-by-destination expansion for medium fan-outs. Raising the limit from 12 to 13 captures another common broadcast size while avoiding the much larger runtime jump associated with substantially higher subset counts.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    if len(terminals) <= 12:
+=======
+    if len(terminals) <= 13:
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+relay_aware_greedy_fallback
+</NAME>
+
+<DESCRIPTION>
+Replace the large-fan-out fallback with a relay-aware expansion heuristic. Instead of attaching only the nearest pending destination, this evaluates every reachable relay as a possible fan-out point and incrementally adds its cheapest downstream destination paths. The selected candidate minimizes newly introduced unique-edge cost per destination reached, so one paid ingress path can serve multiple destinations. This better models cloud broadcast transfers over parallel multi-network topologies while retaining a polynomial planning cost for workloads too large for exact Steiner DP.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    else:
+        selected = nx.DiGraph()
+        selected.add_node(src)
+        pending = set(terminals)
+        while pending:
+            lengths, paths = nx.multi_source_dijkstra(
+                h, list(selected.nodes), weight="cost"
+            )
+            candidates = [
+                (lengths[dst], dst, paths[dst])
+                for dst in pending
+                if dst in lengths
+            ]
+            if not candidates:
+                break
+            _, _, path = min(candidates, key=lambda item: item[0])
+            for u, v in zip(path, path[1:]):
+                selected.add_edge(u, v, **G[u][v])
+            pending.difference_update(path)
+=======
+    else:
+        # For large terminal sets, grow the tree through relays rather than
+        # repeatedly selecting one nearest destination.  A relay's ingress
+        # path is paid once and can be amortized across several egress paths.
+        selected = nx.DiGraph()
+        selected.add_node(src)
+        pending = set(terminals)
+
+        def edge_cost(edge):
+            return h[edge[0]][edge[1]]["cost"]
+
+        while pending:
+            ingress_lengths, ingress_paths = nx.multi_source_dijkstra(
+                h, list(selected.nodes), weight="cost"
+            )
+            existing_edges = set(selected.edges)
+            best_key = None
+            best_edges = None
+            best_covered = None
+
+            for relay in h.nodes:
+                if relay not in ingress_lengths:
+                    continue
+                downstream_lengths, downstream_paths = nx.single_source_dijkstra(
+                    h, relay, weight="cost"
+                )
+                reachable = sorted(
+                    (downstream_lengths[dst], dst)
+                    for dst in pending
+                    if dst in downstream_lengths
+                )
+                if not reachable:
+                    continue
+
+                # Consider prefixes because several paths from a relay often
+                # share low-cost links before they fan out at later relays.
+                candidate_edges = set(zip(
+                    ingress_paths[relay], ingress_paths[relay][1:]
+                ))
+                added_cost = sum(
+                    edge_cost(edge) for edge in candidate_edges
+                    if edge not in existing_edges
+                )
+                covered = []
+                for _, dst in reachable:
+                    covered.append(dst)
+                    for edge in zip(downstream_paths[dst], downstream_paths[dst][1:]):
+                        if edge not in candidate_edges:
+                            candidate_edges.add(edge)
+                            if edge not in existing_edges:
+                                added_cost += edge_cost(edge)
+
+                    key = (added_cost / len(covered), added_cost, -len(covered))
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_edges = set(candidate_edges)
+                        best_covered = set(covered)
+
+            if best_edges is None:
+                break
+
+            for u, v in best_edges:
+                selected.add_edge(u, v, **G[u][v])
+
+            # A newly added route can traverse other pending terminals too.
+            pending.difference_update(
+                node for node in selected.nodes if node in pending
+            )
+            pending.difference_update(best_covered)
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+prune_redundant_broadcast_edges
+</NAME>
+
+<DESCRIPTION>
+Prune redundant directed edges after either exact reconstruction or greedy relay expansion. Multi-path relay construction can occasionally retain an edge that is bypassed by another selected branch. Each candidate removal is accepted only when every requested reachable terminal remains source-reachable, reducing unique transfer charges without sacrificing broadcast completeness.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    for dst in dsts:
+=======
+    # Relay fan-out candidates may overlap an existing branch.  Remove any
+    # edge whose deletion still leaves all planned terminals reachable.
+    required_terminals = [dst for dst in terminals if dst in selected]
+    changed = True
+    while changed:
+        changed = False
+        for u, v in list(selected.edges):
+            data = dict(selected[u][v])
+            selected.remove_edge(u, v)
+            if all(nx.has_path(selected, src, dst) for dst in required_terminals):
+                changed = True
+                break
+            selected.add_edge(u, v, **data)
+
+    for dst in dsts:
+>>>>>>> REPLACE
+</DIFF>

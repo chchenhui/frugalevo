@@ -1,0 +1,529 @@
+--- a/original.py
++++ b/original.py
+@@ -1,246 +1,346 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+-    Deterministic hybrid annealing and coordinate-LP construction for the
+-    eleven-point Heilbronn problem in an equilateral triangle.
+-
+-    Internal coordinates are (u, v), with u >= 0, v >= 0, u + v <= 1.
+-    Their determinant areas equal Cartesian triangle areas normalized by the
+-    enclosing equilateral triangle area.
++    Deterministic vectorized multi-start construction for the 11-point
++    Heilbronn problem in an equilateral triangle.
++
++    Optimization is performed in simplex coordinates (u, v), u >= 0,
++    v >= 0, u + v <= 1.  Determinants in these coordinates are exactly
++    Cartesian areas normalized by the enclosing triangle area.
+     """
+     n = 11
+-    rng = np.random.default_rng(7711031987)
++    movable_n = 8
++    rng = np.random.default_rng(2025030811)
+     sqrt3_over_2 = np.sqrt(3.0) * 0.5
+ 
+     triples = np.array(
+-        [(i, j, k) for i in range(n - 2)
++        [(i, j, k)
++         for i in range(n - 2)
+          for j in range(i + 1, n - 1)
+          for k in range(j + 1, n)],
+         dtype=np.intp,
+     )
+     vertices = np.array(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)), dtype=float)
+ 
+-    def project(x: np.ndarray) -> np.ndarray:
+-        x = np.maximum(np.asarray(x, dtype=float), 0.0)
+-        s = float(x[0] + x[1])
+-        return x / s if s > 1.0 else x
+-
+-    def determinants(p: np.ndarray) -> np.ndarray:
++    # Triangle-to-movable-point incidence matrix.  It permits vectorized
++    # selection of points participating in currently dangerous triangles.
++    incidence = np.zeros((len(triples), movable_n), dtype=float)
++    for row, tri in enumerate(triples):
++        for q in tri:
++            if q >= 3:
++                incidence[row, q - 3] = 1.0
++
++    def project_rows(x: np.ndarray) -> np.ndarray:
++        """Project one or more points onto u>=0, v>=0, u+v<=1."""
++        y = np.maximum(np.asarray(x, dtype=float), 0.0)
++        sums = y.sum(axis=-1, keepdims=True)
++        return y / np.maximum(sums, 1.0)
++
++    def determinants_batch(p: np.ndarray) -> np.ndarray:
++        """Oriented determinants for shape (m, 11, 2)."""
++        a = p[:, triples[:, 0], :]
++        b = p[:, triples[:, 1], :]
++        c = p[:, triples[:, 2], :]
++        return ((b[:, :, 0] - a[:, :, 0]) * (c[:, :, 1] - a[:, :, 1])
++                - (b[:, :, 1] - a[:, :, 1]) * (c[:, :, 0] - a[:, :, 0]))
++
++    def values(p: np.ndarray) -> np.ndarray:
++        q = p[None, :, :] if p.ndim == 2 else p
++        return np.abs(determinants_batch(q))
++
++    def batch_quality(p: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++        """
++        Exact minimum is retained separately from a lower-tail merit.
++        The tail term makes plateaus navigable without changing final ranking.
++        """
++        z = values(p)
++        exact = z.min(axis=1)
++        lower = np.partition(z, 23, axis=1)[:, :24].mean(axis=1)
++        merit = exact + 0.095 * lower
++        return z, exact, merit
++
++    def make_population(population: int) -> np.ndarray:
++        p = np.empty((population, n, 2), dtype=float)
++        p[:, :3, :] = vertices
++
++        template_a = np.array(
++            ((0.135, 0.070), (0.405, 0.055), (0.735, 0.075),
++             (0.075, 0.350), (0.305, 0.255), (0.600, 0.235),
++             (0.075, 0.690), (0.315, 0.535)), dtype=float
++        )
++        template_b = np.array(
++            ((0.185, 0.055), (0.505, 0.055), (0.795, 0.060),
++             (0.080, 0.435), (0.365, 0.290), (0.640, 0.270),
++             (0.085, 0.760), (0.355, 0.550)), dtype=float
++        )
++        template_c = np.array(
++            ((0.095, 0.125), (0.390, 0.105), (0.690, 0.105),
++             (0.145, 0.410), (0.455, 0.235), (0.705, 0.175),
++             (0.130, 0.710), (0.405, 0.485)), dtype=float
++        )
++
++        alphas = (0.38, 0.68, 1.05, 1.55, 2.30)
++        for r in range(population):
++            mode = r % 8
++            if mode < 5:
++                bary = rng.dirichlet((alphas[mode],) * 3, size=movable_n)
++                p[r, 3:, :] = bary[:, 1:]
++            else:
++                base = (template_a if mode == 5 else
++                        template_b if mode == 6 else template_c)
++                jitter = rng.normal(0.0, 0.026 + 0.006 * (r // 8), base.shape)
++                p[r, 3:, :] = project_rows(base + jitter)
++
++        return p
++
++    # Vectorized global phase.  A larger set of cells is searched than in
++    # sequential annealing, but each generation is a single NumPy evaluation.
++    population = 48
++    generations = 5600
++    state = make_population(population)
++    z, score, merit = batch_quality(state)
++
++    best_index = int(np.argmax(score + 1e-7 * merit))
++    best = state[best_index].copy()
++    best_score = float(score[best_index])
++    best_merit = float(merit[best_index])
++
++    for it in range(generations):
++        q = it / float(generations - 1)
++        # More aggressive early spatial moves, followed by a fine local phase.
++        step = 0.095 * (1.0 - q) ** 1.38 + 0.00042
++        danger_width = 0.014 * (1.0 - q) ** 1.10 + 0.0010
++        temperature = 0.0024 * (1.0 - q) ** 2.25 + 8.0e-7
++
++        # Every triangle near the minimum votes for its movable points.
++        danger = np.exp(-np.maximum(z - score[:, None], 0.0) / danger_width)
++        point_weight = danger @ incidence + 0.025
++        cumulative = np.cumsum(point_weight, axis=1)
++        draws = rng.random(population) * cumulative[:, -1]
++        changed = (draws[:, None] > cumulative).sum(axis=1)
++
++        proposal = state.copy()
++        noise = rng.normal(0.0, step, size=(population, 2))
++        proposal[np.arange(population), changed + 3] = project_rows(
++            proposal[np.arange(population), changed + 3] + noise
++        )
++
++        # Early paired moves help escape a bad local orientation chamber.
++        pair_probability = 0.10 * (1.0 - q)
++        paired = rng.random(population) < pair_probability
++        if np.any(paired):
++            rows = np.flatnonzero(paired)
++            other = rng.integers(0, movable_n, size=len(rows))
++            same = other == changed[rows]
++            other[same] = (other[same] + 1) % movable_n
++            proposal[rows, other + 3] = project_rows(
++                proposal[rows, other + 3]
++                + rng.normal(0.0, 0.62 * step, size=(len(rows), 2))
++            )
++
++        pz, pscore, pmerit = batch_quality(proposal)
++        delta = pmerit - merit
++        accept = ((delta >= 0.0) |
++                  (rng.random(population) <
++                   np.exp(np.maximum(-700.0, delta / temperature))))
++
++        if np.any(accept):
++            state[accept] = proposal[accept]
++            z[accept] = pz[accept]
++            score[accept] = pscore[accept]
++            merit[accept] = pmerit[accept]
++
++        local_best = int(np.argmax(score + 1e-7 * merit))
++        if (score[local_best] > best_score + 1e-14 or
++                (abs(score[local_best] - best_score) <= 1e-14 and
++                 merit[local_best] > best_merit)):
++            best = state[local_best].copy()
++            best_score = float(score[local_best])
++            best_merit = float(merit[local_best])
++
++        # Controlled recombination preserves good basins while periodically
++        # introducing different sign-pattern neighborhoods.
++        if it > 0 and it % 350 == 0 and it < generations - 450:
++            rank = np.argsort(score + 1e-7 * merit)
++            elite_ids = rank[-10:]
++            replace_ids = rank[:8]
++            for dst in replace_ids:
++                aa, bb = rng.choice(elite_ids, size=2, replace=False)
++                child = 0.57 * state[aa, 3:] + 0.43 * state[bb, 3:]
++                child += rng.normal(0.0, 0.030 * (1.0 - q) + 0.004, child.shape)
++                state[dst, 3:] = project_rows(child)
++            z, score, merit = batch_quality(state)
++
++    # Include several high-quality global basins in exact local polishing.
++    ranking = np.argsort(score + 1e-8 * merit)[::-1]
++    elite = [state[i].copy() for i in ranking[:8]]
++    elite.append(best.copy())
++
++    def det_single(p: np.ndarray) -> np.ndarray:
+         a = p[triples[:, 0]]
+         b = p[triples[:, 1]]
+         c = p[triples[:, 2]]
+         return ((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+                 - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+ 
+-    def values(p: np.ndarray) -> np.ndarray:
+-        return np.abs(determinants(p))
+-
+-    def score_and_merit(p: np.ndarray) -> tuple[np.ndarray, float, float]:
+-        z = values(p)
+-        low = np.partition(z, 17)[:18]
+-        # The mean lower tail breaks ties and gives annealing useful guidance.
+-        return z, float(z.min()), float(z.min() + 0.055 * low.mean())
+-
+-    def make_start(restart: int) -> np.ndarray:
+-        p = np.empty((n, 2), dtype=float)
+-        p[:3] = vertices
+-
+-        # Alternate edge-seeking, uniform/interior, and structured starts.
+-        mode = restart % 4
+-        if mode == 0:
+-            bary = rng.dirichlet((0.42, 0.42, 0.42), size=8)
+-            p[3:] = bary[:, 1:]
+-        elif mode == 1:
+-            bary = rng.dirichlet((0.82, 0.82, 0.82), size=8)
+-            p[3:] = bary[:, 1:]
+-        elif mode == 2:
+-            bary = rng.dirichlet((1.55, 1.55, 1.55), size=8)
+-            p[3:] = bary[:, 1:]
+-        else:
+-            # A staggered triangular template, with fixed reproducible jitter.
+-            template = np.array(
+-                ((0.16, 0.07), (0.43, 0.055), (0.76, 0.07),
+-                 (0.075, 0.38), (0.30, 0.27), (0.58, 0.25),
+-                 (0.075, 0.72), (0.31, 0.55)),
+-                dtype=float,
+-            )
+-            p[3:] = np.array([project(q + rng.normal(0.0, 0.035, 2))
+-                              for q in template])
+-        return p
+-
+-    best = np.vstack((vertices, np.full((8, 2), 1.0 / 3.0)))
+-    _, best_score, best_merit = score_and_merit(best)
+-    elite = []
+-
+-    # Diverse global phase.  The lower iteration count is offset by more
+-    # independent cells and occasional joint moves.
+-    restarts = 14
+-    iterations = 14000
+-    for restart in range(restarts):
+-        current = make_start(restart)
+-        current_values, current_score, current_merit = score_and_merit(current)
+-
+-        for it in range(iterations):
+-            q = it / float(iterations - 1)
+-            step = 0.125 * (1.0 - q) ** 1.48 + 0.00065
+-            scale = 0.012 * (1.0 - q) ** 1.15 + 0.00038
+-            temperature = 0.0028 * (1.0 - q) ** 2.15 + 1.5e-6
+-
+-            # Bias selection toward points occurring in dangerous triangles.
+-            if rng.random() < 0.88:
+-                cutoff = current_score + max(2.4 * scale, 0.0012)
+-                active = triples[current_values <= cutoff]
+-                chosen = active[int(rng.integers(len(active)))]
+-                movable = chosen[chosen >= 3]
+-                index = (int(rng.choice(movable)) if len(movable)
+-                         else int(rng.integers(3, n)))
+-            else:
+-                index = int(rng.integers(3, n))
+-
+-            candidate = current.copy()
+-            candidate[index] = project(
+-                candidate[index] + rng.normal(0.0, step, size=2)
+-            )
+-
+-            # Rare paired displacement helps reorganize a bad local cell.
+-            if rng.random() < 0.075 * (1.0 - q):
+-                other = int(rng.integers(3, n - 1))
+-                if other >= index:
+-                    other += 1
+-                candidate[other] = project(
+-                    candidate[other] + rng.normal(0.0, 0.72 * step, size=2)
+-                )
+-
+-            cand_values, cand_score, cand_merit = score_and_merit(candidate)
+-            delta = cand_merit - current_merit
+-            if delta >= 0.0 or rng.random() < np.exp(max(-700.0, delta / temperature)):
+-                current = candidate
+-                current_values = cand_values
+-                current_score = cand_score
+-                current_merit = cand_merit
+-
+-            if (current_score > best_score + 1e-14 or
+-                    (abs(current_score - best_score) <= 1e-14 and
+-                     current_merit > best_merit)):
+-                best = current.copy()
+-                best_score = current_score
+-                best_merit = current_merit
+-
+-        elite.append((current_score, current_merit, current.copy()))
+-
+-    elite.append((best_score, best_merit, best.copy()))
+-    elite.sort(key=lambda x: (x[0], x[1]), reverse=True)
+-    elite = elite[:5]
+-
+     def clip_halfplane(poly: np.ndarray, aa: float, bb: float,
+                        rhs: float) -> np.ndarray:
+-        """Clip convex polygon by aa*x + bb*y >= rhs."""
++        """Clip convex polygon against aa*u + bb*v >= rhs."""
+         if len(poly) == 0:
+             return poly
+-        result = []
+-        prev = poly[-1]
+-        pv = aa * prev[0] + bb * prev[1] - rhs
+-        for cur in poly:
+-            cv = aa * cur[0] + bb * cur[1] - rhs
+-            pin = pv >= -2e-13
+-            cin = cv >= -2e-13
+-            if pin != cin:
+-                den = pv - cv
+-                if abs(den) > 1e-18:
+-                    t = pv / den
+-                    result.append(prev + t * (cur - prev))
+-            if cin:
+-                result.append(cur)
+-            prev, pv = cur, cv
+-        return np.asarray(result, dtype=float)
++        out = []
++        previous = poly[-1]
++        previous_value = aa * previous[0] + bb * previous[1] - rhs
++
++        for current in poly:
++            current_value = aa * current[0] + bb * current[1] - rhs
++            previous_inside = previous_value >= -2e-13
++            current_inside = current_value >= -2e-13
++
++            if previous_inside != current_inside:
++                denominator = previous_value - current_value
++                if abs(denominator) > 1e-18:
++                    out.append(previous + (previous_value / denominator)
++                               * (current - previous))
++            if current_inside:
++                out.append(current)
++
++            previous = current
++            previous_value = current_value
++
++        return np.asarray(out, dtype=float)
+ 
+     def coordinate_lp(p: np.ndarray, index: int) -> np.ndarray:
+         """
+-        Maximize the minimum determinant by moving one point, retaining signs
+-        of all its current oriented triples.  Feasibility at a fixed target is
+-        a convex polygon, solved exactly by half-plane clipping.
++        Exact one-coordinate maximin update within its present orientation
++        chamber.  A half-plane feasibility bisection solves the 2D LP.
+         """
+-        det = determinants(p)
+-        involved = np.flatnonzero(np.any(triples == index, axis=1))
+-        outside = np.flatnonzero(~np.any(triples == index, axis=1))
+-        fixed_limit = float(np.min(np.abs(det[outside]))) if len(outside) else 1.0
++        det = det_single(p)
++        involved_mask = np.any(triples == index, axis=1)
++        involved = np.flatnonzero(involved_mask)
++        outside = np.flatnonzero(~involved_mask)
++
++        old_min = float(np.min(np.abs(det)))
++        fixed_limit = (float(np.min(np.abs(det[outside])))
++                       if len(outside) else 1.0)
++        if fixed_limit <= old_min + 1e-13:
++            return p[index].copy()
+ 
+         constraints = []
+-        base = p[index].copy()
++        trial = p.copy()
+         for row in involved:
+             tri = triples[row]
+             sign = 1.0 if det[row] >= 0.0 else -1.0
+ 
+-            def oriented_at(x: np.ndarray) -> float:
+-                trial = p.copy()
+-                trial[index] = x
+-                ii, jj, kk = tri
+-                a, b, c = trial[ii], trial[jj], trial[kk]
+-                return ((b[0] - a[0]) * (c[1] - a[1])
+-                        - (b[1] - a[1]) * (c[0] - a[0]))
+-
+-            f0 = oriented_at(np.array((0.0, 0.0)))
+-            f1 = oriented_at(np.array((1.0, 0.0)))
+-            f2 = oriented_at(np.array((0.0, 1.0)))
+-            # sign * (A*u + B*v + C) >= target
+-            constraints.append((sign * (f1 - f0),
+-                                sign * (f2 - f0),
+-                                sign * f0))
+-
+-        old_score = float(np.min(np.abs(det)))
+-        lo, hi = old_score, fixed_limit
+-        best_poly = None
+-        for _ in range(30):
++            trial[index] = (0.0, 0.0)
++            f0 = det_single(trial[None, :, :])[0, row]
++            trial[index] = (1.0, 0.0)
++            f1 = det_single(trial[None, :, :])[0, row]
++            trial[index] = (0.0, 1.0)
++            f2 = det_single(trial[None, :, :])[0, row]
++
++            constraints.append((
++                sign * (f1 - f0),
++                sign * (f2 - f0),
++                sign * f0,
++            ))
++
++        lo, hi = old_min, fixed_limit
++        feasible_poly = None
++        for _ in range(34):
+             target = 0.5 * (lo + hi)
+             poly = np.array(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)))
+             for aa, bb, cc in constraints:
+                 poly = clip_halfplane(poly, aa, bb, target - cc)
+                 if len(poly) == 0:
+                     break
+             if len(poly):
+                 lo = target
+-                best_poly = poly
++                feasible_poly = poly
+             else:
+                 hi = target
+ 
+-        if best_poly is None or not np.all(np.isfinite(best_poly)):
+-            return p[index]
+-        # Centroid is safely in the feasible cell and avoids gratuitously
+-        # selecting a vertex with poor lower-tail slack.
+-        return project(np.mean(best_poly, axis=0))
+-
+-    # Exact coordinate maximin passes on several elite annealing basins.
+-    for _, _, seed in elite:
++        if feasible_poly is None or not np.all(np.isfinite(feasible_poly)):
++            return p[index].copy()
++
++        # Test centroid and feasible-cell vertices using the same lower-tail
++        # criterion used globally; this is more robust than always centroiding.
++        candidates = np.vstack((
++            p[index],
++            feasible_poly.mean(axis=0),
++            feasible_poly,
++        ))
++        candidate_points = project_rows(candidates)
++        best_point = p[index].copy()
++        best_key = (-np.inf, -np.inf)
++
++        for point in candidate_points:
++            trial[index] = point
++            zz = np.abs(det_single(trial))
++            key = (float(zz.min()),
++                   float(zz.min() + 0.095 * np.partition(zz, 23)[:24].mean()))
++            if key > best_key:
++                best_key = key
++                best_point = point.copy()
++
++        return best_point
++
++    # Coordinate LP turns promising stochastic configurations into exact
++    # local maximin configurations.
++    for seed in elite:
+         candidate = seed.copy()
+-        for sweep in range(22):
+-            before = float(values(candidate).min())
++
++        for sweep in range(26):
++            before = float(np.abs(det_single(candidate)).min())
+             order = rng.permutation(np.arange(3, n))
++
+             for idx in order:
+-                proposal = coordinate_lp(candidate, int(idx))
++                proposal_point = coordinate_lp(candidate, int(idx))
++                if np.allclose(proposal_point, candidate[idx], atol=2e-13,
++                               rtol=0.0):
++                    continue
++
+                 trial = candidate.copy()
+-                trial[idx] = proposal
+-                trial_values, trial_score, trial_merit = score_and_merit(trial)
+-                old_values, old_score, old_merit = score_and_merit(candidate)
++                trial[idx] = proposal_point
++                zz = np.abs(det_single(trial))
++                oldz = np.abs(det_single(candidate))
++                trial_score = float(zz.min())
++                old_score = float(oldz.min())
++                trial_merit = float(
++                    trial_score + 0.095 * np.partition(zz, 23)[:24].mean()
++                )
++                old_merit = float(
++                    old_score + 0.095 * np.partition(oldz, 23)[:24].mean()
++                )
++
+                 if (trial_score > old_score + 1e-12 or
+                         (abs(trial_score - old_score) <= 1e-12 and
+                          trial_merit > old_merit + 1e-13)):
+                     candidate = trial
+-            if float(values(candidate).min()) <= before + 2e-11:
++
++            after = float(np.abs(det_single(candidate)).min())
++            if after <= before + 1e-11:
+                 break
+ 
+-        _, cand_score, cand_merit = score_and_merit(candidate)
+-        if (cand_score > best_score + 1e-14 or
+-                (abs(cand_score - best_score) <= 1e-14 and
+-                 cand_merit > best_merit)):
+-            best, best_score, best_merit = candidate, cand_score, cand_merit
++        zz = np.abs(det_single(candidate))
++        candidate_score = float(zz.min())
++        candidate_merit = float(
++            candidate_score + 0.095 * np.partition(zz, 23)[:24].mean()
++        )
++        if (candidate_score > best_score + 1e-14 or
++                (abs(candidate_score - best_score) <= 1e-14 and
++                 candidate_merit > best_merit)):
++            best = candidate.copy()
++            best_score = candidate_score
++            best_merit = candidate_merit
+ 
+     points = np.empty((n, 2), dtype=float)
+     points[:, 0] = best[:, 0] + 0.5 * best[:, 1]
+     points[:, 1] = sqrt3_over_2 * best[:, 1]
+     return points
+ 
+ 
+ # EVOLVE-BLOCK-END

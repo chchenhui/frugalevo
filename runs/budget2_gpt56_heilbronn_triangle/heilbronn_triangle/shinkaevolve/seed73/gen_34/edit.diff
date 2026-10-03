@@ -1,0 +1,213 @@
+--- a/original.py
++++ b/original.py
+@@ -1,180 +1,209 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+     Deterministically construct 11 points in the equilateral unit-side triangle.
+ 
+     Internally the search is performed in barycentric-like coordinates in the
+     reference triangle {(u,v): u>=0, v>=0, u+v<=1}.  Absolute determinants in
+     this reference triangle are exactly normalized triangle areas after the
+     affine map to the requested equilateral triangle.
+     """
+     try:
+         rng = np.random.default_rng(11031987)
+         n = 11
+         triples = np.array(
+             [(i, j, k) for i in range(n) for j in range(i + 1, n)
+              for k in range(j + 1, n)],
+             dtype=np.intp,
+         )
+ 
+         def uniform_simplex(count):
+             a = rng.random((count, 2))
+             over = a.sum(axis=1) > 1.0
+             a[over] = 1.0 - a[over]
+             return a
+ 
+         def areas_for(pop):
+             q = pop[:, triples, :]
+             d = (q[:, :, 1, 0] - q[:, :, 0, 0]) * (
+                 q[:, :, 2, 1] - q[:, :, 0, 1]
+             ) - (q[:, :, 1, 1] - q[:, :, 0, 1]) * (
+                 q[:, :, 2, 0] - q[:, :, 0, 0]
+             )
+             return np.abs(d)
+ 
+         def evaluate(pop, tail_weight):
+             aa = areas_for(pop)
+             low = np.partition(aa, 7, axis=1)[:, :8]
+             minimum = aa.min(axis=1)
+             # The tail term is useful early on to avoid a population having
+             # many nearly-degenerate triples, but is made small near the end.
+             return minimum + tail_weight * low.mean(axis=1), minimum
+ 
+         def enforce(pop, edge_count):
+             """Restore fixed vertices and the selected active boundary faces."""
+             pop[:, 0, :] = (0.0, 0.0)
+             pop[:, 1, :] = (1.0, 0.0)
+             pop[:, 2, :] = (0.0, 1.0)
+ 
+             # Boundary slots cycle through AB, AC, and BC.
+             for slot in range(edge_count):
+                 ix = 3 + slot
+                 t = np.clip(pop[:, ix, 0], 0.0, 1.0)
+                 face = slot % 3
+                 if face == 0:       # AB
+                     pop[:, ix, 0] = t
+                     pop[:, ix, 1] = 0.0
+                 elif face == 1:     # AC
+                     pop[:, ix, 0] = 0.0
+                     pop[:, ix, 1] = t
+                 else:               # BC
+                     pop[:, ix, 0] = t
+                     pop[:, ix, 1] = 1.0 - t
+ 
+             first_free = 3 + edge_count
+             if first_free < n:
+                 z = pop[:, first_free:, :]
+                 np.maximum(z, 0.0, out=z)
+                 s = z.sum(axis=2)
+                 bad = s > 1.0
+                 if np.any(bad):
+                     z[bad] /= s[bad, None]
+             return pop
+ 
+         def initial_population(size, edge_count):
+             pop = np.empty((size, n, 2), dtype=float)
+             pop[:, :3] = np.array(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)))
+             for slot in range(edge_count):
+                 # Stratified initial edge values avoid all islands beginning
+                 # from the same symmetric, low-quality configuration.
+                 t = (np.arange(size) + rng.random(size)) / size
+                 rng.shuffle(t)
+                 ix = 3 + slot
+                 if slot % 3 == 0:
+                     pop[:, ix] = np.column_stack((t, np.zeros(size)))
+                 elif slot % 3 == 1:
+                     pop[:, ix] = np.column_stack((np.zeros(size), t))
+                 else:
+                     pop[:, ix] = np.column_stack((t, 1.0 - t))
+             free = 3 + edge_count
+             if free < n:
+                 pop[:, free:] = uniform_simplex(size * (n - free)).reshape(
+                     size, n - free, 2
+                 )
+             return pop
+ 
+         best_points = None
+         best_minimum = -1.0
+ 
+         # Different numbers of boundary points correspond to different active
+         # constraint hypotheses.  Keeping separate islands avoids one model
+         # prematurely destroying another model's promising structure.
+         for edge_count, population_size in ((0, 34), (3, 42), (6, 42)):
+             pop = initial_population(population_size, edge_count)
+             pop = enforce(pop, edge_count)
+             generations = 1900
+ 
+             for generation in range(generations):
+                 frac = generation / float(generations - 1)
+                 tail_weight = 0.075 * (1.0 - frac) + 0.014 * frac
+                 score, true_min = evaluate(pop, tail_weight)
+ 
+                 imax = int(np.argmax(true_min))
+                 if true_min[imax] > best_minimum:
+                     best_minimum = float(true_min[imax])
+                     best_points = pop[imax].copy()
+ 
+                 elite = int(np.argmax(score))
+                 # Large exploratory moves first, then constrained polishing.
+                 sigma = 0.075 * (1.0 - frac) ** 1.65 + 0.0012
+                 trial = pop.copy()
+ 
+                 # Differential moves give long, scale-independent jumps.
+                 a = rng.integers(0, population_size, population_size)
+                 b = rng.integers(0, population_size, population_size)
+                 differential = pop[a] - pop[b]
+                 de_mask = rng.random(population_size) < 0.38
+                 trial[de_mask] = (
+                     pop[elite]
+                     + (0.66 - 0.22 * frac) * differential[de_mask]
+                 )
+ 
+-                trial += rng.normal(0.0, sigma, trial.shape)
++                # Near convergence, reserve some offspring for an active-set
++                # local search.  The points occurring in the currently
++                # smallest triples are precisely those whose displacement can
++                # raise the max-min objective.  Other offspring retain the
++                # unbiased, full-dimensional mutation needed for exploration.
++                noise = rng.normal(0.0, sigma, trial.shape)
++                targeted_rows = (
++                    (frac > 0.64)
++                    & (rng.random(population_size) < 0.30)
++                )
++                if np.any(targeted_rows):
++                    target_indices = np.flatnonzero(targeted_rows)
++                    parent_areas = areas_for(pop[target_indices])
++                    limiting = np.argpartition(parent_areas, 11, axis=1)[:, :12]
++                    limiting_triples = triples[limiting]
++                    movable = np.zeros((len(target_indices), n), dtype=bool)
++                    for point in range(3, n):
++                        movable[:, point] = np.any(
++                            limiting_triples == point, axis=(1, 2)
++                        )
++
++                    # Make these candidates true local offspring rather than
++                    # allowing an unrelated differential jump to move every
++                    # inactive coordinate.  Boundary enforcement below still
++                    # restricts boundary slots to their designated faces.
++                    trial[target_indices] = pop[target_indices]
++                    noise[target_indices] *= movable[:, :, None]
++                    noise[target_indices] *= 0.34 + 0.16 * (1.0 - frac)
++
++                trial += noise
+                 trial = enforce(trial, edge_count)
+                 trial_score, _ = evaluate(trial, tail_weight)
+ 
+                 accept = trial_score >= score
+                 pop[accept] = trial[accept]
+ 
+                 # Periodic deterministic rejuvenation of the weakest members
+                 # around the current elite prevents stagnant islands.
+                 if generation % 190 == 189:
+                     score, _ = evaluate(pop, tail_weight)
+                     weak = np.argsort(score)[:max(2, population_size // 7)]
+                     center = pop[int(np.argmax(score))]
+                     pop[weak] = center + rng.normal(
+                         0.0, max(0.012, sigma * 2.2),
+                         (len(weak), n, 2),
+                     )
+                     enforce(pop, edge_count)
+ 
+             _, final_min = evaluate(pop, 0.0)
+             ix = int(np.argmax(final_min))
+             if final_min[ix] > best_minimum:
+                 best_minimum = float(final_min[ix])
+                 best_points = pop[ix].copy()
+ 
+         # Affine map from reference simplex to the requested equilateral one:
+         # (u,v) -> (u + v/2, sqrt(3)*v/2).
+         result = np.empty((n, 2), dtype=float)
+         result[:, 0] = best_points[:, 0] + 0.5 * best_points[:, 1]
+         result[:, 1] = (np.sqrt(3.0) * 0.5) * best_points[:, 1]
+         return result
+ 
+     except Exception:
+         # Valid deterministic fallback if an unexpected numerical/runtime issue
+         # occurs in a restricted execution environment.
+         h = np.sqrt(3.0) * 0.5
+         return np.array([
+             [0.0, 0.0], [1.0, 0.0], [0.5, h],
+             [0.25, 0.0], [0.75, 0.0],
+             [0.125, 0.216506350946], [0.875, 0.216506350946],
+             [0.25, 0.433012701892], [0.75, 0.433012701892],
+             [0.50, 0.216506350946], [0.50, 0.577350269190],
+         ], dtype=float)
+ 
+ 
+ # EVOLVE-BLOCK-END

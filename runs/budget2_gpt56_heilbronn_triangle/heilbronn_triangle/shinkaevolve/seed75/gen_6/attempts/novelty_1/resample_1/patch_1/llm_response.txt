@@ -1,0 +1,226 @@
+<NAME>
+deterministic_maximin11
+</NAME>
+
+<DESCRIPTION>
+This version replaces the zero-point placeholder with a deterministic maximin optimizer for the 11-point Heilbronn triangle problem.
+
+It fixes the three vertices of the containing equilateral triangle, optimizes the remaining eight points in barycentric coordinates, and maximizes the minimum normalized area over all 165 point triples. The primary search uses seeded differential evolution, followed by constrained SLSQP polishing when SciPy is available. Results are cached after the first call, so repeated calls are effectively constant time.
+
+A deterministic NumPy-only fallback arrangement is included for environments without SciPy or when optimization fails.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+# Cached because the search is deterministic and the returned configuration is
+# invariant between calls.
+_CACHED_POINTS = None
+
+# All triples of eleven point indices.
+_TRIPLES = np.array(
+    [
+        (i, j, k)
+        for i in range(11)
+        for j in range(i + 1, 11)
+        for k in range(j + 1, 11)
+    ],
+    dtype=np.intp,
+)
+
+_SQRT3_OVER_2 = np.sqrt(3.0) * 0.5
+
+
+def _decode_barycentric(z: np.ndarray) -> np.ndarray:
+    """
+    Decode eight pairs in [0, 1]^2 into points in the reference triangle.
+
+    For each pair (a, b), use barycentric coordinates
+        u = a, v = (1-a)b,
+    so u >= 0, v >= 0, and u+v <= 1 without requiring penalty constraints.
+    The first three points are the vertices of the reference triangle.
+    """
+    q = np.asarray(z, dtype=float).reshape(8, 2)
+    u = q[:, 0]
+    v = (1.0 - u) * q[:, 1]
+
+    bary = np.empty((11, 2), dtype=float)
+    bary[0] = (0.0, 0.0)
+    bary[1] = (1.0, 0.0)
+    bary[2] = (0.0, 1.0)
+    bary[3:, 0] = u
+    bary[3:, 1] = v
+    return bary
+
+
+def _minimum_normalized_area(bary: np.ndarray) -> float:
+    """
+    The determinant in (u,v) barycentric coordinates is exactly the triangle
+    area divided by the area of the containing reference triangle.
+    """
+    p = bary[_TRIPLES]
+    det = (
+        (p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+        - (p[:, 2, 0] - p[:, 0, 0]) * (p[:, 1, 1] - p[:, 0, 1])
+    )
+    return float(np.min(np.abs(det)))
+
+
+def _to_cartesian(bary: np.ndarray) -> np.ndarray:
+    """Map reference-triangle barycentric coordinates to Cartesian points."""
+    out = np.empty_like(bary)
+    out[:, 0] = bary[:, 0] + 0.5 * bary[:, 1]
+    out[:, 1] = _SQRT3_OVER_2 * bary[:, 1]
+    return out
+
+
+def _fallback_search() -> np.ndarray:
+    """
+    Dependency-free deterministic fallback.  It is intentionally modest, but
+    always produces eleven distinct valid points if SciPy is unavailable.
+    """
+    rng = np.random.default_rng(11031987)
+
+    best_z = None
+    best_value = -1.0
+
+    # Random multistart plus local coordinate perturbations.  This is only used
+    # in restricted environments where scipy.optimize cannot be imported.
+    for _ in range(220):
+        z = rng.random(16)
+        value = _minimum_normalized_area(_decode_barycentric(z))
+        scale = 0.18
+
+        for step in range(900):
+            candidate = z.copy()
+            coordinate = int(rng.integers(16))
+            candidate[coordinate] = np.clip(
+                candidate[coordinate] + rng.normal(0.0, scale), 0.0, 1.0
+            )
+            candidate_value = _minimum_normalized_area(
+                _decode_barycentric(candidate)
+            )
+
+            # Small annealing allowance prevents early trapping.
+            if (
+                candidate_value >= value
+                or rng.random() < np.exp((candidate_value - value) / max(scale, 1e-8))
+            ):
+                z = candidate
+                value = candidate_value
+
+            scale *= 0.9965
+
+        if value > best_value:
+            best_value = value
+            best_z = z.copy()
+
+    return _to_cartesian(_decode_barycentric(best_z))
+
+
+def _optimized_points() -> np.ndarray:
+    """
+    Run a reproducible global maximin search, then polish it with explicit
+    area constraints.  The optimizer works only with valid triangle points.
+    """
+    try:
+        from scipy.optimize import differential_evolution, minimize
+    except Exception:
+        return _fallback_search()
+
+    def objective(z: np.ndarray) -> float:
+        return -_minimum_normalized_area(_decode_barycentric(z))
+
+    try:
+        # Differential evolution is robust for this non-convex, nonsmooth
+        # objective.  A fixed seed makes the result completely reproducible.
+        global_result = differential_evolution(
+            objective,
+            bounds=[(0.0, 1.0)] * 16,
+            strategy="best1bin",
+            popsize=22,
+            maxiter=900,
+            mutation=(0.45, 0.95),
+            recombination=0.82,
+            tol=1.0e-9,
+            atol=1.0e-11,
+            seed=11031987,
+            polish=False,
+            updating="immediate",
+            workers=1,
+        )
+
+        best_z = np.asarray(global_result.x, dtype=float)
+        best_value = -float(global_result.fun)
+
+        # Explicitly introduce the epigraph variable t for a final constrained
+        # polish.  This usually improves the narrow active-area bottlenecks.
+        initial = np.concatenate((best_z, [best_value]))
+
+        def area_constraints(w: np.ndarray) -> np.ndarray:
+            bary = _decode_barycentric(w[:-1])
+            p = bary[_TRIPLES]
+            det = (
+                (p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+                - (p[:, 2, 0] - p[:, 0, 0]) * (p[:, 1, 1] - p[:, 0, 1])
+            )
+            return np.abs(det) - w[-1]
+
+        polished = minimize(
+            lambda w: -w[-1],
+            initial,
+            method="SLSQP",
+            bounds=[(0.0, 1.0)] * 16 + [(0.0, 1.0)],
+            constraints={"type": "ineq", "fun": area_constraints},
+            options={"maxiter": 3000, "ftol": 1.0e-12, "disp": False},
+        )
+
+        if polished.success:
+            candidate_z = np.asarray(polished.x[:-1], dtype=float)
+            candidate_value = _minimum_normalized_area(
+                _decode_barycentric(candidate_z)
+            )
+            if candidate_value >= best_value - 1.0e-11:
+                best_z = candidate_z
+
+        points = _to_cartesian(_decode_barycentric(best_z))
+
+        # Defensive validity check before returning an optimizer result.
+        if (
+            points.shape == (11, 2)
+            and np.all(np.isfinite(points))
+            and np.all(points[:, 1] >= -1.0e-12)
+            and np.all(points[:, 0] >= -1.0e-12)
+            and np.all(points[:, 0] <= 1.0 + 1.0e-12)
+        ):
+            return points
+
+    except Exception:
+        # An interrupted or unavailable optimizer must not break the API.
+        pass
+
+    return _fallback_search()
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct eleven points on or inside the equilateral triangle with vertices
+    (0,0), (1,0), and (0.5,sqrt(3)/2), maximizing the smallest triangle area.
+
+    Returns:
+        np.ndarray: Cartesian coordinates with shape (11, 2).
+    """
+    global _CACHED_POINTS
+
+    if _CACHED_POINTS is None:
+        _CACHED_POINTS = _optimized_points()
+
+    # Return a copy so callers cannot mutate the cached optimum.
+    return _CACHED_POINTS.copy()
+
+
+# EVOLVE-BLOCK-END
+```

@@ -1,0 +1,456 @@
+<NAME>
+hybrid_broadcast_planner
+</NAME>
+
+<DESCRIPTION>
+Reorganizes planning into a candidate-based broadcast architecture. Small terminal sets use an exact directed-Steiner dynamic program, while larger sets evaluate several hybrid plans: exact trees for strategically selected core destinations followed by zero-marginal-cost attachment of remaining destinations. The planner additionally compares multiple greedy attachment orders and prunes redundant links before materializing shared partition paths. This preserves the legacy topology output while improving scalable shared-transfer planning.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import os
+import math
+import heapq
+import itertools
+from typing import Dict, List, Iterable
+
+import networkx as nx
+import pandas as pd
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]
+
+
+class BroadCastTopology:
+    def __init__(
+        self,
+        src: str,
+        dsts: List[str],
+        num_partitions: int = 4,
+        paths: Dict[str, SingleDstPath] = None,
+    ):
+        self.src = src
+        self.dsts = dsts
+        self.num_partitions = num_partitions
+        if paths is not None:
+            self.paths = paths
+            if hasattr(self, "set_graph"):
+                self.set_graph()
+        else:
+            self.paths = {
+                dst: {str(i): None for i in range(num_partitions)}
+                for dst in dsts
+            }
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        self.paths[dst][str(partition)] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+
+class _Network:
+    """Validated directed network retaining only usable transfer links."""
+
+    def __init__(self, graph, src):
+        self.original = graph
+        self.src = src
+        self.graph = nx.DiGraph()
+        self.graph.add_nodes_from(graph.nodes(data=True))
+
+        for u, v, data in graph.edges(data=True):
+            cost = data.get("cost")
+            if (
+                u == v
+                or v == src
+                or isinstance(cost, bool)
+                or not isinstance(cost, (int, float))
+                or not math.isfinite(float(cost))
+                or float(cost) < 0.0
+            ):
+                continue
+            self.graph.add_edge(u, v, **dict(data))
+            self.graph[u][v]["cost"] = float(cost)
+
+
+class _ExactCoreSolver:
+    """Exact Dreyfus-Wagner directed Steiner solver for a small terminal core."""
+
+    def __init__(self, graph, src, terminals):
+        self.graph = graph
+        self.src = src
+        self.terminals = list(terminals)
+        self.nodes = list(graph.nodes())
+        self.reverse = graph.reverse(copy=False)
+
+    def solve(self):
+        count = len(self.terminals)
+        states = 1 << count
+        inf = float("inf")
+        value = [{node: inf for node in self.nodes} for _ in range(states)]
+        decision = [{} for _ in range(states)]
+
+        for mask in range(1, states):
+            costs = value[mask]
+            choices = decision[mask]
+
+            if mask & (mask - 1) == 0:
+                terminal = self.terminals[mask.bit_length() - 1]
+                costs[terminal] = 0.0
+                choices[terminal] = ("terminal",)
+
+            subset = (mask - 1) & mask
+            while subset:
+                other = mask ^ subset
+                if other and subset < other:
+                    left = value[subset]
+                    right = value[other]
+                    for node in self.nodes:
+                        candidate = left[node] + right[node]
+                        if candidate < costs[node]:
+                            costs[node] = candidate
+                            choices[node] = ("split", subset, other)
+                subset = (subset - 1) & mask
+
+            serial = itertools.count()
+            heap = [
+                (cost, next(serial), node)
+                for node, cost in costs.items()
+                if cost < inf
+            ]
+            heapq.heapify(heap)
+
+            while heap:
+                current, _, node = heapq.heappop(heap)
+                if current != costs[node]:
+                    continue
+                for predecessor in self.reverse.neighbors(node):
+                    candidate = current + float(
+                        self.graph[predecessor][node]["cost"]
+                    )
+                    if candidate < costs[predecessor]:
+                        costs[predecessor] = candidate
+                        choices[predecessor] = ("edge", node)
+                        heapq.heappush(
+                            heap, (candidate, next(serial), predecessor)
+                        )
+
+        full = states - 1
+        if value[full][self.src] == inf:
+            raise nx.NetworkXNoPath(
+                f"No broadcast path exists from {self.src} to {self.terminals}"
+            )
+
+        tree = nx.DiGraph()
+        tree.add_node(self.src)
+        expanded = set()
+
+        def expand(node, mask):
+            key = (node, mask)
+            if key in expanded:
+                return
+            expanded.add(key)
+
+            choice = decision[mask].get(node)
+            if choice is None:
+                raise nx.NetworkXNoPath("Unable to reconstruct broadcast tree")
+
+            if choice[0] == "terminal":
+                return
+            if choice[0] == "split":
+                expand(node, choice[1])
+                expand(node, choice[2])
+                return
+
+            nxt = choice[1]
+            tree.add_edge(node, nxt, **dict(self.graph[node][nxt]))
+            expand(nxt, mask)
+
+        expand(self.src, full)
+        return tree
+
+
+class _SharedTreeBuilder:
+    """Attaches terminals by their true marginal network-transfer cost."""
+
+    def __init__(self, graph, src, initial_tree=None):
+        self.graph = graph
+        self.src = src
+        self.tree = initial_tree.copy() if initial_tree is not None else nx.DiGraph()
+        self.tree.add_node(src)
+
+    def _marginal_path(self, dst):
+        def weight(u, v, data):
+            return 0.0 if self.tree.has_edge(u, v) else float(data["cost"])
+
+        return nx.dijkstra_path(self.graph, self.src, dst, weight=weight)
+
+    def attach(self, terminals, order=None):
+        remaining = set(terminals)
+
+        if order is not None:
+            for dst in order:
+                if dst not in remaining:
+                    continue
+                path = self._marginal_path(dst)
+                self._add(path)
+                remaining.remove(dst)
+            return self.tree
+
+        while remaining:
+            best = None
+            for dst in remaining:
+                try:
+                    path = self._marginal_path(dst)
+                except nx.NetworkXNoPath:
+                    continue
+
+                cost = sum(
+                    0.0 if self.tree.has_edge(u, v)
+                    else float(self.graph[u][v]["cost"])
+                    for u, v in zip(path, path[1:])
+                )
+                candidate = (cost, len(path), str(dst), dst, path)
+                if best is None or candidate < best:
+                    best = candidate
+
+            if best is None:
+                raise nx.NetworkXNoPath(
+                    f"No broadcast path exists from {self.src} to {sorted(remaining)}"
+                )
+
+            self._add(best[-1])
+            remaining.remove(best[-2])
+
+        return self.tree
+
+    def _add(self, path):
+        for u, v in zip(path, path[1:]):
+            self.tree.add_edge(u, v, **dict(self.graph[u][v]))
+
+
+def _tree_cost(tree):
+    return sum(float(data["cost"]) for _, _, data in tree.edges(data=True))
+
+
+def _prune_tree(tree, src, terminals):
+    """Remove selected edges that are not needed by any destination."""
+    needed = set(terminals)
+    changed = True
+
+    while changed:
+        changed = False
+        for node in list(tree.nodes()):
+            if node == src or node in needed:
+                continue
+            if tree.out_degree(node) == 0:
+                tree.remove_node(node)
+                changed = True
+
+    return tree
+
+
+class _HybridPlanner:
+    """
+    Produces and compares exact, greedy, and exact-core-plus-attachment plans.
+    """
+
+    EXACT_LIMIT = 15
+    CORE_LIMIT = 10
+
+    def __init__(self, graph, src, terminals):
+        self.graph = graph
+        self.src = src
+        self.terminals = list(terminals)
+
+    def solve(self):
+        if len(self.terminals) <= self.EXACT_LIMIT:
+            return _ExactCoreSolver(
+                self.graph, self.src, self.terminals
+            ).solve()
+
+        candidates = []
+        distances = nx.single_source_dijkstra_path_length(
+            self.graph, self.src, weight="cost"
+        )
+
+        ranked_far = sorted(
+            self.terminals,
+            key=lambda node: (-distances.get(node, float("inf")), str(node)),
+        )
+        ranked_near = list(reversed(ranked_far))
+
+        for order in (None, ranked_far, ranked_near):
+            try:
+                tree = _SharedTreeBuilder(self.graph, self.src).attach(
+                    self.terminals, order=order
+                )
+                candidates.append(tree)
+            except nx.NetworkXNoPath:
+                pass
+
+        core_sets = [
+            ranked_far[:self.CORE_LIMIT],
+            ranked_near[:self.CORE_LIMIT],
+        ]
+
+        # A structurally diverse core favors terminals whose direct source
+        # routes overlap least with the already selected core.
+        try:
+            source_paths = {
+                dst: nx.dijkstra_path(self.graph, self.src, dst, weight="cost")
+                for dst in self.terminals
+            }
+            diverse = []
+            used_edges = set()
+            for dst in ranked_far:
+                edges = set(zip(source_paths[dst], source_paths[dst][1:]))
+                if len(diverse) < self.CORE_LIMIT:
+                    diverse.append(dst)
+                    used_edges.update(edges)
+                    continue
+                score = len(edges - used_edges)
+                if score > 0:
+                    diverse.append(dst)
+                    used_edges.update(edges)
+                if len(diverse) >= self.CORE_LIMIT:
+                    break
+            if diverse:
+                core_sets.append(diverse[:self.CORE_LIMIT])
+        except nx.NetworkXNoPath:
+            pass
+
+        seen = set()
+        for core in core_sets:
+            core = list(dict.fromkeys(core))
+            signature = tuple(core)
+            if not core or signature in seen:
+                continue
+            seen.add(signature)
+
+            try:
+                core_tree = _ExactCoreSolver(
+                    self.graph, self.src, core
+                ).solve()
+                remaining = [dst for dst in self.terminals if dst not in set(core)]
+                tree = _SharedTreeBuilder(
+                    self.graph, self.src, core_tree
+                ).attach(remaining)
+                candidates.append(tree)
+            except nx.NetworkXNoPath:
+                pass
+
+        if not candidates:
+            raise nx.NetworkXNoPath(
+                f"No broadcast path exists from {self.src} to {self.terminals}"
+            )
+
+        for tree in candidates:
+            _prune_tree(tree, self.src, self.terminals)
+
+        return min(candidates, key=_tree_cost)
+
+
+class _Materializer:
+    def __init__(self, topology, tree, source_graph, src):
+        self.topology = topology
+        self.tree = tree
+        self.source_graph = source_graph
+        self.src = src
+
+    def populate(self, dsts: Iterable):
+        for dst in dsts:
+            if dst == self.src:
+                edge_path = []
+            else:
+                path = nx.dijkstra_path(self.tree, self.src, dst, weight="cost")
+                edge_path = [
+                    [u, v, self.source_graph[u][v]]
+                    for u, v in zip(path, path[1:])
+                ]
+
+            for partition in range(self.topology.num_partitions):
+                self.topology.set_dst_partition_paths(
+                    dst, partition, list(edge_path)
+                )
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    topology = BroadCastTopology(src, dsts, num_partitions)
+    unique_dsts = list(dict.fromkeys(dsts))
+    terminals = [dst for dst in unique_dsts if dst != src]
+
+    if not terminals:
+        for dst in dsts:
+            for partition in range(num_partitions):
+                topology.set_dst_partition_paths(dst, partition, [])
+        return topology
+
+    network = _Network(G, src)
+    graph = network.graph
+
+    if src not in graph:
+        raise nx.NetworkXNoPath(f"No broadcast path exists from {src}")
+
+    missing = [dst for dst in terminals if dst not in graph]
+    if missing:
+        raise nx.NetworkXNoPath(f"No broadcast path exists to {missing}")
+
+    tree = _HybridPlanner(graph, src, terminals).solve()
+    _Materializer(topology, tree, G, src).populate(dsts)
+    return topology
+
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    cost_file = (
+        os.path.join(current_dir, "profiles/cost.csv")
+        if cost_path is None else cost_path
+    )
+    throughput_file = (
+        os.path.join(current_dir, "profiles/throughput.csv")
+        if throughput_path is None else throughput_path
+    )
+
+    cost = pd.read_csv(cost_file)
+    throughput = pd.read_csv(throughput_file)
+    graph = nx.DiGraph()
+
+    for _, row in throughput.iterrows():
+        src_region = row["src_region"]
+        dst_region = row["dst_region"]
+        if src_region != dst_region:
+            graph.add_edge(
+                src_region,
+                dst_region,
+                cost=None,
+                throughput=num_vms * row["throughput_sent"] / 1e9,
+            )
+
+    for _, row in cost.iterrows():
+        if graph.has_edge(row["src"], row["dest"]):
+            graph[row["src"]][row["dest"]]["cost"] = row["cost"]
+
+    no_cost_pairs = [
+        (u, v) for u, v, data in graph.edges(data=True)
+        if data.get("cost") is None
+    ]
+    print("Unable to get costs for: ", no_cost_pairs)
+    return graph
+
+
+# EVOLVE-BLOCK-END
+```</CODE>

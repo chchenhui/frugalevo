@@ -1,0 +1,324 @@
+<NAME>
+vectorized_triangle13
+</NAME>
+
+<DESCRIPTION>
+This crossover retains the stronger equilateral-triangle construction, multiple symmetry-broken seed families, directed bottleneck-gradient proposals, and strict maximin polishing from the current implementation. It improves internal efficiency by precomputing incident-triangle masks, vectorizing bottleneck-gradient computation, avoiding repeated mask allocation, and replacing the expensive full soft-min exponential calculation with a deterministic lower-tail ranking score. The strict smallest triangle area remains the primary selection criterion, while the weighted lower tail resolves ties and improves robustness against exchanging one limiting triangle for another.
+
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+_CACHE = None
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Deterministically construct thirteen points in a fixed equilateral hull.
+
+    The three first points fix a convex hull.  Every remaining point is
+    projected into that hull, and the search maximizes the normalized minimum
+    triangle area because the hull area is constant.
+    """
+    global _CACHE
+    if _CACHE is not None:
+        return _CACHE.copy()
+
+    rng = np.random.default_rng(13031957)
+    n = 13
+    hull_count = 3
+    root3 = np.sqrt(3.0)
+
+    corners = np.array(
+        (
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (0.5, 0.5 * root3),
+        ),
+        dtype=np.float64,
+    )
+
+    tri = np.asarray(
+        [
+            (i, j, k)
+            for i in range(n - 2)
+            for j in range(i + 1, n - 1)
+            for k in range(j + 1, n)
+        ],
+        dtype=np.intp,
+    )
+    triangle_count = len(tri)
+
+    incident = tuple(
+        np.flatnonzero(np.any(tri == point, axis=1))
+        for point in range(n)
+    )
+    fixed_masks = tuple(
+        np.logical_not(np.isin(np.arange(triangle_count), incident[point]))
+        for point in range(n)
+    )
+
+    tail_count = 18
+    tail_weights = np.linspace(1.0, 0.18, tail_count, dtype=np.float64)
+
+    seed_families = (
+        np.array(
+            (
+                (0.50, 0.10), (0.25, 0.16), (0.75, 0.16),
+                (0.14, 0.29), (0.50, 0.30), (0.86, 0.29),
+                (0.31, 0.46), (0.69, 0.46), (0.50, 0.62),
+                (0.50, 0.77),
+            ),
+            dtype=np.float64,
+        ),
+        np.array(
+            (
+                (0.20, 0.11), (0.50, 0.09), (0.80, 0.11),
+                (0.34, 0.25), (0.66, 0.25), (0.17, 0.39),
+                (0.50, 0.43), (0.83, 0.27), (0.35, 0.58),
+                (0.62, 0.55),
+            ),
+            dtype=np.float64,
+        ),
+        np.array(
+            (
+                (0.48, 0.10), (0.19, 0.18), (0.73, 0.17),
+                (0.36, 0.29), (0.66, 0.34), (0.13, 0.33),
+                (0.51, 0.47), (0.78, 0.32), (0.30, 0.54),
+                (0.53, 0.68),
+            ),
+            dtype=np.float64,
+        ),
+        np.array(
+            (
+                (0.31, 0.10), (0.66, 0.12), (0.51, 0.21),
+                (0.15, 0.25), (0.79, 0.23), (0.38, 0.39),
+                (0.67, 0.43), (0.22, 0.48), (0.49, 0.57),
+                (0.47, 0.73),
+            ),
+            dtype=np.float64,
+        ),
+    )
+
+    def project_to_hull(candidates: np.ndarray) -> np.ndarray:
+        """Project Cartesian candidates into the fixed equilateral hull."""
+        result = np.asarray(candidates, dtype=np.float64).copy()
+        result[:, 0] = np.clip(result[:, 0], 0.002, 0.998)
+        result[:, 1] = np.maximum(result[:, 1], 0.002)
+        ceiling = root3 * np.minimum(result[:, 0], 1.0 - result[:, 0])
+        result[:, 1] = np.minimum(result[:, 1], ceiling - 0.002)
+        return result
+
+    def triangle_areas(points: np.ndarray) -> np.ndarray:
+        a = points[tri[:, 0]]
+        b = points[tri[:, 1]]
+        c = points[tri[:, 2]]
+        return 0.5 * np.abs(
+            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+        )
+
+    def incident_areas(
+        points: np.ndarray,
+        candidates: np.ndarray,
+        point_index: int,
+    ) -> np.ndarray:
+        """Evaluate only area constraints changed by one moved point."""
+        ids = incident[point_index]
+        local_tri = tri[ids]
+        count = len(candidates)
+
+        work = np.broadcast_to(
+            points[local_tri],
+            (count, len(local_tri), 3, 2),
+        ).copy()
+        positions = np.nonzero(local_tri == point_index)
+        work[:, positions[0], positions[1], :] = candidates[:, None, :]
+
+        u = work[:, :, 1] - work[:, :, 0]
+        v = work[:, :, 2] - work[:, :, 0]
+        return 0.5 * np.abs(u[:, :, 0] * v[:, :, 1] - u[:, :, 1] * v[:, :, 0])
+
+    def lower_tail_score(values: np.ndarray) -> np.ndarray:
+        """Deterministic secondary score among essentially equal bottlenecks."""
+        low = np.partition(values, tail_count - 1, axis=1)[:, :tail_count]
+        low.sort(axis=1)
+        return low @ tail_weights
+
+    def bottleneck_direction(
+        points: np.ndarray,
+        values: np.ndarray,
+        point_index: int,
+    ) -> np.ndarray:
+        """
+        Vectorized ascent direction for the tight incident area constraints.
+
+        The signed determinant gradient is exact while all other vertices are
+        held fixed.  Combining gradients from the lower incident tail avoids
+        overreacting to a single constraint that may cease to be limiting.
+        """
+        ids = incident[point_index]
+        local = values[ids]
+        count = min(14, len(ids))
+        chosen = ids[np.argpartition(local, count - 1)[:count]]
+        chosen_tri = tri[chosen]
+
+        a = points[chosen_tri[:, 0]]
+        b = points[chosen_tri[:, 1]]
+        c = points[chosen_tri[:, 2]]
+        determinant = (
+            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+        )
+        sign = np.where(determinant >= 0.0, 1.0, -1.0)
+
+        gradients = np.empty((count, 2), dtype=np.float64)
+        role0 = chosen_tri[:, 0] == point_index
+        role1 = chosen_tri[:, 1] == point_index
+        role2 = ~(role0 | role1)
+
+        gradients[role0] = np.column_stack(
+            (
+                b[role0, 1] - c[role0, 1],
+                c[role0, 0] - b[role0, 0],
+            )
+        )
+        gradients[role1] = np.column_stack(
+            (
+                c[role1, 1] - a[role1, 1],
+                a[role1, 0] - c[role1, 0],
+            )
+        )
+        gradients[role2] = np.column_stack(
+            (
+                a[role2, 1] - b[role2, 1],
+                b[role2, 0] - a[role2, 0],
+            )
+        )
+
+        threshold = values[chosen].min()
+        weights = np.exp(-(values[chosen] - threshold) / 0.006)
+        direction = np.sum(
+            gradients * (weights * sign)[:, None],
+            axis=0,
+        )
+        norm = float(np.linalg.norm(direction))
+        return direction / norm if norm > 1.0e-12 else np.zeros(2)
+
+    best_points = None
+    best_value = -np.inf
+
+    try:
+        restarts = 16
+        sweeps = 560
+        movable_indices = np.arange(hull_count, n)
+
+        for restart in range(restarts):
+            base = seed_families[restart % len(seed_families)]
+            points = np.vstack(
+                (
+                    corners,
+                    project_to_hull(
+                        base + rng.uniform(-0.080, 0.080, size=(10, 2))
+                    ),
+                )
+            )
+            areas = triangle_areas(points)
+
+            for sweep in range(sweeps):
+                progress = sweep / (sweeps - 1)
+                step = 0.105 * (1.0 - progress) ** 1.65 + 0.0015
+
+                for point_index in rng.permutation(movable_indices):
+                    current = points[point_index].copy()
+                    proposals = np.empty((13, 2), dtype=np.float64)
+                    proposals[0] = current
+
+                    directions = rng.normal(size=(12, 2))
+                    directions /= np.maximum(
+                        np.linalg.norm(directions, axis=1, keepdims=True),
+                        1.0e-12,
+                    )
+                    radii = step * (0.25 + 1.15 * rng.random(12))
+                    proposals[1:] = current + directions * radii[:, None]
+
+                    ascent = bottleneck_direction(points, areas, point_index)
+                    if np.any(ascent):
+                        proposals[1:4] = current + step * np.array(
+                            (0.35, 0.85, 1.45)
+                        )[:, None] * ascent
+
+                    if sweep < sweeps // 3:
+                        proposals[-2:] = rng.uniform(
+                            0.075, 0.925, size=(2, 2)
+                        )
+
+                    proposals = project_to_hull(proposals)
+                    local = incident_areas(points, proposals, point_index)
+
+                    mask = fixed_masks[point_index]
+                    fixed_minimum = float(areas[mask].min())
+                    candidate_minimum = np.minimum(
+                        local.min(axis=1),
+                        fixed_minimum,
+                    )
+                    maximum = float(candidate_minimum.max())
+                    tied = candidate_minimum >= maximum - 2.0e-7
+
+                    trial = np.broadcast_to(areas, (len(proposals), triangle_count)).copy()
+                    trial[:, incident[point_index]] = local
+                    scores = lower_tail_score(trial)
+                    scores[~tied] = -np.inf
+                    choice = int(np.argmax(scores))
+
+                    points[point_index] = proposals[choice]
+                    areas[incident[point_index]] = local[choice]
+
+            angles = np.linspace(0.0, 2.0 * np.pi, 48, endpoint=False)
+            unit_circle = np.column_stack((np.cos(angles), np.sin(angles)))
+
+            for polish_step in (0.008, 0.004, 0.002, 0.0008):
+                for _ in range(4):
+                    for point_index in movable_indices:
+                        current = points[point_index].copy()
+                        proposals = np.empty((49, 2), dtype=np.float64)
+                        proposals[0] = current
+                        proposals[1:] = current + polish_step * unit_circle
+                        proposals = project_to_hull(proposals)
+
+                        local = incident_areas(points, proposals, point_index)
+                        fixed_minimum = float(
+                            areas[fixed_masks[point_index]].min()
+                        )
+                        candidate_minimum = np.minimum(
+                            local.min(axis=1),
+                            fixed_minimum,
+                        )
+                        choice = int(np.argmax(candidate_minimum))
+
+                        if candidate_minimum[choice] >= areas.min() - 1.0e-15:
+                            points[point_index] = proposals[choice]
+                            areas[incident[point_index]] = local[choice]
+
+            value = float(areas.min())
+            if value > best_value:
+                best_value = value
+                best_points = points.copy()
+
+    except (FloatingPointError, ValueError, RuntimeError, np.linalg.LinAlgError):
+        best_points = None
+
+    if best_points is None or not np.all(np.isfinite(best_points)):
+        fallback = seed_families[0]
+        best_points = np.vstack((corners, project_to_hull(fallback)))
+
+    _CACHE = np.asarray(best_points, dtype=np.float64)
+    return _CACHE.copy()
+
+
+# EVOLVE-BLOCK-END
+```

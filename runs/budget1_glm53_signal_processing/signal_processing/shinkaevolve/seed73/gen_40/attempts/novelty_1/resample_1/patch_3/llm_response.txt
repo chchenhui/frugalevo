@@ -1,0 +1,48 @@
+<NAME>
+local_adaptive_snap_postprocess</NAME>
+<DESCRIPTION>
+The previous SEARCH block did not exist in the file, so this attempt anchors on the exact, verbatim dispatch tail that was confirmed to exist (the final returns of the top-level selection logic). Instead of trying to modify the unknown internals of the filters, this edit wraps the dispatch: it captures whichever filter's output was selected and applies a fully-vectorized local-adaptive snap refinement as a post-processing step before returning. The refinement computes a rolling robust noise scale (MAD of first differences over ±25-sample windows via np.lib.stride_tricks.sliding_window_view, O(n) with no added latency), then zeroes out diffs smaller than 0.5x the LOCAL sigma. Noisy non-stationary segments get aggressive noise suppression (fewer spurious reversals / false trend changes), while clean segments keep their dynamics intact (reducing lag error and preserving genuine trends). A floor of 0.25x the global MAD-of-diffs prevents degenerate all-zero thresholds in flat regions, and short signals gracefully fall back to the global scale. This targets the multi-objective tradeoff directly: adaptivity lets reversal penalty and responsiveness be optimized jointly rather than traded off against one global constant.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+            return enhanced_filter_with_trend_preservation(input_signal, window_size)
+        else:
+            return adaptive_filter(input_signal, window_size)
+=======
+            y = enhanced_filter_with_trend_preservation(input_signal, window_size)
+        else:
+            y = adaptive_filter(input_signal, window_size)
+        # Local adaptive snap refinement: rolling robust noise scale (MAD of
+        # first differences over +/-25-sample windows), fully vectorized.
+        # Aggressive de-noising in volatile segments (fewer false reversals),
+        # gentle treatment in clean segments (lower lag error, dynamics kept).
+        x_smooth = np.asarray(y, dtype=float)
+        n = x_smooth.size
+        if n > 3:
+            d = np.diff(x_smooth)
+            med_d = np.median(d)
+            global_sigma = np.median(np.abs(d - med_d)) * 1.4826
+            global_sigma = max(global_sigma, 1e-12)
+            half_w = 25
+            if n - 1 > 2 * half_w:
+                d_pad = np.pad(d, half_w, mode='edge')
+                win = np.lib.stride_tricks.sliding_window_view(
+                    d_pad, 2 * half_w + 1)
+                local_med = np.median(win, axis=1)
+                local_sigma = (
+                    np.median(np.abs(win - local_med[:, None]), axis=1) * 1.4826
+                )
+                # Floor local scale so flat regions don't snap everything.
+                local_sigma = np.maximum(local_sigma, 0.25 * global_sigma)
+            else:
+                local_sigma = np.full(d.size, global_sigma)
+            # Keep a step only if it exceeds 0.5x the LOCAL noise scale.
+            keep = np.abs(d) > 0.5 * local_sigma
+            d_f = np.where(keep, d, 0.0)
+            x_snap = np.concatenate(
+                ([x_smooth[0]], x_smooth[0] + np.cumsum(d_f))
+            )
+            return x_snap
+        return x_smooth
+>>>>>>> REPLACE
+</DIFF>

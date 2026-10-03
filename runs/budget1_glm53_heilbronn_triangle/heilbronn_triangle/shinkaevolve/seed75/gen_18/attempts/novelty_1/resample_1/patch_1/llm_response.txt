@@ -1,0 +1,149 @@
+<NAME>
+kworst_triplet_guided_polish</NAME>
+
+<DESCRIPTION>
+The current random single-point polish is undirected: it picks a random point and hopes it helps. Following the recommendation, we should identify the bottom-k worst triplets and concentrate the search effort on the points participating in them, evaluating many candidate displacements vectorized at once. Concretely: (1) compute all triplet areas, (2) take the worst triplet's three vertices as the "hot" point set (plus occasionally the bottom-10 triplets' union for wider moves), (3) generate a batch of candidate perturbations for each hot point, evaluate all of them with one vectorized area computation, and accept the best improving candidate. This gives the search many escape directions from local minima while reusing the existing vectorized `_areas` machinery, and it evaluates dozens of moves for the cost of roughly one. We also raise the polish budget slightly since batched evaluation is cheap, and keep a global-best tracker to never lose an improvement.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ---- Hybrid local/global polish: relocate worst-triplet point, then refine ----
+    def _clip_pt(p):
+        x = np.clip(p[0], 0.0, 1.0)
+        yhi = SQRT3 * x if x <= 0.5 else SQRT3 * (1.0 - x)
+        return np.array([x, np.clip(p[1], 0.0, yhi)])
+
+    cur = _min_area(pts)
+    best_pts = pts.copy()
+    step = 0.01
+    stall = 0
+    total = 0
+    max_polish = 3000
+    while total < max_polish and step > 1e-5:
+        total += 1
+        cand = pts.copy()
+        improved = False
+        i = int(rng.integers(n))
+        cand[i] = _clip_pt(pts[i] + rng.normal(0.0, step, size=2))
+        a = _min_area(cand)
+        if a > cur + 1e-14:
+            pts, cur = cand, a
+            improved = True
+            if cur > _min_area(best_pts):
+                best_pts = pts.copy()
+        if not improved:
+            stall += 1
+            if stall % 25 == 0:
+                step *= 0.6
+            if stall % 40 == 0 and step < 1e-2:
+                # global relocation: teleport the point in the worst triplet
+                areas = _areas(pts)
+                t = int(np.argmin(areas))
+                wi = int(TRIPLES[t][rng.integers(3)])
+                u, v = rng.random(), rng.random()
+                if u + v > 1.0:
+                    u, v = 1.0 - u, 1.0 - v
+                cand = pts.copy()
+                cand[wi] = [v + 0.5 * (1 - u - v), (1 - u - v) * SQRT3 / 2.0]
+                a = _min_area(cand)
+                if a > cur:
+                    pts, cur = cand, a
+                    step = max(step, 0.01)
+                    if cur > _min_area(best_pts):
+                        best_pts = pts.copy()
+        else:
+            stall = 0
+    pts = best_pts
+    return pts
+=======
+    # ---- k-worst-triplet guided polish: move points from the worst triplets ----
+    def _clip_pt(p):
+        x = np.clip(p[0], 0.0, 1.0)
+        yhi = SQRT3 * x if x <= 0.5 else SQRT3 * (1.0 - x)
+        return np.array([x, np.clip(p[1], 0.0, yhi)])
+
+    nT = len(TRIPLES)
+
+    def _min_area_batch(base_pts, move_idx, move_pts):
+        """Vectorized min area over a batch of candidates, each moving one point.
+        base_pts: (n,2); move_idx: (B,); move_pts: (B,2). Returns (B,) min areas."""
+        B = move_idx.shape[0]
+        P = np.broadcast_to(base_pts, (B, n, 2)).copy()
+        P[np.arange(B), move_idx] = move_pts
+        A = P[:, TRIPLES[:, 0]]
+        Bv = P[:, TRIPLES[:, 1]]
+        Cv = P[:, TRIPLES[:, 2]]
+        cross = (Bv[:, :, 0] - A[:, :, 0]) * (Cv[:, :, 1] - A[:, :, 1]) - \
+                (Bv[:, :, 1] - A[:, :, 1]) * (Cv[:, :, 0] - A[:, :, 0])
+        return 0.5 * np.abs(cross).min(axis=1) / TRI_AREA
+
+    cur = _min_area(pts)
+    best_pts = pts.copy()
+    best_val = cur
+    step = 0.02
+    stall = 0
+    total = 0
+    max_polish = 400
+    batch = 24
+    while total < max_polish and step > 1e-5:
+        total += 1
+        areas = _areas(pts) / TRI_AREA
+        # hot points: vertices of the worst triplet, plus occasionally the
+        # union of the bottom-10 triplets for wider escape moves.
+        order = np.argsort(areas)
+        if rng.random() < 0.35:
+            hot = np.unique(TRIPLES[order[:10]].ravel())
+        else:
+            hot = np.unique(TRIPLES[order[:1]].ravel())
+        # build batched candidates: each hot point x several perturbations
+        move_idx = np.repeat(hot, 1)
+        reps = max(1, batch // len(hot))
+        move_idx = np.tile(hot, reps)
+        noise = rng.normal(0.0, step, size=(move_idx.shape[0], 2))
+        move_pts = np.array([_clip_pt(pts[i] + d) for i, d in zip(move_idx, noise)])
+        # reject candidates that collide with other points
+        dmin = np.array([
+            np.min(np.linalg.norm(np.delete(pts, i, axis=0) - mp, axis=1))
+            for i, mp in zip(move_idx, move_pts)
+        ])
+        ok = dmin > 1e-7
+        if not np.any(ok):
+            move_idx = move_idx[ok]
+            stall += 1
+        else:
+            move_idx = move_idx[ok]
+            move_pts = move_pts[ok]
+            vals = _min_area_batch(pts, move_idx, move_pts)
+            b = int(np.argmax(vals))
+            if vals[b] > cur + 1e-14:
+                pts = pts.copy()
+                pts[move_idx[b]] = move_pts[b]
+                cur = float(vals[b])
+                stall = 0
+                if cur > best_val:
+                    best_val = cur
+                    best_pts = pts.copy()
+            else:
+                stall += 1
+                # occasional global relocation: teleport a worst-triplet point
+                if stall % 15 == 0 and step < 5e-2:
+                    wi = int(TRIPLES[order[0]][rng.integers(3)])
+                    u, v = rng.random(), rng.random()
+                    if u + v > 1.0:
+                        u, v = 1.0 - u, 1.0 - v
+                    cand = pts.copy()
+                    cand[wi] = [v + 0.5 * (1 - u - v), (1 - u - v) * SQRT3 / 2.0]
+                    a = _min_area(cand)
+                    if a > cur:
+                        pts, cur = cand, a
+                        step = max(step, 0.02)
+                        if cur > best_val:
+                            best_val = cur
+                            best_pts = pts.copy()
+                        stall = 0
+        if stall % 10 == 0 and stall > 0:
+            step *= 0.7
+    pts = best_pts
+    return pts
+>>>>>>> REPLACE
+</DIFF>

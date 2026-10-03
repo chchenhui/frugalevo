@@ -1,0 +1,53 @@
+<NAME>
+lpt_local_search_refinement
+</NAME>
+<DESCRIPTION>
+The greedy LPT packing in `balanced_packing` is fast but leaves a residual load spread between the heaviest and lightest packs, which caps both the GPU-load balancedness (0.66) and the per-expert balancedness (0.25). Since the algorithm runtime is currently negligible (times_algorithm ≈ 0.01) while speed_score is dominated by inference time (i.e., by the quality of the placement), we can afford a cheap local-search refinement phase. After the greedy assignment, for each layer we repeatedly identify the heaviest and lightest packs and swap the largest-weight item in the heavy pack with the smallest-weight item in the light pack whenever the swap provably reduces the spread (weight difference exceeds half the spread). This preserves all invariants (each pack still holds exactly n/m items, ranks remain a valid permutation) so downstream code is unaffected, while monotonically shrinking the max–min pack load gap — directly improving GPU load balance and, through it, inference-time balance. The refinement converges quickly (a few swaps per layer) so the added runtime is negligible.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        pack_weights[layer_rows, pack] += weight[layer_rows, group]
+        pack_items[layer_rows, pack] += 1
+    return pack_index, rank_in_pack
+=======
+        pack_weights[layer_rows, pack] += weight[layer_rows, group]
+        pack_items[layer_rows, pack] += 1
+
+    # Local-search refinement: swap items between the heaviest and lightest
+    # packs to shrink the load spread. Counts and ranks remain valid.
+    for i in range(num_layers):
+        wi = weight[i]
+        pi = pack_index[i]
+        ri = rank_in_pack[i]
+        loads = torch.zeros(num_packs)
+        loads.scatter_add_(0, pi, wi)
+        for _ in range(num_groups):
+            h = int(loads.argmax())
+            l = int(loads.argmin())
+            diff = float(loads[h] - loads[l])
+            if diff <= 0:
+                break
+            in_h = (pi == h).nonzero(as_tuple=True)[0]
+            in_l = (pi == l).nonzero(as_tuple=True)[0]
+            w_h = wi[in_h]
+            w_l = wi[in_l]
+            a_pos = int(in_h[int(w_h.argmax())])
+            b_pos = int(in_l[int(w_l.argmin())])
+            a = float(wi[a_pos])
+            b = float(wi[b_pos])
+            # Swapping reduces the spread only if the weight gap exceeds
+            # half of the current spread.
+            if a > b and (a - b) > diff * 0.5:
+                ra = int(ri[a_pos])
+                rb = int(ri[b_pos])
+                pi[a_pos] = l
+                pi[b_pos] = h
+                ri[a_pos] = rb
+                ri[b_pos] = ra
+                loads[h] += b - a
+                loads[l] += a - b
+            else:
+                break
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

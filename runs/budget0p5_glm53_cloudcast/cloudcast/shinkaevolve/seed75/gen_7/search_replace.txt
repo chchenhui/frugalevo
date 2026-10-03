@@ -1,0 +1,82 @@
+<NAME>
+load_aware_multipath_broadcast</NAME>
+
+<DESCRIPTION>
+The current algorithm sends every partition of data to every destination along the exact same shortest path, causing all num_partitions copies to traverse the same edges. This is doubly wasteful: (1) it overloads a single network route when parallel paths across multi-cloud topologies exist, and (2) it ignores that edge costs (the objective) can be reduced by spreading traffic over cheaper alternative routes.
+
+The proposed improvement:
+1. Uses `nx.shortest_simple_paths` to enumerate the K cheapest simple paths (in cost order) from src to each dst.
+2. Assigns partitions round-robin over these candidate paths so that partitions are spread across multiple parallel routes, reducing per-edge load and enabling overlap (parallel transfers across networks).
+3. Applies a load-aware cost inflation: each time an edge is used by a partition, its effective cost is slightly increased for subsequent path selections, which naturally balances traffic across the topology and avoids concentrating all flow on one hot path (important under throughput constraints that cause congestion-driven cost).
+4. Falls back to the original single-shortest-path behavior if path enumeration is unavailable (e.g., undirected graphs or exceptions), preserving robustness.
+
+This keeps the same output structure (BroadCastTopology with per-partition edge lists) so downstream code is unaffected, while reducing total transfer cost and improving parallelism.
+</DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Load-aware effective costs: edges get slightly more expensive each time
+    # they are used, encouraging traffic to spread over parallel network paths.
+    load = {}
+    INFLATION = 0.25
+
+    def effective_cost(u, v, data):
+        base = data.get("cost")
+        if base is None:
+            base = 1.0
+        return base * (1.0 + INFLATION * load.get((u, v), 0))
+
+    def candidate_paths(dst, k):
+        """Return up to k cheapest simple paths under effective costs."""
+        try:
+            paths = nx.shortest_simple_paths(
+                h, src, dst, weight=lambda u, v, d: effective_cost(u, v, d)
+            )
+            out = []
+            for path in paths:
+                out.append(path)
+                if len(out) >= k:
+                    break
+            return out
+        except Exception:
+            try:
+                return [nx.dijkstra_path(h, src, dst, weight="cost")]
+            except Exception:
+                return []
+
+    for dst in dsts:
+        num_candidates = min(num_partitions, 4)
+        paths = candidate_paths(dst, num_candidates)
+        if not paths:
+            continue
+
+        for j in range(bc_topology.num_partitions):
+            # Round-robin partitions across candidate parallel paths so
+            # partitions traverse different networks (overlap transfers).
+            path = paths[j % len(paths)]
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                load[(s, t)] = load.get((s, t), 0) + 1
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

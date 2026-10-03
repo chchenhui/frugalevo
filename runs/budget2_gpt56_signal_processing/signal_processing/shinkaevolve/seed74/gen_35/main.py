@@ -1,0 +1,411 @@
+# EVOLVE-BLOCK-START
+"""
+Real-Time Adaptive Signal Processing Algorithm for Non-Stationary Time Series
+
+This algorithm implements a sliding window approach to filter volatile,
+non-stationary time series data while minimizing noise and preserving signal
+dynamics with low causal latency.
+"""
+import numpy as np
+
+
+def adaptive_filter(x, window_size=20):
+    """
+    Efficient sliding-window moving-average baseline.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window (W samples)
+
+    Returns:
+        y: Filtered output signal with length = len(x) - window_size + 1
+    """
+    x = np.asarray(x, dtype=float)
+    if x.ndim != 1:
+        raise ValueError("Input signal must be a 1D array")
+    if window_size < 1:
+        raise ValueError("window_size must be at least 1")
+    if len(x) < window_size:
+        raise ValueError(
+            f"Input signal length ({len(x)}) must be >= window_size ({window_size})"
+        )
+
+    cumulative = np.concatenate(([0.0], np.cumsum(x, dtype=float)))
+    return (cumulative[window_size:] - cumulative[:-window_size]) / float(window_size)
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Robust causal trend tracker with confirmation-gated output turns.
+
+    A Huber-reweighted, exponentially weighted local line supplies a current
+    endpoint observation and local slope.  An adaptive alpha-beta state tracker
+    follows sustained motion with low lag.  A second presentation state releases
+    the internal estimate smoothly and only changes its displayed direction
+    after coherent reversal evidence, reducing spurious slope changes without
+    freezing genuine turns.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window
+
+    Returns:
+        Filtered signal with length len(x) - window_size + 1
+    """
+    x = np.asarray(x, dtype=float)
+    if x.ndim != 1:
+        raise ValueError("Input signal must be a 1D array")
+    if window_size < 2:
+        raise ValueError("window_size must be at least 2")
+    if len(x) < window_size:
+        raise ValueError(
+            f"Input signal length ({len(x)}) must be >= window_size ({window_size})"
+        )
+
+    output_length = len(x) - window_size + 1
+    y = np.empty(output_length, dtype=float)
+    eps = 1e-12
+
+    # Endpoint-centered basis: time zero is the newest causal sample.
+    time = np.arange(1 - window_size, 1, dtype=float)
+    base_weights = np.exp(time / max(0.42 * window_size, 1.0))
+    base_weights /= np.sum(base_weights)
+
+    base_time_mean = np.dot(base_weights, time)
+    base_centered_time = time - base_time_mean
+    base_time_variance = np.dot(
+        base_weights, base_centered_time * base_centered_time
+    )
+
+    # A shorter horizon acts as independent evidence for a real turn.
+    recent_length = min(window_size, 7)
+    recent_time = time[-recent_length:]
+    recent_weights = np.exp(np.linspace(-1.55, 0.0, recent_length))
+    recent_weights /= np.sum(recent_weights)
+    recent_time_mean = np.dot(recent_weights, recent_time)
+    recent_centered_time = recent_time - recent_time_mean
+    recent_time_variance = np.dot(
+        recent_weights, recent_centered_time * recent_centered_time
+    )
+
+    level = 0.0
+    velocity = 0.0
+    reported_level = 0.0
+    reported_direction = 0
+    pending_direction = 0
+    pending_count = 0
+
+    for i in range(output_length):
+        window = x[i : i + window_size]
+
+        # Initial endpoint weighted least-squares estimate.
+        value_mean = np.dot(base_weights, window)
+        slope = (
+            np.dot(base_weights, base_centered_time * (window - value_mean))
+            / max(base_time_variance, eps)
+        )
+        observation = value_mean - slope * base_time_mean
+
+        # One robust reweighting pass prevents isolated endpoint impulses from
+        # causing either a state shock or a false trend reversal.
+        residuals = window - (observation + slope * time)
+        residual_median = np.median(residuals)
+        noise_scale = max(
+            1.4826 * np.median(np.abs(residuals - residual_median)),
+            1e-8,
+        )
+
+        huber_limit = 2.35 * noise_scale
+        huber = np.minimum(
+            1.0, huber_limit / (np.abs(residuals) + eps)
+        )
+        weights = base_weights * huber
+        weight_sum = np.sum(weights)
+
+        if weight_sum > eps:
+            weights /= weight_sum
+            time_mean = np.dot(weights, time)
+            centered_time = time - time_mean
+            value_mean = np.dot(weights, window)
+            denominator = np.dot(weights, centered_time * centered_time)
+
+            if denominator > eps:
+                slope = np.dot(
+                    weights, centered_time * (window - value_mean)
+                ) / denominator
+                observation = value_mean - slope * time_mean
+
+        # Short-horizon slope is not used as a direct measurement; it only
+        # qualifies whether a prospective trend reversal is coherent.
+        recent_window = window[-recent_length:]
+        recent_mean = np.dot(recent_weights, recent_window)
+        recent_slope = np.dot(
+            recent_weights,
+            recent_centered_time * (recent_window - recent_mean),
+        ) / max(recent_time_variance, eps)
+
+        if i == 0:
+            level = observation
+            velocity = slope
+            reported_level = level
+            if abs(velocity) > 0.08 * noise_scale:
+                reported_direction = 1 if velocity > 0.0 else -1
+            y[i] = reported_level
+            continue
+
+        prediction = level + velocity
+        innovation = observation - prediction
+
+        # Innovation clipping rejects one-sample contamination while retaining
+        # enough range for sustained non-stationary movement.
+        innovation_limit = 2.9 * noise_scale + 1.10 * abs(slope)
+        bounded_innovation = np.clip(
+            innovation, -innovation_limit, innovation_limit
+        )
+
+        motion = abs(slope) + 0.34 * abs(bounded_innovation)
+        alpha = motion / (motion + 1.65 * noise_scale + eps)
+        alpha = np.clip(alpha, 0.11, 0.70)
+
+        level = prediction + alpha * bounded_innovation
+
+        slope_same_direction = (
+            slope * recent_slope > 0.0
+            and abs(slope) > 0.05 * noise_scale
+            and abs(recent_slope) > 0.05 * noise_scale
+        )
+        if slope_same_direction:
+            slope_confidence = min(abs(slope), abs(recent_slope)) / (
+                max(abs(slope), abs(recent_slope)) + eps
+            )
+        else:
+            slope_confidence = 0.0
+
+        slope_gain = 0.10 + 0.17 * slope_confidence
+        candidate_velocity = (
+            (1.0 - slope_gain) * velocity
+            + slope_gain * slope
+            + (0.075 + 0.08 * alpha) * bounded_innovation
+        )
+
+        velocity_deadband = 0.055 * noise_scale
+        if abs(candidate_velocity) < velocity_deadband:
+            candidate_velocity = 0.0
+        velocity = candidate_velocity
+
+        # Presentation target includes a modest predictive component. This
+        # reduces endpoint regression lag without exposing raw measurement
+        # noise directly in the displayed series.
+        target = level + 0.20 * velocity
+        delta = target - reported_level
+        direction_deadband = 0.10 * noise_scale + 0.018 * abs(velocity)
+
+        desired_direction = 0
+        if delta > direction_deadband:
+            desired_direction = 1
+        elif delta < -direction_deadband:
+            desired_direction = -1
+
+        if reported_direction == 0 and desired_direction != 0:
+            reported_direction = desired_direction
+            pending_direction = 0
+            pending_count = 0
+
+        elif (
+            reported_direction != 0
+            and desired_direction != 0
+            and desired_direction != reported_direction
+        ):
+            # A turn is strong when both local trend horizons agree with the
+            # prospective direction or when the internal state is materially
+            # beyond the current reported level.
+            coherent_turn = (
+                slope_same_direction
+                and (1 if slope > 0.0 else -1) == desired_direction
+            )
+            strong_turn = (
+                abs(delta) > 1.55 * noise_scale + 0.55 * abs(velocity)
+                and coherent_turn
+            )
+
+            if strong_turn:
+                pending_count = 2
+                pending_direction = desired_direction
+            elif pending_direction == desired_direction:
+                pending_count += 1
+            else:
+                pending_direction = desired_direction
+                pending_count = 1
+
+            if pending_count >= 2:
+                reported_direction = desired_direction
+                pending_direction = 0
+                pending_count = 0
+            else:
+                # Keep the output monotone in its established direction while
+                # collecting confirmation evidence.
+                delta = 0.0
+        else:
+            pending_direction = 0
+            pending_count = 0
+
+        # Gradual bounded catch-up is intentionally separate from the internal
+        # tracker: it lowers reversal chatter yet releases real turns promptly.
+        catchup_limit = 1.65 * noise_scale + 0.80 * abs(velocity) + 0.12 * abs(slope)
+        step = np.clip(delta, -catchup_limit, catchup_limit)
+
+        if reported_direction > 0:
+            step = max(0.0, step)
+        elif reported_direction < 0:
+            step = min(0.0, step)
+
+        # In a noise deadband, preserve the prior displayed level rather than
+        # creating tiny alternating slopes.
+        if abs(step) < 0.035 * noise_scale:
+            step = 0.0
+
+        reported_level += step
+        y[i] = reported_level
+
+    return y
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """
+    Main signal processing function that applies the selected algorithm.
+
+    Args:
+        input_signal: Input time series data
+        window_size: Window size for processing
+        algorithm_type: Type of algorithm to use ("basic" or "enhanced")
+
+    Returns:
+        Filtered signal
+    """
+    if algorithm_type == "enhanced":
+        return enhanced_filter_with_trend_preservation(input_signal, window_size)
+    else:
+        return adaptive_filter(input_signal, window_size)
+
+
+# EVOLVE-BLOCK-END
+
+
+def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+    """
+    Generate synthetic test signal with known characteristics.
+
+    Args:
+        length: Length of the signal
+        noise_level: Standard deviation of noise to add
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (noisy_signal, clean_signal)
+    """
+    np.random.seed(seed)
+    t = np.linspace(0, 10, length)
+
+    # Create a complex signal with multiple components
+    clean_signal = (
+        2 * np.sin(2 * np.pi * 0.5 * t)  # Low frequency component
+        + 1.5 * np.sin(2 * np.pi * 2 * t)  # Medium frequency component
+        + 0.5 * np.sin(2 * np.pi * 5 * t)  # Higher frequency component
+        + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)  # Decaying oscillation
+    )
+
+    # Add non-stationary behavior
+    trend = 0.1 * t * np.sin(0.2 * t)  # Slowly varying trend
+    clean_signal += trend
+
+    # Add random walk component for non-stationarity
+    random_walk = np.cumsum(np.random.randn(length) * 0.05)
+    clean_signal += random_walk
+
+    # Add noise
+    noise = np.random.normal(0, noise_level, length)
+    noisy_signal = clean_signal + noise
+
+    return noisy_signal, clean_signal
+
+
+def run_signal_processing(noisy_signal=None, signal_length=1000, noise_level=0.3, window_size=20):
+    """
+    Run the signal processing algorithm on a test signal.
+
+    Args:
+        noisy_signal: Input signal to filter (if provided, use this; otherwise generate)
+        signal_length: Length if generating signal (for backward compatibility)
+        noise_level: Noise level if generating signal (for backward compatibility)
+        window_size: Window size for processing
+
+    Returns:
+        Dictionary containing results and metrics
+    """
+    # Use provided signal or generate test signal (for backward compatibility)
+    if noisy_signal is not None:
+        # Filter the provided signal
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+        clean_signal = None  # Not available when using provided signal
+    else:
+        # Generate test signal (for __main__ and backward compatibility)
+        noisy_signal, clean_signal = generate_test_signal(signal_length, noise_level)
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+
+    # Calculate basic metrics (only if we have clean_signal from generation)
+    if len(filtered_signal) > 0 and clean_signal is not None:
+        # Align signals for comparison (account for processing delay)
+        delay = window_size - 1
+        aligned_clean = clean_signal[delay:]
+        aligned_noisy = noisy_signal[delay:]
+
+        # Ensure same length
+        min_length = min(len(filtered_signal), len(aligned_clean))
+        filtered_signal = filtered_signal[:min_length]
+        aligned_clean = aligned_clean[:min_length]
+        aligned_noisy = aligned_noisy[:min_length]
+
+        # Calculate correlation with clean signal
+        correlation = np.corrcoef(filtered_signal, aligned_clean)[0, 1] if min_length > 1 else 0
+
+        # Calculate noise reduction
+        noise_before = np.var(aligned_noisy - aligned_clean)
+        noise_after = np.var(filtered_signal - aligned_clean)
+        noise_reduction = (noise_before - noise_after) / noise_before if noise_before > 0 else 0
+
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": aligned_clean,
+            "noisy_signal": aligned_noisy,
+            "correlation": correlation,
+            "noise_reduction": noise_reduction,
+            "signal_length": min_length,
+        }
+    elif len(filtered_signal) > 0:
+        # When using provided signal (no clean_signal available), just return filtered signal
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": None,
+            "noisy_signal": None,
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": len(filtered_signal),
+        }
+    else:
+        return {
+            "filtered_signal": [],
+            "clean_signal": [],
+            "noisy_signal": [],
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": 0,
+        }
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    results = run_signal_processing()
+    print("Signal processing completed!")
+    print(f"Correlation with clean signal: {results['correlation']:.3f}")
+    print(f"Noise reduction: {results['noise_reduction']:.3f}")
+    print(f"Processed signal length: {results['signal_length']}")

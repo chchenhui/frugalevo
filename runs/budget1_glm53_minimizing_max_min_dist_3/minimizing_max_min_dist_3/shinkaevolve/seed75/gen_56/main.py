@@ -1,0 +1,187 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """Construct 14 points in 3D maximizing min pairwise / max pairwise distance."""
+    from scipy.optimize import minimize
+    from scipy.special import logsumexp
+
+    n, d = 14, 3
+    iu = np.triu_indices(n, 1)
+
+    def dists(p):
+        diff = p[:, None, :] - p[None, :, :]
+        return np.sqrt(np.maximum((diff * diff).sum(-1), 1e-16))[iu]
+
+    def ratio(p):
+        D = dists(p)
+        return D.min() / max(D.max(), 1e-12)
+
+    def norm_pts(p):
+        p = p - p.mean(axis=0)
+        s = np.linalg.norm(p, axis=1).max()
+        return p / max(s, 1e-12)
+
+    rng = np.random.default_rng(0)
+    best_pts, best_r = None, -1.0
+
+    # --- Seed families ---
+    def d6_seed(h, r, pz):
+        t = 2 * np.pi * np.arange(6) / 6.0
+        r1 = np.stack([r * np.cos(t), r * np.sin(t), np.full(6, h)], axis=1)
+        r2 = np.stack([r * np.cos(t + np.pi / 6), r * np.sin(t + np.pi / 6),
+                       np.full(6, -h)], axis=1)
+        return np.vstack([r1, r2, [[0, 0, pz], [0, 0, -pz]]])
+
+    seeds = [d6_seed(h, r, pz) for h in (0.25, 0.35, 0.45)
+             for r in (0.9, 1.0, 1.1) for pz in (1.0, 1.1)]
+
+    # twisted heptagon pairs (D7-like)
+    for twist in (0.0, np.pi / 7, 2 * np.pi / 7):
+        for h in (0.3, 0.45):
+            t = 2 * np.pi * np.arange(7) / 7.0
+            r1 = np.stack([np.cos(t), np.sin(t), np.full(7, h)], axis=1)
+            r2 = np.stack([np.cos(t + twist), np.sin(t + twist),
+                           np.full(7, -h)], axis=1)
+            seeds.append(np.vstack([r1, r2]))
+
+    # icosahedron + 2 poles
+    phi = (1 + np.sqrt(5)) / 2
+    ico = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1]], dtype=float)
+    ico /= np.linalg.norm(ico, axis=1, keepdims=True)
+    for pz in (1.0, 1.15):
+        seeds.append(np.vstack([ico, [[0, 0, pz], [0, 0, -pz]]]))
+
+    for _ in range(4):
+        p = rng.normal(size=(n, d))
+        seeds.append(p / np.linalg.norm(p, axis=1, keepdims=True))
+
+    # --- Annealed soft-min/soft-max L-BFGS ---
+    def anneal(pts, ladder=(0.04, 0.015, 0.006, 0.002, 0.0008), maxit=250):
+        for T in ladder:
+            def loss(x, T=T):
+                p = x.reshape(n, d)
+                p = p - p.mean(axis=0)
+                D = dists(p)
+                D = D / max(D.max(), 1e-9)
+                smin = -T * logsumexp(-D / T)
+                smax = T * logsumexp(D / T)
+                return -(smin / smax)
+            res = minimize(loss, pts.ravel(), method="L-BFGS-B",
+                           options={"maxiter": maxit, "maxfun": 3 * maxit})
+            q = res.x.reshape(n, d)
+            if np.isfinite(q).all():
+                pts = norm_pts(q)
+        return pts
+
+    # --- Ranked-neighborhood exact-ratio polish ---
+    # Perturb every point involved in near-binding min/max constraints
+    # along random unit directions at decreasing step sizes; keep any
+    # strict exact-ratio improvement. Cheap and guaranteed non-degrading.
+    def ranked_polish(pts, steps=(0.02, 0.008, 0.003, 0.001, 0.0003), rounds=25):
+        pts = pts.copy()
+        cur = ratio(pts)
+        rnd = np.random.default_rng(123)
+        # staged tolerance band: broad early (escape local optima by
+        # improving many near-binding constraints), tight late (precision)
+        tol_schedule = [0.10, 0.07, 0.05, 0.03, 0.02]
+        for rd in range(rounds):
+            improved = False
+            tol = tol_schedule[min(rd, len(tol_schedule) - 1)]
+            Dfull = np.sqrt(np.maximum(
+                ((pts[:, None] - pts[None]) ** 2).sum(-1), 1e-16))
+            Dp = Dfull[iu]
+            dmin, dmax = Dp.min(), Dp.max()
+            tight = (Dp <= dmin * (1 + tol)) | (Dp >= dmax * (1 - tol))
+            hot = sorted(set(iu[0][tight]) | set(iu[1][tight]))
+            if not hot:
+                hot = list(range(n))
+            # binding pair indices
+            imin = int(np.argmin(Dp))
+            imax = int(np.argmax(Dp))
+            i0, j0 = iu[0][imin], iu[1][imin]
+            k0, l0 = iu[0][imax], iu[1][imax]
+            for s in steps:
+                # axis moves on the binding closest pair / diameter pair
+                for mode in ("min", "max"):
+                    Q = pts.copy()
+                    if mode == "min":
+                        u = Q[i0] - Q[j0]
+                    else:
+                        u = Q[l0] - Q[k0]
+                    nu = np.linalg.norm(u)
+                    if nu < 1e-12:
+                        continue
+                    u = u / nu
+                    if mode == "min":
+                        Q[i0] += 0.5 * s * u
+                        Q[j0] -= 0.5 * s * u
+                    else:
+                        Q[k0] -= 0.5 * s * u
+                        Q[l0] += 0.5 * s * u
+                    r = ratio(Q)
+                    if r > cur + 1e-12:
+                        pts, cur, improved = Q.copy(), r, True
+                        break
+                if improved:
+                    break
+                # random-direction moves on all near-binding points
+                for idx in hot:
+                    dirs = rnd.normal(size=(6, d))
+                    dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+                    cands = pts[None].repeat(6, axis=0)
+                    cands[:, idx] += s * dirs
+                    for c in cands:
+                        r = ratio(c)
+                        if r > cur + 1e-12:
+                            pts, cur, improved = c.copy(), r, True
+                if improved:
+                    break
+            if not improved:
+                break
+        return pts
+
+    # --- Main pass over seeds ---
+    for P0 in seeds:
+        pts = anneal(norm_pts(np.asarray(P0, float)))
+        r = ratio(pts)
+        if r > best_r:
+            best_r, best_pts = r, pts.copy()
+        pts = ranked_polish(pts, rounds=10)
+        r = ratio(pts)
+        if r > best_r:
+            best_r, best_pts = r, pts.copy()
+
+    # --- Basin hopping: perturb, re-anneal, ranked polish ---
+    for trial in range(30):
+        scale = 0.012 + 0.010 * trial
+        P0 = best_pts + scale * rng.normal(size=(n, d)) / np.sqrt(3)
+        pts = anneal(norm_pts(P0), ladder=(0.02, 0.008, 0.003, 0.001),
+                     maxit=200)
+        pts = ranked_polish(pts)
+        r = ratio(pts)
+        if r > best_r:
+            best_r, best_pts = r, pts.copy()
+
+    # --- Final fine anneal + deep ranked polish on incumbent ---
+    pts = anneal(best_pts, ladder=(0.003, 0.001), maxit=500)
+    pts = ranked_polish(pts, steps=(0.01, 0.004, 0.0015, 0.0005, 0.00015),
+                        rounds=40)
+    if ratio(pts) > best_r:
+        best_pts = pts.copy()
+
+    points = np.asarray(best_pts, dtype=float)
+    points = points - points.mean(axis=0)
+    Dm = dists(points).max()
+    if (not np.isfinite(points).all()) or points.shape != (n, d) or Dm <= 0:
+        points = np.random.default_rng(1).normal(size=(n, d))
+    else:
+        points = points / Dm
+    return points
+
+
+# EVOLVE-BLOCK-END

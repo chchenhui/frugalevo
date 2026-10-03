@@ -1,0 +1,223 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+from typing import Tuple, List
+import numpy as np
+
+
+class Evolved(Algorithm):
+    """
+    Evolved algorithm: optimizes character-level prefix reuse for prompt
+    prefix caching by choosing a per-row (in practice, a global) column
+    ordering that maximizes exact serial-Trie reuse, measured as the sum of
+    adjacent longest-common-prefix lengths of the lexicographically sorted
+    serialized rows.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------
+    # Serialization helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _serialize_cell(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, float) and np.isnan(v):
+            return ""
+        if v is pd.NA or v is pd.NaT:
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(v)
+
+    def _serialize(self, df: pd.DataFrame):
+        """Return list-of-lists of serialized strings for each cell."""
+        cols = df.columns.tolist()
+        n = len(df)
+        ser = []
+        for c in cols:
+            col_vals = df[c].tolist()
+            ser.append([self._serialize_cell(v) for v in col_vals])
+        # ser[j][i] = serialized value of column j, row i
+        return cols, ser, n
+
+    # ------------------------------------------------------------------
+    # Exact scoring: sum of adjacent LCPs of sorted serialized rows
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        if a == b:
+            return len(a)
+        lo, hi = 0, min(len(a), len(b))
+        # binary search on prefix equality (comparisons run in C)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _score_order(self, order: List[int], ser, n: int, ser_rows=None) -> int:
+        if ser_rows is not None:
+            rows = ser_rows
+        else:
+            # transpose to rows in the given column order
+            cols_in_order = [ser[j] for j in order]
+            rows = ["".join(cols_in_order[j][i] for j in range(len(order)))
+                    for i in range(n)]
+        if n <= 1:
+            return 0
+        rows_sorted = sorted(rows)
+        total = 0
+        prev = rows_sorted[0]
+        for i in range(1, n):
+            cur = rows_sorted[i]
+            total += self._lcp(prev, cur)
+            prev = cur
+        return total
+
+    # ------------------------------------------------------------------
+    # Candidate constructions
+    # ------------------------------------------------------------------
+    def _freq_order(self, ser, num_cols: int, n: int) -> List[int]:
+        """Global order ranked by sum over serialized values v of
+        len(v) * count(v) * (count(v)-1), deterministic tie breaks."""
+        scores = []
+        for j in range(num_cols):
+            col = ser[j]
+            counts = {}
+            for v in col:
+                counts[v] = counts.get(v, 0) + 1
+            s = sum(len(v) * c * (c - 1) for v, c in counts.items())
+            avg_len = sum(len(v) for v in col) / max(1, n)
+            scores.append((s, avg_len, -j))
+        order = sorted(range(num_cols), key=lambda j: (scores[j][0], scores[j][1], scores[j][2]), reverse=True)
+        return order
+
+    def _conditional_order(self, ser, num_cols: int, n: int) -> List[int]:
+        """Pick the column with the largest length-weighted pair repetition
+        as the leading field, then order the rest by the frequency heuristic
+        computed on rows sharing the modal value of the leading column."""
+        if num_cols <= 2:
+            return list(range(num_cols))
+        best_j, best_score = 0, -1.0
+        col_stats = []
+        for j in range(num_cols):
+            counts = {}
+            for v in ser[j]:
+                counts[v] = counts.get(v, 0) + 1
+            s = sum(len(v) * c * (c - 1) for v, c in counts.items())
+            col_stats.append(counts)
+            if s > best_score:
+                best_score, best_j = s, j
+        if best_score <= 0:
+            return self._freq_order(ser, num_cols, n)
+        # suffix order on rows grouped by modal value of leading column
+        modal_val, modal_cnt = None, -1
+        for v, c in col_stats[best_j].items():
+            if c > modal_cnt:
+                modal_cnt, modal_val = c, v
+        rows_idx = [i for i in range(n) if ser[best_j][i] == modal_val]
+        rest = [j for j in range(num_cols) if j != best_j]
+        scores = []
+        for j in rest:
+            counts = {}
+            for i in rows_idx:
+                v = ser[j][i]
+                counts[v] = counts.get(v, 0) + 1
+            s = sum(len(v) * c * (c - 1) for v, c in counts.items())
+            avg_len = sum(len(ser[j][i]) for i in rows_idx) / max(1, len(rows_idx))
+            scores.append((s, avg_len, -j))
+        rest_sorted = sorted(rest, key=lambda j: (scores[rest.index(j)][0],
+                                                  scores[rest.index(j)][1],
+                                                  scores[rest.index(j)][2]),
+                            reverse=True)
+        return [best_j] + rest_sorted
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        original_columns = df.columns.tolist()
+        num_rows, num_cols = df.shape
+        if num_cols == 0 or num_rows == 0:
+            return df.copy(), [[] for _ in range(num_rows)]
+
+        cols, ser, n = self._serialize(df)
+
+        # Candidate orders (indices into cols)
+        candidates = [list(range(num_cols))]
+        freq = self._freq_order(ser, num_cols, n)
+        if freq != candidates[0]:
+            candidates.append(freq)
+        cond = self._conditional_order(ser, num_cols, n)
+        if cond not in candidates:
+            candidates.append(cond)
+
+        # Precompute serialized rows per candidate lazily; score each once.
+        best_order, best_score = candidates[0], -1
+        for cand in candidates:
+            cols_in_order = [ser[j] for j in cand]
+            rows = ["".join(cols_in_order[k][i] for k in range(num_cols))
+                    for i in range(n)]
+            score = self._score_order(cand, ser, n, ser_rows=rows)
+            if score > best_score:
+                best_score, best_order = score, cand
+
+        best_col_names = [cols[j] for j in best_order]
+
+        # Honor col_merge: place each merge group's columns contiguously,
+        # keeping the merged columns together without altering values.
+        if col_merge:
+            merged_set = set()
+            for group in col_merge:
+                merged_set.update(c for c in group if c in best_col_names)
+            # ensure groups are contiguous in the final order
+            order = []
+            placed = set()
+            for c in best_col_names:
+                if c in placed:
+                    continue
+                group_hit = None
+                for group in col_merge:
+                    if c in group:
+                        group_hit = group
+                        break
+                if group_hit is not None:
+                    for gc in group_hit:
+                        if gc in best_col_names and gc not in placed:
+                            order.append(gc)
+                            placed.add(gc)
+                else:
+                    order.append(c)
+                    placed.add(c)
+            best_col_names = order
+
+        # Build reordered dataframe with preserved values, object dtype for safety
+        reordered = df.loc[:, best_col_names].copy()
+        try:
+            reordered = reordered.astype(object)
+        except Exception:
+            pass
+
+        column_orderings = [list(best_col_names) for _ in range(num_rows)]
+        assert reordered.shape == df.shape
+        assert reordered.columns.tolist() == best_col_names
+        return reordered, column_orderings
+
+# EVOLVE-BLOCK-END

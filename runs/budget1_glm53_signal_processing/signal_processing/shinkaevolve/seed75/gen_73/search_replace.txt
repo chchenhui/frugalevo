@@ -1,0 +1,110 @@
+<NAME>
+sg_kernel_bank_rts_slope_lead</NAME>
+<DESCRIPTION>
+This edit composes the Gen 45 percentile-blended 3-scale Savitzky-Golay kernel bank (half-widths [sg_half//2, sg_half, 2*sg_half] with Gaussian volatility-membership weights at the 20/50/80th percentiles of local volatility, which achieved noise reduction 0.82 and smoothness on its own) with the current constant-acceleration Kalman + RTS + reversal-gate pipeline. The current best's smoothness is only 0.20 and slope_changes ~80, driven by residual micro-oscillations in the smoothed level. A multi-scale zero-phase SG bank applied to the RTS output suppresses those oscillations aggressively (biggest half-width = 2*sg_half) while the percentile-matched Gaussian weights keep narrow windows on quiet segments, preserving responsiveness (lag stays bounded because the SG is zero-phase). To compensate for any residual lag from the wider windows, the RTS slope channel (already denoised by forward+backward evidence, lightly SG-smoothed with a fixed 5-tap order-2 kernel) is used for a small conservative lead extrapolation (0.2*sg_half samples of slope), following the successful Gen 46 lead design. This targets the untried Pareto point between the aggressive smoothing bank and the slope-gated lead.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # --- Localized reversal-suppression hysteresis ---
+    estimates = _local_hysteresis(estimates)
+
+    output_length = n - window_size + 1
+    y = estimates[n - output_length:]
+    return y
+=======
+    # --- Multi-scale percentile-blended SG kernel bank (Gen 45) ---
+    # Aggressive zero-phase smoothing with volatility-adaptive weights:
+    # narrow windows on quiet segments (responsiveness), wide windows on
+    # volatile ones (noise reduction, fewer false reversals).
+    estimates = _sg_kernel_bank(estimates, window_size)
+
+    # --- Conservative slope-lead lag compensation via RTS slope ---
+    # The RTS slope state is already denoised by forward+backward
+    # evidence; a light 5-tap order-2 SG pass strips residual ripple,
+    # then a small lead along it cancels residual SG lag.
+    rts_slope = smoothed[:, 1].copy()
+    if n >= 7:
+        c5 = np.array([-3.0, 12.0, 17.0, 12.0, -3.0]) / 35.0
+        hs = 2
+        if n > hs + 1:
+            pad_s = np.concatenate((
+                2 * rts_slope[0] - rts_slope[1:hs + 1][::-1],
+                rts_slope,
+                2 * rts_slope[-1] - rts_slope[n - 2:n - hs - 2:-1][::-1],
+            ))
+            sl = np.convolve(pad_s, c5, mode='valid')
+            if len(sl) == n:
+                rts_slope = sl
+        sg_half = max(2, window_size // 4)
+        lead = 0.2 * sg_half
+        estimates = estimates + lead * rts_slope
+
+    output_length = n - window_size + 1
+    y = estimates[n - output_length:]
+    return y
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def adaptive_filter(x, window_size=20):
+=======
+def _sg_coeffs(h):
+    """Order-2 SG kernel (value at center, zero phase) for half-width h."""
+    t_off = np.arange(-h, h + 1, dtype=float)
+    A = np.vstack([t_off ** k for k in range(3)]).T
+    return (np.linalg.pinv(A.T @ A) @ A.T)[0]
+
+
+def _sg_smooth(sig, h):
+    """Reflect-pad and convolve with the order-2 SG kernel; returns len(sig)."""
+    n = len(sig)
+    c = _sg_coeffs(h)[::-1]
+    if n > h + 1:
+        pad = np.concatenate([
+            2 * sig[0] - sig[1:h + 1][::-1],
+            sig,
+            2 * sig[-1] - sig[n - 2:n - h - 2:-1][::-1],
+        ])
+    else:
+        pad = sig
+    out = np.convolve(pad, c, mode='valid')
+    if len(out) != n:
+        return sig
+    return out
+
+
+def _sg_kernel_bank(y, window_size):
+    """Percentile-blended 3-scale SG bank: half-widths
+    [sg_half//2, sg_half, 2*sg_half], Gaussian membership weights
+    centered at the 20/50/80th percentiles of local volatility."""
+    n = len(y)
+    if n < 8:
+        return y
+    sg_half = max(2, window_size // 4)
+    halves = sorted({max(1, sg_half // 2), sg_half, 2 * sg_half})
+    halves = [h for h in halves if 2 * h + 1 <= max(3, n)]
+    if len(halves) <= 1 or n < 2 * max(halves) + 1:
+        return _sg_smooth(y, halves[0]) if halves else y
+
+    # local volatility: |1st difference|, lightly averaged (3-tap)
+    d = np.abs(np.diff(y, prepend=y[0]))
+    v = np.convolve(d, np.ones(3) / 3.0, mode='same')
+    v = np.maximum(v, 1e-12)
+
+    centers = np.percentile(v, [20.0, 50.0, 80.0])[:len(halves)]
+    spread = max(centers[-1] - centers[0], 1e-9)
+    W = np.stack([
+        np.exp(-0.5 * ((v - c) / spread) ** 2) for c in centers
+    ])
+    W = W / (W.sum(axis=0, keepdims=True) + 1e-12)
+    out = np.zeros(n)
+    for j, h in enumerate(halves):
+        out += W[j] * _sg_smooth(y, h)
+    return out
+
+
+def adaptive_filter(x, window_size=20):
+>>>>>>> REPLACE
+
+</DIFF>

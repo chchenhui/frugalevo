@@ -1,0 +1,224 @@
+<NAME>
+exact_steiner_broadcast
+</NAME>
+
+<DESCRIPTION>
+Replace the greedy relay-attachment heuristic with an exact dynamic-programming directed Steiner arborescence search for manageable destination sets. The existing greedy approach can commit to an inexpensive early relay branch that prevents a substantially cheaper shared backbone from being selected later.
+
+The replacement optimizes the cost of the union of broadcast edges: a dynamic-programming state represents the minimum-cost subnetwork rooted at every possible relay node for every subset of destinations. It combines already solved destination subsets at common relay nodes, then propagates those solutions backward through incoming links. This identifies shared network segments globally rather than only sharing paths opportunistically.
+
+The reconstructed directed subgraph is then converted into complete source-to-destination paths for `BroadCastTopology`, preserving its existing interface and partition behavior. Unpriced edges, self loops, and inbound edges to the source remain excluded so the routing objective remains valid.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Build a low-cost directed broadcast tree.
+
+    Instead of independently paying for a source-to-destination path for every
+    receiver, each newly reached node can relay data to later receivers.  The
+    greedy attachment rule chooses the destination with the least incremental
+    cost from the currently constructed tree.
+    """
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Routing through edges with an unknown price makes total-cost optimization
+    # undefined.  Preserve all nodes so disconnected destinations still produce
+    # the same clear NetworkX error as ordinary shortest-path routing.
+    h = nx.DiGraph()
+    h.add_nodes_from(G.nodes(data=True))
+    h.add_edges_from(
+        (u, v, data)
+        for u, v, data in G.edges(data=True)
+        if u != v and v != src and data.get("cost") is not None
+        and not pd.isna(data.get("cost"))
+    )
+
+    tree_nodes = {src}
+    tree_paths = {src: []}
+    remaining = set(dsts)
+
+    while remaining:
+        # A destination may have been reached incidentally while attaching a
+        # branch for another destination.
+        reached_destinations = remaining.intersection(tree_nodes)
+        if reached_destinations:
+            remaining.difference_update(reached_destinations)
+            continue
+
+        best = None
+        reverse_graph = h.reverse(copy=False)
+
+        for dst in remaining:
+            distances, reverse_paths = nx.single_source_dijkstra(
+                reverse_graph, dst, weight="cost"
+            )
+            for relay in tree_nodes.intersection(distances):
+                candidate = (distances[relay], dst, relay, reverse_paths[relay])
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+
+        if best is None:
+            raise nx.NetworkXNoPath(
+                "No priced broadcast route exists from %r to %r"
+                % (src, sorted(remaining))
+            )
+
+        _, dst, _, reverse_path = best
+        route = list(reversed(reverse_path))
+
+        # If the candidate path crosses the existing tree, only retain the
+        # suffix after its last tree node.  This avoids adding duplicate edges
+        # and makes the existing relay the actual branch point.
+        last_tree_index = max(
+            index for index, node in enumerate(route) if node in tree_nodes
+        )
+        branch = route[last_tree_index:]
+
+        for previous, node in zip(branch, branch[1:]):
+            if node not in tree_nodes:
+                tree_paths[node] = tree_paths[previous] + [
+                    [previous, node, G[previous][node]]
+                ]
+                tree_nodes.add(node)
+
+    # BroadCastTopology stores complete paths per receiver.  They all refer to
+    # the same relay tree, allowing consumers to coalesce shared transfers.
+    for dst in dsts:
+        for partition in range(bc_topology.num_partitions):
+            for edge in tree_paths[dst]:
+                bc_topology.append_dst_partition_path(dst, partition, edge)
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Build a minimum-cost shared broadcast subnetwork.
+
+    The dynamic program solves the directed Steiner arborescence problem for
+    the requested destinations: it can merge arbitrary destination subsets at
+    any relay before routing the merged data toward the source.  This avoids
+    greedy early attachments that can miss a cheaper shared backbone.
+    """
+    import heapq
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    terminals = list(dict.fromkeys(dsts))
+
+    if not terminals:
+        return bc_topology
+
+    h = nx.DiGraph()
+    h.add_nodes_from(G.nodes(data=True))
+    h.add_edges_from(
+        (u, v, data)
+        for u, v, data in G.edges(data=True)
+        if u != v and v != src and data.get("cost") is not None
+        and not pd.isna(data.get("cost"))
+    )
+
+    nodes = list(h.nodes)
+    node_index = {node: index for index, node in enumerate(nodes)}
+    if src not in node_index or any(dst not in node_index for dst in terminals):
+        raise nx.NetworkXNoPath(
+            "No priced broadcast route exists from %r to %r" % (src, terminals)
+        )
+
+    terminal_count = len(terminals)
+    state_count = 1 << terminal_count
+    infinity = float("inf")
+    costs = [[infinity] * len(nodes) for _ in range(state_count)]
+    choices = [[None] * len(nodes) for _ in range(state_count)]
+
+    for mask in range(1, state_count):
+        for bit, terminal in enumerate(terminals):
+            if mask == (1 << bit):
+                terminal_index = node_index[terminal]
+                costs[mask][terminal_index] = 0.0
+                choices[mask][terminal_index] = ("terminal",)
+                break
+        else:
+            submask = (mask - 1) & mask
+            while submask:
+                other = mask ^ submask
+                if other and submask < other:
+                    for index in range(len(nodes)):
+                        candidate = costs[submask][index] + costs[other][index]
+                        if candidate < costs[mask][index]:
+                            costs[mask][index] = candidate
+                            choices[mask][index] = ("merge", submask, other)
+                submask = (submask - 1) & mask
+
+        # Propagate each merged solution backwards across incoming edges.
+        # Reaching predecessor ``v`` from ``u`` in this traversal means the
+        # broadcast uses the original directed edge v -> u.
+        queue = [
+            (cost, index)
+            for index, cost in enumerate(costs[mask])
+            if cost < infinity
+        ]
+        heapq.heapify(queue)
+
+        while queue:
+            current_cost, current_index = heapq.heappop(queue)
+            if current_cost != costs[mask][current_index]:
+                continue
+
+            current = nodes[current_index]
+            for predecessor in h.predecessors(current):
+                predecessor_index = node_index[predecessor]
+                candidate = current_cost + h[predecessor][current]["cost"]
+                if candidate < costs[mask][predecessor_index]:
+                    costs[mask][predecessor_index] = candidate
+                    choices[mask][predecessor_index] = ("edge", current_index)
+                    heapq.heappush(queue, (candidate, predecessor_index))
+
+    full_mask = state_count - 1
+    source_index = node_index[src]
+    if costs[full_mask][source_index] == infinity:
+        raise nx.NetworkXNoPath(
+            "No priced broadcast route exists from %r to %r" % (src, terminals)
+        )
+
+    selected = nx.DiGraph()
+    selected.add_nodes_from(nodes)
+    visited_states = set()
+
+    def reconstruct(mask, index):
+        state = (mask, index)
+        if state in visited_states:
+            return
+        visited_states.add(state)
+
+        choice = choices[mask][index]
+        if choice is None or choice[0] == "terminal":
+            return
+        if choice[0] == "merge":
+            reconstruct(choice[1], index)
+            reconstruct(choice[2], index)
+            return
+
+        next_index = choice[1]
+        node = nodes[index]
+        next_node = nodes[next_index]
+        selected.add_edge(node, next_node, **G[node][next_node])
+        reconstruct(mask, next_index)
+
+    reconstruct(full_mask, source_index)
+
+    for dst in dsts:
+        if dst == src:
+            path = [src]
+        else:
+            path = nx.shortest_path(selected, src, dst, weight="cost")
+
+        for partition in range(bc_topology.num_partitions):
+            for previous, node in zip(path, path[1:]):
+                bc_topology.append_dst_partition_path(
+                    dst, partition, [previous, node, G[previous][node]]
+                )
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

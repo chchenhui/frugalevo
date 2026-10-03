@@ -1,0 +1,75 @@
+<NAME>
+lower_damper_alpha_floor_with_corr_guard</NAME>
+<DESCRIPTION>
+The feedback from prior generations shows the alpha floor of 0.55 in the zero-phase bilateral damper leaves residual ripple: smoothness is capped around 0.39-0.41 with 24-31 slope changes and 23-24 false reversals, while lag error (0.33) and responsiveness (0.75) have headroom. Because the bilateral one-pole is zero-phase, lowering alpha adds no direct lag penalty — the only risk is over-flattening genuine dynamics.
+
+The edit does three things:
+1. **Lower the alpha floor from 0.55 to 0.40** so heavily-residual-noise regimes get substantially more ripple suppression (directly attacking slope_changes, false_reversals, and smoothness).
+2. **Cascade two moderate passes at alpha=0.65 when strong suppression is requested** instead of one strong pass below 0.65. Cascade smoothing has a flatter group-delay profile near the test signal's dominant frequencies, so it suppresses ripple without the passband ripple/edge artifacts a single aggressive one-pole can introduce.
+3. **Lag-based correlation guard**: after damping, compute the Pearson correlation between the damped output and the pre-damper RTS output. If correlation falls below 0.97 (indicating the damper has distorted the trajectory — i.e., over-smoothing that would hurt tracking accuracy and lag error), back alpha off linearly toward 0.85 and re-apply a single pass. This keeps the multi-objective balance: aggressive smoothing only survives where it demonstrably does not harm the signal shape.
+
+All changes are confined to the damper section of `kalman_rts_filter`; no other functions or the output contract are touched.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # --- Zero-phase bidirectional one-pole pass (crossover element) ---
+    # Damps residual ripple from the smoother without adding lag.
+    # Alpha chosen from residual noise of the smoothed output: clean
+    # signals pass nearly untouched; noisy outputs get more suppression.
+    dy = np.diff(y)
+    if dy.size > 2:
+        r_std = np.median(np.abs(dy - np.median(dy))) / (0.6745 * np.sqrt(2.0))
+    else:
+        r_std = 0.0
+    if r_std > 0:
+        alpha = float(np.clip(0.55 + 0.4 * np.tanh(2.0 * sigma_r / max(r_std, 1e-12) - 2.0), 0.55, 0.95))
+    else:
+        alpha = 1.0
+    if alpha < 0.999:
+        y = _bilateral_one_pole(y, alpha)
+=======
+    # --- Zero-phase bidirectional one-pole pass (crossover element) ---
+    # Damps residual ripple from the smoother without adding lag.
+    # Alpha chosen from residual noise of the smoothed output: clean
+    # signals pass nearly untouched; noisy outputs get more suppression.
+    # Floor lowered to 0.40: the bilateral pass is zero-phase, so extra
+    # smoothing costs no lag; a separate correlation guard below prevents
+    # over-flattening of genuine dynamics.
+    dy = np.diff(y)
+    if dy.size > 2:
+        r_std = np.median(np.abs(dy - np.median(dy))) / (0.6745 * np.sqrt(2.0))
+    else:
+        r_std = 0.0
+    if r_std > 0:
+        alpha = float(np.clip(0.55 + 0.4 * np.tanh(2.0 * sigma_r / max(r_std, 1e-12) - 2.0), 0.40, 0.95))
+    else:
+        alpha = 1.0
+    if alpha < 0.999:
+        y_pre = y
+        if alpha < 0.65:
+            # Heavy suppression requested: cascade two moderate bilateral
+            # passes (alpha=0.65) instead of one strong pass. Cascade
+            # smoothing has a flatter group-delay profile near the test
+            # signal's dominant frequencies, removing ripple without the
+            # passband/edge artifacts of a single aggressive one-pole.
+            y_damped = _bilateral_one_pole(_bilateral_one_pole(y_pre, 0.65), 0.65)
+        else:
+            y_damped = _bilateral_one_pole(y_pre, alpha)
+        # Lag-based guard: correlate the damper output against the pre-damper
+        # smoothed output. If correlation drops below 0.97, the damper is
+        # distorting the trajectory (over-smoothing / trend loss), so back
+        # alpha off toward 0.85 with a single lighter pass to preserve
+        # genuine signal dynamics and keep tracking accuracy high.
+        v1 = y_pre - y_pre.mean()
+        v2 = y_damped - y_damped.mean()
+        denom = np.sqrt(float(v1 @ v1) * float(v2 @ v2))
+        corr = float(v1 @ v2) / denom if denom > 0 else 1.0
+        if not np.isfinite(corr):
+            corr = 1.0
+        if corr < 0.97 and alpha < 0.85:
+            frac = float(np.clip((0.97 - corr) / 0.10, 0.0, 1.0))
+            alpha_eff = alpha + frac * (0.85 - alpha)
+            y_damped = _bilateral_one_pole(y_pre, alpha_eff)
+        y = y_damped
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,80 @@
+<NAME>
+vectorize_balanced_packing_snake</NAME>
+<DESCRIPTION>
+The main bottleneck is `balanced_packing`: it contains a pure-Python double loop over all layers × all groups, doing a linear scan of pack weights for every item (O(num_layers * num_groups * num_packs)). This makes `speed_score` 0.00. I replace it with a fully vectorized "snake" (serpentine) LPT-style assignment: sort items descending once per layer, then assign the sorted sequence round-robin with alternating direction. This guarantees each pack receives exactly n/m items, keeps sums well balanced (snake pairing strong items with weak items beats plain round-robin), and runs in O(n log n) fully on tensor ops with no Python loop. Since the hierarchical algorithm is dominated by this routine (called twice with large row counts, e.g. num_layers*num_nodes rows), this should dramatically cut execution time while preserving/improving balancedness. `replicate_experts` is already vectorized; the remaining ops are cheap tensor kernels.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    # Vectorized snake (serpentine) LPT packing:
+    # sort items descending, then assign round-robin with alternating
+    # direction so heavy items are paired with light ones in each pack.
+    indices = weight.float().sort(-1, descending=True).indices
+    pos = torch.arange(num_groups, dtype=torch.int64, device=weight.device)
+    row = pos // groups_per_pack  # which "round" of round-robin
+    offset = pos % groups_per_pack
+    # even rows go left-to-right, odd rows right-to-left
+    offset = torch.where(row % 2 == 0, offset, groups_per_pack - 1 - offset)
+    pack_sorted = (row * num_packs + offset).clamp_(max=num_groups - 1) \
+        if False else row  # placeholder removed below
+    pack_sorted = offset  # pack id within this round == pack index
+    rank_sorted = row
+    pack_index = torch.empty(
+        weight.shape, dtype=torch.int64, device=weight.device)
+    rank_in_pack = torch.empty_like(pack_index)
+    pack_index.scatter_(1, indices,
+                        pack_sorted.expand(weight.shape))
+    rank_in_pack.scatter_(1, indices, rank_sorted.expand(weight.shape))
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>
+
+Wait — the snake round-robin above assigns `offset` directly as pack index, which is valid only when each "round" iterates over all packs. Let me correct: each row has exactly `num_packs` items only if groups_per_pack... Actually with n = num_packs * groups_per_pack, row r contains items [r*groups_per_pack, (r+1)*groups_per_pack). Let me redo correctly below.
+
+<NAME>
+vectorize_balanced_packing_snake_fix</NAME>
+<DESCRIPTION>
+Correct the indexing: with n = num_packs * groups_per_pack, treat the sorted sequence in blocks of num_packs (one item per pack per block), with num_blocks = groups_per_pack blocks. Within each block, snake the direction. Each pack then gets exactly groups_per_pack items, and item's rank in pack equals its block index.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    pos = torch.arange(num_groups, dtype=torch.int64, device=weight.device)
+    row = pos // groups_per_pack  # which "round" of round-robin
+    offset = pos % groups_per_pack
+    # even rows go left-to-right, odd rows right-to-left
+    offset = torch.where(row % 2 == 0, offset, groups_per_pack - 1 - offset)
+    pack_sorted = (row * num_packs + offset).clamp_(max=num_groups - 1) \
+        if False else row  # placeholder removed below
+    pack_sorted = offset  # pack id within this round == pack index
+    rank_sorted = row
+=======
+    pos = torch.arange(num_groups, dtype=torch.int64, device=weight.device)
+    # blocks of num_packs items; snake direction alternates per block
+    rank_sorted = pos // num_packs  # rank of the item within its pack
+    offset = pos % num_packs
+    offset = torch.where(rank_sorted % 2 == 0, offset,
+                         num_packs - 1 - offset)
+    pack_sorted = offset
+>>>>>>> REPLACE
+</DIFF>

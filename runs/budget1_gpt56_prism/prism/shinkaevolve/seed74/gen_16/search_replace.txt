@@ -1,0 +1,140 @@
+<NAME>
+multi_seed_initial_packing
+</NAME>
+
+<DESCRIPTION>
+Replace the single intrinsic-pressure ordering with several complementary feasible packing seeds and retain the one with the lowest actual maximum KVPR before refinement. KVPR placement has two competing constraints: high-load models should be balanced, while large models must preserve memory for later placements. A single ordering can make an early irreversible fragmentation decision. The new seeds prioritize intrinsic pressure, model size, raw load, and transformed load-to-memory pressure, while every placement choice directly minimizes the projected global KVPR. The existing move, swap, and pair-move local search then refines a substantially stronger initial solution without changing its logic.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Large models with high request pressure are the hardest to place safely.
+    sorted_models = sorted(models, key=intrinsic_pressure, reverse=True)
+    placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+    remaining = [GPU_MEM_SIZE for _ in range(gpu_num)]
+    load = [0.0 for _ in range(gpu_num)]
+
+    def ratio(gpu_id):
+        if remaining[gpu_id] <= 0:
+            return float("inf") if load[gpu_id] else 0.0
+        return load[gpu_id] / remaining[gpu_id]
+
+    for model in sorted_models:
+        model_weight = weight(model)
+        best_gpu = None
+        best_score = None
+
+        for gpu_id in range(gpu_num):
+            if model.model_size > remaining[gpu_id]:
+                continue
+
+            new_remaining = remaining[gpu_id] - model.model_size
+            new_ratio = (
+                float("inf") if new_remaining <= 0
+                else (load[gpu_id] + model_weight) / new_remaining
+            )
+            score = max(
+                new_ratio,
+                max((ratio(other) for other in range(gpu_num) if other != gpu_id),
+                    default=0.0),
+            )
+            candidate = (score, new_ratio, -new_remaining)
+            if best_score is None or candidate < best_score:
+                best_score = candidate
+                best_gpu = gpu_id
+
+        if best_gpu is None:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on any GPU. "
+                f"Remaining per-GPU memory: {remaining}"
+            )
+
+        placement[best_gpu].append(model)
+        load[best_gpu] += model_weight
+        remaining[best_gpu] -= model.model_size
+=======
+    # Different ordering rules handle load balancing and memory fragmentation
+    # differently.  Keep the best actual-KVPR seed for the local refinement.
+    orders = [
+        sorted(models, key=intrinsic_pressure, reverse=True),
+        sorted(models, key=lambda m: (m.model_size, weight(m)), reverse=True),
+        sorted(models, key=lambda m: (weight(m), m.model_size), reverse=True),
+        sorted(
+            models,
+            key=lambda m: (
+                weight(m) + intrinsic_pressure(m) * m.model_size,
+                m.model_size,
+            ),
+            reverse=True,
+        ),
+    ]
+
+    best_seed = None
+    for sorted_models in orders:
+        candidate_placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+        candidate_remaining = [GPU_MEM_SIZE for _ in range(gpu_num)]
+        candidate_load = [0.0 for _ in range(gpu_num)]
+        feasible = True
+
+        for model in sorted_models:
+            model_weight = weight(model)
+            best_gpu = None
+            best_score = None
+
+            for gpu_id in range(gpu_num):
+                if model.model_size > candidate_remaining[gpu_id]:
+                    continue
+
+                new_remaining = candidate_remaining[gpu_id] - model.model_size
+                new_ratio = (
+                    float("inf") if new_remaining <= 0 and candidate_load[gpu_id] + model_weight
+                    else (candidate_load[gpu_id] + model_weight) / new_remaining
+                    if new_remaining > 0 else 0.0
+                )
+                projected = [
+                    new_ratio if other == gpu_id else (
+                        candidate_load[other] / candidate_remaining[other]
+                        if candidate_remaining[other] > 0 else
+                        (float("inf") if candidate_load[other] else 0.0)
+                    )
+                    for other in range(gpu_num)
+                ]
+                score = (max(projected), new_ratio, -new_remaining)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_gpu = gpu_id
+
+            if best_gpu is None:
+                feasible = False
+                break
+
+            candidate_placement[best_gpu].append(model)
+            candidate_load[best_gpu] += model_weight
+            candidate_remaining[best_gpu] -= model.model_size
+
+        if feasible:
+            seed_score = max(
+                candidate_load[gpu_id] / candidate_remaining[gpu_id]
+                if candidate_remaining[gpu_id] > 0 else
+                (float("inf") if candidate_load[gpu_id] else 0.0)
+                for gpu_id in range(gpu_num)
+            )
+            if best_seed is None or seed_score < best_seed[0]:
+                best_seed = (
+                    seed_score, candidate_placement, candidate_remaining,
+                    candidate_load,
+                )
+
+    if best_seed is None:
+        raise ValueError(
+            f"Unable to place all models on {gpu_num} GPUs of {GPU_MEM_SIZE} GB."
+        )
+
+    _, placement, remaining, load = best_seed
+
+    def ratio(gpu_id):
+        if remaining[gpu_id] <= 0:
+            return float("inf") if load[gpu_id] else 0.0
+        return load[gpu_id] / remaining[gpu_id]
+>>>>>>> REPLACE
+</DIFF>

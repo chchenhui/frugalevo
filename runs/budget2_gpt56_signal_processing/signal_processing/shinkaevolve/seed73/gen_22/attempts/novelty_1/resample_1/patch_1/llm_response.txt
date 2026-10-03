@@ -1,0 +1,134 @@
+<NAME>
+output_reversal_hysteresis
+</NAME>
+
+<DESCRIPTION>
+Add a causal hysteresis stage after Kalman/regression fusion. The current fusion output directly exposes small alternating endpoint-estimation errors, which explains the high slope-change and false-reversal counts despite strong correlation and noise reduction. The new stage maintains an output velocity, suppresses only weak opposite-direction steps, and requires two consecutive weak reversal observations before changing direction. A reversal with strong agreement between the robust regression and Kalman slope estimates is accepted immediately, preserving response to genuine turns and limiting added lag.
+
+The rejection band is driven by the regression residual scale rather than total window variation, so a legitimate steep local trend is not incorrectly treated as noisy volatility.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def run(self):
+        output_length = len(self.samples) - self.window_size + 1
+        output = np.empty(output_length, dtype=float)
+
+        for index, sample in enumerate(self.samples):
+            kalman_level, kalman_slope = self.tracker.update(sample)
+
+            if index < self.window_size - 1:
+                continue
+
+            window_start = index - self.window_size + 1
+            window = self.samples[window_start:index + 1]
+            local_level, local_slope, residual_scale = self.regressor.estimate(window)
+
+            # Motion relative to local residual noise determines fusion.
+            # In quiet periods, Kalman smoothing suppresses false reversals.
+            # During genuine movement, endpoint regression receives more weight.
+            trend_strength = abs(local_slope) * self.window_size
+            motion_ratio = trend_strength / (residual_scale + 1e-8)
+            local_weight = 0.20 + 0.45 * (motion_ratio / (1.0 + motion_ratio))
+
+            # If the independent trend estimates disagree strongly, favor the
+            # robust state tracker to avoid a single-window directional artifact.
+            slope_disagreement = abs(local_slope - kalman_slope)
+            disagreement_ratio = slope_disagreement / (residual_scale + 1e-8)
+            local_weight /= 1.0 + 0.12 * disagreement_ratio
+            local_weight = float(np.clip(local_weight, 0.12, 0.58))
+
+            output[window_start] = (
+                local_weight * local_level
+                + (1.0 - local_weight) * kalman_level
+            )
+
+        return output
+=======
+    def run(self):
+        output_length = len(self.samples) - self.window_size + 1
+        output = np.empty(output_length, dtype=float)
+        output_level = None
+        output_velocity = 0.0
+        pending_direction = 0
+        pending_count = 0
+
+        for index, sample in enumerate(self.samples):
+            kalman_level, kalman_slope = self.tracker.update(sample)
+
+            if index < self.window_size - 1:
+                continue
+
+            window_start = index - self.window_size + 1
+            window = self.samples[window_start:index + 1]
+            local_level, local_slope, residual_scale = self.regressor.estimate(window)
+
+            # Motion relative to local residual noise determines fusion.
+            # In quiet periods, Kalman smoothing suppresses false reversals.
+            # During genuine movement, endpoint regression receives more weight.
+            trend_strength = abs(local_slope) * self.window_size
+            motion_ratio = trend_strength / (residual_scale + 1e-8)
+            local_weight = 0.20 + 0.45 * (motion_ratio / (1.0 + motion_ratio))
+
+            # If the independent trend estimates disagree strongly, favor the
+            # robust state tracker to avoid a single-window directional artifact.
+            slope_disagreement = abs(local_slope - kalman_slope)
+            disagreement_ratio = slope_disagreement / (residual_scale + 1e-8)
+            local_weight /= 1.0 + 0.12 * disagreement_ratio
+            local_weight = float(np.clip(local_weight, 0.12, 0.58))
+
+            fused_level = (
+                local_weight * local_level
+                + (1.0 - local_weight) * kalman_level
+            )
+
+            if output_level is None:
+                output_level = fused_level
+                output_velocity = 0.5 * (local_slope + kalman_slope)
+                output[window_start] = output_level
+                continue
+
+            raw_step = fused_level - output_level
+            direction = 1 if raw_step >= 0.0 else -1
+            opposite = output_velocity * raw_step < 0.0
+
+            # Residual scale measures noise around the fitted local trajectory,
+            # unlike raw window spread which also includes valid trend movement.
+            # Strong, independently supported turns pass without persistence.
+            slope_agreement = local_slope * kalman_slope > 0.0
+            strong_turn = (
+                slope_agreement
+                and local_slope * raw_step > 0.0
+                and abs(local_slope) > 0.38 * residual_scale
+                and abs(raw_step) > 0.12 * residual_scale
+            )
+            reversal_band = (
+                0.30 * residual_scale + 0.20 * abs(output_velocity)
+            )
+
+            if opposite and not strong_turn and abs(raw_step) < reversal_band:
+                if direction == pending_direction:
+                    pending_count += 1
+                else:
+                    pending_direction = direction
+                    pending_count = 1
+
+                # One contradictory endpoint estimate is normally noise. A
+                # second persistent observation is allowed through, avoiding
+                # the lag of permanently clamping a genuine reversal.
+                if pending_count < 2:
+                    output_velocity *= 0.65
+                    output[window_start] = output_level
+                    continue
+                pending_count = 0
+            else:
+                pending_direction = 0
+                pending_count = 0
+
+            output_level = fused_level
+            output_velocity = 0.62 * output_velocity + 0.38 * raw_step
+            output[window_start] = output_level
+
+        return output
+>>>>>>> REPLACE
+</DIFF>

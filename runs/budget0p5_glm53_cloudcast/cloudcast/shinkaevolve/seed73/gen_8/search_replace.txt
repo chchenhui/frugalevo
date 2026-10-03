@@ -1,0 +1,103 @@
+<NAME>
+diverse_partition_paths_reuse_aware</NAME>
+<DESCRIPTION>
+Replace the naive per-dst Dijkstra path (replicated identically for every partition) with a smarter strategy:
+
+1. Compute up to `num_partitions` diverse shortest-simple-paths per destination and rank them with a combined weight that favors cheap links shared across destinations (reuse reduces redundant transfers) and higher-throughput links (so partitions transfer in parallel rather than queueing on one bottleneck link).
+2. Round-robin partitions across each destination's diverse paths, spreading load over multiple networks instead of dumping all partitions over a single path.
+3. Keep a Dijkstra fallback for robustness so all destinations remain reachable.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Search for a low-cost broadcast topology from src to all dsts.
+
+    Key ideas:
+      1. Compute up to num_partitions diverse shortest-simple-paths per dst
+         (instead of a single path), ranking candidates with a reuse- and
+         throughput-aware combined weight so cheap links shared across
+         destinations are favored (fewer redundant transfers over shared
+         transit links) and higher-throughput links are preferred.
+      2. Round-robin partitions across the diverse paths so traffic is
+         balanced over multiple networks / parallel paths, reducing
+         bottlenecks and overlapping transfers.
+    """
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Precompute up to num_partitions diverse shortest-simple-paths per
+    # destination so partitions can be spread across different networks.
+    dst_paths = {}
+    edge_use_count = {}
+    for dst in dsts:
+        try:
+            paths = []
+            for p in nx.shortest_simple_paths(h, src, dst, weight="cost"):
+                paths.append(p)
+                if len(paths) >= num_partitions:
+                    break
+        except nx.NetworkXNoPath:
+            paths = []
+        if not paths:
+            # Fallback to plain dijkstra so every reachable dst is covered.
+            try:
+                paths = [nx.dijkstra_path(h, src, dst, weight="cost")]
+            except nx.NetworkXNoPath:
+                continue
+        for path in paths:
+            for i in range(len(path) - 1):
+                key = (path[i], path[i + 1])
+                edge_use_count[key] = edge_use_count.get(key, 0) + 1
+        dst_paths[dst] = paths
+
+    def combined_weight(u, v, d):
+        # Favor cheap links already shared by other dsts (higher reuse ->
+        # fewer redundant transfers) and links with higher throughput so
+        # partitions finish faster in parallel.
+        reuse = edge_use_count.get((u, v), 0)
+        cost = d.get("cost") or 0
+        tput = d.get("throughput") or 1e-9
+        return (cost / (1.0 + 0.1 * reuse)) / max(tput, 1e-9)
+
+    # Re-rank each destination's candidate paths with the combined weight
+    # and keep the best num_partitions candidates.
+    for dst in dst_paths:
+        paths = dst_paths[dst]
+        paths.sort(
+            key=lambda p: sum(
+                combined_weight(p[i], p[i + 1], G[p[i]][p[i + 1]])
+                for i in range(len(p) - 1)
+            )
+        )
+        dst_paths[dst] = paths[:max(1, num_partitions)]
+
+    # Assign partitions round-robin over each dst's diverse paths: this
+    # spreads traffic over multiple parallel networks, balancing load and
+    # overlapping transfers to reduce both cost and completion time.
+    for dst in dst_paths:
+        paths = dst_paths[dst]
+        for j in range(num_partitions):
+            path = paths[j % len(paths)]
+            for i in range(len(path) - 1):
+                s, t = path[i], path[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

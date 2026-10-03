@@ -1,0 +1,293 @@
+# EVOLVE-BLOCK-START
+"""
+Multiscale robust real-time filtering for volatile non-stationary signals.
+
+Enhanced path:
+    trailing local-linear trend estimates at two horizons
+    -> dual-timescale robust MAD noise estimation
+    -> confidence-weighted trend consensus
+    -> causal adaptive correction and reversal persistence control
+
+The output remains aligned with the final sample of each original trailing
+window: len(output) == len(x) - window_size + 1.
+"""
+import numpy as np
+
+
+def _validate_signal(x, window_size):
+    signal = np.asarray(x, dtype=float)
+
+    if signal.ndim != 1:
+        raise ValueError("Input signal must be a 1D array")
+
+    if int(window_size) != window_size or window_size <= 0:
+        raise ValueError("window_size must be a positive integer")
+
+    window_size = int(window_size)
+
+    if signal.size < window_size:
+        raise ValueError(
+            f"Input signal length ({signal.size}) must be >= "
+            f"window_size ({window_size})"
+        )
+
+    if not np.all(np.isfinite(signal)):
+        raise ValueError("Input signal must contain only finite values")
+
+    return signal, window_size
+
+
+def adaptive_filter(x, window_size=20):
+    """
+    Basic trailing moving-average filter.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window
+
+    Returns:
+        Filtered output signal with length len(x) - window_size + 1.
+    """
+    signal, window_size = _validate_signal(x, window_size)
+    cumulative = np.concatenate(([0.0], np.cumsum(signal, dtype=float)))
+    return (cumulative[window_size:] - cumulative[:-window_size]) / window_size
+
+
+def _robust_difference_scale(values, floor=1e-6):
+    """MAD-derived measurement-noise estimate from consecutive differences."""
+    if values.size < 3:
+        return floor
+
+    differences = np.diff(values)
+    center = np.median(differences)
+    mad = np.median(np.abs(differences - center))
+
+    # Difference noise has sqrt(2) larger standard deviation than sample noise.
+    mad_scale = mad / (0.6745 * np.sqrt(2.0))
+    fallback = np.std(differences) / np.sqrt(2.0)
+    return max(float(mad_scale), float(fallback) * 0.35, floor)
+
+
+def _endpoint_linear_fit(values):
+    """
+    Robust endpoint local-linear estimate.
+
+    The fitted level is evaluated at the most recent sample, so there is no
+    centered-window phase delay. One Huber reweighting pass limits the effect
+    of impulsive observations without requiring expensive iterative regression.
+    """
+    n = values.size
+    if n == 1:
+        return float(values[0]), 0.0, 1e-6
+
+    t = np.arange(n, dtype=float) - float(n - 1)
+
+    # Gentle recency weighting preserves causality while retaining enough
+    # historical evidence to reject noisy single-sample fluctuations.
+    weights = np.exp(t / max(2.0, 0.55 * n))
+
+    sum_w = np.sum(weights)
+    mean_t = np.sum(weights * t) / sum_w
+    mean_y = np.sum(weights * values) / sum_w
+    denominator = np.sum(weights * (t - mean_t) ** 2)
+
+    if denominator <= 1e-12:
+        return float(values[-1]), 0.0, 1e-6
+
+    slope = np.sum(weights * (t - mean_t) * (values - mean_y)) / denominator
+    intercept = mean_y - slope * mean_t
+    residuals = values - (intercept + slope * t)
+
+    residual_mad = np.median(np.abs(residuals - np.median(residuals)))
+    residual_scale = max(residual_mad / 0.6745, 1e-6)
+
+    # Huber weights: downweight spikes, preserve legitimate coherent ramps.
+    huber_limit = 2.8 * residual_scale
+    robust_weights = weights * np.minimum(
+        1.0, huber_limit / np.maximum(np.abs(residuals), 1e-12)
+    )
+
+    sum_w = np.sum(robust_weights)
+    mean_t = np.sum(robust_weights * t) / sum_w
+    mean_y = np.sum(robust_weights * values) / sum_w
+    denominator = np.sum(robust_weights * (t - mean_t) ** 2)
+
+    if denominator > 1e-12:
+        slope = np.sum(
+            robust_weights * (t - mean_t) * (values - mean_y)
+        ) / denominator
+        intercept = mean_y - slope * mean_t
+
+    endpoint = intercept
+    final_residuals = values - (intercept + slope * t)
+    final_mad = np.median(np.abs(final_residuals - np.median(final_residuals)))
+    fit_scale = max(final_mad / 0.6745, 1e-6)
+
+    return float(endpoint), float(slope), float(fit_scale)
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Causal multiscale robust trend-consensus filter.
+
+    A fast local model tracks genuine changes, while a longer robust model
+    suppresses noise. Their blend is controlled by fast/slow robust noise
+    estimates and agreement between local slopes.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Trailing output alignment window
+
+    Returns:
+        Filtered output with length len(x) - window_size + 1.
+    """
+    signal, window_size = _validate_signal(x, window_size)
+    n_samples = signal.size
+
+    # The short model supplies prompt turn tracking. The long model is bounded
+    # so very large API windows do not create excessive computational latency.
+    fast_span = int(np.clip(max(5, window_size // 3), 5, 11))
+    slow_span = int(np.clip(window_size, fast_span + 2, 31))
+    diff_fast_span = int(np.clip(fast_span, 4, 10))
+    diff_slow_span = int(np.clip(slow_span, 8, 31))
+
+    estimates = np.empty(n_samples, dtype=float)
+    estimates[0] = signal[0]
+
+    level = float(signal[0])
+    velocity = 0.0
+    slow_noise = max(abs(signal[0]) * 0.01, 1e-5)
+
+    direction = 0
+    pending_direction = 0
+    pending_count = 0
+    pending_distance = 0.0
+
+    for index in range(1, n_samples):
+        start_fast = max(0, index - fast_span + 1)
+        start_slow = max(0, index - slow_span + 1)
+
+        fast_values = signal[start_fast:index + 1]
+        slow_values = signal[start_slow:index + 1]
+
+        fast_level, fast_slope, fast_fit_scale = _endpoint_linear_fit(fast_values)
+        slow_level, slow_slope, slow_fit_scale = _endpoint_linear_fit(slow_values)
+
+        diff_fast_start = max(0, index - diff_fast_span)
+        diff_slow_start = max(0, index - diff_slow_span)
+        fast_noise = _robust_difference_scale(signal[diff_fast_start:index + 1])
+        measured_slow_noise = _robust_difference_scale(signal[diff_slow_start:index + 1])
+
+        # Slow scale is stable; fast scale catches current volatility. The
+        # bounded blend prevents one unusual observation from dominating gain.
+        slow_noise = 0.91 * slow_noise + 0.09 * measured_slow_noise
+        noise_scale = max(
+            1e-6,
+            0.42 * fast_noise + 0.58 * slow_noise,
+            0.35 * fast_fit_scale,
+            0.20 * slow_fit_scale,
+        )
+
+        slope_agreement = fast_slope * slow_slope >= 0.0
+        slope_gap = abs(fast_slope - slow_slope) / max(noise_scale, 1e-6)
+
+        # Trust the fast endpoint model most when both scales indicate a
+        # coherent directional change. During disagreement, favor slow trend.
+        activity = abs(fast_slope) / max(noise_scale, 1e-6)
+        fast_weight = 0.24 + 0.34 * (activity / (activity + 1.5))
+        if slope_agreement:
+            fast_weight += 0.16
+        fast_weight -= 0.16 * min(1.0, slope_gap / 3.0)
+        fast_weight = float(np.clip(fast_weight, 0.18, 0.68))
+
+        consensus_level = fast_weight * fast_level + (1.0 - fast_weight) * slow_level
+        consensus_slope = fast_weight * fast_slope + (1.0 - fast_weight) * slow_slope
+
+        predicted = level + velocity
+        innovation = consensus_level - predicted
+        normalized = abs(innovation) / max(noise_scale, 1e-6)
+
+        # Adaptive correction is conservative in quiet noise and increases for
+        # persistent local-model evidence, rather than raw sample spikes.
+        coherence = 1.0 if slope_agreement else 0.0
+        gain = 0.16 + 0.24 * (normalized / (normalized + 1.8)) + 0.10 * coherence
+        gain = float(np.clip(gain, 0.16, 0.50))
+
+        innovation_limit = max(3.2 * noise_scale, 0.75 * abs(consensus_slope))
+        bounded_innovation = float(
+            np.clip(innovation, -innovation_limit, innovation_limit)
+        )
+
+        candidate = predicted + gain * bounded_innovation
+        velocity = 0.72 * velocity + 0.28 * consensus_slope + 0.045 * bounded_innovation
+
+        # A small predictive lead compensates causal smoothing, limited to local
+        # noise scale so it cannot overshoot around genuine turning points.
+        lead = float(np.clip(0.32 * velocity, -0.65 * noise_scale, 0.65 * noise_scale))
+        candidate += lead
+
+        previous = estimates[index - 1]
+        step = candidate - previous
+        movement_threshold = max(0.10 * noise_scale, 1e-7)
+
+        if abs(step) <= movement_threshold:
+            # Preserve continuous motion but do not let tiny jitter define trend.
+            output = previous + 0.22 * step
+        else:
+            move_direction = 1 if step > 0.0 else -1
+
+            if direction == 0 or move_direction == direction:
+                output = candidate
+                direction = move_direction
+                pending_direction = 0
+                pending_count = 0
+                pending_distance = 0.0
+            else:
+                strong_turn = abs(step) >= max(1.35 * noise_scale, 1.8 * abs(velocity))
+
+                if move_direction != pending_direction:
+                    pending_direction = move_direction
+                    pending_count = 1
+                    pending_distance = abs(step)
+                else:
+                    pending_count += 1
+                    pending_distance += abs(step)
+
+                # A real reversal requires either a decisive displacement or
+                # two consecutive locally coherent opposing movements.
+                if strong_turn or (
+                    pending_count >= 2
+                    and pending_distance >= 0.60 * noise_scale
+                ):
+                    output = candidate
+                    direction = move_direction
+                    pending_direction = 0
+                    pending_count = 0
+                    pending_distance = 0.0
+                else:
+                    output = previous + 0.10 * step
+
+        level = output
+        estimates[index] = output
+
+    return estimates[window_size - 1:]
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """
+    Main signal processing dispatcher.
+
+    Args:
+        input_signal: Input time series data
+        window_size: Size of the processing window
+        algorithm_type: "basic" or "enhanced"
+
+    Returns:
+        Filtered signal.
+    """
+    if algorithm_type == "enhanced":
+        return enhanced_filter_with_trend_preservation(input_signal, window_size)
+    return adaptive_filter(input_signal, window_size)
+
+
+# EVOLVE-BLOCK-END

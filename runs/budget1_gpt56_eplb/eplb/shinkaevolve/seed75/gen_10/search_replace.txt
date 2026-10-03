@@ -1,0 +1,88 @@
+<NAME>
+swap_refined_packing
+</NAME>
+
+<DESCRIPTION>
+Refine the cardinality-constrained LPT/heap packing with a small bounded local-search phase. The heap pass remains the fast construction heuristic, while pairwise swaps between packs reduce the sum of squared pack loads without changing the number of experts assigned to any pack. This specifically addresses cases where greedy placement leaves a heavy item in a relatively overloaded GPU/node pack and a lighter item in an underloaded pack.
+
+The refinement is deliberately bounded to four improving swaps per layer, which keeps the added cost small for typical expert and GPU counts while improving the final GPU load distribution. It preserves deterministic tie behavior and reconstructs `pack_index` and `rank_in_pack` after refinement.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    for i in range(num_layers):
+        # Entries are (current_load, pack_id, item_count). Once a pack reaches
+        # capacity it is not reinserted, so the heap always contains exactly
+        # the eligible packs considered by the original greedy policy.
+        available_packs = [(0.0, pack, 0) for pack in range(num_packs)]
+        heapq.heapify(available_packs)
+        layer_weights = weight_cpu[i].tolist()
+        for group in indices[i].tolist():
+            pack_weight, pack, item_count = heapq.heappop(available_packs)
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = item_count
+            item_count += 1
+            if item_count < groups_per_pack:
+                heapq.heappush(available_packs,
+                               (pack_weight + layer_weights[group], pack,
+                                item_count))
+=======
+    for i in range(num_layers):
+        # Entries are (current_load, pack_id, item_count). Once a pack reaches
+        # capacity it is not reinserted, so the heap always contains exactly
+        # the eligible packs considered by the original greedy policy.
+        available_packs = [(0.0, pack, 0) for pack in range(num_packs)]
+        heapq.heapify(available_packs)
+        layer_weights = weight_cpu[i].tolist()
+        pack_items: list[list[int]] = [[] for _ in range(num_packs)]
+        pack_weights = [0.0] * num_packs
+        for group in indices[i].tolist():
+            pack_weight, pack, item_count = heapq.heappop(available_packs)
+            pack_items[pack].append(group)
+            pack_weights[pack] = pack_weight + layer_weights[group]
+            item_count += 1
+            if item_count < groups_per_pack:
+                heapq.heappush(available_packs,
+                               (pack_weights[pack], pack, item_count))
+
+        # LPT is fast but can leave avoidable imbalance under the equal-size
+        # constraint. A few best pair exchanges minimize squared pack load
+        # while retaining exactly groups_per_pack items in every pack.
+        for _ in range(4):
+            best_delta = 0.0
+            best_swap = None
+            for left in range(num_packs):
+                left_weight = pack_weights[left]
+                for right in range(left + 1, num_packs):
+                    right_weight = pack_weights[right]
+                    for left_group in pack_items[left]:
+                        for right_group in pack_items[right]:
+                            moved_weight = (layer_weights[left_group] -
+                                            layer_weights[right_group])
+                            new_left = left_weight - moved_weight
+                            new_right = right_weight + moved_weight
+                            delta = (new_left * new_left +
+                                     new_right * new_right - left_weight *
+                                     left_weight - right_weight *
+                                     right_weight)
+                            if delta < best_delta:
+                                best_delta = delta
+                                best_swap = (left, right, left_group,
+                                             right_group, new_left, new_right)
+            if best_swap is None:
+                break
+            left, right, left_group, right_group, new_left, new_right = (
+                best_swap)
+            left_pos = pack_items[left].index(left_group)
+            right_pos = pack_items[right].index(right_group)
+            pack_items[left][left_pos] = right_group
+            pack_items[right][right_pos] = left_group
+            pack_weights[left] = new_left
+            pack_weights[right] = new_right
+
+        for pack, groups in enumerate(pack_items):
+            for item_count, group in enumerate(groups):
+                pack_index[i, group] = pack
+                rank_in_pack[i, group] = item_count
+>>>>>>> REPLACE
+</DIFF>

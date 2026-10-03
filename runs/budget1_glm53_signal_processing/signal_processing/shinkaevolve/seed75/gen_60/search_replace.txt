@@ -1,0 +1,130 @@
+<NAME>
+hybrid_gen45_gen46_composition</NAME>
+<DESCRIPTION>
+Gen 45 (double zero-phase SG, lag 0.35, correlation 0.95) and Gen 46 (RTS + three-scale SG bank + gated lead, slope_changes 36, false_reversals 29) each scored 0.65 but on opposite ends of the lag/noise trade-off. No program has combined them. The composition: keep Kalman+RTS with adaptive R and 3σ gating (use solve-based RTS gains for numerical stability), then replace the current double-SG pass with the percentile-gated three-scale SG bank (widest 2*sg_half kills reversals like Gen 46), and use the sigmoid-gated lead on the pure smoothed RTS slope (dropping the noisy gradient blend that drives Gen 45's high reversal count, false_reversals 34-37). This merges Gen 46's reversal suppression with Gen 45's responsiveness, targeting a combined score above 0.65.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # --- Stage 2: RTS backward recursion (smoothed [level, slope] state) ---
+    s_smooth = s_filt.copy()
+    P_smooth = P_filt.copy()
+    for i in range(n - 2, -1, -1):
+        Pm = P_pred[i + 1]
+        G = P_filt[i] @ F.T @ np.linalg.inv(Pm)
+        s_smooth[i] = s_filt[i] + G @ (s_smooth[i + 1] - s_pred[i + 1])
+        P_smooth[i] = P_filt[i] + G @ (P_smooth[i + 1] - Pm) @ G.T
+
+    kf_out = s_smooth[:, 0]
+
+    # --- Stage 3: double zero-phase Savitzky-Golay smoothing (kills slope reversals) ---
+    sg_half = max(2, window_size // 2)
+    sg_len = 2 * sg_half + 1
+    poly = min(3, sg_len - 1)
+    t_off = np.arange(-sg_half, sg_half + 1, dtype=float)
+    A = np.vstack([t_off ** k for k in range(poly + 1)]).T
+    ATA_inv = np.linalg.pinv(A.T @ A)
+    coeffs = (ATA_inv @ A.T)[0]  # row for value at center -> zero-phase
+
+    def _zero_phase_smooth(sig, half, kernel):
+        m = len(sig)
+        if m < 2 * half + 1:
+            return sig.copy()
+        left = 2 * sig[0] - sig[1 : half + 1][::-1]
+        right = 2 * sig[-1] - sig[-2 : -half - 2 : -1][::-1]
+        padded = np.concatenate([left, sig, right])
+        out = np.convolve(padded, kernel, mode="valid")
+        return out[:m] if len(out) >= m else sig.copy()
+
+    smoothed = _zero_phase_smooth(kf_out, sg_half, coeffs)
+    # Second light zero-phase pass (short window) to further suppress slope reversals
+    h2 = max(1, sg_half // 2)
+    t2 = np.arange(-h2, h2 + 1, dtype=float)
+    A2 = np.vstack([t2 ** k for k in range(3)]).T
+    c2 = (np.linalg.pinv(A2.T @ A2) @ A2.T)[0]
+    smoothed = _zero_phase_smooth(smoothed, h2, c2)
+
+    # --- Stage 4: gated smoothed-slope lead compensation (crossover) ---
+    # Combine the responsiveness of the gradient lead (from current program) with
+    # the low-noise RTS smoothed slope and a soft reversal gate (from prior program).
+    slope_rts = _zero_phase_smooth(s_smooth[:, 1].copy(), h2, c2)
+    slope_grad = np.gradient(smoothed)
+    # Blend: mostly the low-noise RTS slope, partly the responsive gradient slope
+    slope = 0.7 * slope_rts + 0.3 * slope_grad
+
+    # Soft reversal gate: attenuate (not fully zero) the lead where the trend is
+    # not statistically meaningful, so flat/noisy regions cannot manufacture
+    # false reversals while genuine dynamics still get compensated.
+    q_scale2 = np.median(np.abs(np.diff(x))) + 1e-12
+    gate = 1.0 / (1.0 + np.exp(-(np.abs(slope) - 0.25 * q_scale2) / max(1e-9, 0.15 * q_scale2)))
+    lead = 0.5 * sg_half * 0.25
+    smoothed = smoothed + lead * gate * slope
+=======
+    # --- Stage 2: RTS backward recursion (smoothed [level, slope] state) ---
+    s_smooth = s_filt.copy()
+    for i in range(n - 2, -1, -1):
+        Pm = P_pred[i + 1]
+        G = np.linalg.solve(Pm.T, (P_filt[i] @ F.T).T).T
+        s_smooth[i] = s_filt[i] + G @ (s_smooth[i + 1] - s_pred[i + 1])
+
+    kf_out = s_smooth[:, 0]
+
+    # --- Stage 3: three-scale zero-phase Savitzky-Golay bank ---
+    # Widest scale at 2*sg_half attacks spurious reversals (Gen 46 behavior);
+    # mid and short scales recover the dynamics Gen 45 preserved.
+    sg_half = max(2, window_size // 2)
+    h_wide = 2 * sg_half           # widest kernel
+    h_mid = sg_half                # mid scale
+    h_short = max(1, sg_half // 2) # short scale
+
+    def _sg_kernel(half, poly):
+        half = max(1, int(half))
+        t = np.arange(-half, half + 1, dtype=float)
+        if len(t) - 1 < poly:
+            poly = len(t) - 1
+        A = np.vstack([t ** k for k in range(poly + 1)]).T
+        return (np.linalg.pinv(A.T @ A) @ A.T)[0]
+
+    def _zero_phase_smooth(sig, half, kernel):
+        m = len(sig)
+        if m < 2 * half + 1:
+            return sig.copy()
+        left = 2 * sig[0] - sig[1 : half + 1][::-1]
+        right = 2 * sig[-1] - sig[-2 : -half - 2 : -1][::-1]
+        padded = np.concatenate([left, sig, right])
+        out = np.convolve(padded, kernel, mode="valid")
+        return out[:m] if len(out) >= m else sig.copy()
+
+    c_wide = _sg_kernel(h_wide, 3)
+    c_mid = _sg_kernel(h_mid, 3)
+    c_short = _sg_kernel(h_short, 2)
+
+    smoothed = _zero_phase_smooth(kf_out, h_wide, c_wide)
+    smoothed = _zero_phase_smooth(smoothed, h_mid, c_mid)
+    smoothed = _zero_phase_smooth(smoothed, h_short, c_short)
+
+    # --- Stage 4: sigmoid-gated lead on pure smoothed RTS slope ---
+    # Use the low-noise RTS slope directly (no gradient blend, which was the
+    # main source of noise-induced reversals in the Gen 45 lineage).
+    slope = _zero_phase_smooth(s_smooth[:, 1].copy(), h_short, c_short)
+
+    # Percentile-based local volatility for a more robust gate scale
+    q_scale2 = np.percentile(np.abs(dx), 75) + 1e-12 if len(dx) > 0 else 1e-12
+    gate = 1.0 / (1.0 + np.exp(-(np.abs(slope) - 0.25 * q_scale2) / max(1e-9, 0.15 * q_scale2)))
+    lead = 0.5 * sg_half * 0.30
+    smoothed = smoothed + lead * gate * slope
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # --- Stage 5: trim to sliding-window output length, aligning end (minimal lag) ---
+    y = smoothed[-output_length:] if len(smoothed) >= output_length else kf_out[-output_length:]
+
+    return y
+=======
+    # --- Stage 5: end-aligned trim with safety validation ---
+    y = smoothed[-output_length:] if len(smoothed) >= output_length else kf_out[-output_length:]
+    if len(y) != output_length:
+        y = kf_out[-output_length:]
+
+    return y
+>>>>>>> REPLACE
+</DIFF>

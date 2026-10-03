@@ -1,0 +1,114 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct an arrangement of 13 points on or inside a convex region in order
+    to maximize the area of the smallest triangle formed by these points.
+
+    Deterministic annealed hill-climb over free 2D coordinates, starting from a
+    convex-position (circle-based) configuration which avoids collinear triples.
+
+    Returns:
+        points: np.ndarray of shape (13,2) with the x,y coordinates of the points.
+    """
+    n = 13
+    rng = np.random.default_rng(seed=42)
+
+    # Precompute all C(13,3)=286 index triples for vectorized area evaluation
+    ii, jj, kk = np.array(np.triu_indices(n, 1)).tolist()
+    triples = np.array(
+        [(i, j, k)
+         for i in range(n)
+         for j in range(i + 1, n)
+         for k in range(j + 1, n)],
+        dtype=np.int64,
+    )
+    ti, tj, tk = triples[:, 0], triples[:, 1], triples[:, 2]
+
+    def hull_area(P):
+        # Monotonic chain convex hull area
+        pts = sorted(map(tuple, P.tolist()))
+        if len(pts) < 3:
+            return 1e-12
+        uniq = []
+        for p in pts:
+            while len(uniq) >= 2:
+                a, b = uniq[-2], uniq[-1]
+                if (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) <= 0:
+                    uniq.pop()
+                else:
+                    break
+            uniq.append(p)
+        lower = uniq
+        pts_r = sorted(map(tuple, P.tolist()), reverse=True)
+        uniq = []
+        for p in pts_r:
+            while len(uniq) >= 2:
+                a, b = uniq[-2], uniq[-1]
+                if (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) <= 0:
+                    uniq.pop()
+                else:
+                    break
+            uniq.append(p)
+        upper = uniq
+        hull = lower[:-1] + upper[:-1]
+        A = 0.0
+        m = len(hull)
+        for a in range(m):
+            x1, y1 = hull[a]
+            x2, y2 = hull[(a + 1) % m]
+            A += x1 * y2 - x2 * y1
+        return abs(A) / 2.0 + 1e-12
+
+    def objective(P):
+        # min triangle area / hull area (vectorized over all 286 triples)
+        ax, ay = P[ti, 0], P[ti, 1]
+        bx, by = P[tj, 0], P[tj, 1]
+        cx, cy = P[tk, 0], P[tk, 1]
+        areas = 0.5 * np.abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
+        return areas.min() / hull_area(P)
+
+    # ---- Initialization: points in convex position on a jittered circle ----
+    angles = np.linspace(0, 2 * np.pi, n, endpoint=False) + rng.normal(0, 0.05, n)
+    radii = 1.0 + rng.normal(0, 0.05, n)
+    P = np.column_stack((radii * np.cos(angles), radii * np.sin(angles)))
+    # small inward perturbations to explore near-convex layouts too
+    P += rng.normal(0, 0.02, P.shape)
+
+    best_obj = objective(P)
+
+    # ---- Annealed coordinate-descent hill climb ----
+    step = 0.15
+    min_step = 1e-5
+    iters_per_step = 4000
+    while step > min_step:
+        improved_any = False
+        for it in range(iters_per_step):
+            i = rng.integers(n)
+            old = P[i].copy()
+            P[i] += rng.normal(0.0, step, 2)
+            new_obj = objective(P)
+            if new_obj >= best_obj:
+                if new_obj > best_obj:
+                    improved_any = True
+                best_obj = new_obj
+            else:
+                P[i] = old  # reject
+        if not improved_any:
+            step *= 0.5
+        else:
+            step *= 0.9
+        if step < min_step:
+            break
+
+    # Final deterministic cleanup: verify finiteness and degeneracy
+    if not np.all(np.isfinite(P)):
+        angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        P = np.column_stack((np.cos(angles), np.sin(angles)))
+
+    return P
+
+
+# EVOLVE-BLOCK-END

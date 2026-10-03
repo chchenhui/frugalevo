@@ -1,0 +1,237 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct fourteen points in R^3 maximizing the exact minimum squared
+    pairwise distance divided by the exact maximum squared pairwise distance.
+
+    Translation and uniform scaling are immaterial, so all states are
+    centered and RMS-normalized during deterministic continuation.
+    """
+    n = 14
+    pair_i, pair_j = np.triu_indices(n, 1)
+
+    def normalize(points: np.ndarray) -> np.ndarray:
+        points = points - points.mean(axis=0, keepdims=True)
+        rms = np.sqrt(np.mean(np.sum(points * points, axis=1)))
+        return points / max(rms, 1e-14)
+
+    def score(points: np.ndarray) -> float:
+        delta = points[pair_i] - points[pair_j]
+        squared = np.einsum("ij,ij->i", delta, delta)
+        return float(squared.min() / squared.max())
+
+    def soft_gradient(points: np.ndarray, sharpness: float) -> np.ndarray:
+        """
+        Gradient of softmin(log distance) minus softmax(log distance).
+        Pairwise logarithms improve scaling behavior near active contacts.
+        """
+        delta = points[pair_i] - points[pair_j]
+        squared = np.einsum("ij,ij->i", delta, delta)
+        squared = np.maximum(squared, 1e-15)
+        logs = 0.5 * np.log(squared)
+
+        lo = logs.min()
+        hi = logs.max()
+        near = np.exp(-sharpness * (logs - lo))
+        far = np.exp(sharpness * (logs - hi))
+        near /= near.sum()
+        far /= far.sum()
+
+        pair_force = (near - far)[:, None] * delta / squared[:, None]
+        result = np.zeros_like(points)
+        np.add.at(result, pair_i, pair_force)
+        np.add.at(result, pair_j, -pair_force)
+        result -= result.mean(axis=0, keepdims=True)
+        return result
+
+    def refine(seed: np.ndarray, iterations: int, mode: int) -> np.ndarray:
+        """
+        Annealed normalized ascent with exact-objective checkpointing.
+
+        Unlike a simple best-state recorder, repeated meaningful regression
+        triggers rollback to the incumbent contact graph.  This is most
+        useful once the soft objective is sharp enough that momentum can
+        otherwise carry the configuration out of a good nonsmooth basin.
+        """
+        points = normalize(seed.astype(float, copy=True))
+        best = points.copy()
+        best_value = score(points)
+        velocity = np.zeros_like(points)
+        step_multiplier = 1.0
+        regressions = 0
+
+        for iteration in range(iterations):
+            progress = iteration / max(iterations - 1, 1)
+
+            if mode == 0:
+                # Broad basin discovery: moderate force field retained for
+                # most of the trajectory before contacts become localized.
+                sharpness = 4.5 + 185.0 * progress ** 1.80
+                base_step = 0.046 * (1.0 - 0.58 * progress)
+                momentum = 0.83
+            elif mode == 1:
+                # Alternate continuation useful for asymmetric perturbations.
+                sharpness = 7.0 + 255.0 * progress ** 1.38
+                base_step = 0.041 * (1.0 - 0.64 * progress)
+                momentum = 0.80
+            else:
+                # High-sharpness contact balancing around an elite state.
+                sharpness = 38.0 + 610.0 * progress * progress
+                base_step = 0.019 * (1.0 - 0.70 * progress)
+                momentum = 0.76
+
+            direction = soft_gradient(points, sharpness)
+            direction_norm = np.sqrt(np.mean(np.sum(direction * direction, axis=1)))
+            if direction_norm > 1e-15:
+                direction /= direction_norm
+
+            velocity = momentum * velocity + (1.0 - momentum) * direction
+            points = normalize(points + step_multiplier * base_step * velocity)
+
+            if iteration % 8 == 7 or iteration == iterations - 1:
+                value = score(points)
+                tolerance = 2.0e-5 if mode != 2 else 8.0e-6
+
+                if value > best_value:
+                    best_value = value
+                    best = points.copy()
+                    regressions = 0
+                    # Recover step length gently after a successful move.
+                    step_multiplier = min(1.0, step_multiplier * 1.05)
+                elif value < best_value * (1.0 - tolerance):
+                    regressions += 1
+                else:
+                    regressions = max(0, regressions - 1)
+
+                # Explicit rollback avoids wasting the sharp final phase in
+                # a weaker surrogate-only basin.
+                if regressions >= 3:
+                    points = best.copy()
+                    velocity.fill(0.0)
+                    step_multiplier *= 0.58
+                    regressions = 0
+
+        return best
+
+    def layered_seed(radius: float, height: float, twist: float,
+                     pole: float, noise: float, seed: int) -> np.ndarray:
+        angles = np.arange(6, dtype=float) * (np.pi / 3.0)
+        lower = np.column_stack((
+            radius * np.cos(angles),
+            radius * np.sin(angles),
+            -height * np.ones(6),
+        ))
+        upper = np.column_stack((
+            radius * np.cos(angles + twist),
+            radius * np.sin(angles + twist),
+            height * np.ones(6),
+        ))
+        points = np.vstack((
+            lower, upper,
+            [[0.0, 0.0, -pole], [0.0, 0.0, pole]],
+        ))
+        if noise > 0.0:
+            points += noise * np.random.default_rng(seed).standard_normal((n, 3))
+        return points
+
+    def evolutionary_polish(points: np.ndarray) -> np.ndarray:
+        """
+        Small deterministic exact-objective evolution around the best smooth
+        result.  Candidates are accepted solely by the evaluator objective.
+        """
+        rng = np.random.default_rng(918273)
+        incumbent = normalize(points)
+        incumbent_value = score(incumbent)
+
+        # Coarse perturbations can alter contact assignments; fine steps
+        # subsequently improve an already favorable active graph.
+        for sigma, rounds in (
+            (0.026, 18), (0.014, 24), (0.007, 30),
+            (0.0030, 36), (0.0012, 36),
+        ):
+            for _ in range(rounds):
+                candidates = incumbent[None, :, :] + sigma * rng.standard_normal(
+                    (6, n, 3)
+                )
+                candidates -= candidates.mean(axis=1, keepdims=True)
+                rms = np.sqrt(np.mean(np.sum(candidates * candidates, axis=2), axis=1))
+                candidates /= rms[:, None, None]
+
+                delta = candidates[:, pair_i, :] - candidates[:, pair_j, :]
+                squared = np.einsum("bij,bij->bi", delta, delta)
+                values = squared.min(axis=1) / squared.max(axis=1)
+                k = int(np.argmax(values))
+                if values[k] > incumbent_value:
+                    incumbent = candidates[k].copy()
+                    incumbent_value = float(values[k])
+
+        return incumbent
+
+    initializers = []
+    layer_parameters = (
+        (1.00, 0.43, np.pi / 6.0, 1.30),
+        (1.00, 0.49, np.pi / 6.0, 1.36),
+        (1.06, 0.46, 0.46,       1.37),
+        (0.95, 0.53, 0.57,       1.34),
+        (1.08, 0.39, 0.50,       1.29),
+        (0.99, 0.58, 0.62,       1.43),
+    )
+    for k, parameters in enumerate(layer_parameters):
+        initializers.append(
+            layered_seed(*parameters, noise=0.011, seed=1009 + 97 * k)
+        )
+
+    cube = np.array(
+        [[x, y, z]
+         for x in (-1.0, 1.0)
+         for y in (-1.0, 1.0)
+         for z in (-1.0, 1.0)],
+        dtype=float,
+    )
+    initializers.append(np.vstack((cube, np.diag((1.50, 1.68, 1.82)),
+                                  -np.diag((1.50, 1.68, 1.82)))))
+
+    for seed in (271828, 314159):
+        initializers.append(
+            np.random.default_rng(seed).standard_normal((n, 3))
+        )
+
+    best_points = None
+    best_value = -np.inf
+
+    # Complementary broad continuations.
+    for index, initial in enumerate(initializers):
+        candidate = refine(initial, iterations=1220, mode=index % 2)
+        value = score(candidate)
+        if value > best_value:
+            best_value = value
+            best_points = candidate
+
+    # Focused basin exploration around the strongest exact candidate.
+    restart_rng = np.random.default_rng(148731)
+    for amplitude in (0.017, 0.029, 0.043, 0.061):
+        perturbed = best_points + amplitude * restart_rng.standard_normal((n, 3))
+        candidate = refine(perturbed, iterations=880, mode=1)
+        value = score(candidate)
+        if value > best_value:
+            best_value = value
+            best_points = candidate
+
+    polished = refine(best_points, iterations=1650, mode=2)
+    polished_value = score(polished)
+    if polished_value > best_value:
+        best_points = polished
+        best_value = polished_value
+
+    evolved = evolutionary_polish(best_points)
+    evolved_value = score(evolved)
+    if evolved_value > best_value:
+        best_points = evolved
+
+    return np.asarray(best_points, dtype=float)
+
+
+# EVOLVE-BLOCK-END

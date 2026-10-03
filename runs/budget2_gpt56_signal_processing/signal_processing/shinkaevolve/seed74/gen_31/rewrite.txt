@@ -1,0 +1,315 @@
+# EVOLVE-BLOCK-START
+"""
+Causal gated multi-scale alpha-beta trend tracker.
+
+A robust short and long endpoint regression form a zero-phase-delay causal
+measurement.  A predictive alpha-beta state tracker then uses innovation
+consistency gating and reversal confirmation to reject isolated endpoint noise
+without suppressing sustained non-stationary movement.
+"""
+import numpy as np
+
+
+def _robust_scale(values, fallback=1e-6):
+    """MAD-based finite scale estimate."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+
+    if values.size == 0:
+        return float(fallback)
+
+    center = np.median(values)
+    scale = 1.4826 * np.median(np.abs(values - center))
+
+    if not np.isfinite(scale) or scale < 1e-10:
+        scale = np.std(values)
+
+    if not np.isfinite(scale) or scale < 1e-10:
+        scale = max(float(fallback), 1e-6)
+
+    return float(max(scale, 1e-10))
+
+
+def _robust_endpoint_fit(window, decay, fallback_scale):
+    """
+    Exponentially weighted robust local-linear estimate at the newest sample.
+
+    Returns:
+        level: zero-delay endpoint level
+        slope: per-sample local slope
+        scale: robust residual scale
+    """
+    window = np.asarray(window, dtype=float)
+    valid = np.isfinite(window)
+    count = int(np.count_nonzero(valid))
+
+    if count == 0:
+        return np.nan, 0.0, float(fallback_scale)
+
+    z = window[valid]
+    if count == 1:
+        return float(z[0]), 0.0, float(fallback_scale)
+
+    length = len(window)
+    t = (np.arange(length, dtype=float) - (length - 1))[valid]
+
+    base_weights = np.exp(t / max(float(decay), 1.0))
+    base_weights /= max(np.sum(base_weights), 1e-12)
+
+    def weighted_line(weights):
+        sw = np.sum(weights)
+        st = np.sum(weights * t)
+        stt = np.sum(weights * t * t)
+        sz = np.sum(weights * z)
+        stz = np.sum(weights * t * z)
+
+        determinant = sw * stt - st * st
+        if determinant <= 1e-14:
+            return float(np.average(z, weights=weights)), 0.0
+
+        level = (stt * sz - st * stz) / determinant
+        slope = (sw * stz - st * sz) / determinant
+        return float(level), float(slope)
+
+    level, slope = weighted_line(base_weights)
+
+    # Two bounded IRLS refinements provide endpoint outlier robustness while
+    # keeping the per-window calculation small and deterministic.
+    scale = float(fallback_scale)
+    weights = base_weights
+    for _ in range(2):
+        residual = z - (level + slope * t)
+        scale = _robust_scale(residual, fallback=scale)
+        limit = max(1.65 * scale, 1e-10)
+        huber = np.minimum(1.0, limit / np.maximum(np.abs(residual), 1e-12))
+        weights = base_weights * huber
+        level, slope = weighted_line(weights)
+
+    residual = z - (level + slope * t)
+    scale = _robust_scale(residual, fallback=scale)
+    return level, slope, scale
+
+
+def adaptive_filter(x, window_size=20):
+    """
+    Causal robust multi-scale gated trend filter.
+
+    Args:
+        x: One-dimensional real-valued input signal.
+        window_size: Number of trailing samples required for an output.
+
+    Returns:
+        Endpoint-aligned filtered signal of length len(x) - window_size + 1.
+    """
+    x = np.asarray(x, dtype=float)
+
+    if x.ndim != 1:
+        raise ValueError("Input signal must be a 1D array")
+    if window_size < 1:
+        raise ValueError("window_size must be >= 1")
+    if len(x) < window_size:
+        raise ValueError(
+            f"Input signal length ({len(x)}) must be >= window_size ({window_size})"
+        )
+
+    output_length = len(x) - window_size + 1
+    if not np.any(np.isfinite(x)):
+        return np.full(output_length, np.nan)
+    if window_size == 1:
+        return x.copy()
+
+    finite = x[np.isfinite(x)]
+    if finite.size >= 3:
+        global_noise = _robust_scale(np.diff(finite), fallback=1e-5) / np.sqrt(2.0)
+    else:
+        global_noise = _robust_scale(finite, fallback=1e-5)
+    global_noise = max(float(global_noise), 1e-6)
+
+    # A 45% short horizon responds to genuine local maneuvers.  The long fit
+    # remains available as a low-variance reference during ambiguous motion.
+    short_size = max(3, min(window_size, int(np.ceil(0.45 * window_size))))
+    short_decay = max(1.35, 0.30 * short_size)
+    long_decay = max(2.2, 0.46 * window_size)
+
+    y = np.empty(output_length, dtype=float)
+
+    position = np.nan
+    velocity = 0.0
+    accepted_direction = 0.0
+    pending_direction = 0.0
+    pending_count = 0
+    running_noise = global_noise
+
+    for out_index, endpoint in enumerate(range(window_size - 1, len(x))):
+        long_window = x[endpoint - window_size + 1:endpoint + 1]
+        short_window = x[endpoint - short_size + 1:endpoint + 1]
+
+        long_level, long_slope, long_scale = _robust_endpoint_fit(
+            long_window, long_decay, global_noise
+        )
+        short_level, short_slope, short_scale = _robust_endpoint_fit(
+            short_window, short_decay, global_noise
+        )
+
+        if not np.isfinite(long_level):
+            measurement = short_level
+            measured_slope = short_slope
+            local_noise = max(short_scale, global_noise * 0.25)
+        elif not np.isfinite(short_level):
+            measurement = long_level
+            measured_slope = long_slope
+            local_noise = max(long_scale, global_noise * 0.25)
+        else:
+            local_noise = max(
+                0.5 * (short_scale + long_scale),
+                0.25 * global_noise,
+                1e-8,
+            )
+
+            slope_unit = max(
+                0.18 * global_noise,
+                0.30 * (abs(short_slope) + abs(long_slope)),
+                1e-9,
+            )
+            coherence = np.tanh(
+                (short_slope * long_slope) / (slope_unit * slope_unit)
+            )
+
+            # Conflict strongly favors the low-variance long estimate.  Strong
+            # agreement permits enough short-scale contribution for low lag.
+            short_weight = float(np.clip(0.47 + 0.17 * coherence, 0.30, 0.64))
+            measurement = short_weight * short_level + (1.0 - short_weight) * long_level
+            measured_slope = (
+                short_weight * short_slope + (1.0 - short_weight) * long_slope
+            )
+
+        if not np.isfinite(measurement):
+            measurement = position if np.isfinite(position) else 0.0
+            measured_slope = 0.0
+
+        running_noise = 0.94 * running_noise + 0.06 * local_noise
+        noise = max(running_noise, local_noise * 0.65, 1e-8)
+
+        if not np.isfinite(position):
+            position = measurement
+            velocity = measured_slope
+            accepted_direction = np.sign(velocity)
+            y[out_index] = position
+            continue
+
+        prediction = position + velocity
+        innovation = measurement - prediction
+        innovation_sign = np.sign(innovation)
+
+        velocity_sign = np.sign(velocity) if abs(velocity) > 0.06 * noise else 0.0
+        slope_sign = (
+            np.sign(measured_slope) if abs(measured_slope) > 0.08 * noise else 0.0
+        )
+
+        # An isolated measurement spike is especially dangerous when it opposes
+        # both independent trend references.  Cap its gain and innovation
+        # before it can create a future state-velocity reversal.
+        counter_to_velocity = velocity_sign != 0.0 and innovation_sign == -velocity_sign
+        counter_to_slope = slope_sign != 0.0 and innovation_sign == -slope_sign
+        inconsistent = counter_to_velocity and counter_to_slope
+
+        innovation_limit = 1.8 * noise if inconsistent else 3.2 * noise
+        bounded_innovation = np.clip(innovation, -innovation_limit, innovation_limit)
+
+        activity = min(abs(innovation) / max(2.0 * noise, 1e-8), 1.0)
+        alpha = 0.24 + 0.36 * activity
+        if inconsistent:
+            alpha = min(alpha, 0.38)
+
+        slope_gain = 0.10 + 0.24 * activity
+        if inconsistent:
+            slope_gain = min(slope_gain, 0.15)
+
+        implied_slope = velocity + 0.16 * bounded_innovation
+        velocity_measurement = 0.72 * measured_slope + 0.28 * implied_slope
+        proposed_velocity = velocity + slope_gain * (velocity_measurement - velocity)
+
+        proposed_direction = (
+            np.sign(proposed_velocity)
+            if abs(proposed_velocity) > 0.10 * noise
+            else 0.0
+        )
+
+        reversal = (
+            accepted_direction != 0.0
+            and proposed_direction != 0.0
+            and proposed_direction != accepted_direction
+        )
+
+        turn_support = (
+            slope_sign == proposed_direction
+            and innovation_sign == proposed_direction
+            and abs(innovation) > 0.75 * noise
+        )
+        strong_turn = (
+            turn_support
+            and abs(innovation) > 2.15 * noise
+            and abs(measured_slope) > 0.16 * noise
+        )
+
+        allow_turn = True
+        if reversal:
+            if turn_support:
+                if proposed_direction == pending_direction:
+                    pending_count += 1
+                else:
+                    pending_direction = proposed_direction
+                    pending_count = 1
+            else:
+                pending_direction = 0.0
+                pending_count = 0
+
+            allow_turn = strong_turn or pending_count >= 2
+
+            if allow_turn:
+                accepted_direction = proposed_direction
+                pending_direction = 0.0
+                pending_count = 0
+            else:
+                # Freeze position during an unconfirmed opposite move.  Decay
+                # velocity modestly rather than reversing it on a single sample.
+                position = position
+                velocity = 0.88 * velocity
+                y[out_index] = position
+                continue
+        else:
+            pending_direction = 0.0
+            pending_count = 0
+            if proposed_direction != 0.0:
+                accepted_direction = proposed_direction
+
+        position = prediction + alpha * bounded_innovation
+        velocity = proposed_velocity
+        y[out_index] = position
+
+    return y
+
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """Backward-compatible enhanced public filtering entry point."""
+    return adaptive_filter(x, window_size)
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """
+    Apply the selected filtering algorithm.
+
+    Args:
+        input_signal: Input time-series data.
+        window_size: Required trailing history.
+        algorithm_type: "basic" or "enhanced".
+
+    Returns:
+        Endpoint-aligned filtered signal.
+    """
+    if algorithm_type == "enhanced":
+        return enhanced_filter_with_trend_preservation(input_signal, window_size)
+    return adaptive_filter(input_signal, window_size)
+
+
+# EVOLVE-BLOCK-END

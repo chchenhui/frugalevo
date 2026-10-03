@@ -1,0 +1,73 @@
+# EVOLVE-BLOCK-START
+#include <iostream>
+#include <vector>
+#include <utility>
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int n, m;
+    std::cin >> n >> m;
+
+    const int height = n / m;
+    std::vector<std::vector<int>> stacks(m, std::vector<int>(height));
+
+    for (int i = 0; i < m; ++i) {
+        for (int j = 0; j < height; ++j) {
+            std::cin >> stacks[i][j];
+        }
+    }
+
+    std::vector<std::pair<int, int>> operations;
+    operations.reserve(2 * n);
+
+    for (int target = 1; target <= n; ++target) {
+        int source = -1;
+        int position = -1;
+
+        for (int s = 0; s < m && source == -1; ++s) {
+            for (int p = 0; p < static_cast<int>(stacks[s].size()); ++p) {
+                if (stacks[s][p] == target) {
+                    source = s;
+                    position = p;
+                    break;
+                }
+            }
+        }
+
+        // The target must exist because previous targets only were removed.
+        if (source == -1) {
+            return 0;
+        }
+
+        if (position + 1 < static_cast<int>(stacks[source].size())) {
+            int destination = (source + 1) % m;
+
+            // Move the complete block above target to another stack.
+            int first_moved_box = stacks[source][position + 1];
+            operations.push_back({first_moved_box, destination + 1});
+
+            stacks[destination].insert(
+                stacks[destination].end(),
+                stacks[source].begin() + position + 1,
+                stacks[source].end()
+            );
+            stacks[source].erase(
+                stacks[source].begin() + position + 1,
+                stacks[source].end()
+            );
+        }
+
+        // Target is now guaranteed to be at the top.
+        operations.push_back({target, 0});
+        stacks[source].pop_back();
+    }
+
+    for (const auto& op : operations) {
+        std::cout << op.first << ' ' << op.second << '\n';
+    }
+
+    return 0;
+}
+# EVOLVE-BLOCK-END

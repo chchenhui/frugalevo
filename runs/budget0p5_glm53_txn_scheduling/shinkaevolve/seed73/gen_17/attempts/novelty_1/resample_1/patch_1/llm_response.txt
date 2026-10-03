@@ -1,0 +1,101 @@
+<NAME>
+beam_search_multistart</NAME>
+<DESCRIPTION>
+Replace the randomized greedy sampling with a beam search over partial schedules. At each step, for each beam candidate, evaluate ALL remaining transactions by their single-step lookahead makespan (computed with get_opt_seq_cost on the extended prefix), keep the top-k lowest-cost extensions, and run many randomized restarts (each seeded with a different starting transaction plus randomized tie-breaking) to escape local optima. Beam search with full one-step lookahead is fundamentally stronger than random sampling because it systematically explores the best extensions rather than sampling a few random ones, while multiple restarts with shuffled seeds provide diversity.
+</DESCRIPTION>
+<CODE>
+```python
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using multi-restart beam search with full
+    one-step lookahead makespan evaluation.
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    n = workload.num_txns
+    all_txns = list(range(n))
+    cost_cache = {}
+
+    def seq_cost(seq):
+        key = tuple(seq)
+        if key not in cost_cache:
+            cost_cache[key] = workload.get_opt_seq_cost(list(seq))
+        return cost_cache[key]
+
+    def beam_search(beam_width, seed_txn, time_budget_restarts):
+        # Beam of (cost, seq, remaining_set)
+        remaining0 = set(all_txns)
+        remaining0.discard(seed_txn)
+        beam = [(seq_cost([seed_txn]), [seed_txn], frozenset(remaining0))]
+        while True:
+            candidates = []
+            for cost, seq, remaining in beam:
+                if not remaining:
+                    return cost, seq
+                rem_list = list(remaining)
+                # full one-step lookahead over all remaining txns
+                for t in rem_list:
+                    new_seq = seq + [t]
+                    c = seq_cost(new_seq)
+                    candidates.append((c, new_seq, remaining - {t}))
+            # keep top beam_width by cost
+            candidates.sort(key=lambda x: x[0])
+            beam = candidates[:beam_width]
+            # randomized tie-break diversity: occasionally keep an extra random candidate
+            if len(candidates) > beam_width:
+                extra = random.choice(candidates[beam_width:beam_width + 5])
+                beam.append(extra)
+        return beam[0][0], beam[0][1]
+
+    best_cost = None
+    best_seq = None
+    beam_width = 3
+    # restarts: try every txn as seed (deterministic coverage) plus random seeds
+    seeds = list(all_txns) + [random.randint(0, n - 1) for _ in range(20)]
+    for seed in seeds:
+        try:
+            cost, seq = beam_search(beam_width, seed, 10)
+        except Exception:
+            continue
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            best_seq = seq
+    if best_seq is None:
+        # fallback
+        best_seq = all_txns
+        best_cost = seq_cost(best_seq)
+    return best_cost, best_seq
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")
+```
+</CODE>

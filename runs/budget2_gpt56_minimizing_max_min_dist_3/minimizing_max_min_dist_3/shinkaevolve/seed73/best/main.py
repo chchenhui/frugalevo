@@ -1,0 +1,241 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.optimize import minimize
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct 14 reproducible points in R^3 with a large minimum-distance to
+    diameter ratio.  Translation and uniform scale are normalized away because
+    they do not affect the objective.
+    """
+    n, d = 14, 3
+    rng = np.random.default_rng(20240517)
+    iu, ju = np.triu_indices(n, 1)
+
+    def normalize(points: np.ndarray) -> np.ndarray:
+        points -= points.mean(axis=0)
+        points /= np.sqrt(np.mean(points * points))
+        return points
+
+    def exact_ratio(points: np.ndarray) -> float:
+        delta = points[iu] - points[ju]
+        dsq = np.einsum("ij,ij->i", delta, delta)
+        return float(dsq.min() / dsq.max())
+
+    def soft_gradient(points: np.ndarray, beta: float) -> np.ndarray:
+        delta = points[iu] - points[ju]
+        dsq = np.einsum("ij,ij->i", delta, delta)
+        log_dist = 0.5 * np.log(dsq + 1.0e-15)
+
+        low = -beta * log_dist
+        low -= low.max()
+        w_min = np.exp(low)
+        w_min /= w_min.sum()
+
+        high = beta * log_dist
+        high -= high.max()
+        w_max = np.exp(high)
+        w_max /= w_max.sum()
+
+        pair_gradient = (
+            (w_min - w_max)[:, None] * delta / (dsq[:, None] + 1.0e-15)
+        )
+        gradient = np.zeros_like(points)
+        np.add.at(gradient, iu, pair_gradient)
+        np.add.at(gradient, ju, -pair_gradient)
+        return gradient
+
+    best_points = None
+    best_ratio = -np.inf
+
+    for restart in range(12):
+        points = normalize(rng.normal(size=(n, d)))
+        first = np.zeros_like(points)
+        second = np.zeros_like(points)
+
+        # Broad smooth search establishes a good global contact graph.
+        for step in range(8000):
+            beta = 5.0 + 115.0 * step / 7999.0
+            gradient = soft_gradient(points, beta)
+
+            first = 0.9 * first + 0.1 * gradient
+            second = 0.999 * second + 0.001 * gradient * gradient
+            mhat = first / (1.0 - 0.9 ** (step + 1))
+            vhat = second / (1.0 - 0.999 ** (step + 1))
+
+            learning_rate = 0.028 * (0.10 + 0.90 * (1.0 - step / 8000.0))
+            points += learning_rate * mhat / (np.sqrt(vhat) + 1.0e-8)
+            normalize(points)
+
+        # Sharper smoothing resolves the final nearest/farthest contacts.
+        first.fill(0.0)
+        second.fill(0.0)
+        for step in range(2200):
+            beta = 120.0 + 480.0 * step / 2199.0
+            gradient = soft_gradient(points, beta)
+
+            first = 0.9 * first + 0.1 * gradient
+            second = 0.999 * second + 0.001 * gradient * gradient
+            mhat = first / (1.0 - 0.9 ** (step + 1))
+            vhat = second / (1.0 - 0.999 ** (step + 1))
+
+            learning_rate = 0.006 * (1.0 - 0.55 * step / 2200.0)
+            points += learning_rate * mhat / (np.sqrt(vhat) + 1.0e-8)
+            normalize(points)
+
+        # Finish with exact-objective acceptance, but retain the sharp
+        # soft-contact force rather than using only isotropic random kicks.
+        # Tangent noise and single-point proposals let active contact graphs
+        # exchange while every accepted move improves the true hard ratio.
+        current_ratio = exact_ratio(points)
+        proposal_scale = 0.010
+        stalled_batches = 0
+
+        for polish_step in range(650):
+            direction = soft_gradient(points, 520.0 + 180.0 * (polish_step % 5))
+            direction -= direction.mean(axis=0, keepdims=True)
+            direction_norm = np.sqrt(np.mean(direction * direction))
+            if direction_norm > 1.0e-14:
+                direction /= direction_norm
+            else:
+                direction.fill(0.0)
+
+            candidate_points = points
+            candidate_ratio = current_ratio
+
+            # A pure force step is useful when the final soft objective still
+            # agrees with the current hard contacts.
+            trial = points + proposal_scale * direction
+            normalize(trial)
+            trial_ratio = exact_ratio(trial)
+            if trial_ratio > candidate_ratio:
+                candidate_ratio = trial_ratio
+                candidate_points = trial
+
+            # Perturb force-guided directions in the normalized configuration
+            # space, avoiding wasteful translation and scale components.
+            for _ in range(3):
+                noise = rng.normal(size=(n, d))
+                noise -= noise.mean(axis=0, keepdims=True)
+                noise /= np.sqrt(np.mean(noise * noise))
+                trial = points + proposal_scale * (direction + 0.38 * noise)
+                normalize(trial)
+                trial_ratio = exact_ratio(trial)
+                if trial_ratio > candidate_ratio:
+                    candidate_ratio = trial_ratio
+                    candidate_points = trial
+
+            # Local moves are especially effective when one point participates
+            # in several nearly active shortest or longest pairs.
+            for _ in range(2):
+                index = rng.integers(n)
+                trial = points.copy()
+                local_noise = rng.normal(size=d)
+                local_noise /= np.linalg.norm(local_noise)
+                trial[index] += proposal_scale * (
+                    direction[index] + 0.55 * local_noise
+                )
+                normalize(trial)
+                trial_ratio = exact_ratio(trial)
+                if trial_ratio > candidate_ratio:
+                    candidate_ratio = trial_ratio
+                    candidate_points = trial
+
+            if candidate_ratio > current_ratio + 1.0e-14:
+                points = candidate_points
+                current_ratio = candidate_ratio
+                proposal_scale = min(0.022, proposal_scale * 1.045)
+                stalled_batches = 0
+            else:
+                stalled_batches += 1
+                if stalled_batches % 14 == 0:
+                    proposal_scale *= 0.60
+                    if proposal_scale < 1.5e-6:
+                        break
+
+        if current_ratio > best_ratio:
+            best_ratio = current_ratio
+            best_points = points.copy()
+
+    # Direct hard-constraint polish.  After scaling so that the shortest
+    # squared distance is one, maximizing the ratio is exactly equivalent to
+    # minimizing an epigraph variable D with 1 <= q_ij <= D for every pair.
+    # This also resolves the small discrepancy between a finite-beta surrogate
+    # and the evaluator's actual nonsmooth minimum/maximum ratio.
+    initial_delta = best_points[iu] - best_points[ju]
+    initial_q = np.einsum("ij,ij->i", initial_delta, initial_delta)
+    constrained_points = best_points / np.sqrt(initial_q.min())
+    initial_delta = constrained_points[iu] - constrained_points[ju]
+    initial_q = np.einsum("ij,ij->i", initial_delta, initial_delta)
+    initial_state = np.concatenate(
+        (constrained_points.ravel(), [float(initial_q.max())])
+    )
+
+    def diameter_constraints(state: np.ndarray, lower: float) -> np.ndarray:
+        coordinates = state[:-1].reshape(n, d)
+        delta = coordinates[iu] - coordinates[ju]
+        q = np.einsum("ij,ij->i", delta, delta)
+        return np.concatenate((q - lower, state[-1] - q))
+
+    def diameter_constraint_jacobian(
+        state: np.ndarray, lower: float
+    ) -> np.ndarray:
+        del lower
+        coordinates = state[:-1].reshape(n, d)
+        delta = coordinates[iu] - coordinates[ju]
+        count = iu.size
+        jacobian = np.zeros((2 * count, n * d + 1), dtype=np.float64)
+        rows = np.arange(count)[:, None]
+        axes = np.arange(d)[None, :]
+        first_columns = d * iu[:, None] + axes
+        second_columns = d * ju[:, None] + axes
+        derivative = 2.0 * delta
+        jacobian[rows, first_columns] = derivative
+        jacobian[rows, second_columns] = -derivative
+        jacobian[count + rows, first_columns] = -derivative
+        jacobian[count + rows, second_columns] = derivative
+        jacobian[count:, -1] = 1.0
+        return jacobian
+
+    objective_jacobian = np.zeros(n * d + 1, dtype=np.float64)
+    objective_jacobian[-1] = 1.0
+    polished_state = initial_state
+    for lower_bound, tolerance, iterations in (
+        (1.0 - 1.0e-8, 2.0e-11, 500),
+        (1.0, 2.0e-13, 800),
+    ):
+        result = minimize(
+            fun=lambda state: state[-1],
+            x0=polished_state,
+            jac=lambda state: objective_jacobian,
+            method="SLSQP",
+            constraints={
+                "type": "ineq",
+                "fun": lambda state, bound=lower_bound: diameter_constraints(
+                    state, bound
+                ),
+                "jac": lambda state, bound=lower_bound: diameter_constraint_jacobian(
+                    state, bound
+                ),
+            },
+            options={"maxiter": iterations, "ftol": tolerance, "disp": False},
+        )
+        if np.all(np.isfinite(result.x)):
+            polished_state = result.x
+
+    polished_points = polished_state[:-1].reshape(n, d)
+    polished_delta = polished_points[iu] - polished_points[ju]
+    polished_q = np.einsum("ij,ij->i", polished_delta, polished_delta)
+    # Reject a merely approximate/infeasible optimizer endpoint.  Rescaling is
+    # harmless and gives exact-score comparison independent of its scale.
+    if polished_q.min() >= 1.0 - 2.0e-7 and polished_q.max() > 0.0:
+        polished_points /= np.sqrt(polished_q.min())
+        polished_ratio = exact_ratio(polished_points)
+        if polished_ratio > best_ratio:
+            best_points = polished_points
+
+    return np.asarray(best_points, dtype=np.float64)
+
+
+# EVOLVE-BLOCK-END

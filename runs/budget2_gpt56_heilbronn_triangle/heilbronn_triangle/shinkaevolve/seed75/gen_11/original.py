@@ -1,0 +1,90 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Deterministically search for a high-minimum-area configuration of eleven
+    points in the unit equilateral triangle.
+    """
+    n = 11
+    height = np.sqrt(3.0) / 2.0
+    triples = np.asarray(list(combinations(range(n), 3)), dtype=int)
+    rng = np.random.default_rng(11031987)
+
+    def project_to_triangle(point: np.ndarray) -> np.ndarray:
+        """Project a point into x >= 0, y >= 0, y <= sqrt(3) min(x, 1-x)."""
+        x, y = np.clip(point, 0.0, 1.0)
+        y = min(y, height)
+        if y > np.sqrt(3.0) * min(x, 1.0 - x):
+            # Orthogonal projection onto the nearest sloping edge.
+            if x <= 0.5:
+                x = (x + np.sqrt(3.0) * y) / 4.0
+                y = np.sqrt(3.0) * x
+            else:
+                x = (x + np.sqrt(3.0) * (1.0 - y) + 3.0) / 4.0
+                y = np.sqrt(3.0) * (1.0 - x)
+        return np.array((np.clip(x, 0.0, 1.0), np.clip(y, 0.0, height)))
+
+    def areas(points: np.ndarray) -> np.ndarray:
+        a = points[triples[:, 0]]
+        b = points[triples[:, 1]]
+        c = points[triples[:, 2]]
+        return 0.5 * np.abs(
+            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+        )
+
+    def objective(points: np.ndarray) -> tuple[float, float]:
+        values = np.sort(areas(points))
+        # Rewarding several active constraints avoids brittle one-triangle moves.
+        return values[0], values[0] + 0.18 * values[:12].mean()
+
+    vertices = np.array(((0.0, 0.0), (1.0, 0.0), (0.5, height)))
+    best_points = None
+    best_minimum = -1.0
+
+    # Independent starts are valuable because the maximin landscape is highly
+    # non-convex.  The total work is still small: 8 * 18000 * 165 areas.
+    for restart in range(8):
+        points = np.empty((n, 2))
+        points[:3] = vertices
+        barycentric = rng.dirichlet((1.0, 1.0, 1.0), size=n - 3)
+        points[3:, 0] = barycentric[:, 1] + 0.5 * barycentric[:, 2]
+        points[3:, 1] = height * barycentric[:, 2]
+
+        current_minimum, current_score = objective(points)
+        local_best = points.copy()
+        local_best_minimum = current_minimum
+
+        for iteration in range(18000):
+            fraction = iteration / 17999.0
+            step = 0.105 * (1.0 - fraction) ** 1.7 + 0.0015
+            temperature = 0.0018 * (1.0 - fraction) ** 2 + 0.000015
+
+            index = int(rng.integers(3, n))
+            candidate = points.copy()
+            candidate[index] = project_to_triangle(
+                candidate[index] + rng.normal(0.0, step, size=2)
+            )
+            candidate_minimum, candidate_score = objective(candidate)
+
+            change = candidate_score - current_score
+            if change >= 0.0 or rng.random() < np.exp(change / temperature):
+                points = candidate
+                current_minimum = candidate_minimum
+                current_score = candidate_score
+
+            if candidate_minimum > local_best_minimum:
+                local_best_minimum = candidate_minimum
+                local_best = candidate.copy()
+
+        if local_best_minimum > best_minimum:
+            best_minimum = local_best_minimum
+            best_points = local_best
+
+    return best_points
+
+
+# EVOLVE-BLOCK-END

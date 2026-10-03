@@ -1,0 +1,263 @@
+--- a/original.py
++++ b/original.py
+@@ -1,143 +1,156 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+-
+-def _min_tri_area(points: np.ndarray) -> float:
+-    n = len(points)
+-    best = np.inf
+-    for i in range(n - 2):
+-        for j in range(i + 1, n - 1):
+-            for k in range(j + 1, n):
+-                ax, ay = points[i]
+-                bx, by = points[j]
+-                cx, cy = points[k]
+-                area = abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay)) * 0.5
+-                if area < best:
+-                    best = area
+-    return best
++_N = 13
++_idx = np.array([(i, j, k) for i in range(_N - 2)
++                 for j in range(i + 1, _N - 1)
++                 for k in range(j + 1, _N)], dtype=np.int64)
++_I, _J, _K = _idx[:, 0], _idx[:, 1], _idx[:, 2]
+ 
+ 
+-def _hull_area(points: np.ndarray) -> float:
+-    # Shoelace on convex hull (monotone chain)
+-    pts = sorted(map(tuple, points))
+-    if len(pts) <= 2:
+-        return 0.0
++def _min_tri(P):
++    ax, ay = P[_I, 0], P[_I, 1]
++    bx, by = P[_J, 0], P[_J, 1]
++    cx, cy = P[_K, 0], P[_K, 1]
++    return np.abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay)).min() * 0.5
+ 
+-    def cross(o, a, b):
+-        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+ 
+-    lower = []
+-    for p in pts:
+-        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+-            lower.pop()
+-        lower.append(p)
+-    upper = []
+-    for p in reversed(pts):
+-        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+-            upper.pop()
+-        upper.append(p)
+-    hull = lower[:-1] + upper[:-1]
++def _hull_area(P):
++    # Monotone chain, numpy-friendly
++    order = np.lexsort((P[:, 1], P[:, 0]))
++    pts = P[order]
++    def chain(pts):
++        out = []
++        for p in pts:
++            while len(out) >= 2:
++                o, a = out[-2], out[-1]
++                if (a[0]-o[0])*(p[1]-o[1]) - (a[1]-o[1])*(p[0]-o[0]) <= 0:
++                    out.pop()
++                else:
++                    break
++            out.append(p)
++        return out
++    lo = chain(pts)
++    up = chain(pts[::-1])
++    hull = np.array(lo[:-1] + up[:-1])
++    m = len(hull)
+     a = 0.0
+-    m = len(hull)
+     for i in range(m):
+         x1, y1 = hull[i]
+         x2, y2 = hull[(i + 1) % m]
+         a += x1 * y2 - x2 * y1
+     return abs(a) * 0.5
+ 
+ 
+-def _optimize(seed: int, iters: int = 600) -> np.ndarray:
+-    rng = np.random.default_rng(seed)
+-    n = 13
++def _ratio(P):
++    ha = _hull_area(P)
++    if ha < 1e-12:
++        return 0.0
++    return _min_tri(P) / ha
+ 
+-    # Symmetric initialization: 3-fold rotational structure + center
+-    base = rng.random((4, 2)) * 0.8 + 0.1
+-    pts = [np.array([0.5, 0.5])]
+-    for b in base:
++
++def _climb(P, rng, iters, amp0=0.05, target=None):
++    """Stochastic hill climbing on the exact ratio; moves one point at a time."""
++    P = P.copy()
++    best = _ratio(P)
++    best_P = P.copy()
++    amp = amp0
++    fails = 0
++    for it in range(iters):
++        i = rng.integers(_N)
++        d = rng.normal(size=2) * amp
++        old = P[i].copy()
++        new = old + d
++        # keep in unit box (hull area <= 1 automatically)
++        if not (0.0 <= new[0] <= 1.0 and 0.0 <= new[1] <= 1.0):
++            amp *= 0.98
++            continue
++        P[i] = new
++        v = _ratio(P)
++        if v > best + 1e-14:
++            best = v
++            best_P = P.copy()
++            fails = 0
++            amp = min(amp * 1.02, 0.15)
++        else:
++            P[i] = old
++            fails += 1
++            if fails > 60:
++                amp *= 0.85
++                fails = 0
++                if amp < 1e-4:
++                    break
++    return best_P, best
++
++
++def _inits(rng):
++    inits = []
++    # regular 13-gon squeezed into unit box
++    th = 2 * np.pi * np.arange(_N) / _N
++    inits.append(0.5 + 0.45 * np.stack([np.cos(th), np.sin(th)], axis=1))
++    # 3-fold symmetric: center + 4 orbits
++    P = np.full((_N, 2), 0.5)
++    for oi, b in enumerate([(0.25, 0.3), (0.4, 0.15), (0.3, 0.45), (0.45, 0.4)]):
+         for r in range(3):
+-            th = 2 * np.pi * r / 3
+-            R = np.array([[np.cos(th), -np.sin(th)],
+-                          [np.sin(th), np.cos(th)]])
+-            c = R @ (b - 0.5) + 0.5
+-            pts.append(c)
+-    P = np.array(pts)
+-
+-    alpha = 8.0  # softmin temperature
+-    step = 0.004
+-    best_P = P.copy()
+-    best_val = _min_tri_area(P) / _hull_area(P)
+-
+-    for it in range(iters):
+-        areas = []
+-        idxs = []
+-        for i in range(n - 2):
+-            for j in range(i + 1, n - 1):
+-                for k in range(j + 1, n):
+-                    ax, ay = P[i]
+-                    bx, by = P[j]
+-                    cx, cy = P[k]
+-                    areas.append((bx-ax)*(cy-ay) - (cx-ax)*(by-ay))
+-                    idxs.append((i, j, k))
+-        A = np.array(areas)
+-        idxs = np.array(idxs)
+-        absA = np.abs(A)
+-
+-        # softmin weighting over small areas
+-        w = np.exp(-alpha * (absA - absA.min()))
+-        w /= w.sum()
+-
+-        G = np.zeros_like(P)
+-        for t, (i, j, k) in enumerate(idxs):
+-            s = np.sign(A[t]) if A[t] != 0 else 0.0
+-            gi = np.array([-(P[j][1]-P[k][1]), (P[j][0]-P[k][0])]) * s
+-            gj = np.array([(P[k][1]-P[i][1]), -(P[k][0]-P[i][0])]) * s
+-            gk = np.array([(P[i][1]-P[j][1]), -(P[i][0]-P[j][0])]) * s
+-            G[i] += 0.5 * w[t] * gi
+-            G[j] += 0.5 * w[t] * gj
+-            G[k] += 0.5 * w[t] * gk
+-
+-        # barrier toward staying inside [eps,1-eps]^2 box; also pull mildly to center
+-        box_grad = np.zeros_like(P)
+-        eps = 0.05
+-        box_grad[:, 0] = -1.0 / np.maximum(P[:, 0] - eps, 1e-3) + 1.0 / np.maximum(1 - eps - P[:, 0], 1e-3)
+-        box_grad[:, 1] = -1.0 / np.maximum(P[:, 1] - eps, 1e-3) + 1.0 / np.maximum(1 - eps - P[:, 1], 1e-3)
+-        G += 1e-5 * box_grad
+-
+-        P = P + step * G / (np.linalg.norm(G) + 1e-9) * np.sqrt(len(P))
+-        cur = _min_tri_area(P) / _hull_area(P)
+-        if cur > best_val:
+-            best_val = cur
+-            best_P = P.copy()
+-        step *= 0.999
+-
+-    return best_P
++            a = 2 * np.pi * r / 3
++            R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
++            v = R @ (np.array(b) - 0.5)
++            P[1 + 3 * oi + r] = 0.5 + v
++    inits.append(P)
++    # jittered grid 5x3 in unit box
++    xs = np.linspace(0.1, 0.9, 5)
++    ys = np.linspace(0.15, 0.85, 3)
++    P = np.stack([[x, y] for y in ys for x in xs])
++    P = P + rng.normal(scale=0.02, size=P.shape)
++    inits.append(np.clip(P, 0, 1))
++    # random
++    inits.append(rng.random((_N, 2)) * 0.9 + 0.05)
++    return inits
+ 
+ 
+ def heilbronn_convex13() -> np.ndarray:
+     """
+     Construct an arrangement of 13 points in a convex region maximizing
+-    the smallest triangle area (Heilbronn problem, n=13).
++    the smallest triangle area (Heilbronn problem, n = 13).
+ 
+     Returns:
+         points: np.ndarray of shape (13,2) with x,y coordinates.
+     """
+-    # Deterministic multi-start over fixed seeds; pick best
+     best_P = None
+     best_val = -1.0
++
+     for seed in (42, 7, 123, 2024):
+-        P = _optimize(seed, iters=400)
+-        val = _min_tri_area(P) / _hull_area(P)
+-        if val > best_val:
+-            best_val = val
+-            best_P = P
++        rng = np.random.default_rng(seed)
++        for init in _inits(rng):
++            # Phase 1: coarse climb
++            P, v = _climb(init, rng, iters=4000, amp0=0.06)
++            # Phase 2: basin hopping around the local optimum
++            for hop in range(6):
++                Q = P + rng.normal(scale=0.03, size=P.shape)
++                Q = np.clip(Q, 0.0, 1.0)
++                Q, vq = _climb(Q, rng, iters=2500, amp0=0.02)
++                if vq > v:
++                    P, v = Q, vq
++            if v > best_val:
++                best_val = v
++                best_P = P.copy()
+ 
+-    # Rescale so convex hull has unit area (points stay in convex position set)
++    if best_P is None or best_val <= 0:
++        th = 2 * np.pi * np.arange(_N) / _N
++        best_P = 0.5 + 0.45 * np.stack([np.cos(th), np.sin(th)], axis=1)
++
++    # Final deterministic polish on the global best
++    rng = np.random.default_rng(12345)
++    best_P, best_val = _climb(best_P, rng, iters=6000, amp0=0.01)
++
++    # Rescale so the convex hull has unit area (ratio invariant under this)
+     ha = _hull_area(best_P)
+     if ha > 1e-12:
+         c = best_P.mean(axis=0)
+         best_P = (best_P - c) / np.sqrt(ha) + c
+ 
++    assert np.all(np.isfinite(best_P)) and best_P.shape == (13, 2)
+     return best_P
+ 
+ 
+ # EVOLVE-BLOCK-END

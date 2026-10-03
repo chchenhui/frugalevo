@@ -1,0 +1,278 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.optimize import minimize
+
+N, D = 14, 3
+PAIRS_I, PAIRS_J = np.triu_indices(N, k=1)
+NPairs = PAIRS_I.size
+
+
+def _pair_dists(flat_or_pts):
+    P = flat_or_pts.reshape(N, D) if flat_or_pts.ndim == 1 else flat_or_pts
+    return np.linalg.norm(P[PAIRS_I] - P[PAIRS_J], axis=1)
+
+
+def _ratio(pts):
+    ds = _pair_dists(pts)
+    dmax = ds.max()
+    if dmax <= 0:
+        return -1.0
+    return ds.min() / dmax
+
+
+def _safe_output(pts, fallback):
+    pts = np.asarray(pts, dtype=float)
+    if pts.shape != (N, D) or not np.all(np.isfinite(pts)):
+        return np.asarray(fallback, dtype=float).copy()
+    return pts
+
+
+# ---------------- analytic jacobian helpers ----------------
+
+def _dist_jac_matrix(flat):
+    """(NPairs, N*D) jacobian of all pairwise distances."""
+    P = flat.reshape(N, D)
+    diff = P[PAIRS_I] - P[PAIRS_J]
+    d = np.linalg.norm(diff, axis=1)
+    u = diff / np.maximum(d, 1e-12)[:, None]
+    J = np.zeros((NPairs, N * D))
+    rows = np.arange(NPairs)
+    J[rows, 3 * PAIRS_I] = u[:, 0]
+    J[rows, 3 * PAIRS_I + 1] = u[:, 1]
+    J[rows, 3 * PAIRS_I + 2] = u[:, 2]
+    J[rows, 3 * PAIRS_J] = -u[:, 0]
+    J[rows, 3 * PAIRS_J + 1] = -u[:, 1]
+    J[rows, 3 * PAIRS_J + 2] = -u[:, 2]
+    return J, d
+
+
+def _slsqp(pts, maxiter=500, ftol=1e-12):
+    """Max dmin s.t. all pair distances <= 1, with analytic jacobians."""
+
+    def objective(flat):
+        return -_pair_dists(flat).min()
+
+    def objective_jac(flat):
+        J, d = _dist_jac_matrix(flat)
+        k = int(np.argmin(d))
+        g = -J[k]
+        return g
+
+    def cons_fun(flat):
+        return 1.0 - _pair_dists(flat)
+
+    def cons_jac(flat):
+        J, _ = _dist_jac_matrix(flat)
+        return -J
+
+    ds = _pair_dists(pts)
+    dmax = ds.max()
+    if dmax > 0:
+        pts = pts / dmax
+    try:
+        res = minimize(
+            objective,
+            pts.ravel(),
+            jac=objective_jac,
+            method='SLSQP',
+            constraints={'type': 'ineq', 'fun': cons_fun, 'jac': cons_jac},
+            options={'maxiter': maxiter, 'ftol': ftol},
+        )
+        out = res.x.reshape(N, D)
+    except Exception:
+        out = pts
+    # project back into feasible region if slightly violated
+    ds = _pair_dists(out)
+    dm = ds.max()
+    if dm > 1.0:
+        out = out / dm
+    return _safe_output(out, pts)
+
+
+# ---------------- pre-optimizer: diameter-normalized repulsion ----------------
+
+def _repulsion(pts, iters=250, step=0.05, power=10.0):
+    pts = pts.copy()
+    for _ in range(iters):
+        diff = pts[PAIRS_I] - pts[PAIRS_J]
+        dist = np.maximum(np.linalg.norm(diff, axis=1), 1e-9)
+        pts /= max(np.linalg.norm(pts[PAIRS_I] - pts[PAIRS_J], axis=1).max(), 1e-9)
+        w = 1.0 / dist ** power
+        forces = (w[:, None] * diff) / dist[:, None]
+        grad = np.zeros_like(pts)
+        np.add.at(grad, PAIRS_I, forces)
+        np.add.at(grad, PAIRS_J, -forces)
+        # keep centroid fixed
+        grad -= grad.mean(axis=0, keepdims=True)
+        norm = np.linalg.norm(grad, axis=1, keepdims=True)
+        norm[norm == 0] = 1.0
+        pts += step * grad / norm
+        step *= 0.995
+    return pts
+
+
+# ---------------- seed zoo ----------------
+
+def _unit(v):
+    return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+
+
+def _icosahedron():
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    ico = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    ], dtype=float)
+    return _unit(ico)
+
+
+def _fibonacci_sphere(offset=0.0):
+    k = np.arange(N) + 0.5
+    ph = np.arccos(1.0 - 2.0 * k / N)
+    th = np.pi * (1.0 + 5.0 ** 0.5) * k + offset
+    return np.stack([np.cos(th) * np.sin(ph),
+                     np.sin(th) * np.sin(ph),
+                     np.cos(ph)], axis=1)
+
+
+def _antiprism(m=7, z=0.5, twist=None):
+    k = np.arange(m)
+    th = 2 * np.pi * k / m
+    th2 = th + (np.pi / m if twist is None else twist)
+    ring1 = np.stack([np.cos(th), np.sin(th), z * np.ones(m)], axis=1)
+    ring2 = np.stack([np.cos(th2), np.sin(th2), -z * np.ones(m)], axis=1)
+    return np.vstack([ring1, ring2])
+
+
+def _two_shell(scale=0.45, z=0.4):
+    k = np.arange(7)
+    th = 2 * np.pi * k / 7
+    outer = np.stack([np.cos(th), np.sin(th), z * np.ones(7)], axis=1)
+    inner = scale * np.stack([np.cos(th + np.pi / 7), np.sin(th + np.pi / 7),
+                              -z * np.ones(7)], axis=1)
+    return np.vstack([outer, inner])
+
+
+def _seeds(rng):
+    seeds = []
+    ico = _icosahedron()
+    poles = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]])
+    base = np.vstack([ico, poles])
+    for _ in range(3):
+        seeds.append(_unit(base + 0.05 * rng.standard_normal((N, D))))
+    for off in (0.0, 0.7, 1.9):
+        seeds.append(_fibonacci_sphere(off))
+    for z in (0.35, 0.5, 0.65):
+        seeds.append(_unit(_antiprism(7, z)))
+    for tw in (0.3, 0.6):
+        seeds.append(_unit(_antiprism(7, 0.5, tw)))
+    seeds.append(_two_shell())
+    seeds.append(_two_shell(0.6, 0.25))
+    for _ in range(6):
+        seeds.append(_unit(rng.standard_normal((N, D))))
+    return [s for s in seeds
+            if np.asarray(s).shape == (N, D) and np.all(np.isfinite(s))]
+
+
+# ---------------- cascade: escalating tolerance + perturbation restarts --------
+
+def _cascade(pts, rng, rounds=6):
+    best = pts
+    best_r = _ratio(best)
+    # pass 1
+    cand = _slsqp(best, maxiter=400, ftol=1e-12)
+    r = _ratio(cand)
+    if r > best_r:
+        best, best_r = cand, r
+    # escalating passes with perturbation restarts
+    for i in range(rounds):
+        scale = max(1e-6, 1e-3 / (2 ** i))
+        pert = best + scale * rng.standard_normal(best.shape)
+        pert = pert / max(_pair_dists(pert).max(), 1e-9)
+        cand = _slsqp(pert, maxiter=300 + 100 * i, ftol=1e-13 - i * 1e-15)
+        r = _ratio(cand)
+        if r > best_r + 1e-15:
+            best, best_r = cand, r
+    return best, best_r
+
+
+def _bottleneck(pts, tries=8):
+    best, best_r = pts, _ratio(pts)
+    for _ in range(tries):
+        ds = _pair_dists(best)
+        k = int(np.argmin(ds))
+        i, j = PAIRS_I[k], PAIRS_J[k]
+        direction = best[i] - best[j]
+        nrm = np.linalg.norm(direction)
+        if nrm <= 0:
+            break
+        direction = direction / nrm
+        improved = False
+        for s in (0.05, 0.025, 0.1):
+            cand = best.copy()
+            cand[i] += s * direction
+            cand[j] -= s * direction
+            cand = _slsqp(cand, maxiter=250, ftol=1e-13)
+            r = _ratio(cand)
+            if r > best_r + 1e-13:
+                best, best_r = cand, r
+                improved = True
+                break
+        if not improved:
+            break
+    return best
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3 dimensions in order to maximize the ratio of
+    minimum to maximum pairwise distance.
+
+    Returns
+        points: np.ndarray of shape (14, 3)
+    """
+    rng = np.random.default_rng(42)
+
+    # stage 1: cheap screening of seeds via repulsion + quick ratio
+    screened = []
+    for init in _seeds(rng):
+        pre = _repulsion(init)
+        r_pre, r_init = _ratio(pre), _ratio(init)
+        for cand, r in ((pre, r_pre), (init, r_init)):
+            if r > 0:
+                screened.append((r, cand))
+    if not screened:
+        screened = [(0.0, np.zeros((N, D)))]
+
+    screened.sort(key=lambda t: t[0], reverse=True)
+
+    # stage 2: jacobian SLSQP on top candidates
+    polished = []
+    for r, cand in screened[:8]:
+        sol = _slsqp(cand, maxiter=500, ftol=1e-12)
+        polished.append((_ratio(sol), sol))
+
+    polished.sort(key=lambda t: t[0], reverse=True)
+
+    # stage 3: escalating-tolerance perturbation cascade on top 3
+    best_pts, best_ratio = None, -1.0
+    for r, pts in polished[:3]:
+        cand, rc = _cascade(pts, rng)
+        if rc > best_ratio:
+            best_ratio, best_pts = rc, cand
+
+    # stage 4: bottleneck micro-polish
+    if best_pts is not None:
+        cand = _bottleneck(best_pts)
+        rc = _ratio(cand)
+        if rc > best_ratio:
+            best_ratio, best_pts = rc, cand
+
+    if best_pts is None:
+        best_pts = np.random.default_rng(0).standard_normal((N, D))
+
+    return _safe_output(best_pts, np.random.default_rng(1).standard_normal((N, D)))
+
+
+# EVOLVE-BLOCK-END

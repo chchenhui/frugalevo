@@ -1,0 +1,124 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Deterministically search for a high-minimum-area 11 point configuration.
+
+    The first three points are the vertices of the equilateral container.  The
+    remaining points are represented by two barycentric parameters, which makes
+    infeasible candidates impossible during the evolutionary search.
+    """
+    sqrt3_over_2 = np.sqrt(3.0) * 0.5
+    vertices = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [0.5, sqrt3_over_2]], dtype=float
+    )
+    triples = np.array(
+        [(i, j, k) for i in range(11) for j in range(i + 1, 11)
+         for k in range(j + 1, 11)],
+        dtype=int,
+    )
+    rng = np.random.default_rng(11031987)
+
+    def decode(population: np.ndarray) -> np.ndarray:
+        """Map [0,1]^16 parameters to eight points in the triangle."""
+        p = population.reshape(-1, 8, 2)
+        # u, v, 1-u-v are barycentric coordinates.  u=(1-v)*q
+        # ensures u >= 0 and u+v <= 1 without constraints or penalties.
+        # The square-root transform makes (u, v) uniform by area in the
+        # simplex rather than concentrating candidates near the top vertex.
+        v = 1.0 - np.sqrt(p[:, :, 1])
+        u = p[:, :, 0] * (1.0 - v)
+        free = np.empty((len(population), 8, 2), dtype=float)
+        free[:, :, 0] = u + 0.5 * v
+        free[:, :, 1] = sqrt3_over_2 * v
+        return np.concatenate(
+            (np.broadcast_to(vertices, (len(population), 3, 2)), free), axis=1
+        )
+
+    def quality(population: np.ndarray) -> np.ndarray:
+        """Minimum doubled triangle area for every member of a population."""
+        p = decode(population)
+        a = p[:, triples[:, 0]]
+        b = p[:, triples[:, 1]]
+        c = p[:, triples[:, 2]]
+        double_areas = np.abs(
+            (b[:, :, 0] - a[:, :, 0]) * (c[:, :, 1] - a[:, :, 1])
+            - (b[:, :, 1] - a[:, :, 1]) * (c[:, :, 0] - a[:, :, 0])
+        )
+        return double_areas.min(axis=1)
+
+    # A moderately large, entirely vectorized population gives substantially
+    # better designs than a hand-picked lattice while remaining reproducible.
+    population_size = 224
+    dimensions = 16
+    population = rng.random((population_size, dimensions))
+    scores = quality(population)
+
+    for generation in range(1400):
+        order = np.argsort(scores)
+        elite = population[order[-1]]
+        indices = np.arange(population_size)
+        a = rng.permutation(indices)
+        b = rng.permutation(indices)
+        c = rng.permutation(indices)
+        # Ensure the three donor indices differ from the target index.
+        a = np.where(a == indices, (a + 1) % population_size, a)
+        b = np.where((b == indices) | (b == a), (b + 2) % population_size, b)
+        c = np.where(
+            (c == indices) | (c == a) | (c == b), (c + 3) % population_size, c
+        )
+
+        # Blend conventional DE/rand/1 with a weak pull toward the best member.
+        scale = 0.72 if generation < 900 else 0.48
+        mutant = population[a] + scale * (population[b] - population[c])
+        mutant += 0.10 * (elite - population[a])
+        mutant = np.mod(mutant, 2.0)
+        mutant = np.where(mutant > 1.0, 2.0 - mutant, mutant)
+
+        crossover = rng.random((population_size, dimensions)) < 0.82
+        crossover[np.arange(population_size), rng.integers(dimensions,
+                                                           size=population_size)] = True
+        trial = np.where(crossover, mutant, population)
+        trial_scores = quality(trial)
+        accept = trial_scores >= scores
+        population[accept] = trial[accept]
+        scores[accept] = trial_scores[accept]
+
+    # Nonsmooth max-min objectives benefit from a final direct batch refinement.
+    best = population[np.argmax(scores)].copy()
+    best_score = quality(best[None, :])[0]
+    step = 0.055
+    for _ in range(420):
+        # Near a good configuration, moving every point at once almost always
+        # damages one of the active minimum-area triangles.  Mix sparse moves
+        # with a smaller number of global moves to resolve individual active
+        # constraints without losing coordinated refinement capability.
+        noise = rng.normal(0.0, step, size=(96, dimensions))
+        mask = np.ones((96, dimensions), dtype=bool)
+        mask[:40] = False
+        mask[40:72] = False
+        mask[np.arange(40), rng.integers(dimensions, size=40)] = True
+        rows = np.arange(40, 72)
+        first = rng.integers(dimensions, size=32)
+        second = rng.integers(dimensions, size=32)
+        mask[rows, first] = True
+        mask[rows, second] = True
+        candidates = best + noise * mask
+        candidates = np.mod(candidates, 2.0)
+        candidates = np.where(candidates > 1.0, 2.0 - candidates, candidates)
+        candidate_scores = quality(candidates)
+        winner = np.argmax(candidate_scores)
+        if candidate_scores[winner] > best_score:
+            best = candidates[winner]
+            best_score = candidate_scores[winner]
+            step *= 1.015
+        else:
+            step *= 0.985
+        step = max(step, 0.0015)
+
+    return decode(best[None, :])[0]
+
+
+# EVOLVE-BLOCK-END

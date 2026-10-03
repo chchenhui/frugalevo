@@ -1,0 +1,295 @@
+<NAME>
+steiner_discount_sweep
+</NAME>
+<DESCRIPTION>
+The current approach routes each destination independently along its shortest path, and repeats those edges for every partition — producing many redundant, high-cost transfers. Instead, I treat the problem as a directed Steiner tree problem: build a single shared tree from src to all destinations so each edge's transfer cost is paid once (data sent over a shared edge is reused by all downstream destinations/partitions). I use the classic shortest-path-attachment Steiner heuristic with a tunable discount parameter: when attaching a new destination, edges already in the tree are discounted, encouraging heavy sharing. The algorithm sweeps discount values {0.0, 0.05, 0.1, 0.25, 0.5, 1.0} internally, computes the resulting tree's true total edge cost, and keeps the cheapest tree. Order of destination attachment also matters, so multiple attachment orders (including one sorted by shortest-path distance) are tried. This reduces redundant transfers, exploits multi-network shared links, and directly minimizes total transfer cost without changing the output contract.
+</NAME>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+import itertools
+
+
+def _steiner_tree(h, src, dsts, discount, order):
+    """
+    Shortest-path-attachment Steiner heuristic with edge discounting.
+    Edges already in the tree get cost * (1 - discount) during attachment,
+    encouraging sharing. Returns set of edges (u, v).
+    """
+    tree_edges = set()
+    terminals = {src}
+    # use copy of graph so we can modify weights safely
+    wg = h.copy()
+    for u, v in wg.edges():
+        c = wg[u][v].get("cost")
+        if c is None:
+            c = 1e9
+        wg[u][v]["cost"] = float(c)
+
+    for dst in order:
+        if dst in terminals:
+            continue
+        # discount edges already in the tree
+        for (u, v) in tree_edges:
+            wg[u][v]["cost"] = h[u][v]["cost"] * (1.0 - discount)
+        try:
+            path = nx.dijkstra_path(wg, _nearest_terminal(terminals), dst, weight="cost") \
+                if False else None
+        except Exception:
+            path = None
+        # attach from the best terminal: try dijkstra from each terminal is
+        # expensive; instead run from src and from each terminal, pick cheapest.
+        best_path, best_cost = None, float("inf")
+        for term in list(terminals):
+            try:
+                d, p = nx.single_source_dijkstra(wg, term, weight="cost")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+            if dst in d and d[dst] < best_cost:
+                best_cost, best_path = d[dst], p[dst]
+        if best_path is None:
+            # restore weights before failing
+            for (u, v) in tree_edges:
+                wg[u][v]["cost"] = h[u][v]["cost"]
+            return None
+        # cut the path back to the first node already in the tree
+        # (nodes reachable via current tree); walk from dst backwards to
+        # the first tree node encountered
+        nodes = set()
+        for (u, v) in tree_edges:
+            nodes.add(u)
+            nodes.add(v)
+        nodes.add(src)
+        # find the earliest index in the path whose node is in the tree
+        idx = 0
+        for i, n in enumerate(best_path):
+            if n in nodes:
+                idx = i
+                break
+        for i in range(idx, len(best_path) - 1):
+            tree_edges.add((best_path[i], best_path[i + 1]))
+        terminals.add(dst)
+        # restore weights
+        for (u, v) in tree_edges:
+            wg[u][v]["cost"] = h[u][v]["cost"]
+    return tree_edges
+
+
+def _nearest_terminal(terminals):
+    return next(iter(terminals))
+
+
+def _tree_cost(h, edges):
+    total = 0.0
+    for (u, v) in edges:
+        c = h[u][v].get("cost")
+        if c is None:
+            c = 1e9
+        total += float(c)
+    return total
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Handle missing costs: assign large cost so they are avoided when possible
+    for u, v in h.edges():
+        if h[u][v].get("cost") is None:
+            h[u][v]["cost"] = 1e9
+
+    reachable_dsts = [d for d in dsts if d in h and nx.has_path(h, src, d)]
+
+    # Baseline: per-destination shortest paths (independent routing)
+    try:
+        _, sp_paths = nx.single_source_dijkstra(h, src, weight="cost")
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        sp_paths = {}
+
+    # Sweep discount values for the Steiner heuristic and keep best tree
+    discounts = [0.0, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0]
+    orders = [reachable_dsts]
+    # a couple of alternative orders: by shortest-path distance (closest first / farthest first)
+    try:
+        dist_map = nx.single_source_dijkstra_path_length(h, src, weight="cost")
+        sorted_dsts = sorted(reachable_dsts, key=lambda d: dist_map.get(d, 1e9))
+        orders.append(list(sorted_dsts))
+        orders.append(list(reversed(sorted_dsts)))
+    except Exception:
+        pass
+
+    best_edges = None
+    best_cost = float("inf")
+    for disc in discounts:
+        for order in orders:
+            edges = _steiner_tree(h, src, reachable_dsts, disc, order)
+            if edges is None:
+                continue
+            c = _tree_cost(h, edges)
+            if c < best_cost:
+                best_cost = c
+                best_edges = edges
+
+    # Baseline independent routing for comparison
+    base_edges = set()
+    for d in reachable_dsts:
+        p = sp_paths.get(d)
+        if p is None:
+            try:
+                p = nx.dijkstra_path(h, src, d, weight="cost")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+        for i in range(len(p) - 1):
+            base_edges.add((p[i], p[i + 1]))
+    base_total = _tree_cost(h, base_edges)
+
+    # Choose the cheaper strategy. We must still record per-destination
+    # connectivity so the topology is valid: for each dst, route through
+    # the tree if we use the tree.
+    use_tree = best_edges is not None and best_cost < base_total
+
+    if use_tree:
+        tree_graph = nx.DiGraph()
+        tree_graph.add_nodes_from(h.nodes())
+        for (u, v) in best_edges:
+            tree_graph.add_edge(u, v, cost=h[u][v]["cost"])
+        for d in reachable_dsts:
+            try:
+                p = nx.dijkstra_path(tree_graph, src, d, weight="cost")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                p = sp_paths.get(d) or nx.dijkstra_path(h, src, d, weight="cost")
+            for i in range(len(p) - 1):
+                s, t = p[i], p[i + 1]
+                for j in range(num_partitions):
+                    bc_topology.append_dst_partition_path(d, j, [s, t, G[s][t]])
+    else:
+        for d in reachable_dsts:
+            p = sp_paths.get(d)
+            if p is None:
+                try:
+                    p = nx.dijkstra_path(h, src, d, weight="cost")
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    continue
+            for i in range(len(p) - 1):
+                s, t = p[i], p[i + 1]
+                for j in range(num_partitions):
+                    bc_topology.append_dst_partition_path(d, j, [s, t, G[s][t]])
+
+    # Unreachable destinations: leave empty / try direct fallback
+    for d in dsts:
+        if d not in reachable_dsts:
+            try:
+                p = nx.dijkstra_path(G, src, d, weight="cost")
+                for i in range(len(p) - 1):
+                    s, t = p[i], p[i + 1]
+                    for j in range(num_partitions):
+                        bc_topology.append_dst_partition_path(d, j, [s, t, G[s][t]])
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+
+    return bc_topology
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]  # [[src, dst, edge data]]
+
+
+class BroadCastTopology:
+    def __init__(self, src: str, dsts: List[str], num_partitions: int = 4, paths: Dict[str, SingleDstPath] = None):
+        self.src = src  # single str
+        self.dsts = dsts  # list of strs
+        self.num_partitions = num_partitions
+
+        # dict(dst) --> dict(partition) --> list(nx.edges)
+        # example: {dst1: {partition1: [src->node1, node1->dst1], partition 2: [src->dst1]}}
+        if paths is not None:
+            self.paths = paths
+            self.set_graph()
+        else:
+            self.paths = {dst: {str(i): None for i in range(num_partitions)} for dst in dsts}
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        """
+        Set paths for partition = partition to reach dst
+        """
+        partition = str(partition)
+        self.paths[dst][partition] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        """
+        Append path for partition = partition to reach dst
+        """
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    """
+    Default graph with capacity constraints and cost info
+    nodes: regions, edges: links
+    per edge:
+        throughput: max tput achievable (gbps)
+        cost: $/GB
+        flow: actual flow (gbps), must be < throughput, default = 0
+    """
+    # Use relative path from this file's location
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if cost_path is None:
+        cost = pd.read_csv(os.path.join(current_dir, "profiles/cost.csv"))
+    else:
+        cost = pd.read_csv(cost_path)
+
+    if throughput_path is None:
+        throughput = pd.read_csv(os.path.join(current_dir, "profiles/throughput.csv"))
+    else:
+        throughput = pd.read_csv(throughput_path)
+
+    G = nx.DiGraph()
+    for _, row in throughput.iterrows():
+        if row["src_region"] == row["dst_region"]:
+            continue
+        G.add_edge(row["src_region"], row["dst_region"], cost=None, throughput=num_vms * row["throughput_sent"] / 1e9)
+
+    for _, row in cost.iterrows():
+        if row["src"] in G and row["dest"] in G[row["src"]]:
+            G[row["src"]][row["dest"]]["cost"] = row["cost"]
+
+    # some pairs not in the cost grid
+    no_cost_pairs = []
+    for edge in G.edges.data():
+        src, dst = edge[0], edge[1]
+        if edge[-1]["cost"] is None:
+            no_cost_pairs.append((src, dst))
+    print("Unable to get costs for: ", no_cost_pairs)
+
+    return G
+
+
+# EVOLVE-BLOCK-END
+
+# Helper functions that won't be evolved
+def create_broadcast_topology(src: str, dsts: List[str], num_partitions: int = 4):
+    """Create a broadcast topology instance"""
+    return BroadCastTopology(src, dsts, num_partitions)
+
+def run_search_algorithm(src: str, dsts: List[str], G, num_partitions: int):
+    """Run the search algorithm and return the topology"""
+    return search_algorithm(src, dsts, G, num_partitions)
+```
+</CODE>

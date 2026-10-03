@@ -1,0 +1,173 @@
+<NAME>
+add_scipy_polish_and_pair_climb</NAME>
+<DESCRIPTION>
+The current program only uses a repulsion relaxation, which plateaus at ratio^2 ≈ 0.22 (score 0.93). Prior generations showed that adding (a) an annealed soft-min/soft-max L-BFGS polish and (b) a vectorized steepest-ascent hill climb that moves all binding min/max pairs simultaneously (the "multi-pair binding-constraint" strategy from the recommendations) pushes the score to ~0.94+. I add both as post-processing stages: every relax result gets a short polish + climb, and the final winner gets a high-precision polish and a multi-pair climb. This is targeted: the relax stage stays as the global basin search, while the new stages do the fine convergence on the true objective. To stay within timeout, climb uses multi-pair candidate generation (all pairs within 5% of dmin/dmax) and polish uses a small tau ladder.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def d6_family(R, h, z0):
+=======
+def _ij_arrays():
+    return (np.array([i for i in range(N) for j in range(i + 1, N)]),
+            np.array([j for i in range(N) for j in range(i + 1, N)]))
+
+
+_IJ0, _IJ1 = _ij_arrays()
+
+
+def d6_family(R, h, z0):
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def perturb(P, rng, scale):
+    return normalize(P + rng.normal(scale=scale, size=P.shape))
+=======
+def perturb(P, rng, scale):
+    return normalize(P + rng.normal(scale=scale, size=P.shape))
+
+
+def polish(P0, taus=(0.02, 0.008, 0.003, 0.001, 0.0004, 0.00015)):
+    """Annealed soft-min/soft-max L-BFGS polish on squared distances."""
+    try:
+        from scipy.optimize import minimize
+        from scipy.special import logsumexp
+    except Exception:
+        return normalize(P0)
+
+    P = normalize(P0)
+    x = P.ravel()
+
+    def obj(z, tau):
+        X = z.reshape(N, D)
+        d2 = np.sum((X[_IJ0] - X[_IJ1]) ** 2, axis=1)
+        return tau * (logsumexp(-d2 / tau) + logsumexp(d2 / tau))
+
+    for tau in taus:
+        try:
+            res = minimize(lambda z, t=tau: obj(z, t), x, method="L-BFGS-B",
+                           options={"maxiter": 300, "ftol": 1e-15,
+                                    "gtol": 1e-13})
+            if np.isfinite(res.x).all():
+                x = res.x
+        except Exception:
+            break
+    return normalize(x.reshape(N, D))
+
+
+def _batch_scores(C):
+    """Scores for a stack of candidates (m, N, D), vectorized."""
+    diff = C[:, :, None, :] - C[:, None, :, :]
+    D2 = (diff * diff).sum(-1)
+    dd = np.sqrt(np.maximum(D2[:, IU[0], IU[1]], 1e-24))
+    return dd.min(axis=1) / dd.max(axis=1)
+
+
+def climb(P, steps=(0.01, 0.003, 0.001, 3e-4, 1e-4, 3e-5)):
+    """Steepest ascent on the true ratio with multi-pair binding moves.
+
+    All pairs within 5% of dmin get separation candidates and all pairs
+    within 5% of dmax get contraction candidates, evaluated in one batch.
+    """
+    P = normalize(P)
+    best_r = score(P)
+    for step in steps:
+        n_acc = 0
+        while n_acc < 600:
+            d = pdist(P)[IU]
+            dmin, dmax = d.min(), d.max()
+            cands = []
+            minpairs = [(int(_IJ0[k]), int(_IJ1[k]))
+                        for k in range(len(d)) if d[k] < dmin * 1.05]
+            maxpairs = [(int(_IJ0[k]), int(_IJ1[k]))
+                        for k in range(len(d)) if d[k] > dmax * 0.95]
+            for (i, j) in minpairs[:6]:
+                u = P[j] - P[i]
+                nu = np.linalg.norm(u)
+                if nu > 1e-12:
+                    u = u / nu
+                    Q = P.copy()
+                    Q[i] -= step * u
+                    Q[j] += step * u
+                    cands.append(Q)
+            for (i, j) in maxpairs[:6]:
+                v = P[j] - P[i]
+                nv = np.linalg.norm(v)
+                if nv > 1e-12:
+                    v = v / nv
+                    Q = P.copy()
+                    Q[i] += 0.5 * step * v
+                    Q[j] -= 0.5 * step * v
+                    cands.append(Q)
+            # combined simultaneous move on one min pair + one max pair
+            if minpairs and maxpairs:
+                i0, j0 = minpairs[0]
+                i1, j1 = maxpairs[0]
+                u = P[j0] - P[i0]
+                v = P[j1] - P[i1]
+                if np.linalg.norm(u) > 1e-12 and np.linalg.norm(v) > 1e-12:
+                    Q = P.copy()
+                    Q[i0] -= step * u / np.linalg.norm(u)
+                    Q[j0] += step * u / np.linalg.norm(u)
+                    Q[i1] += 0.5 * step * v / np.linalg.norm(v)
+                    Q[j1] -= 0.5 * step * v / np.linalg.norm(v)
+                    cands.append(Q)
+            if not cands:
+                break
+            C = np.stack(cands, axis=0)
+            rs = _batch_scores(C)
+            k = int(np.argmax(rs))
+            if rs[k] > best_r + 1e-15:
+                best_r = float(rs[k])
+                P = normalize(C[k])
+                n_acc += 1
+            else:
+                break
+    return P, best_r
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # final polish: tight relaxation restarts around best
+    for k in range(8):
+        Q, s = relax(perturb(best, rng, 0.02), iters=400)
+        if s > best_s:
+            best_s, best = s, Q
+
+    # exact symmetric D6 candidate as a guarded final comparison
+=======
+    # final polish: tight relaxation restarts around best
+    for k in range(8):
+        Q, s = relax(perturb(best, rng, 0.02), iters=400)
+        if s > best_s:
+            best_s, best = s, Q
+        # gradient polish + multi-pair climb on each tight restart
+        Qp = polish(Q)
+        qp = score(Qp)
+        if qp > best_s + 1e-12:
+            best_s, best = qp, Qp
+        Qc, qc = climb(Qp)
+        if qc > best_s + 1e-12:
+            best_s, best = qc, Qc
+
+    # coordinated high-precision refinement of the global best
+    Q = polish(best)
+    q = score(Q)
+    if q > best_s + 1e-12:
+        best_s, best = q, Q
+    Qc, qc = climb(Q)
+    if qc > best_s + 1e-12:
+        best_s, best = qc, Qc
+    for k in range(4):
+        Q = polish(best + 0.02 * (0.7 ** k) * rng.normal(size=best.shape))
+        q = score(Q)
+        if q > best_s + 1e-12:
+            best_s, best = q, Q
+        Qc, qc = climb(Q)
+        if qc > best_s + 1e-12:
+            best_s, best = qc, Qc
+
+    # exact symmetric D6 candidate as a guarded final comparison
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

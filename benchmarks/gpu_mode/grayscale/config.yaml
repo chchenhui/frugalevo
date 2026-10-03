@@ -1,0 +1,176 @@
+# GPU Mode: Grayscale Triton Kernel Optimization
+
+max_iterations: 100
+checkpoint_interval: 1
+log_level: "INFO"
+
+llm:
+  models:
+    - name: "gpt-5"
+      weight: 1.0
+  api_base: https://api.openai.com/v1
+  temperature: 1.0
+  # top_p: 0.95  # omitted by default; some providers (e.g. Anthropic) reject both temperature and top_p
+  max_tokens: 32000
+  timeout: 600
+
+prompt:
+  system_message: |
+    You are an expert Triton engineer tasked with translating PyTorch code into highly optimized Triton kernel code.
+
+    You will be implementing a Grayscale conversion kernel that converts RGB images to grayscale using the luminance formula:
+    Y = 0.2989 * R + 0.5870 * G + 0.1140 * B
+
+    Your task:
+    - Implement the grayscale conversion as a highly optimized Triton kernel.
+    - The input is an (H, W, 3) float32 tensor and a pre-allocated (H, W) float32 output tensor.
+    - Your function receives `data = (rgb, output)` and should write the result into `output` and return it.
+
+    Your function should be defined as 'custom_kernel' with the following signature:
+    Input:
+    - `data`: Tuple of (rgb: torch.Tensor, output: torch.Tensor)
+        - rgb: Input tensor of shape [H, W, 3] (float32, contiguous)
+        - output: Pre-allocated output tensor of shape [H, W] (float32, contiguous)
+
+    Output:
+    - output: Grayscale tensor [H, W] (write in-place to the provided output tensor and return it)
+
+    Here is the reference PyTorch implementation:
+    ```python
+    import torch
+
+    # Reference code in PyTorch
+    def ref_kernel(data):
+        rgb, output = data
+        weights = torch.tensor([0.2989, 0.5870, 0.1140], device=rgb.device, dtype=rgb.dtype)
+        output[...] = torch.sum(rgb * weights, dim=-1)
+        return output
+    ```
+
+    Here is an example of a basic Triton implementation:
+    ```python
+    import torch
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def grayscale_kernel(
+        rgb_ptr, out_ptr,
+        H, W,
+        stride_h, stride_w, stride_c,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        n_pixels = H * W
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_pixels
+
+        h_idx = offsets // W
+        w_idx = offsets % W
+
+        r = tl.load(rgb_ptr + h_idx * stride_h + w_idx * stride_w + 0 * stride_c, mask=mask)
+        g = tl.load(rgb_ptr + h_idx * stride_h + w_idx * stride_w + 1 * stride_c, mask=mask)
+        b = tl.load(rgb_ptr + h_idx * stride_h + w_idx * stride_w + 2 * stride_c, mask=mask)
+
+        gray = 0.2989 * r + 0.5870 * g + 0.1140 * b
+
+        out_offsets = h_idx * W + w_idx
+        tl.store(out_ptr + out_offsets, gray, mask=mask)
+
+    def custom_kernel(data):
+        rgb, output = data
+        H, W, C = rgb.shape
+        assert C == 3
+        rgb = rgb.contiguous()
+        stride_h, stride_w, stride_c = rgb.stride()
+        n_pixels = H * W
+        BLOCK_SIZE = 1024
+        grid = (triton.cdiv(n_pixels, BLOCK_SIZE),)
+        grayscale_kernel[grid](
+            rgb, output, H, W,
+            stride_h, stride_w, stride_c,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        return output
+    ```
+
+    To help you understand which triton version we are using, here is some example triton code for an unrelated task:
+    ```python
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def matmul_persistent_ws_kernel(
+       a_ptr, b_ptr, c_ptr, M, N, K,
+       stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ):
+       pid = tl.program_id(axis=0) # async_task 0, 1, 2
+       num_pid_m = tl.cdiv(M, BLOCK_M) # async_task 0, 1, 2
+       num_pid_n = tl.cdiv(N, BLOCK_N) # async_task 0, 1, 2
+       pid_m = pid // num_pid_m # async_task 0, 1, 2
+       pid_n = pid % num_pid_n # async_task 0, 1, 2
+       offs_m_1 = pid_m * BLOCK_M + tl.arange(0, BLOCK_M // 2) # async_task 0, 1, 2
+       offs_m_2 = pid_m * BLOCK_M + tl.arange(BLOCK_M // 2, BLOCK_M) # async_task 0, 1, 2
+       offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_N) # async_task 0, 1, 2
+       offs_k = tl.arange(0, BLOCK_K) # async_task 0
+       a_ptrs_1 = a_ptr + (offs_m_1[:, None] * stride_am + offs_k[None, :] * stride_ak) # async_task 0
+       a_ptrs_2 = a_ptr + (offs_m_2[:, None] * stride_am + offs_k[None, :] * stride_ak) # async_task 0
+       b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn) # async_task 0
+       acc_1 = tl.zeros((BLOCK_M // 2, BLOCK_N), dtype=tl.float32) # async_task 1
+       acc_1 = tl.zeros((BLOCK_M // 2, BLOCK_N), dtype=tl.float32) # async_task 2
+       for k in range(0, tl.cdiv(K, BLOCK_K)): # async_task 0, 1, 2
+           a_1 = tl.load(a_ptrs_1)   # async_task 0
+           a_2 = tl.load(a_ptrs_2)   # async_task 0
+           b = tl.load(b_ptrs)   # async_task 0
+           acc_1 += tl.dot(a_1, b)   # async_task 1
+           acc_2 += tl.dot(a_2, b)   # async_task 2
+           a_ptrs_1 += BLOCK_K * stride_ak # async_task 0
+           a_ptrs_2 += BLOCK_K * stride_ak # async_task 0
+           b_ptrs += BLOCK_K * stride_bk # async_task 0
+       c_1 = acc_1.to(tl.float16) # async_task 1
+       c_2 = acc_2.to(tl.float16) # async_task 2
+       c_ptrs_1 = c_ptr_1 + stride_cm * offs_m_1[:, None] + stride_cn * offs_n[None, :] # async_task 1
+       c_ptrs_2 = c_ptr_2 + stride_cm * offs_m_2[:, None] + stride_cn * offs_n[None, :] # async_task 2
+       tl.store(c_ptrs_1, c_1) # async_task 1
+       tl.store(c_ptrs_2, c_2) # async_task 2
+    ```
+
+    A few general triton tips:
+    - tl.arange only takes in constexpr arguments (static or tl.constexpr)
+    - You cannot use continue in your kernel code
+    - tl.dot can only take in two input tensors
+    - There is no tl.mean
+
+    Here are the different configs that your kernel will be benchmarked on (optimize runtime for these):
+
+    Benchmark Cases:
+      - {"size": 1024}  (1024x1024 RGB image)
+      - {"size": 2048}  (2048x2048 RGB image)
+      - {"size": 4096}  (4096x4096 RGB image)
+      - {"size": 8192}  (8192x8192 RGB image)
+
+    Key optimization strategies to consider:
+    - Memory coalescing: the RGB data is (H, W, 3), so adjacent pixels in a row are stride-3 apart. Consider vectorized loads or layout transformations.
+    - Block size tuning: larger blocks amortize launch overhead but may reduce occupancy.
+    - Use of shared memory or register-level optimizations for the weighted sum.
+    - Vectorized loads (e.g., loading 3 floats at once per pixel).
+
+    Rules:
+    - The tensors arguments passed in will be already on your cuda device.
+    - Define all of your code in one final ```python ``` block.
+    - We will test the correctness of your kernel on multiple input shapes, make sure to support different potential test cases.
+    - Your final output must be in float32.
+    - You must use trition 3.3.1 and these kernels will be run on an H100.
+    - You do not have to implement everything in triton, you may choose to have some of the operations done in pytorch. However, you must implement at least part of the operations in a kernel.
+    - Include a short docstring at the top summarizing your algorithm.
+evaluator:
+  timeout: 600
+  max_retries: 3
+  cascade_evaluation: true
+  cascade_thresholds: [0.4, 0.3]
+
+diff_based_generation: true
+max_solution_length: 60000
+random_seed: 42

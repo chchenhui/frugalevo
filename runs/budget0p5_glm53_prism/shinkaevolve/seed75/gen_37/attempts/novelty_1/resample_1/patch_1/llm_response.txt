@@ -1,0 +1,233 @@
+<NAME>
+greedy_plus_refine_and_second_target
+</NAME>
+<DESCRIPTION>
+Keep the greedy density-based initial placement, then add local search refinement: repeatedly target the GPU with max KVPR and try moves, swaps, and 2-for-1 moves to reduce the global max. When the hot-GPU loop stalls, run a second refinement phase targeting the second-worst GPU, gated on not increasing the global max. This follows the recommendation and reuses one set of operators.
+</DESCRIPTION>
+<CODE>
+```python
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+    """
+    EPS = 1e-12
+
+    def kvpr_of(used, weighted):
+        if used >= GPU_MEM_SIZE - EPS:
+            return float('inf')
+        return weighted / (GPU_MEM_SIZE - used)
+
+    # ---- Greedy initial placement (sort by r_j/s_j density descending) ----
+    sorted_models = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
+
+    placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+    shared_kv = [GPU_MEM_SIZE for _ in range(gpu_num)]
+    weighted_req_rate = [0.0 for _ in range(gpu_num)]
+
+    for model in sorted_models:
+        best_idx = None
+        best_ratio = float('inf')
+        for gpu_id in range(gpu_num):
+            if model.model_size <= shared_kv[gpu_id] + EPS:
+                current_ratio = weighted_req_rate[gpu_id] / shared_kv[gpu_id] if shared_kv[gpu_id] > EPS else float('inf')
+                if current_ratio < best_ratio:
+                    best_ratio = current_ratio
+                    best_idx = gpu_id
+        if best_idx is None:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on any GPU. "
+                f"Remaining per-GPU memory: {shared_kv}"
+            )
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    if gpu_num == 0:
+        return placement
+
+    # ---- Local search refinement ----
+    def global_state():
+        kvprs = []
+        for g in range(gpu_num):
+            used = GPU_MEM_SIZE - shared_kv[g]
+            kvprs.append(kvpr_of(used, weighted_req_rate[g]))
+        return kvprs
+
+    kvprs = global_state()
+
+    def try_op(hot, kvprs, allow_equal):
+        """Find best reducing operation involving hot GPU. Returns (gain, op) or None."""
+        hot_k = kvprs[hot]
+        target_max = hot_k  # we want to reduce hot's kvpr below this
+        best_gain = -EPS if allow_equal else 0.0
+        best = None
+        hot_models = placement[hot]
+
+        # single moves from hot to other GPUs
+        for m in hot_models:
+            w = m.req_rate / m.slo
+            for g in range(gpu_num):
+                if g == hot:
+                    continue
+                if m.model_size > shared_kv[g] + EPS:
+                    continue
+                new_hot = kvpr_of(GPU_MEM_SIZE - shared_kv[hot] + m.model_size,
+                                  weighted_req_rate[hot] - w)
+                new_g = kvpr_of(GPU_MEM_SIZE - shared_kv[g] - m.model_size,
+                                weighted_req_rate[g] + w)
+                new_max = max(max(kvprs[:hot], kvprs[hot+1:]), new_g) if gpu_num > 1 else new_g
+                gain = hot_k - new_hot
+                if gain > best_gain + EPS and new_hot < hot_k - EPS:
+                    if new_max < hot_k - EPS or (allow_equal and new_max <= hot_k + EPS):
+                        best_gain = gain
+                        best = ('move', m, hot, g)
+        # swaps between hot and other GPUs
+        for m1 in hot_models:
+            w1 = m1.req_rate / m1.slo
+            for g in range(gpu_num):
+                if g == hot:
+                    continue
+                for m2 in placement[g]:
+                    w2 = m2.req_rate / m2.slo
+                    d1 = m2.model_size - m1.model_size
+                    if shared_kv[hot] + d1 < -EPS or shared_kv[g] - d1 < -EPS:
+                        continue
+                    new_hot = kvpr_of(GPU_MEM_SIZE - shared_kv[hot] - d1,
+                                      weighted_req_rate[hot] - w1 + w2)
+                    new_g = kvpr_of(GPU_MEM_SIZE - shared_kv[g] + d1,
+                                    weighted_req_rate[g] + w1 - w2)
+                    if new_hot >= hot_k - EPS:
+                        continue
+                    gain = hot_k - new_hot
+                    if gain > best_gain + EPS:
+                        best_gain = gain
+                        best = ('swap', m1, m2, hot, g)
+        # 2-for-1 moves: two models from hot for one from g
+        if len(hot_models) >= 2:
+            n = len(hot_models)
+            for i in range(n):
+                m1 = hot_models[i]
+                for j in range(i + 1, n):
+                    m2 = hot_models[j]
+                    w12 = m1.req_rate / m1.slo + m2.req_rate / m2.slo
+                    s12 = m1.model_size + m2.model_size
+                    for g in range(gpu_num):
+                        if g == hot:
+                            continue
+                        for m3 in placement[g]:
+                            w3 = m3.req_rate / m3.slo
+                            ds = m3.model_size - s12
+                            if shared_kv[hot] + ds < -EPS or shared_kv[g] - ds < -EPS:
+                                continue
+                            new_hot = kvpr_of(GPU_MEM_SIZE - shared_kv[hot] - ds,
+                                              weighted_req_rate[hot] - w12 + w3)
+                            new_g = kvpr_of(GPU_MEM_SIZE - shared_kv[g] + ds,
+                                            weighted_req_rate[g] + w12 - w3)
+                            if new_hot >= hot_k - EPS:
+                                continue
+                            gain = hot_k - new_hot
+                            if gain > best_gain + EPS:
+                                best_gain = gain
+                                best = ('2for1', m1, m2, m3, hot, g)
+        return best
+
+    def apply_op(op):
+        if op[0] == 'move':
+            _, m, a, b = op
+            placement[a].remove(m)
+            placement[b].append(m)
+            w = m.req_rate / m.slo
+            weighted_req_rate[a] -= w
+            weighted_req_rate[b] += w
+            shared_kv[a] += m.model_size
+            shared_kv[b] -= m.model_size
+        elif op[0] == 'swap':
+            _, m1, m2, a, b = op
+            placement[a].remove(m1)
+            placement[b].remove(m2)
+            placement[a].append(m2)
+            placement[b].append(m1)
+            w1 = m1.req_rate / m1.slo; w2 = m2.req_rate / m2.slo
+            weighted_req_rate[a] += w2 - w1
+            weighted_req_rate[b] += w1 - w2
+            shared_kv[a] += m2.model_size - m1.model_size
+            shared_kv[b] += m1.model_size - m2.model_size
+        else:  # 2for1
+            _, m1, m2, m3, a, b = op
+            placement[a].remove(m1)
+            placement[a].remove(m2)
+            placement[b].remove(m3)
+            placement[a].append(m3)
+            placement[b].append(m1)
+            placement[b].append(m2)
+            w1 = m1.req_rate / m1.slo; w2 = m2.req_rate / m2.slo
+            w3 = m3.req_rate / m3.slo
+            weighted_req_rate[a] += w3 - w1 - w2
+            weighted_req_rate[b] += w1 + w2 - w3
+            shared_kv[a] += m3.model_size - m1.model_size - m2.model_size
+            shared_kv[b] += m1.model_size + m2.model_size - m3.model_size
+
+    # Phase 1: refine targeting the max-KVPR GPU
+    for _ in range(60):
+        kvprs = global_state()
+        hot = max(range(gpu_num), key=lambda g: kvprs[g])
+        op = try_op(hot, kvprs, allow_equal=False)
+        if op is None:
+            break
+        apply_op(op)
+
+    # Phase 2: refine targeting the second-worst GPU
+    for _ in range(30):
+        kvprs = global_state()
+        cur_global_max = max(kvprs)
+        order = sorted(range(gpu_num), key=lambda g: kvprs[g], reverse=True)
+        if len(order) < 2:
+            break
+        hot = order[1]
+        # gate: ops must not push any GPU above current global max
+        op = try_op(hot, kvprs, allow_equal=True)
+        if op is None:
+            # try next-worst GPUs briefly
+            progressed = False
+            for hot in order[2:]:
+                op = try_op(hot, kvprs, allow_equal=True)
+                if op is not None:
+                    progressed = True
+                    break
+            if not progressed:
+                break
+        apply_op(op)
+
+    return placement
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")
+```
+</CODE>

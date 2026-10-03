@@ -1,0 +1,575 @@
+--- a/original.py
++++ b/original.py
+@@ -1,336 +1,339 @@
+ GPU_MEM_SIZE = 80 # GB
+ 
+ # EVOLVE-BLOCK-START
+ 
+ def compute_model_placement(gpu_num, models):
+     """
+-    Compute a memory-feasible model placement that minimizes maximum KVPR.
+-
+-    The implementation uses:
+-    1. Multiple deterministic greedy construction orders.
+-    2. Selection of the best complete candidate placement.
+-    3. Local improvement using relocations and pairwise swaps.
++    Place models while minimizing the maximum GPU KV cache pressure ratio.
++
++    A threshold p is feasible when every GPU can satisfy:
++        used_memory + total_load / p <= GPU_MEM_SIZE
++
++    Therefore, packing transformed item sizes:
++        model_size + model_load / p
++    into 80 GB bins guarantees actual KVPR <= p.
+     """
+ 
+     EPS = 1e-12
+-
+-    def model_load(model):
++    models = list(models)
++
++    if gpu_num <= 0:
++        if models:
++            raise ValueError("Unable to place models because gpu_num must be positive.")
++        return {}
++
++    def load_of(model):
+         return model.req_rate / model.slo
+ 
++    model_info = [(model, model.model_size, load_of(model)) for model in models]
++
++    if any(size > GPU_MEM_SIZE for _, size, _ in model_info):
++        raise ValueError(
++            "Unable to place all models within GPU memory. "
++            f"Each GPU has {GPU_MEM_SIZE} GB."
++        )
++
+     def pressure(load, remaining):
+-        if remaining <= 0:
+-            return float("inf") if load > 0 else 0.0
++        if remaining <= EPS:
++            return float("inf") if load > EPS else 0.0
+         return load / remaining
+ 
+-    def max_pressure(loads, remaining):
+-        return max(
+-            pressure(loads[gpu], remaining[gpu])
+-            for gpu in range(gpu_num)
+-        ) if gpu_num else 0.0
+-
+-    def build_candidate(ordered_models, packing_mode=False):
++    def score(loads, remaining):
++        values = sorted(
++            (pressure(loads[gpu], remaining[gpu]) for gpu in range(gpu_num)),
++            reverse=True,
++        )
++        return tuple(values) + (-max(remaining),)
++
++    def make_result(bins):
+         placement = {gpu: [] for gpu in range(gpu_num)}
+         remaining = [GPU_MEM_SIZE] * gpu_num
+         loads = [0.0] * gpu_num
+ 
+-        for model in ordered_models:
+-            size = model.model_size
+-            load = model_load(model)
+-            best_gpu = None
+-            best_key = None
++        for gpu, items in enumerate(bins):
++            for model, size, load in items:
++                placement[gpu].append(model)
++                remaining[gpu] -= size
++                loads[gpu] += load
++
++        return placement, remaining, loads
++
++    def greedy_pack(order, transformed=None, best_fit=False):
++        """
++        Pack items using either real memory or transformed threshold sizes.
++        transformed is a mapping from model identity to transformed size.
++        """
++        bins = [[] for _ in range(gpu_num)]
++        used = [0.0] * gpu_num
++        loads = [0.0] * gpu_num
++        memory = [0.0] * gpu_num
++
++        for model, size, load in order:
++            item_size = transformed[id(model)] if transformed is not None else size
++            choices = []
+ 
+             for gpu in range(gpu_num):
+-                if size > remaining[gpu]:
++                if used[gpu] + item_size > GPU_MEM_SIZE + EPS:
+                     continue
+ 
+-                next_remaining = remaining[gpu] - size
++                next_used = used[gpu] + item_size
++                next_memory = memory[gpu] + size
+                 next_load = loads[gpu] + load
+-
+-                if packing_mode:
+-                    # Best-fit decreasing style fallback: preserve large blocks
+-                    # of free memory while favoring lower projected pressure.
++                remaining = GPU_MEM_SIZE - next_memory
++
++                if transformed is None:
++                    projected = pressure(next_load, remaining)
+                     key = (
+-                        next_remaining,
+-                        pressure(next_load, next_remaining),
++                        projected,
++                        -remaining,
+                         gpu,
+                     )
++                elif best_fit:
++                    key = (GPU_MEM_SIZE - next_used, gpu)
+                 else:
+-                    candidate_peak = 0.0
+-                    for other_gpu in range(gpu_num):
+-                        if other_gpu == gpu:
+-                            value = pressure(next_load, next_remaining)
+-                        else:
+-                            value = pressure(loads[other_gpu], remaining[other_gpu])
+-                        if value > candidate_peak:
+-                            candidate_peak = value
+-
+                     key = (
+-                        candidate_peak,
+-                        pressure(next_load, next_remaining),
+-                        -next_remaining,
++                        pressure(next_load, remaining),
++                        GPU_MEM_SIZE - next_used,
+                         gpu,
+                     )
+ 
+-                if best_key is None or key < best_key:
+-                    best_key = key
+-                    best_gpu = gpu
+-
+-            if best_gpu is None:
++                choices.append((key, gpu))
++
++            if not choices:
+                 return None
+ 
+-            placement[best_gpu].append(model)
+-            remaining[best_gpu] -= size
+-            loads[best_gpu] += load
+-
+-        return placement, remaining, loads
++            _, gpu = min(choices)
++            bins[gpu].append((model, size, load))
++            used[gpu] += item_size
++            memory[gpu] += size
++            loads[gpu] += load
++
++        return make_result(bins)
+ 
+     def improve(placement, remaining, loads):
+-        """
+-        Apply the best strictly improving relocation or swap until stable.
+-        """
+-        max_iterations = 40
+-
+-        for _ in range(max_iterations):
+-            current_peak = max_pressure(loads, remaining)
+-            best_action = None
+-            best_peak = current_peak
+-
+-            # Search relocations.
++        """Apply lexicographically improving moves and swaps."""
++        for _ in range(60):
++            current = score(loads, remaining)
++            best = current
++            action = None
++
+             for source in range(gpu_num):
+                 for model in placement[source]:
+                     size = model.model_size
+-                    load = model_load(model)
++                    load = load_of(model)
+ 
+                     for target in range(gpu_num):
+-                        if source == target or size > remaining[target]:
++                        if source == target or size > remaining[target] + EPS:
+                             continue
+ 
+-                        candidate_peak = 0.0
+-                        for gpu in range(gpu_num):
+-                            if gpu == source:
+-                                value = pressure(
+-                                    loads[gpu] - load,
+-                                    remaining[gpu] + size,
+-                                )
+-                            elif gpu == target:
+-                                value = pressure(
+-                                    loads[gpu] + load,
+-                                    remaining[gpu] - size,
+-                                )
+-                            else:
+-                                value = pressure(loads[gpu], remaining[gpu])
+-                            candidate_peak = max(candidate_peak, value)
+-
+-                        if candidate_peak < best_peak - EPS:
+-                            best_peak = candidate_peak
+-                            best_action = ("move", source, target, model)
+-
+-            # Search pairwise swaps. Swaps can repair placements that cannot
+-            # improve through a single feasible relocation.
+-            for left_gpu in range(gpu_num):
+-                for right_gpu in range(left_gpu + 1, gpu_num):
+-                    for left_model in placement[left_gpu]:
++                        new_remaining = remaining[:]
++                        new_loads = loads[:]
++                        new_remaining[source] += size
++                        new_remaining[target] -= size
++                        new_loads[source] -= load
++                        new_loads[target] += load
++                        candidate = score(new_loads, new_remaining)
++
++                        if candidate < best:
++                            best = candidate
++                            action = ("move", source, target, model)
++
++            for left in range(gpu_num):
++                for right in range(left + 1, gpu_num):
++                    for left_model in placement[left]:
+                         left_size = left_model.model_size
+-                        left_load = model_load(left_model)
+-
+-                        for right_model in placement[right_gpu]:
++                        left_load = load_of(left_model)
++
++                        for right_model in placement[right]:
+                             right_size = right_model.model_size
+-                            right_load = model_load(right_model)
+-
+-                            new_left_remaining = (
+-                                remaining[left_gpu] + left_size - right_size
+-                            )
+-                            new_right_remaining = (
+-                                remaining[right_gpu] + right_size - left_size
+-                            )
+-
+-                            if new_left_remaining < 0 or new_right_remaining < 0:
++                            right_load = load_of(right_model)
++
++                            left_free = remaining[left] + left_size - right_size
++                            right_free = remaining[right] + right_size - left_size
++                            if left_free < -EPS or right_free < -EPS:
+                                 continue
+ 
+-                            new_left_load = (
+-                                loads[left_gpu] - left_load + right_load
+-                            )
+-                            new_right_load = (
+-                                loads[right_gpu] - right_load + left_load
+-                            )
+-
+-                            candidate_peak = 0.0
+-                            for gpu in range(gpu_num):
+-                                if gpu == left_gpu:
+-                                    value = pressure(
+-                                        new_left_load,
+-                                        new_left_remaining,
+-                                    )
+-                                elif gpu == right_gpu:
+-                                    value = pressure(
+-                                        new_right_load,
+-                                        new_right_remaining,
+-                                    )
+-                                else:
+-                                    value = pressure(loads[gpu], remaining[gpu])
+-                                candidate_peak = max(candidate_peak, value)
+-
+-                            if candidate_peak < best_peak - EPS:
+-                                best_peak = candidate_peak
+-                                best_action = (
++                            new_remaining = remaining[:]
++                            new_loads = loads[:]
++                            new_remaining[left] = left_free
++                            new_remaining[right] = right_free
++                            new_loads[left] += right_load - left_load
++                            new_loads[right] += left_load - right_load
++                            candidate = score(new_loads, new_remaining)
++
++                            if candidate < best:
++                                best = candidate
++                                action = (
+                                     "swap",
+-                                    left_gpu,
+-                                    right_gpu,
++                                    left,
++                                    right,
+                                     left_model,
+                                     right_model,
+                                 )
+ 
+-            if best_action is None:
++            if action is None:
+                 break
+ 
+-            if best_action[0] == "move":
+-                _, source, target, model = best_action
++            if action[0] == "move":
++                _, source, target, model = action
+                 size = model.model_size
+-                load = model_load(model)
+-
++                load = load_of(model)
+                 placement[source].remove(model)
+                 placement[target].append(model)
+                 remaining[source] += size
+                 remaining[target] -= size
+                 loads[source] -= load
+                 loads[target] += load
+             else:
+-                _, left_gpu, right_gpu, left_model, right_model = best_action
++                _, left, right, left_model, right_model = action
+                 left_size = left_model.model_size
+                 right_size = right_model.model_size
+-                left_load = model_load(left_model)
+-                right_load = model_load(right_model)
+-
+-                placement[left_gpu].remove(left_model)
+-                placement[right_gpu].remove(right_model)
+-                placement[left_gpu].append(right_model)
+-                placement[right_gpu].append(left_model)
+-
+-                remaining[left_gpu] += left_size - right_size
+-                remaining[right_gpu] += right_size - left_size
+-                loads[left_gpu] += right_load - left_load
+-                loads[right_gpu] += left_load - right_load
++                left_load = load_of(left_model)
++                right_load = load_of(right_model)
++
++                placement[left].remove(left_model)
++                placement[right].remove(right_model)
++                placement[left].append(right_model)
++                placement[right].append(left_model)
++
++                remaining[left] += left_size - right_size
++                remaining[right] += right_size - left_size
++                loads[left] += right_load - left_load
++                loads[right] += left_load - right_load
+ 
+         return placement, remaining, loads
+ 
+-    if gpu_num <= 0:
+-        if models:
+-            raise ValueError("Unable to place models because gpu_num must be positive.")
+-        return {}
+-
+-    # Different orderings reduce sensitivity to a single greedy ordering.
+     orderings = [
++        sorted(model_info, key=lambda x: (x[2], x[1]), reverse=True),
++        sorted(model_info, key=lambda x: (x[1], x[2]), reverse=True),
+         sorted(
+-            models,
+-            key=lambda m: (model_load(m), m.model_size),
++            model_info,
++            key=lambda x: (x[2] / max(GPU_MEM_SIZE - x[1], EPS), x[1]),
+             reverse=True,
+         ),
+-        sorted(
+-            models,
+-            key=lambda m: (m.model_size, model_load(m)),
+-            reverse=True,
+-        ),
+-        sorted(
+-            models,
+-            key=lambda m: (
+-                model_load(m) / max(GPU_MEM_SIZE - m.model_size, EPS),
+-                m.model_size,
+-            ),
+-            reverse=True,
+-        ),
+-        sorted(
+-            models,
+-            key=lambda m: (
+-                model_load(m) * m.model_size,
+-                model_load(m),
+-            ),
+-            reverse=True,
+-        ),
+-        # Prioritize models that create high pressure after placement; these
+-        # are difficult to place late because they leave little free memory.
+-        sorted(
+-            models,
+-            key=lambda m: (
+-                model_load(m) / max(GPU_MEM_SIZE - m.model_size, EPS),
+-                model_load(m) / max(m.model_size, EPS),
+-                m.model_size,
+-            ),
+-            reverse=True,
+-        ),
+-        # Size-first ordering with pressure density as a deterministic
+-        # tie-breaker reduces fragmentation from large low-load models.
+-        sorted(
+-            models,
+-            key=lambda m: (
+-                m.model_size,
+-                model_load(m) / max(m.model_size, EPS),
+-                model_load(m),
+-            ),
+-            reverse=True,
+-        ),
+-        # Place request-heavy models per GB early, while retaining a size
+-        # tie-breaker to avoid scattering large models.
+-        sorted(
+-            models,
+-            key=lambda m: (
+-                model_load(m) / max(m.model_size, EPS),
+-                m.model_size,
+-                model_load(m),
+-            ),
+-            reverse=True,
+-        ),
++        sorted(model_info, key=lambda x: (x[2] / max(x[1], EPS), x[1]), reverse=True),
++        sorted(model_info, key=lambda x: (x[2] * x[1], x[2]), reverse=True),
+     ]
+ 
+-    best_result = None
+-    best_score = float("inf")
+-
+-    for index, ordering in enumerate(orderings):
+-        candidate = build_candidate(ordering, packing_mode=(index == 1))
+-        if candidate is None:
+-            continue
+-
+-        placement, remaining, loads = candidate
+-        # Different greedy orders often reach different local optima. Improve
+-        # each feasible seed before comparing them instead of discarding a seed
+-        # solely because its initial greedy pressure is higher.
+-        placement, remaining, loads = improve(placement, remaining, loads)
+-        score = max_pressure(loads, remaining)
+-
+-        if score < best_score:
+-            best_score = score
+-            best_result = (placement, remaining, loads)
+-
+-    if best_result is None:
++    candidates = []
++
++    # Real-memory greedy seeds provide robust fallback behavior.
++    for order in orderings:
++        candidate = greedy_pack(order)
++        if candidate is not None:
++            candidates.append(candidate)
++
++    if not candidates:
+         raise ValueError(
+             "Unable to place all models within GPU memory. "
+             f"Each GPU has {GPU_MEM_SIZE} GB."
+         )
+ 
+-    placement, remaining, loads = best_result
+-    return placement
++    # The best normal seed gives a safe upper bound for threshold search.
++    seed = min(candidates, key=lambda result: score(result[2], result[1]))
++    upper = score(seed[2], seed[1])[0]
++    lower = 0.0
++    for _, size, load in model_info:
++        if load > 0:
++            lower = max(lower, load / max(GPU_MEM_SIZE - size, EPS))
++
++    def try_threshold(target):
++        if target <= EPS:
++            return []
++
++        transformed = {
++            id(model): size + load / target
++            for model, size, load in model_info
++        }
++
++        if any(value > GPU_MEM_SIZE + EPS for value in transformed.values()):
++            return []
++
++        transformed_orders = [
++            sorted(
++                model_info,
++                key=lambda x: (transformed[id(x[0])], x[1], x[2]),
++                reverse=True,
++            ),
++            sorted(
++                model_info,
++                key=lambda x: (x[2] / max(x[1], EPS), transformed[id(x[0])]),
++                reverse=True,
++            ),
++            sorted(
++                model_info,
++                key=lambda x: (
++                    x[2] / max(GPU_MEM_SIZE - x[1], EPS),
++                    transformed[id(x[0])],
++                ),
++                reverse=True,
++            ),
++            sorted(
++                model_info,
++                key=lambda x: (x[1], x[2], transformed[id(x[0])]),
++                reverse=True,
++            ),
++        ]
++
++        results = []
++        for index, order in enumerate(transformed_orders):
++            result = greedy_pack(order, transformed, best_fit=(index == 0))
++            if result is not None:
++                results.append(result)
++        return results
++
++    # Search threshold feasibility, retaining every successful transformed
++    # packing because different orders can have different true KVPR profiles.
++    if upper > lower + EPS:
++        lo, hi = lower, upper
++        threshold_candidates = try_threshold(hi)
++        candidates.extend(threshold_candidates)
++
++        if threshold_candidates:
++            for _ in range(22):
++                middle = (lo + hi) / 2.0
++                results = try_threshold(middle)
++                if results:
++                    hi = middle
++                    candidates.extend(results)
++                else:
++                    lo = middle
++
++    best_result = None
++    best_score = None
++
++    # Improve all successful candidates before choosing the final placement.
++    for placement, remaining, loads in candidates:
++        placement, remaining, loads = improve(placement, remaining, loads)
++        candidate_score = score(loads, remaining)
++        if best_score is None or candidate_score < best_score:
++            best_score = candidate_score
++            best_result = (placement, remaining, loads)
++
++    return best_result[0]
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ if __name__ == "__main__":
+     # Test the algorithm
+ 
+     from evaluator import generate_test_gpu_models
+     from evaluator import calculate_kvcache_pressure
+     from evaluator import safe_float
+     import numpy as np
+ 
+     test_cases = generate_test_gpu_models()
+     all_kvpr = []
+     for i, (gpu_num, gpu_models) in enumerate(test_cases):
+ 
+         results = compute_model_placement(gpu_num, gpu_models)
+         max_kvpr = calculate_kvcache_pressure(results)
+         all_kvpr.append(safe_float(max_kvpr))
+ 
+     avg_kvpr = np.mean(all_kvpr)
+     if avg_kvpr != 0:
+         avg_kvpr = 1.0 / avg_kvpr
+ 
+ 
+     print(f"Max KVPR: {avg_kvpr:.3f}")

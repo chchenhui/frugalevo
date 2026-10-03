@@ -1,0 +1,167 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct an arrangement of n points on or inside a convex region in order to maximize the area of the
+    smallest triangle formed by these points. Here n = 13.
+
+    Returns:
+        points: np.ndarray of shape (13,2) with the x,y coordinates of the points.
+    """
+    n = 13
+    # ---- Deterministic Heilbronn-style constructor for n = 13 ----
+    n = int(n)
+    if n != 13:
+        # Fallback for other n: reproducible uniform points in unit square.
+        rng = np.random.default_rng(seed=seed)
+        points = rng.random((n, 2))
+        return points
+
+    TRIPLES = np.array(
+        [list(c) for c in __import__("itertools").combinations(range(13), 3)],
+        dtype=np.int64,
+    )
+
+    def hull_area(pts):
+        P = sorted(map(tuple, np.round(pts, 12)))
+        ded = []
+        for p in P:
+            if not ded or p != ded[-1]:
+                ded.append(p)
+        if len(ded) < 3:
+            return 0.0
+
+        def cross(o, a, b):
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+        def half(seq):
+            out = []
+            for p in seq:
+                while len(out) >= 2 and cross(out[-2], out[-1], p) <= 0:
+                    out.pop()
+                out.append(p)
+            return out
+
+        hull = half(ded)[:-1] + half(ded[::-1])[:-1]
+        m = len(hull)
+        if m < 3:
+            return 0.0
+        s = 0.0
+        for i in range(m):
+            x1, y1 = hull[i]
+            x2, y2 = hull[(i + 1) % m]
+            s += x1 * y2 - x2 * y1
+        return abs(s) / 2.0
+
+    def tri_areas(pts):
+        A = pts[TRIPLES[:, 0]]
+        B = pts[TRIPLES[:, 1]]
+        C = pts[TRIPLES[:, 2]]
+        cr = (B[:, 0] - A[:, 0]) * (C[:, 1] - A[:, 1]) - (B[:, 1] - A[:, 1]) * (C[:, 0] - A[:, 0])
+        return np.abs(cr) * 0.5
+
+    def score(pts):
+        ha = hull_area(pts)
+        if ha <= 1e-12:
+            return 0.0
+        return float(tri_areas(pts).min()) / ha
+
+    def fallback():
+        pts = [(0.0, 0.0)]
+        for li, r in enumerate([1.0, 0.70, 0.45, 0.20]):
+            base = li * np.pi / 3.0
+            for t in range(3):
+                a = base + t * 2.0 * np.pi / 3.0
+                pts.append((r * np.cos(a), r * np.sin(a)))
+        pts = np.array(pts, dtype=float)
+        return pts / np.sqrt(hull_area(pts))
+
+    def initial_configs():
+        cfgs = []
+        for rot in range(3):
+            pts = [(0.0, 0.0)]
+            for li, r in enumerate([1.0, 0.72, 0.48, 0.24]):
+                base = li * np.pi / 3.0 + rot * 2.0 * np.pi / 3.0
+                for t in range(3):
+                    a = base + t * 2.0 * np.pi / 3.0
+                    pts.append((r * np.cos(a), r * np.sin(a)))
+            cfgs.append(np.array(pts, dtype=float))
+        ang = np.linspace(0.0, 2.0 * np.pi, 13, endpoint=False)
+        cfgs.append(np.stack([np.cos(ang), np.sin(ang)], axis=1))
+        hx = [(0.0, 0.0)]
+        for off in (0.0, np.pi / 6.0):
+            for t in range(6):
+                a = t * np.pi / 3.0 + off
+                hx.append((np.cos(a), np.sin(a)))
+        cfgs.append(np.array(hx, dtype=float))
+        jr = np.random.default_rng(12345)
+        jit = [c + jr.normal(0.0, 0.02, c.shape) for c in cfgs]
+        return cfgs + jit
+
+    def refine(pts, rng, max_iters, deadline):
+        pts = pts.copy()
+        ha = hull_area(pts)
+        if ha <= 1e-12:
+            return pts, 0.0
+        pts = pts / np.sqrt(ha)
+        sc = score(pts)
+        step = 0.02
+        for _ in range(max_iters):
+            if __import__("time").time() > deadline:
+                break
+            ar = tri_areas(pts)
+            worst = np.argsort(ar)[:5]
+            ti = int(worst[rng.integers(0, 5)])
+            i, j, k = TRIPLES[ti]
+            vi = int((i, j, k)[rng.integers(0, 3)])
+            d = rng.standard_normal(2)
+            nn = np.linalg.norm(d)
+            if nn < 1e-18:
+                continue
+            d = d / nn
+            old = pts[vi].copy()
+            pts[vi] = old + step * d
+            nsc = score(pts)
+            if nsc > sc + 1e-12:
+                sc = nsc
+                step = min(step * 1.05, 0.05)
+            else:
+                pts[vi] = old
+                step *= 0.997
+            if step < 1e-5:
+                break
+        return pts, sc
+
+    try:
+        rng = np.random.default_rng(seed if isinstance(seed, int) else 42)
+        deadline = __import__("time").time() + 4.5
+        best, best_sc = None, -1.0
+        for cfg in initial_configs():
+            if cfg.shape[0] != 13:
+                continue
+            p, sc = refine(cfg, rng, 4000, deadline)
+            if sc > best_sc:
+                best_sc, best = sc, p
+            if __import__("time").time() > deadline:
+                break
+        if best is None or best_sc <= 0.0:
+            best = fallback()
+    except Exception:
+        best = fallback()
+
+    ha = hull_area(best)
+    if ha <= 1e-12:
+        best = fallback()
+        ha = hull_area(best)
+    points = best / np.sqrt(ha)
+
+    # Validation: 13 finite, unique points.
+    assert points.shape == (13, 2)
+    assert np.all(np.isfinite(points))
+    assert len(set(map(tuple, np.round(points, 9)))) == 13
+    return points
+
+
+# EVOLVE-BLOCK-END

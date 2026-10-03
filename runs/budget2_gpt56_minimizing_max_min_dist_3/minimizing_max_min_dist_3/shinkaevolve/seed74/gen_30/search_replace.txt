@@ -1,0 +1,181 @@
+<NAME>
+two_tier_diverse_refinement
+</NAME>
+
+<DESCRIPTION>
+Replace the uniform full-cost restart loop with a two-tier search. The existing code spends nearly identical effort on every perturbation of one antipodal seed, even though most starts do not enter a competitive basin. The new approach performs a cheaper continuation pass on a substantially larger and more diverse population, including both gentle symmetry-breaking perturbations and several broad perturbations. It records each candidate’s best exact ratio, selects only the strongest survivors, and gives those survivors a longer high-temperature/contact-focused continuation.
+
+This reallocates approximately the same optimization budget toward basin discovery and survivor polishing. It also avoids ranking candidates solely by their final smooth-objective state: each candidate is ranked by the exact evaluator ratio encountered during its first stage.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # log-mean-exp versions of the minimum and maximum are smooth, positive
+    # approximations with gradients concentrated on the active contact pairs.
+    # Increasing beta progressively changes broad rearrangements into contact
+    # refinement.
+    betas = (18.0, 45.0, 110.0, 260.0, 600.0)
+    rates = (0.030, 0.022, 0.015, 0.010, 0.006)
+    iterations = (130, 150, 180, 210, 240)
+
+    for restart in range(12):
+        if restart == 0:
+            x = points.copy()
+        else:
+            # Independent perturbations deliberately destroy pairwise
+            # antipodality while remaining in the basin of the strong seed.
+            scale = 0.025 + 0.012 * restart
+            x = normalize_configuration(
+                seed_points + scale * rng.normal(size=seed_points.shape)
+            )
+
+        velocity = np.zeros_like(x)
+        for beta, rate, count in zip(betas, rates, iterations):
+            for iteration in range(count):
+                delta = x[pair_i] - x[pair_j]
+                values = np.sum(delta * delta, axis=1)
+
+                low_shift = np.min(values)
+                low_weights = np.exp(-beta * (values - low_shift))
+                low_weights /= np.sum(low_weights)
+                smooth_min = low_shift - np.log(np.mean(
+                    np.exp(-beta * (values - low_shift))
+                )) / beta
+
+                high_shift = np.max(values)
+                high_weights = np.exp(beta * (values - high_shift))
+                high_weights /= np.sum(high_weights)
+                smooth_max = high_shift + np.log(np.mean(
+                    np.exp(beta * (values - high_shift))
+                )) / beta
+
+                # Gradient of log(smooth_min / smooth_max).  Accumulating
+                # pair forces directly avoids materializing a 14x14x3 tensor.
+                coefficients = low_weights / smooth_min - high_weights / smooth_max
+                pair_gradient = 2.0 * coefficients[:, None] * delta
+                gradient = np.zeros_like(x)
+                np.add.at(gradient, pair_i, pair_gradient)
+                np.add.at(gradient, pair_j, -pair_gradient)
+
+                velocity = 0.72 * velocity + gradient
+                x = normalize_configuration(x + rate * velocity)
+
+                if iteration % 20 == 0 or iteration == count - 1:
+                    ratio = actual_ratio(x)
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        points = x.copy()
+=======
+    # Use a broad, inexpensive first pass to find promising nonsymmetric
+    # basins, then spend the sharper continuation only on exact-ratio
+    # survivors.  Ranking by the best exact ratio seen is important because a
+    # finite-temperature objective can temporarily move away from it.
+    stage_betas = (16.0, 48.0, 135.0)
+    stage_rates = (0.032, 0.022, 0.014)
+    stage_iterations = (90, 110, 140)
+    candidates = []
+
+    for restart in range(24):
+        if restart == 0:
+            x = points.copy()
+        else:
+            # The first group explores the nearby broken-antipodal basin;
+            # the second group reaches qualitatively different arrangements.
+            if restart < 15:
+                scale = 0.020 + 0.018 * restart
+            else:
+                scale = 0.32 + 0.045 * (restart - 15)
+            x = normalize_configuration(
+                seed_points + scale * rng.normal(size=seed_points.shape)
+            )
+
+        candidate_ratio = actual_ratio(x)
+        candidate_best = x.copy()
+        velocity = np.zeros_like(x)
+        for beta, rate, count in zip(
+            stage_betas, stage_rates, stage_iterations
+        ):
+            for iteration in range(count):
+                delta = x[pair_i] - x[pair_j]
+                values = np.sum(delta * delta, axis=1)
+
+                low_shift = np.min(values)
+                low_weights = np.exp(-beta * (values - low_shift))
+                low_weights /= np.sum(low_weights)
+                smooth_min = low_shift - np.log(np.mean(
+                    np.exp(-beta * (values - low_shift))
+                )) / beta
+
+                high_shift = np.max(values)
+                high_weights = np.exp(beta * (values - high_shift))
+                high_weights /= np.sum(high_weights)
+                smooth_max = high_shift + np.log(np.mean(
+                    np.exp(beta * (values - high_shift))
+                )) / beta
+
+                coefficients = low_weights / smooth_min - high_weights / smooth_max
+                pair_gradient = 2.0 * coefficients[:, None] * delta
+                gradient = np.zeros_like(x)
+                np.add.at(gradient, pair_i, pair_gradient)
+                np.add.at(gradient, pair_j, -pair_gradient)
+
+                velocity = 0.72 * velocity + gradient
+                x = normalize_configuration(x + rate * velocity)
+
+                if iteration % 20 == 0 or iteration == count - 1:
+                    ratio = actual_ratio(x)
+                    if ratio > candidate_ratio:
+                        candidate_ratio = ratio
+                        candidate_best = x.copy()
+
+        candidates.append((candidate_ratio, candidate_best))
+        if candidate_ratio > best_ratio:
+            best_ratio = candidate_ratio
+            points = candidate_best.copy()
+
+    # Only the most competitive basins receive the expensive high-beta pass.
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    refine_betas = (85.0, 230.0, 620.0)
+    refine_rates = (0.018, 0.011, 0.006)
+    refine_iterations = (150, 180, 220)
+
+    for _, initial_x in candidates[:6]:
+        x = initial_x.copy()
+        velocity = np.zeros_like(x)
+        for beta, rate, count in zip(
+            refine_betas, refine_rates, refine_iterations
+        ):
+            for iteration in range(count):
+                delta = x[pair_i] - x[pair_j]
+                values = np.sum(delta * delta, axis=1)
+
+                low_shift = np.min(values)
+                low_weights = np.exp(-beta * (values - low_shift))
+                low_weights /= np.sum(low_weights)
+                smooth_min = low_shift - np.log(np.mean(
+                    np.exp(-beta * (values - low_shift))
+                )) / beta
+
+                high_shift = np.max(values)
+                high_weights = np.exp(beta * (values - high_shift))
+                high_weights /= np.sum(high_weights)
+                smooth_max = high_shift + np.log(np.mean(
+                    np.exp(beta * (values - high_shift))
+                )) / beta
+
+                coefficients = low_weights / smooth_min - high_weights / smooth_max
+                pair_gradient = 2.0 * coefficients[:, None] * delta
+                gradient = np.zeros_like(x)
+                np.add.at(gradient, pair_i, pair_gradient)
+                np.add.at(gradient, pair_j, -pair_gradient)
+
+                velocity = 0.72 * velocity + gradient
+                x = normalize_configuration(x + rate * velocity)
+
+                if iteration % 20 == 0 or iteration == count - 1:
+                    ratio = actual_ratio(x)
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        points = x.copy()
+>>>>>>> REPLACE
+</DIFF>

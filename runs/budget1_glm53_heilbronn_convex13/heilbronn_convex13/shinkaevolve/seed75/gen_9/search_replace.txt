@@ -1,0 +1,157 @@
+<NAME>
+bottleneck_annealing_and_seeds
+</NAME>
+<DESCRIPTION>
+The key weakness is the blind hill-climbing: it perturbs random points and immediately accepts any score increase, which gets stuck easily. Improvement strategy based on Heilbronn-specific geometric insight: the objective is governed by a few "bottleneck" triangles, so moves should target vertices of the currently-smallest triangles. I also improve seeds (12-gon + center, two-ring 7+6 configuration are classic boundary-heavy Heilbronn candidates), use simulated annealing with reheating to escape local optima, always track the global best, and use a scale-invariant step size (sigma scaled by hull diameter) so moves don't stall for small/large configurations. Targeted edits to the seed construction and the optimization loop.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # --- Boundary-biased initializations ---
+    t = np.linspace(0, 2*np.pi, n, endpoint=False)
+    seeds = []
+    # 1: regular 13-gon on circle
+    seeds.append(np.column_stack([np.cos(t), np.sin(t)]))
+    # 2: ellipse (stretched), boundary emphasis
+    seeds.append(np.column_stack([1.3*np.cos(t), 0.75*np.sin(t)]))
+    # 3: polygon + slight interior perturbations
+    s = np.column_stack([np.cos(t), np.sin(t)])
+    s += rng.normal(0, 0.08, s.shape)
+    seeds.append(s)
+    # 4: fully random
+    seeds.append(rng.random((n, 2)))
+=======
+    # --- Boundary-biased initializations ---
+    t = np.linspace(0, 2*np.pi, n, endpoint=False)
+    seeds = []
+    # 1: regular 13-gon on circle
+    seeds.append(np.column_stack([np.cos(t), np.sin(t)]))
+    # 2: 12-gon ring + center (classic Heilbronn-style boundary-heavy layout)
+    t12 = np.linspace(0, 2*np.pi, 12, endpoint=False)
+    ring = np.column_stack([np.cos(t12), np.sin(t12)])
+    seeds.append(np.vstack([ring, [[0.0, 0.0]]]))
+    # 3: two rings 7 outer + 6 inner (near 3-fold symmetric)
+    t7 = np.linspace(0, 2*np.pi, 7, endpoint=False)
+    t6 = np.linspace(0, 2*np.pi, 6, endpoint=False) + np.pi/6
+    outer = np.column_stack([np.cos(t7), np.sin(t7)])
+    inner = 0.45*np.column_stack([np.cos(t6), np.sin(t6)])
+    seeds.append(np.vstack([outer, inner]))
+    # 4: ellipse (stretched), boundary emphasis
+    seeds.append(np.column_stack([1.3*np.cos(t), 0.75*np.sin(t)]))
+    # 5: polygon + slight interior perturbations
+    s = np.column_stack([np.cos(t), np.sin(t)])
+    s += rng.normal(0, 0.08, s.shape)
+    seeds.append(s)
+    # 6: fully random
+    seeds.append(rng.random((n, 2)))
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def _score(pts, tri_idx):
+    ha = _convex_hull_area(pts)
+    if ha <= 1e-12:
+        return 0.0
+    return _min_triangle_area(pts, tri_idx) / ha
+=======
+def _score(pts, tri_idx):
+    ha = _convex_hull_area(pts)
+    if ha <= 1e-12:
+        return 0.0
+    return _min_triangle_area(pts, tri_idx) / ha
+
+
+def _bottleneck_vertices(pts, tri_idx, k=3):
+    """Indices of points participating in the k smallest triangles."""
+    p = pts[tri_idx]
+    a = p[:, 0]
+    v1 = p[:, 1] - a
+    v2 = p[:, 2] - a
+    cr = np.abs(v1[:, 0]*v2[:, 1] - v1[:, 1]*v2[:, 0])
+    order = np.argsort(cr)[:k]
+    return np.unique(tri_idx[order])
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    best_pts, best_score = seeds[0], _score(seeds[0], tri_idx)
+    time_limit = 2.0
+    t_start = time.time()
+
+    for seed_pts in seeds:
+        if time.time() - t_start > time_limit:
+            break
+        pts = seed_pts.copy()
+        sc = _score(pts, tri_idx)
+        sigma = 0.15
+        # adaptive single-point perturbation hill climb
+        while time.time() - t_start < time_limit:
+            improved = False
+            for _ in range(200):
+                i = rng.integers(n)
+                cand = pts.copy()
+                cand[i] += rng.normal(0, sigma, 2)
+                csc = _score(cand, tri_idx)
+                if csc > sc + 1e-12:
+                    pts, sc = cand, csc
+                    improved = True
+            if improved:
+                sigma *= 1.3
+            else:
+                sigma *= 0.6
+            if sigma < 1e-5:
+                break
+        if sc > best_score:
+            best_score, best_pts = sc, pts.copy()
+=======
+    best_pts, best_score = seeds[0], _score(seeds[0], tri_idx)
+    time_limit = 3.0
+    t_start = time.time()
+
+    per_seed = time_limit / len(seeds)
+    for si, seed_pts in enumerate(seeds):
+        deadline = min(t_start + (si + 1) * per_seed, t_start + time_limit)
+        pts = seed_pts.copy()
+        sc = _score(pts, tri_idx)
+        # scale-invariant initial step size
+        diam = float(np.ptp(pts, axis=0).max()) + 1e-9
+        sigma = 0.08 * diam
+        # simulated annealing with bottleneck-focused moves
+        T = 0.02 * max(sc, 1e-3)
+        since_best = 0
+        while time.time() < deadline:
+            improved = False
+            for _ in range(120):
+                cand = pts.copy()
+                # target a vertex of the smallest triangles half the time
+                if rng.random() < 0.5:
+                    bn = _bottleneck_vertices(pts, tri_idx, k=3)
+                    i = int(rng.choice(bn))
+                else:
+                    i = int(rng.integers(n))
+                cand[i] += rng.normal(0, sigma, 2)
+                csc = _score(cand, tri_idx)
+                d = csc - sc
+                if d > 0 or rng.random() < np.exp(d / max(T, 1e-12)):
+                    pts, sc = cand, csc
+                    if sc > best_score + 1e-14:
+                        best_score, best_pts = sc, cand.copy()
+                        since_best = 0
+                        improved = True
+            if not improved:
+                since_best += 1
+                sigma *= 0.75
+                if since_best > 3:
+                    # reheat to escape local optimum
+                    T = max(T, 0.01 * max(sc, 1e-3))
+                    sigma = 0.08 * diam
+                    since_best = 0
+            else:
+                sigma = min(sigma * 1.2, 0.2 * diam)
+            T = max(T * 0.97, 1e-7)
+            if sigma < 1e-6:
+                sigma = 1e-6
+        if sc > best_score:
+            best_score, best_pts = sc, pts.copy()
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

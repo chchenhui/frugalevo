@@ -1,0 +1,223 @@
+<NAME>
+multi_seed_plus_pressure_relax</NAME>
+<DESCRIPTION>
+The previous edit failed because the SEARCH block had a typo in one line of _make_seeds. I reproduce the same two changes: (1) replace the main construct_packing body to run multi-start over redesigned structured seeds with a perturb-and-resolve pressure pass, and (2) replace _make_seeds with a compact, well-shaped seed set (staggered lattices, corner-anchored, ring). Both diffs now use the exact verbatim text from the current file.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    _refine(centers)
+
+    # Greedy local-search on centers: try small shifts per circle, keep
+    # any shift that raises the total radius sum after re-solving.
+    centers = _local_shift_search(centers)
+
+    radii = compute_max_radii(centers)
+    radii = _greedy_enlarge(centers, radii)
+    sum_radii = float(np.sum(radii))
+    return centers, radii, sum_radii
+=======
+    # Multi-start: try a few structured seeds, refine each, keep the best.
+    best_sum = -1.0
+    best_centers = None
+    for seed in _make_seeds():
+        centers = seed.copy()
+        _refine(centers)
+        # perturb-and-resolve: push centers away from tightest active
+        # constraints, then re-refine; escapes quasi-regular local optima.
+        for _ in range(5):
+            centers = _pressure_perturb(centers)
+            _refine(centers)
+        tot = float(np.sum(compute_max_radii(centers)))
+        if tot > best_sum:
+            best_sum = tot
+            best_centers = centers.copy()
+
+    # Greedy local-search on centers: try small shifts per circle, keep
+    # any shift that raises the total radius sum after re-solving.
+    centers = _local_shift_search(best_centers)
+
+    radii = compute_max_radii(centers)
+    radii = _greedy_enlarge(centers, radii)
+    sum_radii = float(np.sum(radii))
+    return centers, radii, sum_radii
+
+
+def _pressure_perturb(centers):
+    """Move each center away from its tightest constraints (touching
+    neighbors or walls) by a step proportional to its 'pressure', then
+    return the perturbed centers."""
+    n = len(centers)
+    radii = compute_max_radii(centers)
+    out = centers.copy()
+    for i in range(n):
+        x, y = centers[i]
+        ri = radii[i]
+        worst_gap = 1e9
+        fx = fy = 0.0
+        for j in range(n):
+            if j == i:
+                continue
+            dx = x - centers[j, 0]
+            dy = y - centers[j, 1]
+            dist = np.sqrt(dx * dx + dy * dy) + 1e-12
+            gap = dist - (ri + radii[j])
+            worst_gap = min(worst_gap, gap)
+            if gap < 1e-4:
+                fx += dx / dist
+                fy += dy / dist
+        # walls
+        for wall_gap, ddx, ddy in ((x - ri, -1.0, 0.0), (1.0 - x - ri, 1.0, 0.0),
+                                   (y - ri, 0.0, -1.0), (1.0 - y - ri, 0.0, 1.0)):
+            worst_gap = min(worst_gap, wall_gap)
+            if wall_gap < 1e-4:
+                fx += ddx
+                fy += ddy
+        norm = np.sqrt(fx * fx + fy * fy)
+        if norm > 1e-9:
+            step = 0.02 * max(0.0, -worst_gap) + 0.0015
+            out[i, 0] = min(max(x + step * fx / norm, 1e-9), 1.0 - 1e-9)
+            out[i, 1] = min(max(y + step * fy / norm, 1e-9), 1.0 - 1e-9)
+    return out
+>>>>>>> REPLACE
+<DIFF>
+<<<<<<< SEARCH
+def _make_seeds():
+    """Deterministic set of structured starting layouts."""
+    seeds = []
+    # Staggered lattices with varying row-count patterns and spacings
+    patterns = [
+        [5, 4, 5, 4, 5, 3],
+        [4, 5, 4, 5, 4, 4],
+        [6, 5, 5, 5, 5],
+        [5, 5, 6, 5, 5],
+        [7, 6, 6, 7],
+        [4, 6, 6, 6, 4],
+        [3, 5, 5, 5, 5, 3],
+    ]
+    for counts in patterns:
+        for s_extra in (0.0, 0.01, 0.02):
+            nrow = len(counts)
+            # vertical span: rows separated by hex spacing where possible
+            s = (1.0 + s_extra) / max(max(counts), (1.0 + (nrow - 1) * np.sqrt(3) / 2.0) / 1.0)
+            s = min(1.0 / max(counts), 1.0 / (1.0 + (nrow - 1) * np.sqrt(3) / 2.0))
+            s *= (1.0 + s_extra * 0.5)
+            h = s * np.sqrt(3) / 2.0
+            total_h = s + (nrow - 1) * h
+            if total_h > 1.0 or s * max(counts) > 1.0:
+                h = min(h, (1.0 - s) / (nrow - 1)) if nrow > 1 else 0
+            pts = []
+            for row, cnt in enumerate(counts):
+                y = s / 2.0 + row * h
+                off = (s / 2.0) if row % 2 else 0.0
+                # center rows horizontally inside leftover margin
+                width = (cnt - 1) * s + off
+                x0 = max(s / 2.0, (1.0 - width) / 2.0)
+                for j in range(cnt):
+                    x = x0 + off + j * s
+                    if x <= 1.0 - 1e-6 and y <= 1.0 - 1e-6:
+                        pts.append((x, min(y, 1.0 - 1e-6)))
+            if len(pts) >= N:
+                seeds.append(np.array(pts[:N]))
+    # Corner-anchored seed: 4 corner circles + inner staggered lattice
+    c = np.array([[0.15, 0.15], [0.85, 0.15], [0.15, 0.85], [0.85, 0.85]])
+    rest = []
+    for row in range(4):
+        cnt = 6 if row % 2 == 0 else 5
+        y = 0.25 + row * 0.17
+        off = 0.0 if row % 2 == 0 else 0.09
+        for j in range(cnt):
+            x = 0.12 + off + j * 0.155
+            rest.append((x, y))
+    seed = np.vstack([c, np.array(rest[:N - 4])])
+    if len(seed) >= N:
+        seeds.append(seed[:N])
+    # Random-ish deterministic seed (Halton-like) as diversity
+    pts = []
+    p1, p2 = 2, 3
+    def halton(i, b):
+        f, r = 1.0, 0.0
+        while i > 0:
+            f /= b
+            r += f * (i % b)
+            i //= b
+        return r
+    for i in range(1, N + 1):
+        pts.append((0.05 + 0.9 * halton(i, p1), 0.05 + 0.9 * halton(i, p2)))
+    seeds.append(np.array(pts))
+    return seeds
+=======
+def _make_seeds():
+    """Small deterministic set of well-shaped starting layouts."""
+    seeds = []
+    # Seed 1: staggered lattice 5,4,5,4,5,3 (previously best family)
+    pts = []
+    s = 0.2
+    row_counts = [5, 4, 5, 4, 5, 3]
+    row_spacings = [s, s, s, s, s, 0.3]
+    y0 = 0.1
+    gap = (1.0 - 2.0 * y0) / 5.0
+    for row, count in enumerate(row_counts):
+        sp = row_spacings[row]
+        y = y0 + row * gap
+        for j in range(count):
+            pts.append((0.5 + (j - (count - 1) / 2.0) * sp, y))
+    seeds.append(np.array(pts[:N]))
+    # Seed 2: corner-anchored - 4 large corner circles, edge circles,
+    # and a small interior lattice. Favors mixed radii.
+    pts = []
+    for cx in (0.12, 0.88):
+        for cy in (0.12, 0.88):
+            pts.append((cx, cy))
+    # edge circles
+    for x in (0.3, 0.5, 0.7):
+        pts.append((x, 0.06))
+        pts.append((x, 0.94))
+    for y in (0.3, 0.5, 0.7):
+        pts.append((0.06, y))
+        pts.append((0.94, y))
+    # interior staggered lattice
+    for row in range(3):
+        cnt = 4 if row % 2 == 0 else 3
+        y = 0.30 + row * 0.20
+        off = 0.0 if row % 2 == 0 else 0.10
+        for j in range(cnt):
+            pts.append((0.22 + off + j * 0.20, y))
+    seeds.append(np.array(pts[:N]))
+    # Seed 3: denser lattice 6,5,6,5,4 rows, hex spacing
+    pts = []
+    s = 1.0 / 6.0
+    h = s * np.sqrt(3.0) / 2.0
+    row_counts = [6, 5, 6, 5, 4]
+    y = 0.08
+    for row, cnt in enumerate(row_counts):
+        off = (s / 2.0) if row % 2 else 0.0
+        x0 = (1.0 - ((cnt - 1) * s + off)) / 2.0 + off
+        for j in range(cnt):
+            pts.append((x0 + j * s, min(y, 1.0 - 1e-6)))
+        y += h
+    seeds.append(np.array(pts[:N]))
+    # Seed 4: ring-based - big center circle, two rings
+    pts = [(0.5, 0.5)]
+    for i in range(8):
+        a = 2 * np.pi * i / 8
+        pts.append((0.5 + 0.22 * np.cos(a), 0.5 + 0.22 * np.sin(a)))
+    for i in range(17):
+        a = 2 * np.pi * i / 17
+        pts.append((0.5 + 0.42 * np.cos(a), 0.5 + 0.42 * np.sin(a)))
+    seeds.append(np.clip(np.array(pts[:N]), 0.02, 0.98))
+    # Seed 5: staggered lattice 4,5,4,5,4,4 (alternate family)
+    pts = []
+    s = 0.2
+    y0 = 0.08
+    gap = (1.0 - 2.0 * y0) / 5.0
+    row_counts = [4, 5, 4, 5, 4, 4]
+    for row, count in enumerate(row_counts):
+        y = y0 + row * gap
+        off = 0.0 if row % 2 == 0 else s / 2.0
+        x0 = 0.5 - ((count - 1) * s + off) / 2.0 + off
+        for j in range(count):
+            pts.append((x0 + j * s, y))
+    seeds.append(np.array(pts[:N]))
+    return seeds
+>>>>>>> REPLACE
+</DIFF>

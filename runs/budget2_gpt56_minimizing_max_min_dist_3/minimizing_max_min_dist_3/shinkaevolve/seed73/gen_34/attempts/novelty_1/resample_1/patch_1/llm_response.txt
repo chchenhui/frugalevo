@@ -1,0 +1,342 @@
+<NAME>
+batched_contact_exchange
+</NAME>
+
+<DESCRIPTION>
+This redesign uses a batched population pipeline with explicit candidate normalization, exact-score tracking, elite branching, and a separate active-contact exchange polish. The final stage analyzes short and long contact families per point and adaptively tests separation, contraction, and mixed projected-force moves under strict exact-ratio acceptance. This reduces repeated restart overhead while spending more work on promising contact graphs.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Build exactly fourteen points in R^3 maximizing the squared ratio between
+    the smallest and largest pairwise distances.
+
+    The search is organized as:
+      * batched smooth continuation over many candidates;
+      * exact-score elite branching;
+      * sharper batched contact optimization;
+      * exact active-contact exchange polishing.
+    """
+    n_points = 14
+    dimension = 3
+    population_size = 40
+    rng = np.random.default_rng(2024051701)
+
+    pair_i, pair_j = np.triu_indices(n_points, 1)
+    pair_count = pair_i.size
+    pair_ids = np.arange(pair_count)
+
+    incidence = np.zeros((n_points, pair_count), dtype=np.float64)
+    incidence[pair_i, pair_ids] = 1.0
+    incidence[pair_j, pair_ids] = -1.0
+
+    def normalize_batch(configurations: np.ndarray) -> np.ndarray:
+        centered = configurations - configurations.mean(axis=1, keepdims=True)
+        scale = np.sqrt(np.mean(centered * centered, axis=(1, 2)))
+        return centered / np.maximum(scale[:, None, None], 1.0e-15)
+
+    def normalize_one(points: np.ndarray) -> np.ndarray:
+        centered = points - points.mean(axis=0, keepdims=True)
+        scale = np.sqrt(np.mean(centered * centered))
+        return centered / max(scale, 1.0e-15)
+
+    def squared_distances(configurations: np.ndarray) -> np.ndarray:
+        delta = configurations[:, pair_i] - configurations[:, pair_j]
+        return np.einsum("bpd,bpd->bp", delta, delta)
+
+    def batch_scores(configurations: np.ndarray) -> np.ndarray:
+        distances = squared_distances(configurations)
+        return distances.min(axis=1) / distances.max(axis=1)
+
+    def exact_score(points: np.ndarray) -> float:
+        delta = points[pair_i] - points[pair_j]
+        distances = np.einsum("pd,pd->p", delta, delta)
+        return float(distances.min() / distances.max())
+
+    def smooth_forces(
+        configurations: np.ndarray,
+        beta: float,
+    ) -> np.ndarray:
+        """
+        Gradient of smooth-log-min-distance minus smooth-log-max-distance.
+        """
+        delta = configurations[:, pair_i] - configurations[:, pair_j]
+        distances = np.einsum("bpd,bpd->bp", delta, delta)
+        log_distance = 0.5 * np.log(distances + 1.0e-15)
+
+        lower = -beta * log_distance
+        lower -= lower.max(axis=1, keepdims=True)
+        lower = np.exp(lower)
+        lower /= lower.sum(axis=1, keepdims=True)
+
+        upper = beta * log_distance
+        upper -= upper.max(axis=1, keepdims=True)
+        upper = np.exp(upper)
+        upper /= upper.sum(axis=1, keepdims=True)
+
+        pair_force = (
+            (lower - upper)[:, :, None]
+            * delta
+            / (distances[:, :, None] + 1.0e-15)
+        )
+        return np.einsum("np,bpd->bnd", incidence, pair_force)
+
+    def update_best(
+        configurations: np.ndarray,
+        best_points: np.ndarray,
+        best_score: float,
+    ) -> tuple[np.ndarray, float]:
+        scores = batch_scores(configurations)
+        index = int(np.argmax(scores))
+        if scores[index] > best_score:
+            return configurations[index].copy(), float(scores[index])
+        return best_points, best_score
+
+    def continuation(
+        configurations: np.ndarray,
+        steps: int,
+        beta_start: float,
+        beta_end: float,
+        rate_start: float,
+        rate_end: float,
+        best_points: np.ndarray,
+        best_score: float,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """
+        Batched Adam continuation. Moments reset when the contact model moves
+        into a substantially sharper regime.
+        """
+        first = np.zeros_like(configurations)
+        second = np.zeros_like(configurations)
+        age = 0
+        reset_levels = [55.0, 135.0, 235.0]
+        reset_cursor = 0
+
+        while (
+            reset_cursor < len(reset_levels)
+            and reset_levels[reset_cursor] <= beta_start
+        ):
+            reset_cursor += 1
+
+        for step in range(steps):
+            fraction = step / max(steps - 1, 1)
+            beta = beta_start + fraction * (beta_end - beta_start)
+            learning_rate = rate_start + fraction * (rate_end - rate_start)
+
+            if (
+                reset_cursor < len(reset_levels)
+                and beta >= reset_levels[reset_cursor]
+            ):
+                first.fill(0.0)
+                second.fill(0.0)
+                age = 0
+                reset_cursor += 1
+
+            if beta >= 220.0:
+                learning_rate *= 0.48
+                decay2 = 0.9994
+            elif beta >= 130.0:
+                learning_rate *= 0.66
+                decay2 = 0.9985
+            elif beta >= 55.0:
+                learning_rate *= 0.84
+                decay2 = 0.9970
+            else:
+                decay2 = 0.9950
+
+            gradient = smooth_forces(configurations, beta)
+            first = 0.90 * first + 0.10 * gradient
+            second = decay2 * second + (1.0 - decay2) * gradient * gradient
+
+            age += 1
+            bias1 = 1.0 - 0.90 ** age
+            bias2 = 1.0 - decay2 ** age
+            configurations += learning_rate * (
+                first / bias1
+            ) / (np.sqrt(second / bias2) + 1.0e-8)
+            configurations = normalize_batch(configurations)
+
+            if step % 250 == 249 or step == steps - 1:
+                best_points, best_score = update_best(
+                    configurations, best_points, best_score
+                )
+
+        return configurations, best_points, best_score
+
+    def active_contact_directions(points: np.ndarray) -> list[np.ndarray]:
+        """
+        Construct contact-family moves. Short contacts contribute repulsion;
+        long contacts contribute contraction. Per-point overlap determines
+        whether pure or mixed directions are useful.
+        """
+        delta = points[pair_i] - points[pair_j]
+        distances = np.einsum("pd,pd->p", delta, delta)
+        dmin = float(distances.min())
+        dmax = float(distances.max())
+
+        short_width = 0.010 + 0.012 * np.sqrt(dmin)
+        long_width = 0.010 + 0.012 * np.sqrt(dmax)
+
+        short_mask = distances <= dmin * (1.0 + short_width)
+        long_mask = distances >= dmax * (1.0 - long_width)
+
+        short_pair_force = (
+            short_mask[:, None] * delta / (distances[:, None] + 1.0e-15)
+        )
+        long_pair_force = (
+            -long_mask[:, None] * delta / (distances[:, None] + 1.0e-15)
+        )
+
+        separate = incidence @ short_pair_force
+        contract = incidence @ long_pair_force
+
+        short_count = np.zeros(n_points, dtype=np.float64)
+        long_count = np.zeros(n_points, dtype=np.float64)
+        np.add.at(short_count, pair_i[short_mask], 1.0)
+        np.add.at(short_count, pair_j[short_mask], 1.0)
+        np.add.at(long_count, pair_i[long_mask], 1.0)
+        np.add.at(long_count, pair_j[long_mask], 1.0)
+
+        overlap = np.minimum(short_count, long_count)
+        imbalance = short_count - long_count
+        mixed = separate + contract
+
+        weighted = np.empty_like(mixed)
+        for point in range(n_points):
+            if overlap[point] > 0.0:
+                weight = 0.55 + 0.25 * overlap[point] / (
+                    1.0 + short_count[point] + long_count[point]
+                )
+                weighted[point] = weight * mixed[point]
+            elif imbalance[point] > 0.0:
+                weighted[point] = separate[point]
+            elif imbalance[point] < 0.0:
+                weighted[point] = contract[point]
+            else:
+                weighted[point] = mixed[point]
+
+        return [mixed, weighted, separate, contract]
+
+    def tangent_unit(direction: np.ndarray, points: np.ndarray) -> np.ndarray:
+        direction = direction - direction.mean(axis=0, keepdims=True)
+
+        # Remove the radial scale component: normalization would remove it
+        # anyway, so excluding it makes line searches more predictable.
+        radial = np.sum(direction * points) / (
+            np.sum(points * points) + 1.0e-15
+        )
+        direction = direction - radial * points
+
+        norm = np.sqrt(np.mean(direction * direction))
+        if norm < 1.0e-14:
+            return np.zeros_like(direction)
+        return direction / norm
+
+    # Broad independent population exploration.
+    population = normalize_batch(
+        rng.normal(size=(population_size, n_points, dimension))
+    )
+    best_points = population[0].copy()
+    best_score = -np.inf
+
+    population, best_points, best_score = continuation(
+        population,
+        steps=4100,
+        beta_start=6.0,
+        beta_end=100.0,
+        rate_start=0.030,
+        rate_end=0.009,
+        best_points=best_points,
+        best_score=best_score,
+    )
+
+    # Preserve elites and branch them at several perturbation magnitudes.
+    scores = batch_scores(population)
+    elite = population[np.argsort(scores)[-10:]]
+    descendants = np.empty_like(population)
+
+    for elite_index, parent in enumerate(elite):
+        base = 4 * elite_index
+        descendants[base] = parent
+        descendants[base + 1] = parent + 0.015 * rng.normal(size=parent.shape)
+        descendants[base + 2] = parent + 0.034 * rng.normal(size=parent.shape)
+        descendants[base + 3] = parent + 0.058 * rng.normal(size=parent.shape)
+
+    population = normalize_batch(descendants)
+    population, best_points, best_score = continuation(
+        population,
+        steps=6100,
+        beta_start=65.0,
+        beta_end=300.0,
+        rate_start=0.014,
+        rate_end=0.0022,
+        best_points=best_points,
+        best_score=best_score,
+    )
+
+    best_points, best_score = update_best(population, best_points, best_score)
+
+    # Exact objective polishing on several top candidates, not only the winner:
+    # nearby contact graphs can exchange under hard acceptance.
+    final_scores = batch_scores(population)
+    finalist_indices = np.argsort(final_scores)[-5:]
+
+    for finalist_index in finalist_indices:
+        points = population[finalist_index].copy()
+        score = exact_score(points)
+        step_scale = 0.022
+        failures = 0
+
+        for iteration in range(850):
+            directions = active_contact_directions(points)
+            directions.append(
+                smooth_forces(points[None, :, :], (150.0, 260.0, 420.0)[iteration % 3])[0]
+            )
+
+            accepted = False
+            candidate_points = points
+            candidate_score = score
+
+            for raw_direction in directions:
+                direction = tangent_unit(raw_direction, points)
+                if not np.any(direction):
+                    continue
+
+                local_step = step_scale
+                for _ in range(7):
+                    trial = normalize_one(points + local_step * direction)
+                    trial_score = exact_score(trial)
+                    if trial_score > candidate_score + 1.0e-14:
+                        candidate_points = trial
+                        candidate_score = trial_score
+                        accepted = True
+                        break
+                    local_step *= 0.5
+
+            if accepted:
+                points = candidate_points
+                score = candidate_score
+                step_scale = min(0.030, step_scale * 1.035)
+                failures = 0
+            else:
+                failures += 1
+                if failures % 12 == 0:
+                    step_scale *= 0.58
+                if step_scale < 1.0e-6:
+                    break
+
+        if score > best_score:
+            best_points = points
+            best_score = score
+
+    return np.asarray(best_points, dtype=np.float64)
+
+
+# EVOLVE-BLOCK-END
+```

@@ -1,0 +1,139 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def kalman_trend_adaptive_filter(data, window_size=32, q_level=1e-2, q_slope_slow=1e-6,
+                                 q_slope_fast=0.2, trend_lookback=5, innov_gain=3.0,
+                                 blend_span=None):
+    """
+    Adaptive two-state Kalman filter (level + slope) with trend-gated process noise
+    and forward/backward zero-lag fusion.
+
+    data: 1D numpy array of raw samples (volatile, non-stationary)
+    returns: filtered output, same length as data
+    """
+    data = np.asarray(data, dtype=float)
+    n = len(data)
+    if n == 0:
+        return np.copy(data)
+    if n == 1:
+        return np.copy(data)
+
+    if blend_span is None:
+        blend_span = max(3, (window_size // 4) * 2 + 1)  # odd, modest
+    blend_span = min(blend_span, n)
+    blend_half = blend_span // 2
+
+    # ---------------- forward Kalman pass ----------------
+    # State: [level, slope]. Model: level' = level + slope, slope' = slope
+    F = np.array([[1.0, 1.0],
+                  [0.0, 1.0]])
+    H = np.array([[1.0, 0.0]])
+
+    def run_pass(x, d, direction_forward=True):
+        """Run adaptive Kalman pass over d (already oriented). Returns levels."""
+        m = len(d)
+        out = np.empty(m)
+        P = np.eye(2) * 1.0
+        slope_hist = []          # recent slope sign history for trend gating
+        innov_var = 1.0          # running innovation variance estimate
+        x = x.copy()
+
+        for k in range(m):
+            # --- predict ---
+            x = F @ x
+            P = F @ P @ F.T
+
+            # --- adaptive process noise (trend gating) ---
+            if len(slope_hist) >= trend_lookback:
+                s = np.sign(slope_hist[-trend_lookback:])
+                if np.all(s == s[0]) and s[0] != 0:
+                    qs = q_slope_slow          # consistent trend -> stiff slope
+                else:
+                    qs = q_slope_fast         # mixed signs -> loose slope
+            else:
+                qs = q_slope_fast
+            Q = np.diag([q_level, qs])
+            P = P + Q
+
+            # --- innovation ---
+            y = d[k] - (H @ x)[0]
+            S = (H @ P @ H.T)[0, 0] + 1.0
+            # update innovation variance estimate (EMA)
+            innov_var = 0.9 * innov_var + 0.1 * (y * y)
+            thresh = innov_gain * np.sqrt(max(innov_var, 1e-9))
+
+            # --- if innovation too large vs. recent scale, loosen slope ---
+            if abs(y) > thresh:
+                P[1, 1] += q_slope_fast * 4.0
+                S = (H @ P @ H.T)[0, 0] + 1.0
+
+            # --- update ---
+            K = (P @ H.T / S).ravel()
+            x = x + K * y
+            P = P - np.outer(K, H @ P)
+            P = 0.5 * (P + P.T)  # symmetrize
+
+            out[k] = x[0]
+            slope_hist.append(np.sign(x[1]))
+            if len(slope_hist) > trend_lookback * 3:
+                slope_hist.pop(0)
+
+        if not direction_forward:
+            # backward pass output must be re-reversed by caller
+            pass
+        return out
+
+    x0 = np.array([data[0], 0.0])
+    fwd = run_pass(x0, data, True)
+
+    # ---------------- backward pass (for zero-lag fusion) ----------------
+    # Run filter on reversed data: prediction then runs "backward in time",
+    # so its lag is on the opposite side; fusing cancels lag for linear trends.
+    xb0 = np.array([data[-1], 0.0])
+    bwd_full = run_pass(xb0, data[::-1], False)
+    bwd = bwd_full[::-1]
+
+    # ---------------- zero-lag fusion ----------------
+    # For linear trends, forward estimate at k lags by ~dt, backward by ~-dt,
+    # so their average is lag-free. Weight by blend over a short span to keep
+    # endpoints stable.
+    fused = np.empty(n)
+    for k in range(n):
+        # local slope estimate for extrapolation alignment
+        lo = max(0, k - blend_half)
+        hi = min(n, k + blend_half + 1)
+        seg_f = fwd[lo:hi]
+        seg_b = bwd[lo:hi]
+        # weighted average centered on k (weights ramp toward center)
+        w = np.arange(len(seg_f), dtype=float)
+        if len(seg_f) > 1:
+            w = np.abs(w - (k - lo))
+            w = 1.0 / (w + 1.0)
+        else:
+            w = np.array([1.0])
+        fused[k] = float(np.sum(w * (0.5 * seg_f + 0.5 * seg_b)) / np.sum(w))
+
+    # ---------------- gentle zero-lag post-smoother ----------------
+    # One-pole filter applied forward and backward (cancels its own group delay),
+    # moderate strength alpha chosen for noise reduction without lag.
+    def zerolag_smooth(sig, alpha=0.45):
+        if len(sig) < 3:
+            return sig.copy()
+        a = alpha
+        # forward
+        f = np.empty_like(sig)
+        f[0] = sig[0]
+        for i in range(1, len(sig)):
+            f[i] = a * sig[i] + (1 - a) * f[i - 1]
+        # backward
+        b = np.empty_like(sig)
+        b[-1] = sig[-1]
+        for i in range(len(sig) - 2, -1, -1):
+            b[i] = a * sig[i] + (1 - a) * b[i + 1]
+        return 0.5 * (f + b)
+
+    fused = zerolag_smooth(fused, alpha=0.45)
+
+    return fused
+# EVOLVE-BLOCK-END

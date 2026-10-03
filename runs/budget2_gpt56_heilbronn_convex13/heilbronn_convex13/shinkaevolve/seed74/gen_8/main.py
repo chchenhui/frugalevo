@@ -1,0 +1,200 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Deterministically construct 13 points in the unit square.
+
+    The four square corners are retained as hull vertices, so the convex hull
+    has area exactly one.  Therefore the minimum raw triangle area equals the
+    evaluator's normalized minimum-area objective.
+
+    Returns
+    -------
+    np.ndarray
+        Array with shape (13, 2).
+    """
+    rng = np.random.default_rng(13071957)
+
+    corners = np.array(
+        (
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (0.0, 1.0),
+        ),
+        dtype=np.float64,
+    )
+
+    triangle_index = np.array(
+        [
+            (i, j, k)
+            for i in range(13)
+            for j in range(i + 1, 13)
+            for k in range(j + 1, 13)
+        ],
+        dtype=np.intp,
+    )
+
+    def evaluate(interior: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return minimum area and a small-tail average for every candidate.
+
+        The tail average improves search guidance when two layouts have close
+        minimum areas but different numbers of nearly-degenerate triangles.
+        """
+        batch_size = interior.shape[0]
+        layouts = np.empty((batch_size, 13, 2), dtype=np.float64)
+        layouts[:, :4] = corners
+        layouts[:, 4:] = interior
+
+        first = layouts[:, triangle_index[:, 0]]
+        second = layouts[:, triangle_index[:, 1]]
+        third = layouts[:, triangle_index[:, 2]]
+
+        ux = second[..., 0] - first[..., 0]
+        uy = second[..., 1] - first[..., 1]
+        vx = third[..., 0] - first[..., 0]
+        vy = third[..., 1] - first[..., 1]
+
+        areas = 0.5 * np.abs(ux * vy - uy * vx)
+        minimum = np.min(areas, axis=1)
+
+        # Only the smallest constraints influence the auxiliary score.
+        tail = np.partition(areas, 15, axis=1)[:, :16].mean(axis=1)
+        return minimum, tail
+
+    def rank_value(minimum: np.ndarray, tail: np.ndarray, weight: float) -> np.ndarray:
+        return minimum + weight * tail
+
+    population_size = 72
+    islands = 3
+    island_size = population_size // islands
+    dimensions = 18
+
+    population = rng.uniform(0.025, 0.975, size=(population_size, 9, 2))
+
+    # Several perturbed lattice seeds provide useful spacing immediately while
+    # avoiding the exact collinearities of an unperturbed grid.
+    base_grid = np.array(
+        [(x, y) for y in (0.19, 0.50, 0.81) for x in (0.19, 0.50, 0.81)],
+        dtype=np.float64,
+    )
+    for seed_index in range(12):
+        population[seed_index] = np.clip(
+            base_grid + rng.normal(0.0, 0.025 + 0.004 * seed_index, size=(9, 2)),
+            0.008,
+            0.992,
+        )
+
+    minimum, tail = evaluate(population)
+    best_index = int(np.argmax(minimum))
+    best = population[best_index].copy()
+    best_minimum = float(minimum[best_index])
+
+    global_generations = 520
+
+    for generation in range(global_generations):
+        progress = generation / (global_generations - 1)
+        auxiliary_weight = 0.10 * (1.0 - progress) + 0.008 * progress
+        values = rank_value(minimum, tail, auxiliary_weight)
+
+        candidate_blocks = [population[:, None, :, :]]
+
+        # Differential proposals move between successful geometric patterns.
+        differential = np.empty((population_size, 2, 9, 2), dtype=np.float64)
+        for island in range(islands):
+            start = island * island_size
+            stop = start + island_size
+            local = population[start:stop]
+            local_values = values[start:stop]
+            local_best = local[int(np.argmax(local_values))]
+
+            a = rng.integers(0, island_size, size=(island_size, 2))
+            b = rng.integers(0, island_size, size=(island_size, 2))
+            c = rng.integers(0, island_size, size=(island_size, 2))
+
+            scale = 0.34 - 0.16 * progress
+            trial_a = (
+                local
+                + scale * (local[a[:, 0]] - local[b[:, 0]])
+                + rng.uniform(0.0, 0.28, size=(island_size, 1, 1))
+                * (local_best - local)
+            )
+            trial_b = (
+                local[a[:, 1]]
+                + scale * (local[b[:, 1]] - local[c[:, 1]])
+                + rng.normal(0.0, 0.012 * (1.0 - progress) + 0.002, size=(island_size, 9, 2))
+            )
+
+            differential[start:stop, 0] = trial_a
+            differential[start:stop, 1] = trial_b
+
+        candidate_blocks.append(np.clip(differential, 0.0, 1.0))
+
+        # Local Gaussian proposals preserve fine progress around each member.
+        sigma = 0.070 * (0.12 / 0.070) ** progress
+        local_noise = rng.normal(0.0, sigma, size=(population_size, 2, 9, 2))
+        attraction = rng.uniform(0.0, 0.10, size=(population_size, 2, 1, 1))
+        local_trials = population[:, None] + local_noise + attraction * (
+            best[None, None] - population[:, None]
+        )
+        candidate_blocks.append(np.clip(local_trials, 0.0, 1.0))
+
+        candidates = np.concatenate(candidate_blocks, axis=1)
+        flat_candidates = candidates.reshape(-1, 9, 2)
+        candidate_minimum, candidate_tail = evaluate(flat_candidates)
+
+        candidate_minimum = candidate_minimum.reshape(population_size, -1)
+        candidate_tail = candidate_tail.reshape(population_size, -1)
+        candidate_values = rank_value(candidate_minimum, candidate_tail, auxiliary_weight)
+
+        selected = np.argmax(candidate_values, axis=1)
+        population = candidates[np.arange(population_size), selected]
+        minimum = candidate_minimum[np.arange(population_size), selected]
+        tail = candidate_tail[np.arange(population_size), selected]
+
+        current_index = int(np.argmax(minimum))
+        if minimum[current_index] > best_minimum:
+            best_minimum = float(minimum[current_index])
+            best = population[current_index].copy()
+
+        # Replace weak members of each island with fresh layouts at controlled
+        # intervals.  Islands retain their local leaders, avoiding full resets.
+        if generation in (155, 300, 415):
+            values = rank_value(minimum, tail, auxiliary_weight)
+            for island in range(islands):
+                start = island * island_size
+                stop = start + island_size
+                local_order = np.argsort(values[start:stop])
+                replace = start + local_order[: island_size // 4]
+                population[replace] = rng.uniform(0.015, 0.985, size=(len(replace), 9, 2))
+                minimum[replace], tail[replace] = evaluate(population[replace])
+
+    # Dedicated final maximin polishing around the best discovered layout.
+    polish_sigma = 0.020
+    for _ in range(280):
+        proposals = np.clip(
+            best[None] + rng.normal(0.0, polish_sigma, size=(96, 9, 2)),
+            0.0,
+            1.0,
+        )
+        proposals[0] = best
+
+        proposal_minimum, proposal_tail = evaluate(proposals)
+        winner = int(np.argmax(proposal_minimum))
+
+        if proposal_minimum[winner] >= best_minimum:
+            best_minimum = float(proposal_minimum[winner])
+            best = proposals[winner].copy()
+            polish_sigma *= 1.012
+        else:
+            polish_sigma *= 0.986
+
+        polish_sigma = float(np.clip(polish_sigma, 0.0012, 0.030))
+
+    return np.vstack((corners, best))
+
+
+# EVOLVE-BLOCK-END

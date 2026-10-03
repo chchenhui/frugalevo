@@ -1,0 +1,362 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Build low-makespan transaction orders with exact prefix-cost beam search,
+    diversified greedy construction, and variable-neighborhood refinement.
+    """
+    num_txns = workload.num_txns
+    if num_txns == 0:
+        return 0, []
+
+    cost_cache = {}
+
+    def schedule_cost(order):
+        key = tuple(order)
+        if key not in cost_cache:
+            cost_cache[key] = workload.get_opt_seq_cost(order)
+        return cost_cache[key]
+
+    # For small instances the ordering problem can be solved exactly.
+    if num_txns <= 8:
+        import itertools
+
+        best_cost = float("inf")
+        best_order = None
+        for order in itertools.permutations(range(num_txns)):
+            cost = schedule_cost(order)
+            if cost < best_cost:
+                best_cost = cost
+                best_order = list(order)
+        return best_cost, best_order
+
+    def sampled_candidates(remaining, limit):
+        """Return every candidate when cheap, otherwise an unbiased sample."""
+        if len(remaining) <= limit:
+            return remaining[:]
+        return random.sample(remaining, limit)
+
+    def choose_extension(order, remaining, diversity=False):
+        """
+        Select an extension by actual simulated prefix makespan.  Diversity
+        chooses from a restricted near-best candidate list rather than making
+        a completely random scheduling decision.
+        """
+        if len(remaining) <= 36:
+            candidates = remaining[:]
+        else:
+            candidates = sampled_candidates(
+                remaining, min(len(remaining), max(24, 3 * max(1, num_seqs)))
+            )
+
+        scored = []
+        for txn in candidates:
+            scored.append((schedule_cost(order + [txn]), txn))
+        scored.sort(key=lambda item: item[0])
+
+        if not diversity or len(scored) == 1:
+            return scored[0][1]
+
+        # Restricted candidate list: retain alternatives close to the best
+        # prefix cost.  This creates useful independent conflict orientations.
+        best = scored[0][0]
+        slack = max(1, int(best * 0.025))
+        rcl = [txn for cost, txn in scored if cost <= best + slack]
+        rcl = rcl[:min(len(rcl), 5)]
+        return random.choice(rcl)
+
+    def greedy_order(start_txn, diversity=False, initial_order=None):
+        if initial_order is None:
+            order = [start_txn]
+            remaining = list(range(num_txns))
+            remaining.remove(start_txn)
+        else:
+            order = initial_order[:]
+            used = set(order)
+            remaining = [txn for txn in range(num_txns) if txn not in used]
+
+        while remaining:
+            txn = choose_extension(order, remaining, diversity)
+            order.append(txn)
+            remaining.remove(txn)
+
+        return schedule_cost(order), order
+
+    # Evaluate all starts, then retain the best starts plus randomized
+    # alternatives.  This is stronger than selecting a small random subset.
+    start_scores = [(schedule_cost([txn]), txn) for txn in range(num_txns)]
+    start_scores.sort(key=lambda item: item[0])
+
+    beam_width = min(max(6, num_seqs), 12)
+    chosen_starts = [txn for _, txn in start_scores[:beam_width]]
+    if num_txns > beam_width:
+        remaining_starts = [txn for _, txn in start_scores[beam_width:]]
+        random.shuffle(remaining_starts)
+        replace_count = min(max(1, beam_width // 3), len(remaining_starts))
+        chosen_starts[-replace_count:] = remaining_starts[:replace_count]
+
+    beam = [
+        (schedule_cost([txn]), [txn], set(range(num_txns)) - {txn})
+        for txn in chosen_starts
+    ]
+
+    # Beam search preserves several promising prefixes and prevents one early
+    # greedy choice from determining the only final order.
+    for depth in range(1, num_txns):
+        expanded = []
+        seen = set()
+
+        for _, order, remaining_set in beam:
+            remaining = list(remaining_set)
+            if len(remaining) <= 34:
+                candidates = remaining
+            else:
+                candidates = sampled_candidates(
+                    remaining, min(len(remaining), max(22, 2 * beam_width + 10))
+                )
+
+            for txn in candidates:
+                new_order = order + [txn]
+                key = tuple(new_order)
+                if key in seen:
+                    continue
+                seen.add(key)
+                expanded.append((
+                    schedule_cost(new_order),
+                    new_order,
+                    remaining_set - {txn},
+                ))
+
+        expanded.sort(key=lambda item: item[0])
+
+        # Keep cost elites but retain a little diversity within ties.
+        beam = []
+        index = 0
+        while index < len(expanded) and len(beam) < beam_width:
+            end = index + 1
+            while end < len(expanded) and expanded[end][0] == expanded[index][0]:
+                end += 1
+            tied = expanded[index:end]
+            random.shuffle(tied)
+            beam.extend(tied[:beam_width - len(beam)])
+            index = end
+
+    seeds = [(cost, order) for cost, order, _ in beam]
+
+    # Independent greedy/GRASP schedules preserve the useful sampled-greedy
+    # behavior of the original implementation.
+    starts = list(range(num_txns))
+    random.shuffle(starts)
+    greedy_attempts = max(8, 2 * num_seqs)
+    for attempt in range(greedy_attempts):
+        seeds.append(greedy_order(
+            starts[attempt % num_txns],
+            diversity=(attempt % 3 != 0),
+        ))
+
+    def refine(order, current_cost, rounds=None):
+        """
+        Variable-neighborhood descent using exact makespan comparisons.
+        Adjacent swaps are always checked; longer moves are exhaustive on
+        moderate workloads and sampled on large workloads.
+        """
+        if rounds is None:
+            rounds = 5 if num_txns <= 32 else 4
+
+        for _ in range(rounds):
+            best_cost = current_cost
+            best_order = None
+
+            def consider(candidate):
+                nonlocal best_cost, best_order
+                candidate_cost = schedule_cost(candidate)
+                if candidate_cost < best_cost:
+                    best_cost = candidate_cost
+                    best_order = candidate
+
+            # Local adjacent inversions frequently represent direct conflicts.
+            for left in range(num_txns - 1):
+                candidate = order[:]
+                candidate[left], candidate[left + 1] = (
+                    candidate[left + 1], candidate[left]
+                )
+                consider(candidate)
+
+            if num_txns <= 30:
+                insertion_moves = [
+                    (source, destination)
+                    for source in range(num_txns)
+                    for destination in range(num_txns)
+                    if source != destination
+                ]
+                pair_moves = [
+                    (left, right)
+                    for left in range(num_txns - 1)
+                    for right in range(left + 1, num_txns)
+                ]
+            else:
+                samples = 10 * num_txns
+                insertion_moves = [
+                    (random.randrange(num_txns), random.randrange(num_txns))
+                    for _ in range(samples)
+                ]
+                pair_moves = [
+                    tuple(sorted(random.sample(range(num_txns), 2)))
+                    for _ in range(samples)
+                ]
+
+            for source, destination in insertion_moves:
+                if source == destination:
+                    continue
+                candidate = order[:]
+                txn = candidate.pop(source)
+                candidate.insert(destination, txn)
+                consider(candidate)
+
+            for left, right in pair_moves:
+                candidate = order[:]
+                candidate[left], candidate[right] = candidate[right], candidate[left]
+                consider(candidate)
+
+            # Reversal is valuable when a whole conflict-heavy section has
+            # been oriented poorly.  Use fewer reversals on large instances.
+            reverse_moves = pair_moves if num_txns <= 30 else pair_moves[:len(pair_moves) // 2]
+            for left, right in reverse_moves:
+                if right - left < 2:
+                    continue
+                candidate = order[:]
+                candidate[left:right + 1] = reversed(candidate[left:right + 1])
+                consider(candidate)
+
+            if best_order is None:
+                break
+            order, current_cost = best_order, best_cost
+
+        return current_cost, order
+
+    def destroy_and_repair(order, diversity=False):
+        """
+        Rebuild a small neighborhood of an already good schedule.  Keeping the
+        unaffected transactions fixed preserves proven conflict orientations,
+        while exact insertion scoring can jointly repair a poor local region.
+        """
+        remove_count = min(num_txns // 3, max(3, min(6, num_txns // 8 + 2)))
+
+        if random.random() < 0.55:
+            first = random.randrange(num_txns - remove_count + 1)
+            removed = order[first:first + remove_count]
+        else:
+            indices = set(random.sample(range(num_txns), remove_count))
+            removed = [txn for index, txn in enumerate(order) if index in indices]
+
+        removed_set = set(removed)
+        partial = [txn for txn in order if txn not in removed_set]
+        random.shuffle(removed)
+
+        for txn in removed:
+            if len(partial) <= 44:
+                positions = range(len(partial) + 1)
+            else:
+                positions = {0, len(partial)}
+                positions.update(random.sample(
+                    range(1, len(partial)),
+                    min(36, len(partial) - 1),
+                ))
+
+            scored = []
+            for position in positions:
+                candidate = partial[:]
+                candidate.insert(position, txn)
+                scored.append((schedule_cost(candidate), position))
+            scored.sort(key=lambda item: item[0])
+
+            if diversity and len(scored) > 1:
+                best = scored[0][0]
+                slack = max(1, int(best * 0.01))
+                choices = [
+                    position for cost, position in scored
+                    if cost <= best + slack
+                ]
+                position = random.choice(choices[:min(4, len(choices))])
+            else:
+                position = scored[0][1]
+            partial.insert(position, txn)
+
+        return schedule_cost(partial), partial
+
+    unique_seeds = {}
+    for cost, order in seeds:
+        key = tuple(order)
+        if key not in unique_seeds or cost < unique_seeds[key][0]:
+            unique_seeds[key] = (cost, order)
+
+    ranked = sorted(unique_seeds.values(), key=lambda item: item[0])
+    elite_count = min(max(4, min(num_seqs, 8)), len(ranked))
+
+    best_cost = float("inf")
+    best_order = None
+    refined = []
+
+    for seed_cost, seed_order in ranked[:elite_count]:
+        cost, order = refine(seed_order[:], seed_cost)
+        refined.append((cost, order))
+        if cost < best_cost:
+            best_cost, best_order = cost, order
+
+    # Large-neighborhood destroy-and-repair can cross barriers that require
+    # several coordinated insertions, then exact descent polishes the rebuilt
+    # ordering.  Work only from elite local optima to spend evaluations where
+    # their preserved conflict orientations are most valuable.
+    if num_txns >= 7:
+        for seed_cost, seed_order in sorted(refined, key=lambda item: item[0])[:4]:
+            current_cost, current_order = seed_cost, seed_order[:]
+            for attempt in range(4 if num_txns <= 40 else 3):
+                rebuilt_cost, rebuilt_order = destroy_and_repair(
+                    current_order,
+                    diversity=(attempt > 0),
+                )
+                rebuilt_cost, rebuilt_order = refine(
+                    rebuilt_order,
+                    rebuilt_cost,
+                    rounds=2,
+                )
+
+                # The first repaired state is allowed as a new base even if it
+                # is slightly worse, permitting later repairs to leave a local
+                # basin; afterwards retain only non-worsening bases.
+                if attempt == 0 or rebuilt_cost <= current_cost:
+                    current_cost, current_order = rebuilt_cost, rebuilt_order
+
+                if rebuilt_cost < best_cost:
+                    best_cost, best_order = rebuilt_cost, rebuilt_order
+
+    return best_cost, best_order
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

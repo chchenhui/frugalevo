@@ -1,0 +1,63 @@
+<NAME>
+swap_refine_packing
+</NAME>
+
+<DESCRIPTION>
+Add a small vectorized local-search refinement after cardinality-constrained LPT packing. LPT is fast but can leave the currently heaviest and lightest GPU packs with a poor pair of expert assignments. Each refinement pass finds, per layer, the best legal swap between those two packs that reduces their load gap while preserving the exact number of experts per pack.
+
+The refinement is bounded to four passes, uses batched tensor operations instead of Python-level loops, and only accepts strictly improving swaps. It therefore improves the GPU maximum-load objective without changing expert replication counts, topology constraints, or output format. Since only the highest/lowest pair is examined each pass, it avoids expensive general NP-hard partition search.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        pack_weights[rows, pack] += weight_float[rows, group]
+        pack_items[rows, pack] += 1
+
+    return pack_index, rank_in_pack
+=======
+        pack_weights[rows, pack] += weight_float[rows, group]
+        pack_items[rows, pack] += 1
+
+    # LPT is a good initial solution, but equal-cardinality partitions can
+    # often be improved by exchanging one item from the heaviest pack with one
+    # from the lightest pack.  The best swap makes their load difference as
+    # small as possible.  Restricting refinement to this pair keeps the search
+    # bounded and fully vectorized across layers.
+    for _ in range(4):
+        high_pack = pack_weights.argmax(dim=-1)
+        low_pack = pack_weights.argmin(dim=-1)
+        load_gap = (pack_weights[rows, high_pack] -
+                    pack_weights[rows, low_pack])
+
+        is_high = pack_index.eq(high_pack.unsqueeze(-1))
+        is_low = pack_index.eq(low_pack.unsqueeze(-1))
+        # delta is the amount of load transferred from high to low by a swap.
+        delta = (weight_float.unsqueeze(-1) -
+                 weight_float.unsqueeze(-2))
+        valid = (is_high.unsqueeze(-1) & is_low.unsqueeze(-2) &
+                 (delta > 0) & (delta < load_gap[:, None, None]))
+        error = (load_gap[:, None, None] - 2 * delta).abs()
+        error.masked_fill_(~valid, torch.inf)
+        best_error, best_flat = error.flatten(1).min(dim=-1)
+        improve = torch.isfinite(best_error)
+
+        high_item = best_flat // num_groups
+        low_item = best_flat % num_groups
+        refine_rows = rows[improve]
+        selected_high = high_item[improve]
+        selected_low = low_item[improve]
+
+        high_rank = rank_in_pack[refine_rows, selected_high].clone()
+        low_rank = rank_in_pack[refine_rows, selected_low].clone()
+        pack_index[refine_rows, selected_high] = low_pack[improve]
+        pack_index[refine_rows, selected_low] = high_pack[improve]
+        rank_in_pack[refine_rows, selected_high] = low_rank
+        rank_in_pack[refine_rows, selected_low] = high_rank
+
+        transferred = delta[refine_rows, selected_high, selected_low]
+        pack_weights[refine_rows, high_pack[improve]] -= transferred
+        pack_weights[refine_rows, low_pack[improve]] += transferred
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,90 @@
+<NAME>
+reversal_suppression_hysteresis</NAME>
+<DESCRIPTION>
+The current Kalman filter achieves excellent lag error (0.18) and correlation (0.91), but suffers from high slope_changes (317.2) and false_reversals (253.6) — the causal filter tracks noise-induced micro-oscillations too closely. Following the recommendation, I add a final lightweight zero-phase post-processing stage: compute the gradient of the Kalman output, flag short segments where the sign of the gradient flips while the gradient magnitude is small relative to the median (residual micro-oscillations), and apply an extra short zero-phase Savitzky-Golay pass only in a dilated neighborhood of those flagged regions. Since smoothing is restricted to flagged neighborhoods, the well-performing lag/correlation characteristics remain intact elsewhere, while spurious directional reversals are suppressed. This directly targets slope_changes and false_reversals — the two weakest metrics — without sacrificing the responsiveness advantage over the previous zero-phase-heavy program (which had 0.29 lag but only scored 0.59).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        estimates[i] = state[0]
+
+    # Match sliding-window output contract:
+    # output[i] corresponds to window x[i : i+window_size]
+    output_length = n - window_size + 1
+    # emit the causal estimate at the *end* of each window (full evidence,
+    # but produced causally with predictive state -> minimal effective lag)
+    y = estimates[window_size - 1:]
+    return y
+=======
+        estimates[i] = state[0]
+
+    # --- Stage 2: reversal-suppression hysteresis (zero-phase, local only) ---
+    # Flag residual micro-oscillations: gradient sign flips where |grad| is
+    # small relative to typical gradient magnitude. Smooth only there.
+    estimates = _suppress_false_reversals(estimates, window_size)
+
+    # Match sliding-window output contract:
+    # output[i] corresponds to window x[i : i+window_size]
+    output_length = n - window_size + 1
+    # emit the causal estimate at the *end* of each window (full evidence,
+    # but produced causally with predictive state -> minimal effective lag)
+    y = estimates[window_size - 1:]
+    return y
+
+
+def _suppress_false_reversals(s, window_size=20, k=0.5, half=4):
+    """Local zero-phase smoothing of micro-oscillations (sign flips of a weak
+    gradient). Untouched elsewhere to preserve lag and trend structure."""
+    n = len(s)
+    if n < 4 * half + 4:
+        return s
+    g = np.gradient(s)
+    med_g = np.median(np.abs(g)) + 1e-12
+    sign = np.sign(g)
+    # flag points where sign flips vs. both neighbors and gradient is weak
+    flips = np.zeros(n, dtype=bool)
+    flips[1:-1] = ((sign[:-2] * sign[1:-1] < 0) |
+                   (sign[1:-1] * sign[2:] < 0)) & (np.abs(g[1:-1]) < k * med_g)
+    if not flips.any():
+        return s
+    # dilate flagged regions by the SG half-window
+    flag = flips.copy()
+    for shift in range(1, half + 1):
+        flag[shift:] |= flips[:-shift]
+        flag[:-shift] |= flips[shift:]
+    # short zero-phase quadratic SG kernel
+    t_off = np.arange(-half, half + 1, dtype=float)
+    A = np.vstack([t_off ** 0, t_off ** 1, t_off ** 2]).T
+    coeffs = (np.linalg.pinv(A.T @ A) @ A.T)[0]
+    out = s.copy()
+    idx = np.where(flag)[0]
+    lo, hi = idx.min(), idx.max()
+    # apply SG only within contiguous flagged neighborhoods
+    i = 0
+    while i < n:
+        if flag[i]:
+            j = i
+            while j + 1 < n and flag[j + 1]:
+                j += 1
+            a = max(0, i - half)
+            b = min(n, j + half + 1)
+            seg = s[a:b]
+            if len(seg) >= 2 * half + 1:
+                # reflect-pad edges
+                pad = np.concatenate([
+                    2 * seg[0] - seg[1:half + 1][::-1],
+                    seg,
+                    2 * seg[-1] - seg[-2:-half - 2:-1][::-1],
+                ])
+                sm = np.convolve(pad, coeffs[::-1], mode="valid")
+                out[a:b] = sm
+            else:
+                out[a:b] = np.convolve(
+                    np.pad(seg, (half, half), mode="edge"),
+                    np.ones(2 * half + 1) / (2 * half + 1), mode="valid")
+            i = j + 1
+        else:
+            i += 1
+    del lo, hi
+    return out
+>>>>>>> REPLACE
+</DIFF>

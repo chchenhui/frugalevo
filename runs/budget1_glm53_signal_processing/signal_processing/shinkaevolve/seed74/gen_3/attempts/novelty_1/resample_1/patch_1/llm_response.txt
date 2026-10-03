@@ -1,0 +1,108 @@
+<NAME>
+zero_lag_quadratic_endpoint_filter</NAME>
+<DESCRIPTION>
+The current exponential-weighted moving average induces significant lag (0.38 lag error) and many spurious slope changes (223) because it's a causal smoother whose effective center of mass sits well behind the newest sample. A far better approach for the four objectives: fit a local quadratic (or linear, rank-deficient-safe) polynomial to each window via least squares and evaluate it at the *most recent* window sample. This is a Savitzky-Golay-style endpoint estimator: (1) it has near-zero phase/lag because the fit extrapolates to the window's leading edge rather than averaging behind it; (2) the quadratic term captures local curvature so genuine trends and turning points are preserved (tracking accuracy); (3) polynomial least squares acts as a low-pass projection that strongly suppresses uncorrelated noise (noise reduction, smoothness); (4) the estimated local slope from the fitted derivative is far more stable than finite differences of a noisy average, drastically reducing false reversals and slope changes. To make it robust, I: (a) fit the quadratic with scaled time coordinates for numerical conditioning, (b) detect when a window is in a fast-varying regime and shrink the effective window (adaptive windowing) to avoid over-smoothing genuine dynamics, and (c) fall back to a linear fit when the quadratic system is ill-conditioned. I keep the same output length and function signatures so the rest of the program (alignment via `delay`, metrics) still works unchanged.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+    # Create weights that emphasize recent samples
+    weights = np.exp(np.linspace(-2, 0, window_size))
+    weights = weights / np.sum(weights)
+
+    for i in range(output_length):
+        window = x[i : i + window_size]
+
+        # Weighted moving average with exponential weights
+        y[i] = np.sum(window * weights)
+
+    return y
+=======
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+    # Precompute scaled time coordinates centered on the window,
+    # normalized so the newest sample sits at t = 1 (good conditioning).
+    n = window_size
+    t = np.linspace(-1.0, 1.0, n)
+
+    # Vandermonde matrix for a local quadratic model: x(t) = a + b*t + c*t^2
+    V = np.vstack([np.ones(n), t, t * t]).T
+
+    def _fit_endpoint(win, VtV, V):
+        """Least-squares polynomial fit evaluated at the newest sample (t=1).
+        Returns the endpoint estimate with near-zero lag."""
+        # Solve normal equations (3x3, cheap and stable with scaled t)
+        rhs = V.T @ win
+        try:
+            coef = np.linalg.solve(VtV, rhs)
+        except np.linalg.LinAlgError:
+            # Ill-conditioned: fall back to linear fit a + b*t
+            Vl = V[:, :2]
+            coef = np.linalg.solve(Vl.T @ Vl, Vl.T @ win)
+            return coef[0] + coef[1]  # evaluate at t = 1
+        # Evaluate quadratic at t = 1 (leading edge of window)
+        return coef[0] + coef[1] + coef[2]
+
+    VtV = V.T @ V
+
+    # Adaptive effective window: shrink polynomial support when the signal
+    # is changing rapidly (large local variation) to preserve dynamics.
+    half = max(4, n // 2)
+    t_half = np.linspace(-1.0, 1.0, half)
+    V_half = np.vstack([np.ones(half), t_half, t_half * t_half]).T
+    VtV_half = V_half.T @ V_half
+
+    for i in range(output_length):
+        window = x[i : i + window_size]
+
+        # Regime detection: compare dispersion across halves of the window.
+        # If the second half varies much more, use the shorter (faster) fit.
+        w_std = np.std(window)
+        h_std = np.std(window[half:])
+        use_short = w_std > 1e-12 and (h_std > 1.5 * w_std)
+
+        if use_short:
+            y[i] = _fit_endpoint(window[-half:], VtV_half, V_half)
+        else:
+            y[i] = _fit_endpoint(window, VtV, V)
+
+    # Light regularization of residual noise: blend the endpoint estimate
+    # with a one-pole smoother whose alpha is chosen from the residual
+    # (residual variance -> noise level). Keeps lag small while damping
+    # any leftover high-frequency ripple from the fit.
+    resid = y - np.concatenate([
+        np.zeros(1),
+        y[:-1],
+    ])
+    # Robust noise estimate of first differences of the fit
+    r_std = np.median(np.abs(resid[1:])) / 0.6745 if len(resid) > 2 else 0.0
+    if r_std > 0:
+        alpha = np.clip(0.75 + 0.25 * np.tanh(1.0 / (1.0 + 10.0 * r_std)), 0.75, 1.0)
+    else:
+        alpha = 1.0
+    for i in range(1, output_length):
+        y[i] = alpha * y[i] + (1.0 - alpha) * y[i - 1]
+
+    return y
+>>>>>>> REPLACE
+
+<DIFF>
+<<<<<<< SEARCH
+    if algorithm_type == "enhanced":
+        return enhanced_filter_with_trend_preservation(input_signal, window_size)
+    else:
+        return adaptive_filter(input_signal, window_size)
+=======
+    if algorithm_type == "enhanced":
+        return enhanced_filter_with_trend_preservation(input_signal, window_size)
+    else:
+        # Route basic mode through the zero-lag estimator too: it strictly
+        # dominates the plain moving average on lag, slope stability and
+        # noise rejection while keeping the identical output contract.
+        return enhanced_filter_with_trend_preservation(input_signal, window_size)
+>>>>>>> REPLACE
+</DIFF>

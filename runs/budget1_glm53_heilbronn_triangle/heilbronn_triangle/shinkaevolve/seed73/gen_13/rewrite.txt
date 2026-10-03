@@ -1,0 +1,119 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _triangle_area(a, b, c):
+    return 0.5 * abs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+
+
+def _clamp_to_triangle(pts):
+    """Project points back inside the unit equilateral triangle."""
+    s3 = np.sqrt(3.0)
+    x = np.clip(pts[:, 0], 0.0, 1.0)
+    y = pts[:, 1]
+    y = np.clip(y, 0.0, s3 * np.minimum(x, 1.0 - x))
+    return np.stack([x, y], axis=1)
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of 11 points on or inside the unit equilateral triangle
+    to maximize the smallest triangle area (Heilbronn problem, n = 11).
+
+    Deterministic multi-start simulated annealing with targeted perturbation of the
+    smallest triangle's vertices. Fully vectorized area evaluation.
+
+    Returns:
+        points: np.ndarray of shape (11,2).
+    """
+    n = 11
+    HS = np.sqrt(3.0) / 2.0  # half height
+
+    tri = np.array([(i, j, k) for i in range(n) for j in range(i + 1, n)
+                    for k in range(j + 1, n)])
+    I, J, K = tri[:, 0], tri[:, 1], tri[:, 2]
+
+    def areas(pts):
+        ax, ay = pts[I, 0], pts[I, 1]
+        a2 = (pts[J, 0] - ax) * (pts[K, 1] - ay) - (pts[J, 1] - ay) * (pts[K, 0] - ax)
+        return 0.5 * np.abs(a2)
+
+    def min_area(pts):
+        return float(np.min(areas(pts)))
+
+    def worst_triple(pts):
+        return tri[np.argmin(np.asarray(areas(pts)))]
+
+    # Several diverse deterministic initial layouts.
+    def layouts():
+        # L1: vertices + boundary + interior (from current program, improved)
+        yield np.array([
+            [0.0, 0.0], [1.0, 0.0], [0.5, HS],
+            [0.25, 0.0], [0.75, 0.0], [0.0, 0.5 * HS], [1.0, 0.5 * HS],
+            [0.5, 0.0], [0.125, 0.25 * HS], [0.875, 0.25 * HS], [0.5, 0.5 * HS],
+        ])
+        # L2: triangular lattice-ish interior arrangement
+        yield np.array([
+            [0.0, 0.0], [0.5, 0.0], [1.0, 0.0],
+            [0.25, 0.433], [0.75, 0.433],
+            [0.125, 0.2165], [0.375, 0.2165], [0.625, 0.2165], [0.875, 0.2165],
+            [0.5, HS], [0.0, 0.433],
+        ])
+        # L3: jittered grid, fixed seed
+        rng0 = np.random.default_rng(12345)
+        xs = np.linspace(0.05, 0.95, 4)
+        cand = []
+        for yy in [0.05, 0.25, 0.45, 0.65]:
+            for xx in xs:
+                cand.append([xx + rng0.normal(0, 0.02), yy])
+        cand = np.array(cand[:n])
+        yield cand
+
+    best_points = None
+    best_area = -1.0
+
+    for seed, init in enumerate(zip([7, 21, 99], layouts())):
+        rng = np.random.default_rng(seed)
+        points = _clamp_to_triangle(np.array(init, dtype=float))
+        cur_area = min_area(points)
+        if cur_area > best_area:
+            best_area, best_points = cur_area, points.copy()
+
+        # Two-phase annealing: coarse then fine.
+        for phase_scale, n_iters in [(0.05, 2500), (0.015, 2500)]:
+            scale = phase_scale
+            for it in range(n_iters):
+                if best_area >= 0.0375:
+                    break
+                cand = points.copy()
+                if rng.random() < 0.6:
+                    # targeted: move a vertex of the worst triangle
+                    wt = worst_triple(points)
+                    p_idx = wt[rng.integers(3)]
+                else:
+                    p_idx = rng.integers(n)
+                cand[p_idx] += rng.normal(0.0, scale, 2)
+                cand = _clamp_to_triangle(cand)
+                cand_area = min_area(cand)
+
+                temp = 0.002 * (1.0 - it / n_iters)
+                if cand_area >= cur_area - 1e-15 or rng.random() < np.exp(
+                        (cand_area - cur_area) / max(temp, 1e-9)):
+                    points = cand
+                    cur_area = cand_area
+                    if cand_area > best_area:
+                        best_area = cand_area
+                        best_points = cand.copy()
+                if it % 500 == 499:
+                    scale *= 0.7
+            if best_area >= 0.0375:
+                break
+
+    if best_points is None:
+        # Fallback: should never happen, but keep output well-formed.
+        best_points = _clamp_to_triangle(np.zeros((n, 2)) + np.array([0.5, 0.2]))
+
+    return best_points
+
+
+# EVOLVE-BLOCK-END

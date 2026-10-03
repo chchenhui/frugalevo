@@ -1,0 +1,84 @@
+<NAME>
+swap_local_search_postpass</NAME>
+<DESCRIPTION>
+The current sequential greedy k-path assignment suffers from lock-in: the first destinations pick cheap paths, and later ones may fail to find better shared routes. Add a local-search improvement pass after the initial assignment. For each destination, recompute a shortest path on a graph where edges already used by *other* destinations are discounted (since shared edges are effectively amortized across the broadcast). If routing all of this destination's partitions along the new set of edges yields a lower total unique-edge cost than its current assignment, keep the swap; otherwise revert. This exploits multi-network redundancy (discounting shared edges steers destinations toward common trunks, then parallel branches), reduces redundant transfers, and avoids the exception-prone tree grafting seen in earlier generations. Edges with unknown cost (None) are treated as expensive to avoid free rides on unpriced links.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+                edge_load[(s, t)] = edge_load.get((s, t), 0) + 1
+
+    return bc_topology
+=======
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+                edge_load[(s, t)] = edge_load.get((s, t), 0) + 1
+
+    # ---- Local-search improvement pass ----
+    # For each destination, try to reroute it on a graph where edges already
+    # used by other destinations are discounted (shared broadcast trunks are
+    # effectively amortized). Keep the swap only if the total unique-edge cost
+    # of this destination decreases.
+    def edge_cost(s, t):
+        c = h[s][t].get("cost")
+        if c is None:
+            # unpriced links: treat as expensive to avoid free rides
+            return max((h[u][v].get("cost") or 0.0) for u, v in h.edges() if h.number_of_edges() > 0) + 1.0
+        return c
+
+    # Record edges used per destination
+    def dst_edges(dst):
+        used = set()
+        for j in range(num_partitions):
+            for e in bc_topology.paths.get(dst, {}).get(str(j)) or []:
+                used.add((e[0], e[1]))
+        return used
+
+    all_dst_edges = {d: dst_edges(d) for d in dsts}
+
+    for dst in dsts:
+        other_edges = set()
+        for d in dsts:
+            if d != dst:
+                other_edges |= all_dst_edges[d]
+
+        # Build a modified graph discounting edges shared with other dsts
+        h_mod = h.copy()
+        discount = 0.5
+        for u, v in h_mod.edges():
+            base = edge_cost(u, v)
+            if (u, v) in other_edges:
+                h_mod[u][v]["cost"] = base * (1.0 - discount)
+            else:
+                h_mod[u][v]["cost"] = base
+
+        try:
+            new_path = nx.dijkstra_path(h_mod, src, dst, weight="cost")
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+
+        def total_edge_cost(edges):
+            return sum(edge_cost(s, t) for s, t in edges)
+
+        cur_cost = total_edge_cost(all_dst_edges[dst])
+        new_edges = set()
+        for i in range(len(new_path) - 1):
+            new_edges.add((new_path[i], new_path[i + 1]))
+        new_cost = total_edge_cost(new_edges)
+
+        if new_cost < cur_cost:
+            # Re-assign all partitions of this dst to the new path
+            for j in range(num_partitions):
+                segs = []
+                for i in range(len(new_path) - 1):
+                    s, t = new_path[i], new_path[i + 1]
+                    segs.append([s, t, G[s][t]])
+                bc_topology.set_dst_partition_paths(dst, j, segs)
+            all_dst_edges[dst] = new_edges
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

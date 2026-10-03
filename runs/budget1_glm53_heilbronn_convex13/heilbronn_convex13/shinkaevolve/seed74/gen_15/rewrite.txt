@@ -1,0 +1,170 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+
+def _hull_area(points: np.ndarray) -> float:
+    pts = points[np.lexsort((points[:, 1], points[:, 0]))]
+    if len(pts) <= 2:
+        return 0.0
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = np.array(lower[:-1] + upper[:-1])
+    x, y = hull[:, 0], hull[:, 1]
+    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def _tri_areas(points, triples):
+    p = points[triples[:, 0]]
+    q = points[triples[:, 1]]
+    r = points[triples[:, 2]]
+    return 0.5 * np.abs((q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1])
+                        - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0]))
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct an arrangement of n points on or inside a convex region in order to
+    maximize the area of the smallest triangle formed by these points. n = 13.
+
+    Returns:
+        points: np.ndarray of shape (13,2).
+    """
+    n = 13
+    master_seed = 42
+
+    triples = np.array(list(combinations(range(n), 3)))
+    n_tri = len(triples)
+
+    # Precompute, for each point index, the slice of triples containing it.
+    # (Row mask per point: C(12,2) = 66 triples contain any given point.)
+    rows_of = []
+    for i in range(n):
+        mask = (triples == i).any(axis=1)
+        rows = np.where(mask)[0]
+        rows_of.append(rows)
+
+    def run_anneal(pts0, seed, iterations, step0, temp0, temp_decay, step_decay=0.85,
+                   step_period=300, step_min=0.0015):
+        rng = np.random.default_rng(seed)
+        pts = pts0.copy()
+        areas = _tri_areas(pts, triples)
+        cur_min = areas.min()
+        best_pts = pts.copy()
+        best_min = cur_min
+        step = step0
+        temp = temp0
+        for it in range(iterations):
+            i = rng.integers(n)
+            old = pts[i].copy()
+            new = old + rng.normal(0.0, step, 2)
+            if np.any(new < 0.0) or np.any(new > 1.0):
+                temp *= temp_decay
+                continue
+            pts[i] = new
+            rows = rows_of[i]
+            old_slice = areas[rows]
+            areas[rows] = _tri_areas(pts, triples[rows])
+            new_min = areas.min()
+            if new_min >= cur_min or rng.random() < np.exp((new_min - cur_min) / temp):
+                cur_min = new_min
+                if new_min > best_min:
+                    best_min = new_min
+                    best_pts = pts.copy()
+            else:
+                pts[i] = old
+                areas[rows] = old_slice
+            temp *= temp_decay
+            if it % step_period == step_period - 1:
+                step = max(step * step_decay, step_min)
+        return best_pts, best_min
+
+    # ---------- Structured initializations ----------
+    def init_ellipse(seed, frac_boundary=0.9):
+        rng = np.random.default_rng(seed)
+        pts = np.empty((n, 2))
+        nb = int(round(frac_boundary * n))  # boundary points
+        ang = np.sort(rng.random(nb)) * 2 * np.pi
+        pts[:nb, 0] = 0.5 + 0.48 * np.cos(ang)
+        pts[:nb, 1] = 0.5 + 0.48 * np.sin(ang)
+        inner = n - nb
+        if inner > 0:
+            rr = np.sqrt(rng.random(inner)) * 0.25
+            aa = rng.random(inner) * 2 * np.pi
+            pts[nb:, 0] = 0.5 + rr * np.cos(aa)
+            pts[nb:, 1] = 0.5 + rr * np.sin(aa)
+        return pts
+
+    def init_tri3fold(seed, jitter=0.02):
+        """13 points with 3-fold symmetry: 3 corners, 9 on three medians,
+        1 near center (a classical Heilbronn-friendly layout)."""
+        rng = np.random.default_rng(seed)
+        corners = np.array([[0.02, 0.02], [0.98, 0.02], [0.02, 0.98]])
+        pts = [corners[0], corners[1], corners[2]]
+        # 9 points along the three edges, 3 per edge, spread to avoid collinearity
+        for (a, b) in [(0, 1), (1, 2), (2, 0)]:
+            for t in (0.25, 0.5, 0.75):
+                p = corners[a] * t + corners[b] * (1 - t)
+                pts.append(p)
+        # center-ish point, offset to break central collinearities
+        pts.append(np.array([0.36, 0.36]))
+        pts = np.array(pts, dtype=float)
+        pts += rng.normal(0.0, jitter, pts.shape)
+        return np.clip(pts, 0.0, 1.0)
+
+    candidates = []
+    for k in range(6):
+        seed = master_seed + k
+        if k % 2 == 0:
+            init = init_ellipse(seed, frac_boundary=0.85 if k < 2 else 1.0)
+        else:
+            init = init_tri3fold(seed, jitter=0.015)
+        # Long main anneal with incremental updates
+        bp, bm = run_anneal(init, seed + 1000, iterations=4000,
+                            step0=0.05, temp0=0.006, temp_decay=0.9992,
+                            step_period=400, step_decay=0.8)
+        # Short reheat from best, then greedy polish (temp ~ 0)
+        bp2, bm2 = run_anneal(bp, seed + 2000, iterations=800,
+                              step0=0.02, temp0=0.003, temp_decay=0.995,
+                              step_period=200, step_decay=0.8)
+        if bm2 > bm:
+            bp, bm = bp2, bm2
+        bp3, bm3 = run_anneal(bp, seed + 3000, iterations=400,
+                              step0=0.004, temp0=1e-9, temp_decay=0.99,
+                              step_period=1000, step_decay=1.0, step_min=0.0008)
+        if bm3 > bm:
+            bp, bm = bp3, bm3
+        candidates.append((bm, bp))
+
+    # Pick best candidate across restarts
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    best_pts = candidates[0][1].copy()
+    best_score = candidates[0][0]
+
+    # Verify with a full recomputation (safety check).
+    full_min = _tri_areas(best_pts, triples).min()
+    if full_min > best_score:
+        best_score = full_min
+
+    # Rescale so convex hull has unit area (unit-area convex region requirement).
+    hull = _hull_area(best_pts)
+    if hull > 1e-12:
+        s = 1.0 / np.sqrt(hull)
+        best_pts = (best_pts - best_pts.mean(axis=0)) * s + best_pts.mean(axis=0)
+
+    return best_pts
+
+
+# EVOLVE-BLOCK-END

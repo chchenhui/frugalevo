@@ -1,0 +1,300 @@
+<NAME>
+rewrite_trie_prefix_caching_reorder</NAME>
+<DESCRIPTION>
+The previous program was fundamentally broken: its recursive "max group value" logic rewrote cells via itertuples attribute access, dropped/renamed columns (adding an "original_index" column, mutating column names at depth 0), returned an empty column_orderings list, and its assertions/shape checks failed on mixed-type data (validation never passed — output only showed the debug banner prints before failing). The root cause is that the algorithm did not produce valid per-row column orderings consistent with the returned data, and its data manipulation violated the preserve-shape contract.
+
+The fix replaces the entire editable block with a correct, simple, bounded algorithm:
+1. Preserve data exactly: work on an object-dtype copy, apply col_merge with the parent's merging_columns (same semantics as before), never add/drop/fabricate cells, return rows in original order.
+2. Serialize each cell deterministically ("" for missing) for scoring only — stored values untouched.
+3. Build up to three cheap candidate per-row column orderings: (a) a global order ranked by sum(len(v)*count*(count-1)), (b) a global order ranked by count*(count-1), and (c) a recursive conditional partition tree that picks, per group of rows, the remaining column with the best length-weighted pair-repetition savings (using precomputed integer factorization and vectorized bincounts, bounded depth/group size, deterministic ranked tail).
+4. Score each candidate with the true serial-Trie reuse objective (sum of adjacent LCPs of the sorted serialized rows, computed via C-speed binary search on prefix slices), pick the best, and emit the DataFrame with each row's cells permuted to its own ordering plus the matching per-row column_orderings. All public method signatures are preserved.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-caching oriented column reorderer.
+
+    Produces per-row column orderings chosen among a small set of cheap
+    candidate constructions, selecting the one with the best exact
+    character-Trie reuse (sum of adjacent LCPs over sorted serialized rows).
+    Data is preserved exactly; only column permutation varies.
+    """
+
+    MAX_DEPTH = 8
+    MIN_GROUP = 4
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------ #
+    # serialization helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _ser(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, float) and v != v:
+            return ""
+        if pd.api.types.is_scalar(v):
+            try:
+                if pd.isna(v):
+                    return ""
+            except (TypeError, ValueError):
+                pass
+        return str(v)
+
+    def _serialize_matrix(self, df: pd.DataFrame):
+        n, m = df.shape
+        ser = np.empty((n, m), dtype=object)
+        for j, col in enumerate(df.columns):
+            vals = df[col].values
+            ser[:, j] = [self._ser(v) for v in vals]
+        return ser
+
+    # ------------------------------------------------------------------ #
+    # exact trie objective: sum of adjacent LCPs of sorted strings
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        if a == b:
+            return len(a)
+        hi = min(len(a), len(b))
+        lo = 0
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _score(self, ser: np.ndarray, orders: List[List[int]]) -> float:
+        if len(orders) == 0:
+            return 0.0
+        rows = ["".join(ser[i, orders[i]]) for i in range(len(orders))]
+        rows.sort()
+        total = 0
+        prev = rows[0]
+        for cur in rows[1:]:
+            if cur != prev:
+                total += self._lcp(prev, cur)
+                prev = cur
+        return total
+
+    # ------------------------------------------------------------------ #
+    # candidate 1/2: global column orderings by length-weighted repetition
+    # ------------------------------------------------------------------ #
+    def _global_order(self, ser: np.ndarray, weighted: bool) -> List[int]:
+        n, m = ser.shape
+        scores = []
+        for j in range(m):
+            counts = {}
+            for v in ser[:, j]:
+                counts[v] = counts.get(v, 0) + 1
+            s = 0
+            for v, c in counts.items():
+                if c > 1:
+                    s += (len(v) if weighted else 1) * c * (c - 1)
+            scores.append((-s, j))
+        scores.sort()
+        return [j for _, j in scores]
+
+    # ------------------------------------------------------------------ #
+    # candidate 3: conditional prefix partition tree
+    # ------------------------------------------------------------------ #
+    def _conditional_orders(self, ser: np.ndarray, depth_limit: int) -> List[List[int]]:
+        n, m = ser.shape
+        if m == 0:
+            return [[] for _ in range(n)]
+        base_rank = self._global_order(ser, weighted=True)
+
+        # factorize each column once into integer codes + per-code lengths
+        codes = np.zeros((n, m), dtype=np.int64)
+        nuniq = np.zeros(m, dtype=np.int64)
+        code_len = []  # per column: array of str length per code
+        for j in range(m):
+            mapping = {}
+            col_codes = np.empty(n, dtype=np.int64)
+            lens = []
+            for i in range(n):
+                v = ser[i, j]
+                c = mapping.get(v)
+                if c is None:
+                    c = len(mapping)
+                    mapping[v] = c
+                    lens.append(len(v))
+                col_codes[i] = c
+            codes[:, j] = col_codes
+            nuniq[j] = len(mapping)
+            code_len.append(np.asarray(lens, dtype=np.int64))
+
+        orders = [None] * n
+        rows = np.arange(n)
+        remaining = list(base_rank)
+        self._partition(ser, codes, nuniq, code_len, rows, remaining,
+                        [], orders, 0, depth_limit, base_rank)
+        for i in range(n):
+            if orders[i] is None:
+                orders[i] = list(base_rank)
+        return orders
+
+    def _partition(self, ser, codes, nuniq, code_len, rows, remaining,
+                   prefix, orders, depth, depth_limit, base_rank):
+        if (depth >= depth_limit or len(rows) < self.MIN_GROUP
+                or len(remaining) <= 1):
+            tail = [c for c in base_rank if c in set(remaining)]
+            for i in rows:
+                orders[i] = list(prefix) + tail
+            return
+
+        rem = np.asarray(remaining, dtype=np.int64)
+        best_col, best_gain = None, 0
+        # cheap gain per remaining column within this group
+        for j in rem:
+            k = nuniq[j]
+            if k <= 1 or k > len(rows):
+                continue
+            c = codes[rows, j]
+            cnt = np.bincount(c, minlength=k)
+            act = np.nonzero(cnt)[0]
+            if act.size <= 1:
+                continue
+            L = code_len[j][act]
+            cn = cnt[act]
+            gain = float(np.sum(L * cn * (cn - 1)))
+            if gain > best_gain:
+                best_gain, best_col = gain, int(j)
+
+        if best_col is None:
+            tail = [c for c in base_rank if c in set(remaining)]
+            for i in rows:
+                orders[i] = list(prefix) + tail
+            return
+
+        j = best_col
+        k = nuniq[j]
+        c = codes[rows, j]
+        cnt = np.bincount(c, minlength=k)
+        new_remaining = [x for x in remaining if x != j]
+        new_prefix = prefix + [j]
+        if len(rows) > 5000 or k > 256:
+            # wide/large safeguard: split only into value groups, shallow
+            for code in np.nonzero(cnt)[0]:
+                sub = rows[c == code]
+                if sub.size == 0:
+                    continue
+                tail = [x for x in base_rank if x in set(new_remaining)]
+                for i in sub:
+                    orders[i] = list(new_prefix) + tail
+            return
+        for code in np.nonzero(cnt)[0]:
+            sub = rows[c == code]
+            if sub.size == 0:
+                continue
+            self._partition(ser, codes, nuniq, code_len, sub, new_remaining,
+                            new_prefix, orders, depth + 1, depth_limit,
+                            base_rank)
+
+    # ------------------------------------------------------------------ #
+    # public API
+    # ------------------------------------------------------------------ #
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        original_columns = list(df.columns)
+        work = df.copy()
+        work = work.astype(object)
+
+        # honor column merges with the parent's semantics
+        if col_merge:
+            try:
+                stats = self.calculate_col_stats(work, enable_index=True)
+                order = [c for c, _, _, _ in stats]
+            except Exception:
+                order = list(work.columns)
+            for grp in col_merge:
+                final_col_order = [c for c in order if c in set(grp)]
+                if final_col_order:
+                    try:
+                        work = self.merging_columns(work, final_col_order,
+                                                    prepended=False)
+                    except Exception:
+                        pass
+
+        n, m = work.shape
+        if n == 0 or m == 0:
+            orderings = [list(work.columns) for _ in range(n)]
+            return work.reset_index(drop=True), orderings
+
+        ser = self._serialize_matrix(work)
+
+        depth_limit = self.MAX_DEPTH
+        if col_stop is not None:
+            try:
+                depth_limit = max(1, min(depth_limit, int(col_stop)))
+            except Exception:
+                pass
+
+        candidates = []
+        try:
+            g1 = self._global_order(ser, weighted=True)
+            candidates.append([list(g1) for _ in range(n)])
+        except Exception:
+            pass
+        try:
+            g2 = self._global_order(ser, weighted=False)
+            candidates.append([list(g2) for _ in range(n)])
+        except Exception:
+            pass
+        try:
+            candidates.append(self._conditional_orders(ser, depth_limit))
+        except Exception:
+            pass
+
+        if not candidates:
+            base = list(range(m))
+            candidates = [[list(base) for _ in range(n)]]
+
+        best_orders, best_score = None, -1.0
+        for orders in candidates:
+            try:
+                s = self._score(ser, orders)
+            except Exception:
+                continue
+            if s > best_score:
+                best_score, best_orders = s, orders
+        if best_orders is None:
+            base = list(range(m))
+            best_orders = [list(base) for _ in range(n)]
+
+        col_names = list(work.columns)
+        values = work.values
+        out_rows = []
+        for i in range(n):
+            o = best_orders[i]
+            out_rows.append([values[i, j] for j in o])
+        out = pd.DataFrame(out_rows, columns=col_names, dtype=object)
+
+        orderings = [[col_names[j] for j in o] for o in best_orders]
+        assert out.shape == work.shape
+        return out, orderings
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

@@ -1,0 +1,195 @@
+<NAME>
+recency_weighted_sg_leading_edge</NAME>
+
+<DESCRIPTION>
+The current Kalman+Holt cascade achieves smoothness but correlation only 0.85 (Gen 13/17 reached 0.93) and lag_error is high (0.43). The recommendation points to the proven mechanism: a recency-weighted Savitzky-Golay-style local quadratic fit evaluated at the window's leading edge. A quadratic (poly_order=2) weighted least-squares fit over the window, with the time axis centered so the newest sample is t=0, analytically removes group delay: the fitted value at t=0 IS the leading-edge estimate, so lag is near zero while the polynomial fit provides strong noise suppression. The exponential recency weighting (linspace(-1.5, 0)) both suppresses noise (more weight on many averaged samples) and compensates any residual smoothing bias toward recent dynamics. On top of this, I keep a light trend-lock slope damping (EMA on the fitted slope, blended back at 35% weight) to suppress noise-induced directional reversals — this directly targets slope_changes and false_reversals without reintroducing lag into the level estimate. The 3x3 normal-equation solve per window keeps execution time well within budget (prior similar implementation ran in 0.11s with efficiency 1.00).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Enhanced version: adaptive Kalman filter (local level + slope model) with
+    innovation-adaptive measurement noise, cascaded with a light Holt
+    double-exponential smoother and slope-gated reversal suppression.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window (controls adaptation strength)
+
+    Returns:
+        y: Filtered output signal with length = len(x) - window_size + 1
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < window_size:
+        raise ValueError(f"Input signal length ({n}) must be >= window_size ({window_size})")
+
+    output_length = n - window_size + 1
+
+    # ---- Stage 1: adaptive Kalman filter (constant-velocity model) ----
+    # State: [level, slope]. Process noise tuned via window_size:
+    # larger window -> smoother (more noise suppression, more lag tolerance).
+    q_level = 0.08 / max(1, window_size)
+    q_slope = 0.012 / max(1, window_size)
+    Q = np.diag([q_level, q_slope])
+    F = np.array([[1.0, 1.0], [0.0, 1.0]])
+    H = np.array([[1.0, 0.0]])
+
+    level = x[0]
+    slope = 0.0
+    P = np.eye(2)
+    # Robust initial measurement-noise estimate from first differences
+    R = max(np.var(np.diff(x[: min(n, window_size)])) * 0.5, 1e-8)
+    R_min = R * 0.1
+    R_max = R * 10.0
+
+    kf_out = np.empty(n)
+    kf_slope = np.empty(n)
+    for i in range(n):
+        # NIS from previous step drives capped adaptive process noise.
+        # Cap the multiplier at 3x so noise cannot flood the velocity state
+        # (suppresses spurious slope churn / false reversals), while
+        # genuine regime changes still open Q quickly.
+        if i > 0:
+            nis = innov * innov / S
+            q_mult = 1.0 + 2.0 * min(nis, 6.0) / 6.0  # saturates at 3x
+        else:
+            q_mult = 1.0
+
+        # Predict
+        level_pred = level + slope
+        slope_pred = slope
+        P = F @ P @ F.T + Q * q_mult
+
+        # Innovation and adaptive R (EWMA of squared innovations)
+        innov = x[i] - level_pred
+        R = float(np.clip(0.98 * R + 0.02 * max(innov * innov, R_min), R_min, R_max))
+
+        # Robust update: downweight outliers (Huber-style)
+        S = P[0, 0] + R
+        mahal2 = innov * innov / S
+        if mahal2 > 9.0:
+            R_eff = R * mahal2 / 3.0  # inflate R for outliers
+        else:
+            R_eff = R
+        S = P[0, 0] + R_eff
+        K = np.array([P[0, 0] / S, P[1, 0] / S])
+
+        level = level_pred + K[0] * innov
+        slope = slope_pred + K[1] * innov
+        P = (np.eye(2) - np.outer(K, H)) @ P
+        # Symmetrize / stabilize
+        P = 0.5 * (P + P.T)
+
+        kf_out[i] = level
+        kf_slope[i] = slope
+
+    # ---- Stage 2: slope-gated light double-exponential (Holt) smoothing ----
+    # Smooth more where the Kalman slope is small (noise-dominated regions),
+    # smooth less where a genuine trend is present (preserves responsiveness).
+    alpha = 0.6  # base level smoothing
+    beta = 0.15  # base trend smoothing
+    s = kf_out[0]
+    b = kf_slope[0]
+    hs = np.empty(n)
+    for i in range(n):
+        trend_strength = min(abs(kf_slope[i]) / (np.std(kf_slope) + 1e-12), 1.0)
+        a_eff = alpha - 0.4 * trend_strength  # less smoothing in trends
+        a_eff = float(np.clip(a_eff, 0.2, alpha))
+        prev_s, prev_b = s, b
+        s = a_eff * kf_out[i] + (1 - a_eff) * (prev_s + prev_b)
+        b = beta * (s - prev_s) + (1 - beta) * prev_b
+        hs[i] = s
+
+    # ---- Stage 3: slope-gated reversal suppression ----
+    # Suppress sign flips of the estimated slope unless the flip is large
+    # relative to local slope noise (kills noise-induced false reversals).
+    y_full = hs.copy()
+    slope_noise = np.std(np.diff(hs)) + 1e-12
+    gate = 0.5 * slope_noise
+    est_slope = np.zeros(n)
+    est_slope[0] = 0.0
+    for i in range(1, n):
+        est_slope[i] = hs[i] - hs[i - 1]
+    # Median filter on slope (window 3) with gating
+    for i in range(1, n - 1):
+        med = np.median(est_slope[i - 1 : i + 2])
+        if abs(est_slope[i] - med) < gate:
+            est_slope[i] = med
+    # Reintegrate gated slopes through the levels (mild correction)
+    y_full[0] = hs[0]
+    for i in range(1, n):
+        y_full[i] = y_full[i - 1] + est_slope[i]
+
+    # ---- Extract window-aligned output ----
+    y = y_full[window_size - 1 :]
+
+    return y
+=======
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Enhanced version: recency-weighted Savitzky-Golay-style local quadratic fit
+    evaluated at the window's leading edge (zero group delay analytically),
+    combined with trend-lock slope damping to suppress noise-induced reversals.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window (W samples)
+
+    Returns:
+        y: Filtered output signal with length = len(x) - window_size + 1
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < window_size:
+        raise ValueError(f"Input signal length ({n}) must be >= window_size ({window_size})")
+
+    W = window_size
+    output_length = n - W + 1
+
+    # Time axis centered at the leading edge: newest sample is t = 0
+    t = np.arange(W, dtype=float) - (W - 1)
+
+    # Steep exponential recency weighting: old samples decay as exp(-1.5 * age_frac)
+    wts = np.exp(np.linspace(-1.5, 0.0, W))
+
+    # Design matrix for quadratic (poly_order = 2) local model:
+    # x(tau) = a + b*tau + c*tau^2, evaluated at tau = 0 (leading edge)
+    A = np.vstack([np.ones(W), t, t * t]).T
+    Aw = A * wts[:, None]
+
+    # Precompute the normal-equations matrix once (W fixed across windows)
+    M = Aw.T @ A + 1e-9 * np.eye(3)
+
+    y = np.zeros(output_length)
+    raw_slopes = np.zeros(output_length)
+
+    for i in range(output_length):
+        window = x[i : i + W]
+        rhs = Aw.T @ window
+        try:
+            coef = np.linalg.solve(M, rhs)
+        except np.linalg.LinAlgError:
+            coef = np.linalg.lstsq(Aw, window, rcond=None)[0]
+        # Leading-edge value (t=0) -> a; leading-edge slope -> b
+        y[i] = coef[0]
+        raw_slopes[i] = coef[1]
+
+    # ---- Trend-lock damping ----
+    # Light EMA smoothing of the slope sequence; where the damped slope
+    # disagrees with the raw slope, apply a mild level correction. This
+    # suppresses spurious directional reversals (slope churn) without
+    # reintroducing lag into the level estimate.
+    beta = 0.55  # slope EMA smoothing factor
+    locked_slope = 0.0
+    for i in range(output_length):
+        if i == 0:
+            locked_slope = raw_slopes[0]
+        else:
+            locked_slope = beta * locked_slope + (1.0 - beta) * raw_slopes[i]
+        y[i] += 0.35 * (locked_slope - raw_slopes[i])
+
+    return y
+>>>>>>> REPLACE
+</DIFF>

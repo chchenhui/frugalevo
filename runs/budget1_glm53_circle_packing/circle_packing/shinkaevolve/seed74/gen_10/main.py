@@ -1,0 +1,190 @@
+# EVOLVE-BLOCK-START
+"""Hexagonal-lattice + LP radius optimization for packing n=26 circles in a unit square."""
+import numpy as np
+
+try:
+    from scipy.optimize import linprog
+    HAVE_SCIPY = True
+except Exception:
+    HAVE_SCIPY = False
+
+
+def _hex_centers():
+    """Staggered hexagonal lattice: rows of 5,5,5,5,4,3 = 26 circles."""
+    centers = []
+    r0 = 0.093
+    dy = r0 * np.sqrt(3.0)
+    counts = [5, 5, 5, 5, 4, 3]
+    # center the block vertically
+    total_h = 2 * r0 + (len(counts) - 1) * dy
+    y0 = (1.0 - total_h) / 2.0 + r0
+    for k, cnt in enumerate(counts):
+        y = y0 + k * dy
+        xs = np.arange(cnt) * 2 * r0 + (r0 if k % 2 else 0.0)
+        # center each row horizontally
+        xs = xs + (1.0 - (xs[-1] - xs[0])) / 2.0 - xs[0]
+        for x in xs:
+            centers.append([x, y])
+    return np.array(centers)
+
+
+def _lp_radii(centers):
+    """Optimal radii via LP: maximize sum r subject to non-overlap & walls."""
+    n = centers.shape[0]
+    if not HAVE_SCIPY:
+        return _greedy_radii(centers)
+    c = -np.ones(n)
+    A, b = [], []
+    # wall constraints
+    for i in range(n):
+        x, y = centers[i]
+        row = np.zeros(n); row[i] = 1.0
+        A.append(row.copy()); b.append(min(x, y))
+        A.append(row.copy()); b.append(min(1 - x, 1 - y))
+    # pairwise constraints
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.linalg.norm(centers[i] - centers[j])
+            row = np.zeros(n); row[i] = 1.0; row[j] = 1.0
+            A.append(row); b.append(d)
+    res = linprog(c, A_ub=np.array(A), b_ub=np.array(b),
+                  bounds=[(0, None)] * n, method="highs")
+    if res.success:
+        return np.maximum(res.x, 0.0)
+    return _greedy_radii(centers)
+
+
+def _greedy_radii(centers):
+    """Fallback: iterative proportional scaling until convergence."""
+    n = centers.shape[0]
+    x, y = centers[:, 0], centers[:, 1]
+    radii = np.minimum(np.minimum(x, y), np.minimum(1 - x, 1 - y))
+    for _ in range(200):
+        changed = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.linalg.norm(centers[i] - centers[j])
+                s = radii[i] + radii[j]
+                if s > d and s > 0:
+                    scale = d / s
+                    radii[i] *= scale; radii[j] *= scale
+                    changed = True
+        if not changed:
+            break
+    return radii
+
+
+def _slack(centers, radii):
+    """Tightest remaining slack for each circle (0 = fully constrained)."""
+    n = centers.shape[0]
+    x, y = centers[:, 0], centers[:, 1]
+    wall = np.minimum(np.minimum(x, y), np.minimum(1 - x, 1 - y))
+    s = wall - radii
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                d = np.linalg.norm(centers[i] - centers[j])
+                s[i] = min(s[i], d - radii[i] - radii[j])
+    return s
+
+
+def _refine_centers(centers, radii, sweeps=30, step=0.004):
+    """Deterministic relaxation: push each circle away from its tightest
+    contacts and walls so the LP can grow radii further."""
+    n = centers.shape[0]
+    for sweep in range(sweeps):
+        disp = np.zeros((n, 2))
+        for i in range(n):
+            x, y = centers[i]
+            # wall repulsion
+            if x - radii[i] < 0.06: disp[i, 0] += 1.0
+            if 1 - x - radii[i] < 0.06: disp[i, 0] -= 1.0
+            if y - radii[i] < 0.06: disp[i, 1] += 1.0
+            if 1 - y - radii[i] < 0.06: disp[i, 1] -= 1.0
+            # neighbor repulsion weighted by tightness
+            for j in range(n):
+                if i == j: continue
+                diff = centers[i] - centers[j]
+                d = np.linalg.norm(diff)
+                gap = d - radii[i] - radii[j]
+                if gap < 0.02 and d > 1e-9:
+                    w = (0.02 - gap) / 0.02
+                    disp[i] += w * diff / d
+        # normalize displacement and move inside square
+        mag = np.linalg.norm(disp, axis=1, keepdims=True)
+        mag[mag == 0] = 1.0
+        centers = centers + step * disp / mag
+        centers[:, 0] = np.clip(centers[:, 0], 0.03, 0.97)
+        centers[:, 1] = np.clip(centers[:, 1], 0.03, 0.97)
+        # re-solve radii periodically
+        if sweep % 5 == 4:
+            radii = _lp_radii(centers)
+    return centers, radii
+
+
+def construct_packing():
+    """
+    Construct an arrangement of 26 circles in a unit square maximizing
+    the sum of radii: hexagonal initialization + LP radii + force refinement.
+
+    Returns:
+        Tuple of (centers, radii, sum_of_radii)
+    """
+    centers = _hex_centers()
+    radii = _lp_radii(centers)
+    centers, radii = _refine_centers(centers, radii)
+    # final exact radii for validity
+    radii = _lp_radii(centers)
+    # tiny safety shrink to guarantee strict validity
+    radii = np.maximum(radii - 1e-9, 0.0)
+    centers = np.asarray(centers)
+    sum_radii = float(np.sum(radii))
+    return centers, radii, sum_radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)

@@ -1,0 +1,147 @@
+--- a/original.py
++++ b/original.py
+@@ -1,68 +1,96 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
++from itertools import combinations
++from scipy.optimize import minimize
+ 
+ 
+ def min_max_dist_dim3_14() -> np.ndarray:
+     """
+-    Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
++    Creates 14 points in 3 dimensions in order to maximize the ratio of
++    minimum to maximum pairwise distance.
++
++    Strategy: directly optimize the packing objective
++        maximize  min pairwise distance
++        subject to max pairwise distance <= 1
++    so that dmin/dmax equals the optimized minimum distance.
++    Uses multiple structured starts (icosahedron + poles, Fibonacci sphere)
++    plus seeded random starts for robustness.
+ 
+     Returns
+-        points: np.ndarray of shape (14,3) containing the (x,y) coordinates of the 14 points.
++        points: np.ndarray of shape (14,3)
++    """
++    n, d = 14, 3
++    rng = np.random.default_rng(42)
+ 
+-    """
++    pairs = list(combinations(range(n), 2))
++    ii = np.array([a for a, b in pairs])
++    jj = np.array([b for a, b in pairs])
+ 
+-    n = 14
+-    d = 3
++    def pdists(flat):
++        P = flat.reshape(n, d)
++        return np.linalg.norm(P[ii] - P[jj], axis=1)
+ 
+-    # Start from icosahedron vertices (12) + 2 polar points on the unit sphere,
+-    # then refine with a repulsion-based spherical code optimization (Tammes-style).
+-    phi = (1.0 + np.sqrt(5.0)) / 2.0
++    def objective(flat):
++        return -pdists(flat).min()
++
++    def diameter_constraint(flat):
++        return 1.0 - pdists(flat).max()
++
++    # Structured start 1: icosahedron (12) + 2 slightly perturbed polar points
++    phi_gold = (1.0 + np.sqrt(5.0)) / 2.0
+     ico = np.array([
+-        [-1,  phi, 0], [ 1,  phi, 0], [-1, -phi, 0], [ 1, -phi, 0],
+-        [ 0, -1, phi], [ 0,  1, phi], [ 0, -1, -phi], [ 0,  1, -phi],
+-        [ phi, 0, -1], [ phi, 0,  1], [-phi, 0, -1], [-phi, 0,  1],
++        [-1,  phi_gold, 0], [ 1,  phi_gold, 0],
++        [-1, -phi_gold, 0], [ 1, -phi_gold, 0],
++        [ 0, -1, phi_gold], [ 0,  1, phi_gold],
++        [ 0, -1, -phi_gold], [ 0,  1, -phi_gold],
++        [ phi_gold, 0, -1], [ phi_gold, 0,  1],
++        [-phi_gold, 0, -1], [-phi_gold, 0,  1],
+     ], dtype=float)
+     ico /= np.linalg.norm(ico, axis=1, keepdims=True)
+-    extra = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]])
+-    # Perturb the polar points slightly to break symmetry and allow better packing
+-    np.random.seed(0)
+-    extra[0] += 0.05 * np.random.randn(3)
+-    extra[1] += 0.05 * np.random.randn(3)
+-    extra /= np.linalg.norm(extra, axis=1, keepdims=True)
++    pol = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]])
++    pol += 0.05 * np.random.default_rng(0).standard_normal((2, 3))
++    pol /= np.linalg.norm(pol, axis=1, keepdims=True)
++    icosa_start = np.vstack([ico, pol])
+ 
+-    pts = np.vstack([ico, extra])
+-    idx_i, idx_j = np.triu_indices(n, k=1)
++    # Structured start 2: Fibonacci sphere
++    k = np.arange(n) + 0.5
++    ph = np.arccos(1.0 - 2.0 * k / n)
++    th = np.pi * (1.0 + 5.0 ** 0.5) * k
++    fib_start = np.stack([np.cos(th) * np.sin(ph),
++                          np.sin(th) * np.sin(ph),
++                          np.cos(ph)], axis=1)
+ 
+-    # Repulsion optimization: gradient ascent on sum of inverse-power distances,
+-    # with renormalization to the unit sphere each step (spherical code heuristic).
+-    best_pts = pts.copy()
+-    best_dmin = 0.0
+-    step = 0.02
+-    for it in range(600):
+-        diff = pts[idx_i] - pts[idx_j]
+-        dist = np.linalg.norm(diff, axis=1)
+-        dmin = dist.min()
+-        if dmin > best_dmin:
+-            best_dmin = dmin
+-            best_pts = pts.copy()
+-        # Strong repulsion for close pairs (power -8), gentle for the rest (-2)
+-        w = 1.0 / dist ** 9 + 1e-4 / dist ** 3
+-        forces = np.zeros_like(diff)
+-        forces = (w[:, None] * diff) / dist[:, None]
+-        grad = np.zeros_like(pts)
+-        np.add.at(grad, idx_i, forces)
+-        np.add.at(grad, idx_j, -forces)
+-        # Remove radial component to stay on the sphere
+-        grad -= (grad * pts).sum(axis=1, keepdims=True) * pts
+-        norm = np.linalg.norm(grad, axis=1, keepdims=True)
+-        norm[norm == 0] = 1.0
+-        pts = pts + step * grad / norm
+-        pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+-        # Slowly decay the step for convergence
+-        step *= 0.995
++    starts = [icosa_start, fib_start]
++    for _ in range(4):
++        P0 = rng.standard_normal((n, d))
++        P0 /= np.linalg.norm(P0, axis=1, keepdims=True)
++        starts.append(P0)
+ 
+-    points = best_pts
+-    return points
++    best_pts = None
++    best_ratio = -1.0
++
++    for P0 in starts:
++        res = minimize(
++            objective,
++            P0.ravel(),
++            method='SLSQP',
++            constraints={'type': 'ineq', 'fun': diameter_constraint},
++            options={'maxiter': 300, 'ftol': 1e-12},
++        )
++        ds = pdists(res.x)
++        dmax = ds.max()
++        if dmax <= 0:
++            continue
++        ratio = ds.min() / dmax
++        if ratio > best_ratio:
++            best_ratio = ratio
++            best_pts = res.x.reshape(n, d)
++
++    if best_pts is None:
++        np.random.seed(42)
++        best_pts = np.random.randn(n, d)
++
++    return best_pts
+ 
+ 
+ # EVOLVE-BLOCK-END

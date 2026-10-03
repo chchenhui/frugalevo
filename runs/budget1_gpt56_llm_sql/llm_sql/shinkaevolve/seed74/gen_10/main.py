@@ -1,0 +1,311 @@
+# EVOLVE-BLOCK-START
+import math
+from collections import Counter, defaultdict
+from typing import Tuple, List
+
+import numpy as np
+import pandas as pd
+
+from solver import Algorithm
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-cache-oriented row-specific column reordering.
+
+    The returned dataframe always has the original shape, index, and column
+    labels.  For output row i, column_orderings[i][j] identifies the source
+    column whose original value appears at output position j.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    @staticmethod
+    def _string_value(value) -> str:
+        """Match fillna('').astype(str) semantics without modifying source data."""
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, (bool, np.bool_)) and missing:
+                return ""
+        except Exception:
+            pass
+        return str(value)
+
+    @staticmethod
+    def _lcp(left: str, right: str) -> int:
+        """Bounded binary-search LCP; slicing comparisons run in C."""
+        if left == right:
+            return len(left)
+        high = min(len(left), len(right))
+        low = 0
+        while low < high:
+            mid = (low + high + 1) // 2
+            if left[:mid] == right[:mid]:
+                low = mid
+            else:
+                high = mid - 1
+        return low
+
+    def _trie_score(self, strings: List[str]) -> int:
+        if len(strings) < 2:
+            return 0
+        ordered = sorted(strings)
+        return sum(self._lcp(ordered[i - 1], ordered[i]) for i in range(1, len(ordered)))
+
+    @staticmethod
+    def _resolve_column(columns, requested):
+        """Resolve an API column name deterministically, retaining legacy substring support."""
+        for pos, name in enumerate(columns):
+            if name == requested:
+                return pos
+        text = str(requested)
+        matches = [i for i, name in enumerate(columns) if text in str(name)]
+        return matches[0] if len(matches) == 1 else None
+
+    def _make_blocks(self, columns, col_merge):
+        """Turn overlapping merge specifications into contiguous column blocks."""
+        count = len(columns)
+        parent = list(range(count))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            a, b = find(a), find(b)
+            if a != b:
+                parent[b] = a
+
+        for group in col_merge or []:
+            positions = [self._resolve_column(columns, item) for item in group]
+            positions = [p for p in positions if p is not None]
+            for p in positions[1:]:
+                union(positions[0], p)
+
+        grouped = defaultdict(list)
+        for pos in range(count):
+            grouped[find(pos)].append(pos)
+        blocks = list(grouped.values())
+        blocks.sort(key=lambda block: min(block))
+        return blocks
+
+    def _dependency_maps(self, columns, blocks, one_way_dep):
+        column_to_block = {}
+        for block_id, block in enumerate(blocks):
+            for col in block:
+                column_to_block[col] = block_id
+
+        predecessors = defaultdict(set)
+        internal_edges = defaultdict(list)
+
+        for pair in one_way_dep or []:
+            if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+                continue
+            left = self._resolve_column(columns, pair[0])
+            right = self._resolve_column(columns, pair[1])
+            if left is None or right is None or left == right:
+                continue
+            left_block = column_to_block[left]
+            right_block = column_to_block[right]
+            if left_block == right_block:
+                internal_edges[left_block].append((left, right))
+            else:
+                predecessors[right_block].add(left_block)
+
+        return predecessors, internal_edges
+
+    @staticmethod
+    def _topological_columns(block, edges, priority):
+        """Stable topological order for fields inside one merge block."""
+        block_set = set(block)
+        pred = {item: set() for item in block}
+        children = defaultdict(set)
+        for before, after in edges:
+            if before in block_set and after in block_set and before != after:
+                pred[after].add(before)
+                children[before].add(after)
+
+        remaining = set(block)
+        result = []
+        while remaining:
+            ready = [x for x in remaining if not pred[x]]
+            if not ready:
+                # Invalid cyclic constraints cannot be simultaneously honored.
+                # Keep deterministic original-position behavior in that case.
+                ready = list(remaining)
+            chosen = max(ready, key=lambda x: (priority[x], -x))
+            result.append(chosen)
+            remaining.remove(chosen)
+            for child in children[chosen]:
+                pred[child].discard(chosen)
+        return result
+
+    def _global_units(self, block_scores, predecessors, alternative=False):
+        """Stable dependency-respecting global block order."""
+        remaining = set(range(len(block_scores)))
+        result = []
+        while remaining:
+            ready = [u for u in remaining if not (predecessors.get(u, set()) & remaining)]
+            if not ready:
+                ready = list(remaining)
+            if alternative:
+                chosen = max(ready, key=lambda u: (block_scores[u][1], block_scores[u][0], -u))
+            else:
+                chosen = max(ready, key=lambda u: (block_scores[u][0], block_scores[u][1], -u))
+            result.append(chosen)
+            remaining.remove(chosen)
+        return result
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        del early_stop, row_stop, col_stop, distinct_value_threshold, parallel
+
+        rows, cols = df.shape
+        columns = list(df.columns)
+        if rows == 0 or cols == 0:
+            return df.copy(), [[] for _ in range(rows)]
+
+        # Serialization representations are used only for scoring and grouping.
+        values = df.to_numpy(dtype=object, copy=False)
+        text = [[self._string_value(values[r, c]) for c in range(cols)] for r in range(rows)]
+
+        blocks = self._make_blocks(columns, col_merge)
+        predecessors, internal_edges = self._dependency_maps(columns, blocks, one_way_dep)
+
+        # Per-column and per-block repeat scores.  The first score is the
+        # requested len(v) * count(v) * (count(v)-1) heuristic.
+        column_scores = []
+        alternate_scores = []
+        for col in range(cols):
+            counts = Counter(text[row][col] for row in range(rows))
+            column_scores.append(sum(len(value) * count * (count - 1) for value, count in counts.items()))
+            alternate_scores.append(sum(len(value) * max(0, count - 1) for value, count in counts.items()))
+
+        block_columns = []
+        block_scores = []
+        unit_text = []
+        for block_id, block in enumerate(blocks):
+            internal = self._topological_columns(block, internal_edges.get(block_id, []), column_scores)
+            block_columns.append(internal)
+            block_scores.append((
+                sum(column_scores[c] for c in internal),
+                sum(alternate_scores[c] for c in internal),
+            ))
+            unit_text.append(["".join(text[r][c] for c in internal) for r in range(rows)])
+
+        global_units = self._global_units(block_scores, predecessors, alternative=False)
+        alternate_units = self._global_units(block_scores, predecessors, alternative=True)
+
+        def expanded(unit_order):
+            return [col for unit in unit_order for col in block_columns[unit]]
+
+        candidate_orders = [
+            [expanded(global_units) for _ in range(rows)],
+            [expanded(alternate_units) for _ in range(rows)],
+        ]
+
+        # Conditional prefix partition tree.  It is deliberately bounded:
+        # at most 256 groups, 16 leading block selections, and 48 candidates
+        # inspected per group on very wide inputs.
+        default_tail = global_units
+        conditional = [None] * rows
+        node_budget = [256]
+        max_depth = min(len(blocks), 16)
+        candidate_limit = min(len(blocks), 48)
+
+        def assign_group(row_ids, prefix, remaining, depth):
+            if not row_ids:
+                return
+            if depth >= max_depth or not remaining or node_budget[0] <= 0:
+                tail = [u for u in default_tail if u in remaining]
+                order = expanded(prefix + tail)
+                for r in row_ids:
+                    conditional[r] = order
+                return
+
+            available = [
+                u for u in remaining
+                if not (predecessors.get(u, set()) & set(remaining))
+            ]
+            if not available:
+                available = list(remaining)
+
+            available.sort(key=lambda u: (block_scores[u][0], block_scores[u][1], -u), reverse=True)
+            available = available[:candidate_limit]
+
+            best_unit = None
+            best_score = 0
+            for unit in available:
+                counts = Counter(unit_text[unit][r] for r in row_ids)
+                score = sum(len(value) * count * (count - 1) for value, count in counts.items())
+                if score > best_score or (score == best_score and best_unit is not None and unit < best_unit):
+                    best_score = score
+                    best_unit = unit
+
+            if best_unit is None or best_score <= 0:
+                tail = [u for u in default_tail if u in remaining]
+                order = expanded(prefix + tail)
+                for r in row_ids:
+                    conditional[r] = order
+                return
+
+            next_remaining = [u for u in remaining if u != best_unit]
+            partitions = defaultdict(list)
+            for r in row_ids:
+                partitions[unit_text[best_unit][r]].append(r)
+
+            # A non-branching choice can still create a useful common prefix.
+            if len(partitions) == 1:
+                assign_group(row_ids, prefix + [best_unit], next_remaining, depth + 1)
+                return
+
+            node_budget[0] -= len(partitions)
+            if node_budget[0] < 0:
+                tail = [u for u in default_tail if u in remaining]
+                order = expanded(prefix + tail)
+                for r in row_ids:
+                    conditional[r] = order
+                return
+
+            for group_rows in partitions.values():
+                assign_group(group_rows, prefix + [best_unit], next_remaining, depth + 1)
+
+        assign_group(list(range(rows)), [], list(range(len(blocks))), 0)
+        fallback_order = expanded(global_units)
+        for r in range(rows):
+            if conditional[r] is None:
+                conditional[r] = fallback_order
+        candidate_orders.append(conditional)
+
+        def candidate_score(orders):
+            serialized = ["".join(text[r][c] for c in orders[r]) for r in range(rows)]
+            return self._trie_score(serialized)
+
+        scores = [candidate_score(candidate) for candidate in candidate_orders]
+        best_orders = candidate_orders[max(range(len(scores)), key=lambda i: (scores[i], -i))]
+
+        # Keep original labels and index.  Orderings map each output position
+        # back to its original source column, allowing row-specific layouts.
+        output = np.empty((rows, cols), dtype=object)
+        for r, order in enumerate(best_orders):
+            for out_col, source_col in enumerate(order):
+                output[r, out_col] = values[r, source_col]
+
+        reordered = pd.DataFrame(output, index=df.index.copy(), columns=df.columns.copy())
+        column_orderings = [[columns[source] for source in order] for order in best_orders]
+        return reordered, column_orderings
+
+
+# EVOLVE-BLOCK-END

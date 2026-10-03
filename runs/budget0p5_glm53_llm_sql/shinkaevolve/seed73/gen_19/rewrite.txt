@@ -1,0 +1,246 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List
+from collections import Counter
+
+
+class Evolved(Algorithm):
+    """
+    Serial character-Trie oriented reordering.
+
+    Builds a small set of bounded candidate per-row column orderings
+    (global frequency-ranked, an alternate length/frequency tradeoff, and a
+    conditional partition tree), scores each candidate with the true
+    objective (sum of adjacent LCPs over sorted serialized row strings),
+    and returns the best. All cell values and the frame shape are preserved.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------ #
+    # helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _cell_str(v) -> str:
+        """Serialization used for scoring only (never stored back)."""
+        if v is None:
+            return ""
+        if isinstance(v, float) and v != v:
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(v)
+
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        """Longest common prefix via binary search on prefix slices (C-speed)."""
+        hi = min(len(a), len(b))
+        if hi == 0:
+            return 0
+        if a == b:
+            return hi
+        lo = 0
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    @classmethod
+    def _score_strings(cls, strings: List[str]) -> int:
+        """Ideal Trie reuse = sum of adjacent LCPs of the sorted strings."""
+        n = len(strings)
+        if n < 2:
+            return 0
+        s = sorted(strings)
+        total = 0
+        prev = s[0]
+        for i in range(1, n):
+            cur = s[i]
+            total += cls._lcp(prev, cur)
+            prev = cur
+        return total
+
+    # ------------------------------------------------------------------ #
+    # main API
+    # ------------------------------------------------------------------ #
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        df = df.copy()
+        n_rows, n_cols = df.shape
+        cols = list(df.columns)
+
+        if n_rows == 0 or n_cols == 0:
+            orderings = [[] for _ in range(n_rows)]
+            return df.astype(object), orderings
+
+        # ---- preserve raw cell objects per column (no dtype upcasting) ----
+        raw = np.empty((n_rows, n_cols), dtype=object)
+        for j in range(n_cols):
+            raw[:, j] = df.iloc[:, j].to_numpy(dtype=object)
+
+        # ---- serialized cell strings (scoring representation only) ----
+        cellstr = [[self._cell_str(raw[r, j]) for j in range(n_cols)]
+                   for r in range(n_rows)]
+
+        # ---- units: honor col_merge contiguity without altering data ----
+        merged = set()
+        units: List[List[int]] = []
+        for group in col_merge or []:
+            g = [j for j, c in enumerate(cols) if c in group]
+            if g:
+                units.append(g)
+                merged.update(g)
+        for j in range(n_cols):
+            if j not in merged:
+                units.append([j])
+
+        # ---- global column statistics on serialized strings ----
+        col_score_a = np.zeros(n_cols)  # len * c * (c-1)
+        col_score_c = np.zeros(n_cols)  # len * (c-1)
+        nuniq = np.zeros(n_cols, dtype=np.int64)
+        for j in range(n_cols):
+            cnt = Counter(cellstr[i][j] for i in range(n_rows))
+            nuniq[j] = len(cnt)
+            sa = sc = 0.0
+            for v, c in cnt.items():
+                L = len(v)
+                sa += L * c * (c - 1)
+                sc += L * (c - 1)
+            col_score_a[j] = sa
+            col_score_c[j] = sc
+
+        def unit_score(unit, scores):
+            return float(sum(scores[j] for j in unit))
+
+        # deterministic unit ranking (desc score, tie-break by first col idx)
+        def rank_units(scores):
+            return sorted(units, key=lambda u: (-unit_score(u, scores), u[0]))
+
+        order_a = rank_units(col_score_a)   # candidate A unit order
+        order_c = rank_units(col_score_c)   # candidate C unit order
+
+        def expand(order):
+            return [c for u in order for c in u]
+
+        # uniform per-row permutations for A and C
+        perm_a = [expand(order_a)] * n_rows
+        perm_c = [expand(order_c)] * n_rows
+
+        # ---- candidate B: conditional partition tree ----
+        # integer factorization per column
+        codes_arr = []
+        ulen_arr = []
+        for j in range(n_cols):
+            vals, codes = np.unique(
+                np.array([cellstr[i][j] for i in range(n_rows)], dtype=object),
+                return_inverse=True,
+            )
+            codes_arr.append(codes.astype(np.int64))
+            ulen_arr.append(np.array([len(v) for v in vals], dtype=np.int64))
+
+        unit_of_col = {}
+        for ui, u in enumerate(units):
+            for j in u:
+                unit_of_col[j] = ui
+
+        max_depth = col_stop if col_stop else min(len(units), 10)
+        min_group = row_stop if row_stop else 1
+        # branching candidates: cap on wide tables
+        max_cand_cols = 24
+        thresh_nuniq = n_rows * distinct_value_threshold
+
+        order_a_cols = expand(order_a)
+
+        def tail_perm(rows_idx, units_left):
+            tail = sorted(units_left, key=lambda u: (-unit_score(u, col_score_a), u[0]))
+            p = expand(tail)
+            return {r: list(p) for r in rows_idx}
+
+        def cond_recurse(rows_idx, units_left, depth):
+            if (not rows_idx or not units_left or depth >= max_depth
+                    or len(rows_idx) < max(2, min_group)):
+                return tail_perm(rows_idx, units_left)
+            cand_cols = [j for u in units_left for j in u]
+            if len(cand_cols) > max_cand_cols:
+                cand_cols = sorted(
+                    cand_cols, key=lambda j: (-col_score_a[j], j)
+                )[:max_cand_cols]
+            # exclude overly distinct columns from branching (cheap tail still
+            # places them)
+            branch_cols = [j for j in cand_cols if nuniq[j] <= thresh_nuniq]
+            if not branch_cols:
+                branch_cols = cand_cols
+
+            rows_arr = np.array(rows_idx, dtype=np.int64)
+            best_j, best_sav = -1, 0
+            for j in branch_cols:
+                cnts = np.bincount(codes_arr[j][rows_arr])
+                sav = float((ulen_arr[j] * cnts * np.maximum(cnts - 1, 0)).sum())
+                if sav > best_sav:
+                    best_sav, best_j = sav, j
+            if best_j < 0 or best_sav <= early_stop:
+                return tail_perm(rows_idx, units_left)
+
+            ju = unit_of_col[best_j]
+            prefix_unit = next(u for u in units_left if best_j in u)
+            units_left2 = [u for u in units_left if u is not prefix_unit]
+            prefix_cols = list(prefix_unit)
+
+            codes_sub = codes_arr[best_j][rows_arr]
+            result = {}
+            # deterministic partition order: by column index of the unit head
+            for code in np.unique(codes_sub):
+                sub_rows = [int(rows_idx[k])
+                            for k in np.nonzero(codes_sub == code)[0]]
+                sub = cond_recurse(sub_rows, units_left2, depth + 1)
+                for r, p in sub.items():
+                    result[r] = prefix_cols + p
+            # rows are fully partitioned by the selected column
+            return result
+
+        all_rows = list(range(n_rows))
+        b_map = cond_recurse(all_rows, [list(u) for u in units], 0)
+        perm_b = [b_map.get(r, list(order_a_cols)) for r in all_rows]
+
+        # ---- score candidates with the true serial-Trie objective ----
+        def strings_for(perm):
+            return ["".join(cellstr[r][c] for c in perm[r])
+                    for r in range(n_rows)]
+
+        candidates = [perm_a, perm_b, perm_c]
+        scores = [self._score_strings(strings_for(p)) for p in candidates]
+        best_idx = int(np.argmax(scores))
+        best_perm = candidates[best_idx]
+
+        # ---- build output preserving every original cell object ----
+        out = np.empty((n_rows, n_cols), dtype=object)
+        for r in range(n_rows):
+            out[r] = raw[r][best_perm[r]]
+        result_df = pd.DataFrame(out, columns=cols)
+        result_df = result_df.astype(object)
+
+        column_orderings = [[cols[c] for c in best_perm[r]]
+                            for r in range(n_rows)]
+
+        assert result_df.shape == df.shape
+        return result_df, column_orderings
+
+# EVOLVE-BLOCK-END

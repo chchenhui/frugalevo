@@ -1,0 +1,224 @@
+--- a/original.py
++++ b/original.py
+@@ -1,133 +1,191 @@
+ # EVOLVE-BLOCK-START
+ """Constructor-based circle packing for n=26 circles"""
+ import numpy as np
+ 
+ 
+ def construct_packing():
+     """
+-    Construct a specific arrangement of 26 circles in a unit square
+-    that attempts to maximize the sum of their radii.
++    Construct 26 unequal circles by directly optimizing centers and radii.
+ 
+-    Returns:
+-        Tuple of (centers, radii, sum_of_radii)
+-        centers: np.array of shape (26, 2) with (x, y) coordinates
+-        radii: np.array of shape (26) with radius of each circle
+-        sum_of_radii: Sum of all radii
++    A staggered lattice is a useful feasible starting point, but the square
++    boundary strongly favors unequal boundary circles.  Consequently the
++    radii are optimization variables rather than being computed greedily
++    after the centers have been fixed.
+     """
+-    # Initialize arrays for 26 circles
++    from scipy.optimize import minimize
++
+     n = 26
+-    centers = np.zeros((n, 2))
++    rows = (5, 5, 6, 5, 5)
++    base_centers = []
++    for row, count in enumerate(rows):
++        # The six-circle middle row is shifted half a lattice step relative
++        # to the five-circle rows, giving a triangular-lattice seed.
++        xs = np.linspace(1.0 / (count + 1), count / (count + 1), count)
++        y = 0.10 + 0.20 * row
++        base_centers.extend((x, y) for x in xs)
++    base_centers = np.asarray(base_centers, dtype=float)
+ 
+-    # Place circles in a structured pattern
+-    # This is a simple pattern - evolution will improve this
++    pi, pj = np.triu_indices(n, 1)
+ 
+-    # First, place a large circle in the center
+-    centers[0] = [0.5, 0.5]
++    def constraints(z):
++        c = z[:2 * n].reshape(n, 2)
++        r = z[2 * n:]
++        dx = c[pi, 0] - c[pj, 0]
++        dy = c[pi, 1] - c[pj, 1]
++        pair_clearance = dx * dx + dy * dy - (r[pi] + r[pj]) ** 2
++        wall_clearance = np.concatenate((
++            c[:, 0] - r, c[:, 1] - r,
++            1.0 - c[:, 0] - r, 1.0 - c[:, 1] - r
++        ))
++        return np.concatenate((wall_clearance, pair_clearance))
+ 
+-    # Place 8 circles around it in a ring
+-    for i in range(8):
+-        angle = 2 * np.pi * i / 8
+-        centers[i + 1] = [0.5 + 0.3 * np.cos(angle), 0.5 + 0.3 * np.sin(angle)]
++    def constraint_jacobian(z):
++        c = z[:2 * n].reshape(n, 2)
++        r = z[2 * n:]
++        jac = np.zeros((4 * n + len(pi), 3 * n))
++        for k in range(n):
++            jac[k, 2 * k] = 1.0
++            jac[k, 2 * n + k] = -1.0
++            jac[n + k, 2 * k + 1] = 1.0
++            jac[n + k, 2 * n + k] = -1.0
++            jac[2 * n + k, 2 * k] = -1.0
++            jac[2 * n + k, 2 * n + k] = -1.0
++            jac[3 * n + k, 2 * k + 1] = -1.0
++            jac[3 * n + k, 2 * n + k] = -1.0
+ 
+-    # Place 16 more circles in an outer ring
+-    for i in range(16):
+-        angle = 2 * np.pi * i / 16
+-        centers[i + 9] = [0.5 + 0.7 * np.cos(angle), 0.5 + 0.7 * np.sin(angle)]
++        start = 4 * n
++        dx = c[pi, 0] - c[pj, 0]
++        dy = c[pi, 1] - c[pj, 1]
++        rs = r[pi] + r[pj]
++        q = np.arange(len(pi)) + start
++        jac[q, 2 * pi] = 2.0 * dx
++        jac[q, 2 * pi + 1] = 2.0 * dy
++        jac[q, 2 * pj] = -2.0 * dx
++        jac[q, 2 * pj + 1] = -2.0 * dy
++        jac[q, 2 * n + pi] = -2.0 * rs
++        jac[q, 2 * n + pj] = -2.0 * rs
++        return jac
+ 
+-    # Additional positioning adjustment to make sure all circles
+-    # are inside the square and don't overlap
+-    # Clip to ensure everything is inside the unit square
+-    centers = np.clip(centers, 0.01, 0.99)
++    bounds = [(0.0, 1.0)] * (2 * n) + [(1e-7, 0.5)] * n
++    con = {"type": "ineq", "fun": constraints, "jac": constraint_jacobian}
++    rng = np.random.default_rng(271828)
++    starts = [base_centers]
++    perturbed = base_centers + rng.normal(0.0, 0.012, base_centers.shape)
++    starts.append(np.clip(perturbed, 0.065, 0.935))
+ 
+-    # Compute maximum valid radii for this configuration
+-    radii = compute_max_radii(centers)
++    best = None
++    for seed_centers in starts:
++        # 0.055 is safely feasible even after the deliberately small jitter.
++        z0 = np.concatenate((seed_centers.ravel(), np.full(n, 0.055)))
++        result = minimize(
++            lambda z: -np.sum(z[2 * n:]), z0,
++            jac=lambda z: np.r_[np.zeros(2 * n), -np.ones(n)],
++            method="SLSQP", bounds=bounds, constraints=con,
++            options={"maxiter": 1400, "ftol": 1e-11, "disp": False}
++        )
++        if best is None or np.sum(result.x[2 * n:]) > np.sum(best[2 * n:]):
++            best = result.x
+ 
+-    # Calculate the sum of radii
+-    sum_radii = np.sum(radii)
++    centers = best[:2 * n].reshape(n, 2)
++    radii = np.maximum(best[2 * n:], 0.0)
+ 
+-    return centers, radii, sum_radii
++    # Optimizers legitimately stop within a tiny constraint tolerance.  This
++    # common scale factor converts such a result into a strictly valid one.
++    factors = [1.0]
++    for i in range(n):
++        if radii[i] > 0.0:
++            factors.append(min(centers[i, 0], centers[i, 1],
++                               1.0 - centers[i, 0], 1.0 - centers[i, 1])
++                           / radii[i])
++    for i, j in zip(pi, pj):
++        denom = radii[i] + radii[j]
++        if denom > 0.0:
++            factors.append(np.hypot(*(centers[i] - centers[j])) / denom)
++    radii *= max(0.0, min(1.0, min(factors) * (1.0 - 1e-10)))
++
++    return centers, radii, float(np.sum(radii))
+ 
+ 
+ def compute_max_radii(centers):
+     """
+     Compute the maximum possible radii for each circle position
+     such that they don't overlap and stay within the unit square.
+ 
+     Args:
+         centers: np.array of shape (n, 2) with (x, y) coordinates
+ 
+     Returns:
+         np.array of shape (n) with radius of each circle
+     """
+     n = centers.shape[0]
+     radii = np.ones(n)
+ 
+     # First, limit by distance to square borders
+     for i in range(n):
+         x, y = centers[i]
+         # Distance to borders
+         radii[i] = min(x, y, 1 - x, 1 - y)
+ 
+     # Then, limit by distance to other circles
+     # Each pair of circles with centers at distance d can have
+     # sum of radii at most d to avoid overlap
+     for i in range(n):
+         for j in range(i + 1, n):
+             dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+ 
+             # If current radii would cause overlap
+             if radii[i] + radii[j] > dist:
+                 # Scale both radii proportionally
+                 scale = dist / (radii[i] + radii[j])
+                 radii[i] *= scale
+                 radii[j] *= scale
+ 
+     return radii
+ 
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ # This part remains fixed (not evolved)
+ def run_packing():
+     """Run the circle packing constructor for n=26"""
+     centers, radii, sum_radii = construct_packing()
+     return centers, radii, sum_radii
+ 
+ 
+ def visualize(centers, radii):
+     """
+     Visualize the circle packing
+ 
+     Args:
+         centers: np.array of shape (n, 2) with (x, y) coordinates
+         radii: np.array of shape (n) with radius of each circle
+     """
+     import matplotlib.pyplot as plt
+     from matplotlib.patches import Circle
+ 
+     fig, ax = plt.subplots(figsize=(8, 8))
+ 
+     # Draw unit square
+     ax.set_xlim(0, 1)
+     ax.set_ylim(0, 1)
+     ax.set_aspect("equal")
+     ax.grid(True)
+ 
+     # Draw circles
+     for i, (center, radius) in enumerate(zip(centers, radii)):
+         circle = Circle(center, radius, alpha=0.5)
+         ax.add_patch(circle)
+         ax.text(center[0], center[1], str(i), ha="center", va="center")
+ 
+     plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+     plt.show()
+ 
+ 
+ if __name__ == "__main__":
+     centers, radii, sum_radii = run_packing()
+     print(f"Sum of radii: {sum_radii}")
+     # AlphaEvolve improved this to 2.635
+ 
+     # Uncomment to visualize:
+     visualize(centers, radii)

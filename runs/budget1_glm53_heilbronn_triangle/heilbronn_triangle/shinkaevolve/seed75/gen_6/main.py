@@ -1,0 +1,167 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+SQRT3 = np.sqrt(3.0)
+TRI_AREA = SQRT3 / 4.0  # area of the unit equilateral triangle
+
+
+def _all_triples(n):
+    idxs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            for k in range(j + 1, n):
+                idxs.append((i, j, k))
+    return np.array(idxs)
+
+
+TRIPLES = _all_triples(11)
+
+
+def _areas(pts):
+    a = pts[TRIPLES[:, 0]]
+    b = pts[TRIPLES[:, 1]]
+    c = pts[TRIPLES[:, 2]]
+    cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    return 0.5 * np.abs(cross)
+
+
+def _constraints_flat(x):
+    """Linear inequality constraints keeping all points inside the triangle."""
+    p = x.reshape(-1, 2)
+    xs, ys = p[:, 0], p[:, 1]
+    return np.concatenate([
+        ys,                              # y >= 0
+        SQRT3 * xs - ys,                 # below left edge (y <= sqrt3 x)
+        SQRT3 * (1.0 - xs) - ys,         # below right edge
+    ])
+
+
+def _min_area(x):
+    return _areas(x.reshape(-1, 2)).min() / TRI_AREA
+
+
+def _optimize(start, iters):
+    from scipy.optimize import minimize
+    x = start.flatten().copy()
+    best_x, best_val = x.copy(), _min_area(x)
+    try:
+        for p in (10.0, 30.0, 100.0):
+            def obj(xx):
+                ar = _areas(xx.reshape(-1, 2)) / TRI_AREA
+                # smooth min: (1/p) * log sum exp(-p * a)
+                m = ar.min()
+                return (np.log(np.sum(np.exp(-p * (ar - m)))) - p * m) / (-p)
+
+            def jac(xx):
+                ar = _areas(xx.reshape(-1, 2)) / TRI_AREA
+                m = ar.min()
+                w = np.exp(-p * (ar - m))
+                w = w / w.sum()
+                pts = xx.reshape(-1, 2)
+                a = pts[TRIPLES[:, 0]]
+                b = pts[TRIPLES[:, 1]]
+                c = pts[TRIPLES[:, 2]]
+                cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+                s = np.sign(cross)
+                # gradient of |cross|/2 / TRI_AREA wrt all coords
+                g = np.zeros_like(pts)
+                # d area / d a = -s*(c-b)/2 etc.
+                for t in range(len(TRIPLES)):
+                    if w[t] < 1e-14:
+                        continue
+                    i, j, k = TRIPLES[t]
+                    co = 0.5 * s[t] * w[t] / TRI_AREA
+                    g[i, 0] += co * (a[t, 1] - c[t, 1])
+                    g[i, 1] += co * (c[t, 0] - a[t, 0])
+                    g[j, 0] += co * (c[t, 1] - b[t, 1])
+                    g[j, 1] += co * (b[t, 0] - c[t, 0])
+                    g[k, 0] += co * (b[t, 1] - a[t, 1])
+                    g[k, 1] += co * (a[t, 0] - b[t, 0])
+                return -g.flatten()  # obj returns -softmin (to be minimized)
+
+            cons = {'type': 'ineq', 'fun': lambda xx: _constraints_flat(xx),
+                    'jac': None}
+            res = minimize(obj, x, jac=jac, method='SLSQP',
+                           constraints=[cons],
+                           bounds=[(0.0, 1.0)] * 22,
+                           options={'maxiter': iters, 'ftol': 1e-12})
+            if np.isfinite(res.x).all():
+                x = res.x
+            v = _min_area(x)
+            if v > best_val:
+                best_val, best_x = v, x.copy()
+    except Exception:
+        pass
+    return best_x, best_val
+
+
+def _lattice_starts():
+    """Deterministic starting layouts inside the triangle."""
+    starts = []
+    # Triangular lattice rows 1..5 (15 pts) -> pick 11 spread out
+    lat = []
+    for r in range(5):
+        y = r * (SQRT3 / 2) / 4 * (SQRT3 / SQRT3)  # rows at dy = sqrt3/8
+        y = r * (SQRT3 / 2) / 4
+        for c in range(r + 1):
+            x = 0.5 * (1 - r / 4) + c * (1.0 / 4)
+            lat.append((x, y))
+    lat = np.array(lat)
+    # keep 11 well-spread points (drop every other interior one)
+    keep = [0, 1, 2, 3, 4, 5, 6, 8, 9, 12, 14]
+    starts.append(lat[keep])
+    # boundary ring: 3 corners + points along edges
+    t = np.linspace(0, 1, 13)
+    ring = []
+    for f in t:
+        ring.append((f, 0.0))                                   # bottom edge
+    for f in t[1:-1]:
+        ring.append((0.5 * (1 - f) + 1.0 * f, SQRT3 / 2 * f))  # right edge
+    for f in t[1:-1]:
+        ring.append((0.5 * (1 - f), SQRT3 / 2 * f))            # left edge
+    ring = np.array(ring)
+    starts.append(ring[[0, 2, 4, 6, 8, 10, 12, 16, 20, 23, 26]][:11] if len(ring) > 26 else ring[:11])
+    # small interior grid
+    g = []
+    for yy in [0.1, 0.3, 0.5, 0.7]:
+        for xx in [0.15, 0.5, 0.85]:
+            if yy <= SQRT3 * xx and yy <= SQRT3 * (1 - xx):
+                g.append((xx, yy))
+    g = np.array(g)
+    starts.append(g[:11] if len(g) >= 11 else np.vstack([g, lat[:11 - len(g)]]))
+    return starts
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    n = 11
+    rng = np.random.default_rng(12345)
+
+    starts = _lattice_starts()
+    # add seeded random feasible starts
+    for _ in range(3):
+        pts = rng.random((n, 2))
+        pts[:, 1] *= np.minimum(SQRT3 * pts[:, 0], SQRT3 * (1 - pts[:, 0])) * 0.99 + 1e-4
+        starts.append(pts)
+
+    best_x, best_val = None, -1.0
+    for s in starts:
+        try:
+            x, v = _optimize(np.asarray(s, dtype=float), iters=120)
+        except Exception:
+            continue
+        if v > best_val:
+            best_val, best_x = v, x
+
+    if best_x is None:
+        # fallback: lattice points (always valid)
+        best_x = _lattice_starts()[0].flatten()
+        best_x = np.asarray(best_x, dtype=float).reshape(n, 2).flatten()
+
+    pts = best_x.reshape(n, 2)
+    # project into triangle to guarantee feasibility
+    pts[:, 1] = np.clip(pts[:, 1], 0.0, None)
+    pts[:, 1] = np.minimum(pts[:, 1], np.minimum(SQRT3 * pts[:, 0], SQRT3 * (1 - pts[:, 0])))
+    return pts
+
+
+# EVOLVE-BLOCK-END

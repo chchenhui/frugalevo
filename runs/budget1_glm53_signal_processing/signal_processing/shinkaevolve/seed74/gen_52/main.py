@@ -1,0 +1,362 @@
+# EVOLVE-BLOCK-START
+"""
+Locally-Adaptive-Q Kalman / RTS Pipeline Filter
+
+Pipeline architecture:
+  Stage 1  Robust Hampel denoise (impulsive-noise suppression)
+  Stage 2  Local dynamics estimation -> per-sample process noise Q[k]
+           (block MAD of second differences, 50% overlap, interpolated)
+  Stage 3  Forward constant-velocity Kalman pass with Q[k] and adaptive R
+  Stage 4  Backward pass (Q scaled 0.25x) blended for zero-phase output
+  Stage 5  Light short-window Savitzky-Golay polish (reversal suppression)
+  Stage 6  Window-semantics alignment (output i ~ window x[i:i+W])
+"""
+import numpy as np
+
+
+# ---------------- Stage 1: robust denoise ----------------
+
+def _robust_denoise(x, k=5, t=3.0):
+    """Hampel-style outlier clipping against local median / local MAD."""
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < 2 * k + 1:
+        return x.copy()
+    med = np.array([np.median(x[max(0, i - k):min(n, i + k + 1)]) for i in range(n)])
+    dev = x - med
+    mad = np.median(np.abs(dev - np.median(dev)))
+    if mad < 1e-12:
+        mad = np.std(dev) + 1e-12
+    thresh = t * 1.4826 * mad
+    out = x.copy()
+    mask = np.abs(dev) > thresh
+    out[mask] = med[mask]
+    return out
+
+
+def _median3(x):
+    """Length-3 median filter (edge padded) - used to stabilize 2nd-diff."""
+    n = len(x)
+    if n < 3:
+        return x.copy()
+    p = np.pad(x, (1, 1), mode="edge")
+    stacked = np.vstack([p[:-2], p[1:-1], p[2:]])
+    return np.median(stacked, axis=0)
+
+
+# ---------------- Stage 2: local process noise Q[k] ----------------
+
+def _local_process_noise(x, window_size, q_base=0.05, power=2.0,
+                          lo_frac=0.1, hi_frac=8.0, sigma_r=1.0):
+    """
+    Estimate per-sample process noise q[k] from local signal dynamics.
+
+    sigma_acc is estimated as the block MAD of second differences over
+    sliding blocks (length ~ window_size, 50% overlap). A residual-noise
+    floor (sigma_r / sqrt(w)) * sqrt(6) is subtracted per block so that
+    only genuine dynamics remain; the result is floored at 0.05*sigma_r,
+    capped at 1.5*sigma_r, and linearly interpolated to per-sample Q[k].
+    """
+    n = len(x)
+    if n < 6:
+        return np.full(n, q_base)
+
+    xs = _median3(x)                    # suppress noise before differencing
+    d2 = np.diff(xs, n=2)              # approximates acceleration * dt^2
+    m = len(d2)
+    if m < 3:
+        return np.full(n, q_base)
+
+    block = max(4, int(window_size))
+    step = max(1, block // 2)
+
+    # Noise floor of d2 for a smoothed series: residual noise sigma_r/sqrt(w)
+    # amplified by second differencing (factor sqrt(6)).
+    noise_floor = (sigma_r / np.sqrt(block)) * np.sqrt(6.0)
+    floor_val = 0.05 * sigma_r
+    cap_val = 1.5 * sigma_r
+
+    starts = list(range(0, max(1, m - block + 1), step))
+    if m > block and starts[-1] < m - block:
+        starts.append(m - block)
+    if not starts:
+        starts = [0]
+
+    centers = np.empty(len(starts))
+    sigs = []
+    for j, s in enumerate(starts):
+        seg = d2[s:s + block]
+        sig = 1.4826 * np.median(np.abs(seg - np.median(seg)))
+        sigs.append(sig)
+        centers[j] = s + len(seg) / 2.0
+    sigs = np.asarray(sigs)
+
+    # Subtract noise floor, then robust floor/cap against sigma_r.
+    dyn = sigs - noise_floor
+    dyn = np.maximum(dyn, floor_val)
+    dyn = np.minimum(dyn, cap_val)
+    dyn = np.maximum(dyn, 1e-9)
+
+    med = max(np.median(dyn), 1e-12)
+    ratios = (dyn / med) ** power
+    ratios = np.clip(ratios, lo_frac, hi_frac)
+
+    # d2 index i corresponds to sample ~i+1; shift centers into sample space
+    k = np.arange(n, dtype=float)
+    q = q_base * np.interp(k, centers + 1.0, ratios)
+    return np.clip(q, q_base * lo_frac, q_base * hi_frac)
+
+
+# ---------------- Stages 3 & 4: Kalman passes ----------------
+
+def _kalman_pass(z, q_arr, r_base=0.5, innov_gain=0.25,
+                 ema_alpha=0.08, reverse=False):
+    """
+    Constant-velocity Kalman pass with per-step process noise q_arr[i]
+    and innovation-EMA-adaptive measurement noise R.
+    """
+    n = len(z)
+    if reverse:
+        z = z[::-1]
+        q_arr = q_arr[::-1]
+
+    delta = 1.0
+    F = np.array([[1.0, delta], [0.0, 1.0]])
+    H = np.array([1.0, 0.0])
+    I2 = np.eye(2)
+
+    level = float(z[0])
+    vel = 0.0
+    P = np.eye(2)
+    innov_ema = 0.0
+
+    out = np.empty(n)
+    for i in range(n):
+        q = q_arr[i]
+        Q = q * np.array([[delta ** 3 / 3.0, delta ** 2 / 2.0],
+                          [delta ** 2 / 2.0, delta]])
+
+        # Predict
+        level = level + delta * vel
+        P = F @ P @ F.T + Q
+
+        # Adaptive measurement noise (smoothed innovation power)
+        innov = z[i] - level
+        innov_ema = (1.0 - ema_alpha) * innov_ema + ema_alpha * innov * innov
+        r = r_base + innov_gain * innov_ema
+
+        # Update
+        S = P[0, 0] + r
+        K = np.array([P[0, 0] / S, P[1, 0] / S])
+        level += K[0] * innov
+        vel += K[1] * innov
+        P = (I2 - np.outer(K, H)) @ P
+        P = 0.5 * (P + P.T)  # symmetrize
+
+        out[i] = level
+
+    return out[::-1] if reverse else out
+
+
+# ---------------- Stage 5: light SG polish ----------------
+
+def _sg_polish(y, window_size, n):
+    """Short-window order-2 Savitzky-Golay smoothing to kill residual
+    jitter (and hence spurious slope reversals) without adding lag."""
+    w = max(5, window_size // 2)
+    if w % 2 == 0:
+        w += 1
+    if w > n:
+        w = n if n % 2 == 1 else n - 1
+    if w < 5 or w <= 3:
+        return y
+    try:
+        from scipy.signal import savgol_filter
+        return savgol_filter(y, w, 2, mode="interp")
+    except Exception:
+        pass
+    # Fallback: manual local quadratic fit coefficients (centered)
+    half = w // 2
+    t = np.arange(-half, half + 1, dtype=float)
+    A = np.vander(t, 3, increasing=True)
+    coef = np.linalg.pinv(A.T @ A) @ A.T
+    h = coef[0, :]  # smoothing row (value at center)
+    padded = np.pad(y, (half, half), mode="edge")
+    return np.convolve(padded, h[::-1], mode="valid")[:n]
+
+
+# ---------------- Pipeline driver ----------------
+
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """Locally-adaptive-Q Kalman/RTS pipeline filter."""
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n < window_size:
+        raise ValueError(
+            f"Input signal length ({n}) must be >= window_size ({window_size})"
+        )
+
+    # Stage 1: robust impulsive-noise suppression
+    xr = _robust_denoise(x, k=max(3, window_size // 6), t=3.0)
+
+    # Robust measurement-noise estimate from Hampel residual (MAD)
+    resid = x - xr
+    sigma_r = 1.4826 * np.median(np.abs(resid - np.median(resid)))
+    if sigma_r < 1e-12:
+        sigma_r = np.std(resid) + 1e-12
+
+    # Stage 2a: conservative first pass (uniform base Q)
+    fw0 = _kalman_pass(xr, np.full(n, 0.05))
+
+    # Stage 2b: per-sample process noise from FIRST-PASS SMOOTHED output's
+    # second differences, with the residual noise floor subtracted per block.
+    q_arr = _local_process_noise(fw0, window_size, q_base=0.05,
+                                 sigma_r=sigma_r)
+
+    # Stage 3: forward Kalman pass (locally adaptive Q, adaptive R)
+    fw = _kalman_pass(xr, q_arr)
+
+    # Stage 4: backward pass (0.25x Q) + blend -> zero-phase estimate
+    bw = _kalman_pass(fw, 0.25 * q_arr, reverse=True)
+    y = 0.5 * (fw + bw)
+
+    # Stage 5: light polish to suppress residual slope reversals
+    y = _sg_polish(y, window_size, n)
+
+    # Stage 6: align to sliding-window semantics:
+    # output i corresponds to window x[i : i + window_size]
+    output_length = n - window_size + 1
+    anchor = np.arange(output_length) + window_size - 1
+    return y[anchor]
+
+
+def adaptive_filter(x, window_size=20):
+    """Baseline-compatible entry: same pipeline."""
+    return enhanced_filter_with_trend_preservation(x, window_size)
+
+
+def process_signal(input_signal, window_size=20, algorithm_type="enhanced"):
+    """Main signal processing function (same interface as original)."""
+    return enhanced_filter_with_trend_preservation(input_signal, window_size)
+
+# EVOLVE-BLOCK-END
+
+
+def generate_test_signal(length=1000, noise_level=0.3, seed=42):
+    """
+    Generate synthetic test signal with known characteristics.
+
+    Args:
+        length: Length of the signal
+        noise_level: Standard deviation of noise to add
+        seed: Random seed for reproducibility
+
+    Returns:
+        Tuple of (noisy_signal, clean_signal)
+    """
+    np.random.seed(seed)
+    t = np.linspace(0, 10, length)
+
+    # Create a complex signal with multiple components
+    clean_signal = (
+        2 * np.sin(2 * np.pi * 0.5 * t)  # Low frequency component
+        + 1.5 * np.sin(2 * np.pi * 2 * t)  # Medium frequency component
+        + 0.5 * np.sin(2 * np.pi * 5 * t)  # Higher frequency component
+        + 0.8 * np.exp(-t / 5) * np.sin(2 * np.pi * 1.5 * t)  # Decaying oscillation
+    )
+
+    # Add non-stationary behavior
+    trend = 0.1 * t * np.sin(0.2 * t)  # Slowly varying trend
+    clean_signal += trend
+
+    # Add random walk component for non-stationarity
+    random_walk = np.cumsum(np.random.randn(length) * 0.05)
+    clean_signal += random_walk
+
+    # Add noise
+    noise = np.random.normal(0, noise_level, length)
+    noisy_signal = clean_signal + noise
+
+    return noisy_signal, clean_signal
+
+
+def run_signal_processing(noisy_signal=None, signal_length=1000, noise_level=0.3, window_size=20):
+    """
+    Run the signal processing algorithm on a test signal.
+
+    Args:
+        noisy_signal: Input signal to filter (if provided, use this; otherwise generate)
+        signal_length: Length if generating signal (for backward compatibility)
+        noise_level: Noise level if generating signal (for backward compatibility)
+        window_size: Window size for processing
+
+    Returns:
+        Dictionary containing results and metrics
+    """
+    # Use provided signal or generate test signal (for backward compatibility)
+    if noisy_signal is not None:
+        # Filter the provided signal
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+        clean_signal = None  # Not available when using provided signal
+    else:
+        # Generate test signal (for __main__ and backward compatibility)
+        noisy_signal, clean_signal = generate_test_signal(signal_length, noise_level)
+        filtered_signal = process_signal(noisy_signal, window_size, "enhanced")
+
+    # Calculate basic metrics (only if we have clean_signal from generation)
+    if len(filtered_signal) > 0 and clean_signal is not None:
+        # Align signals for comparison (account for processing delay)
+        delay = window_size - 1
+        aligned_clean = clean_signal[delay:]
+        aligned_noisy = noisy_signal[delay:]
+
+        # Ensure same length
+        min_length = min(len(filtered_signal), len(aligned_clean))
+        filtered_signal = filtered_signal[:min_length]
+        aligned_clean = aligned_clean[:min_length]
+        aligned_noisy = aligned_noisy[:min_length]
+
+        # Calculate correlation with clean signal
+        correlation = np.corrcoef(filtered_signal, aligned_clean)[0, 1] if min_length > 1 else 0
+
+        # Calculate noise reduction
+        noise_before = np.var(aligned_noisy - aligned_clean)
+        noise_after = np.var(filtered_signal - aligned_clean)
+        noise_reduction = (noise_before - noise_after) / noise_before if noise_before > 0 else 0
+
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": aligned_clean,
+            "noisy_signal": aligned_noisy,
+            "correlation": correlation,
+            "noise_reduction": noise_reduction,
+            "signal_length": min_length,
+        }
+    elif len(filtered_signal) > 0:
+        # When using provided signal (no clean_signal available), just return filtered signal
+        return {
+            "filtered_signal": filtered_signal,
+            "clean_signal": None,
+            "noisy_signal": None,
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": len(filtered_signal),
+        }
+    else:
+        return {
+            "filtered_signal": [],
+            "clean_signal": [],
+            "noisy_signal": [],
+            "correlation": 0,
+            "noise_reduction": 0,
+            "signal_length": 0,
+        }
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    results = run_signal_processing()
+    print("Signal processing completed!")
+    print(f"Correlation with clean signal: {results['correlation']:.3f}")
+    print(f"Noise reduction: {results['noise_reduction']:.3f}")
+    print(f"Processed signal length: {results['signal_length']}")

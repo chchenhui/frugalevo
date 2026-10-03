@@ -1,0 +1,196 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+_SQRT3 = float(np.sqrt(3.0))
+_H = _SQRT3 / 2.0
+_TRI_AREA = 0.25 * _SQRT3
+_V0 = np.array([0.0, 0.0])
+_V1 = np.array([1.0, 0.0])
+_V2 = np.array([0.5, _H])
+_TRIP = np.array(list(combinations(range(11), 3)), dtype=int)
+_I, _J, _K = _TRIP[:, 0], _TRIP[:, 1], _TRIP[:, 2]
+
+
+def _areas(pts):
+    a = pts[_I]
+    b = pts[_J]
+    c = pts[_K]
+    cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    return 0.5 * np.abs(cross), cross
+
+
+def _min_area(pts):
+    return _areas(pts)[0].min() / (2.0 * _TRI_AREA)
+
+
+def _clip(pts):
+    out = pts.copy()
+    y = out[:, 1]
+    x = out[:, 0]
+    l2 = y / _H
+    l1 = x - 0.5 * l2
+    l0 = 1.0 - l1 - l2
+    bad = (l0 < 0) | (l1 < 0) | (l2 < 0)
+    if np.any(bad):
+        lam = np.stack([np.maximum(l0, 0.0), np.maximum(l1, 0.0), np.maximum(l2, 0.0)], axis=1)
+        lam /= lam.sum(axis=1, keepdims=True)
+        fixed = lam @ np.stack([_V0, _V1, _V2])
+        out[bad] = fixed[bad]
+    return out
+
+
+def _grad_dirs(pts):
+    """Signed-area gradients (in xy) for each triplet's three vertices."""
+    a = pts[_I]
+    b = pts[_J]
+    c = pts[_K]
+    cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    s = np.where(cross >= 0, 1.0, -1.0)
+    gi = 0.5 * s * np.stack([c[:, 1] - b[:, 1], b[:, 0] - c[:, 0]], axis=1)
+    gj = 0.5 * s * np.stack([a[:, 1] - c[:, 1], c[:, 0] - a[:, 0]], axis=1)
+    gk = 0.5 * s * np.stack([b[:, 1] - a[:, 1], a[:, 0] - b[:, 0]], axis=1)
+    return gi, gj, gk
+
+
+def _to_b(g):
+    """xy-gradient direction -> barycentric-simplex direction (per point)."""
+    return np.stack([g[:, 0] - g[:, 1] / _SQRT3, 2.0 * g[:, 1] / _SQRT3], axis=1)
+
+
+def _bottleneck_move(pts, step, rng, nb=8, p_multi=0.75):
+    """Move 1-3 top bottleneck points simultaneously along their area gradients.
+
+    Selection probability proportional to membership counts in the `nb`
+    smallest triangles; the top-2 are occasionally moved together (correlated).
+    """
+    ar, _ = _areas(pts)
+    order = np.argsort(ar)[:nb]
+    cnt = np.zeros(pts.shape[0])
+    for t in order:
+        cnt[_TRIP[t]] += 1.0
+    gi, gj, gk = _grad_dirs(pts)
+    gmap = [gi, gj, gk]
+    dirs = np.zeros_like(pts)
+    if rng.random() < p_multi:
+        # correlated move: top-2 (or top-3) bottleneck points together
+        top = np.argsort(-cnt)[:2 if rng.random() < 0.6 else 3]
+    else:
+        # membership-weighted random pick of one point
+        w = cnt + 1e-9
+        top = [rng.choice(pts.shape[0], p=w / w.sum())]
+    touched = set()
+    for t in order:
+        for local, pt_idx in enumerate(_TRIP[t]):
+            if pt_idx in top and pt_idx not in touched:
+                g = gmap[local][t]
+                nrm = np.hypot(g[0], g[1])
+                if nrm > 1e-15:
+                    dirs[pt_idx] = g / nrm
+                touched.add(pt_idx)
+    cand = pts + step * _to_b(dirs)
+    return _clip(cand)
+
+
+def _optimize(pts, rng, iters=1500, step0=0.02):
+    b = _clip(pts.copy())
+    cur = _min_area(b)
+    best_b, best_v = b.copy(), cur
+    step = step0
+    sigma = 0.012
+    stall = 0
+    for _ in range(iters):
+        ok = False
+        s = step
+        for _ in range(5):
+            cand = _bottleneck_move(b, s, rng)
+            v = _min_area(cand)
+            if v > cur + 1e-14:
+                b, cur = cand, v
+                ok = True
+                break
+            s *= 0.5
+        if ok:
+            stall = 0
+            step = min(step * 1.25, step0)
+            if cur > best_v:
+                best_v, best_b = cur, b.copy()
+        else:
+            stall += 1
+            step *= 0.5
+            if step < 2e-5 or stall > 12:
+                # annealing kick: correlated jitter, SA acceptance
+                kick = _clip(b + rng.normal(0.0, sigma, b.shape))
+                kv = _min_area(kick)
+                if kv > best_v * 0.92 or kv > cur - 4.0 * sigma * sigma:
+                    b, cur = kick, kv
+                sigma *= 0.75
+                if sigma < 5e-4:
+                    sigma = 0.012
+                    b, cur = best_b.copy(), best_v
+                step = step0
+                stall = 0
+    return best_b, best_v
+
+
+def _polish(pts, steps=(0.004, 0.001, 0.0002)):
+    best = _clip(pts.copy())
+    bv = _min_area(best)
+    n_dirs = 12
+    ang = 2.0 * np.pi * np.arange(n_dirs) / n_dirs
+    dirs = np.stack([np.cos(ang), np.sin(ang)], axis=1)
+    for s in steps:
+        improved = True
+        while improved:
+            improved = False
+            for i in range(best.shape[0]):
+                for d in dirs:
+                    cand = best.copy()
+                    cand[i] += s * d
+                    cand = _clip(cand)
+                    v = _min_area(cand)
+                    if v > bv + 1e-13:
+                        best, bv = cand, v
+                        improved = True
+    return best, bv
+
+
+def _lattice_seed(seed, k=3):
+    rng = np.random.default_rng(seed)
+    pts = []
+    for i in range(k + 1):
+        for j in range(k + 1 - i):
+            l = k - i - j
+            pts.append((i * _V0 + j * _V1 + l * _V2) / k)
+    pts.append(np.array([0.5, _SQRT3 / 6.0]))
+    pts = np.array(pts)
+    return _clip(pts + rng.normal(0.0, 0.02, pts.shape))
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of 11 points on or inside the equilateral triangle
+    (0,0), (1,0), (0.5, sqrt(3)/2) maximizing the minimum triangle area.
+
+    Deterministic multi-start optimization with bottleneck-membership-weighted
+    correlated multi-point gradient moves, annealing kicks, and a final
+    single-point pattern-search polish.
+    """
+    try:
+        best_pts, best_val = None, -1.0
+        for si in range(8):
+            seed = 4242 + 11 * si
+            init = _lattice_seed(seed)
+            rng = np.random.default_rng(seed + 1)
+            b, v = _optimize(init, rng)
+            b, v = _polish(b)
+            if v > best_val:
+                best_val, best_pts = v, b
+        if best_pts is None or not np.all(np.isfinite(best_pts)):
+            raise RuntimeError("no result")
+        return np.ascontiguousarray(best_pts, dtype=float)
+    except Exception:
+        return np.ascontiguousarray(_lattice_seed(4242), dtype=float)
+
+
+# EVOLVE-BLOCK-END

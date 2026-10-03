@@ -1,0 +1,345 @@
+<NAME>
+fast_route_sa
+</NAME>
+
+<DESCRIPTION>
+This crossover keeps the stronger broad dirty-cell targeting strategy from the current program while incorporating exact cheapest-detour insertion from the inspiration program. It also replaces the expensive nested visit-time vectors and repeated route validation with a flat route representation, precomputed adjacency/APSP parents, and O(L) gap-based scoring. This allows substantially more simulated-annealing iterations within the same time limit while preserving legal cyclic routes.
+</DESCRIPTION>
+
+<CODE>
+```cpp
+# EVOLVE-BLOCK-START
+#pragma GCC optimize("O3,unroll-loops")
+
+#include <bits/stdc++.h>
+using namespace std;
+
+static const int MAXL = 100000;
+static const int INF = 1e9;
+static const int DR[4] = {0, 1, 0, -1};
+static const int DC[4] = {1, 0, -1, 0};
+static const char CH[4] = {'R', 'D', 'L', 'U'};
+
+int N, M;
+string H[40], V[40];
+int dirt[1600];
+int adjv[1600][4];
+int dista[1600][1600];
+short parentv[1600][1600];
+
+mt19937 rng((unsigned)chrono::high_resolution_clock::now().time_since_epoch().count());
+
+struct State {
+    vector<unsigned char> mv;
+    vector<short> pos;
+    long double score = 1e100L;
+    long double term[1600];
+};
+
+inline int rnd(int l, int r) {
+    return uniform_int_distribution<int>(l, r)(rng);
+}
+
+inline double rnd01() {
+    return uniform_real_distribution<double>(0.0, 1.0)(rng);
+}
+
+inline bool wall_between(int r, int c, int d) {
+    if (d == 0) return c + 1 >= N || V[r][c] == '1';
+    if (d == 1) return r + 1 >= N || H[r][c] == '1';
+    if (d == 2) return c == 0 || V[r][c - 1] == '1';
+    return r == 0 || H[r - 1][c] == '1';
+}
+
+void build_graph() {
+    M = N * N;
+    for (int r = 0; r < N; ++r) {
+        for (int c = 0; c < N; ++c) {
+            int x = r * N + c;
+            for (int d = 0; d < 4; ++d) {
+                if (wall_between(r, c, d)) adjv[x][d] = -1;
+                else adjv[x][d] = (r + DR[d]) * N + c + DC[d];
+            }
+        }
+    }
+}
+
+void apsp() {
+    static int q[1600];
+    for (int s = 0; s < M; ++s) {
+        fill(dista[s], dista[s] + M, INF);
+        dista[s][s] = 0;
+        int head = 0, tail = 0;
+        q[tail++] = s;
+        while (head < tail) {
+            int x = q[head++];
+            for (int d = 0; d < 4; ++d) {
+                int y = adjv[x][d];
+                if (y >= 0 && dista[s][y] == INF) {
+                    dista[s][y] = dista[s][x] + 1;
+                    parentv[s][y] = (short)x;
+                    q[tail++] = y;
+                }
+            }
+        }
+    }
+}
+
+void append_shortest(int a, int b, vector<unsigned char>& out) {
+    static unsigned char tmp[1600];
+    int z = 0, cur = b;
+    while (cur != a) {
+        int p = parentv[a][cur];
+        int d = 0;
+        while (adjv[p][d] != cur) ++d;
+        tmp[z++] = (unsigned char)d;
+        cur = p;
+    }
+    while (z) out.push_back(tmp[--z]);
+}
+
+void evaluate(State& s) {
+    int L = (int)s.mv.size();
+    if (L == 0 || L > MAXL) {
+        s.score = 1e100L;
+        return;
+    }
+
+    s.pos.resize(L + 1);
+    s.pos[0] = 0;
+    static int first[1600], last[1600];
+    static long double accum[1600];
+
+    for (int i = 0; i < M; ++i) {
+        first[i] = -1;
+        last[i] = -1;
+        accum[i] = 0;
+    }
+
+    int cur = 0;
+    for (int t = 1; t <= L; ++t) {
+        int nx = adjv[cur][s.mv[t - 1]];
+        if (nx < 0) {
+            s.score = 1e100L;
+            return;
+        }
+        cur = nx;
+        s.pos[t] = (short)cur;
+        if (first[cur] < 0) first[cur] = t;
+        else {
+            long long gap = t - last[cur];
+            accum[cur] += (long double)gap * (gap - 1) * 0.5L;
+        }
+        last[cur] = t;
+    }
+
+    if (cur != 0) {
+        s.score = 1e100L;
+        return;
+    }
+
+    long double total = 0;
+    for (int x = 0; x < M; ++x) {
+        if (first[x] < 0) {
+            s.score = 1e100L;
+            return;
+        }
+        long long gap = L - last[x] + first[x];
+        accum[x] += (long double)gap * (gap - 1) * 0.5L;
+        s.term[x] = accum[x];
+        total += accum[x] * dirt[x];
+    }
+    s.score = total / L;
+}
+
+bool used_dfs[1600];
+
+void dfs_initial(int x, vector<unsigned char>& mv) {
+    used_dfs[x] = true;
+    for (int d = 0; d < 4; ++d) {
+        int y = adjv[x][d];
+        if (y >= 0 && !used_dfs[y]) {
+            mv.push_back((unsigned char)d);
+            dfs_initial(y, mv);
+            mv.push_back((unsigned char)((d + 2) & 3));
+        }
+    }
+}
+
+int select_target(const State& s, bool broad) {
+    static pair<long double, int> a[1600];
+    for (int x = 0; x < M; ++x) a[x] = {s.term[x] * dirt[x], x};
+
+    int k = broad ? max(10, M / 10) : N;
+    k = min(k, M);
+    nth_element(a, a + k, a + M,
+                [](const auto& p, const auto& q) { return p.first > q.first; });
+    return a[rnd(0, k - 1)].second;
+}
+
+void insert_wiggle(vector<unsigned char>& mv, int at, int x) {
+    int dirs[4], cnt = 0;
+    for (int d = 0; d < 4; ++d) if (adjv[x][d] >= 0) dirs[cnt++] = d;
+    int d = dirs[rnd(0, cnt - 1)];
+    mv.insert(mv.begin() + at, {(unsigned char)d, (unsigned char)((d + 2) & 3)});
+}
+
+int main(int argc, char** argv) {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    double TL = 1.95;
+    if (argc > 1) TL = stod(argv[1]);
+    auto start = chrono::high_resolution_clock::now();
+
+    cin >> N;
+    for (int i = 0; i < N - 1; ++i) cin >> H[i];
+    for (int i = 0; i < N; ++i) cin >> V[i];
+    for (int r = 0; r < N; ++r)
+        for (int c = 0; c < N; ++c)
+            cin >> dirt[r * N + c];
+
+    build_graph();
+    apsp();
+
+    State cur;
+    memset(used_dfs, 0, sizeof(used_dfs));
+    cur.mv.reserve(MAXL);
+    dfs_initial(0, cur.mv);
+    evaluate(cur);
+
+    State best = cur;
+    State cand;
+    cand.mv.reserve(MAXL);
+    cand.pos.reserve(MAXL + 1);
+
+    const double start_temp = 5000.0 * sqrt((double)N);
+    const double end_temp = 0.1;
+    int iter = 0;
+
+    while (true) {
+        if ((++iter & 63) == 0) {
+            double elapsed = chrono::duration<double>(
+                chrono::high_resolution_clock::now() - start).count();
+            if (elapsed >= TL) break;
+        }
+
+        int L = (int)cur.mv.size();
+        int op = rnd(0, 99);
+        bool ok = false;
+
+        cand = cur;
+
+        if (op < 15) {
+            if (L + 2 <= MAXL) {
+                int at = rnd(0, L);
+                insert_wiggle(cand.mv, at, cur.pos[at]);
+                ok = true;
+            }
+        } else if (op < 30) {
+            if (L >= 2) {
+                int count = 0;
+                for (int i = 0; i + 2 <= L; ++i)
+                    if (cur.pos[i] == cur.pos[i + 2]) ++count;
+                if (count) {
+                    int choose = rnd(0, count - 1);
+                    for (int i = 0; i + 2 <= L; ++i) {
+                        if (cur.pos[i] == cur.pos[i + 2] && choose-- == 0) {
+                            cand.mv.erase(cand.mv.begin() + i, cand.mv.begin() + i + 2);
+                            ok = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (op < 58) {
+            if (L >= 2) {
+                int a = rnd(0, L - 1);
+                int b = rnd(a + 1, L);
+                int len = dista[cur.pos[a]][cur.pos[b]];
+                if (len < b - a) {
+                    vector<unsigned char> rep;
+                    rep.reserve(len);
+                    append_shortest(cur.pos[a], cur.pos[b], rep);
+                    cand.mv.erase(cand.mv.begin() + a, cand.mv.begin() + b);
+                    cand.mv.insert(cand.mv.begin() + a, rep.begin(), rep.end());
+                    ok = true;
+                }
+            }
+        } else if (op < 68) {
+            if (L) {
+                int a = rnd(0, L - 1);
+                int b = rnd(a, L - 1);
+                reverse(cand.mv.begin() + a, cand.mv.begin() + b + 1);
+                for (int i = a; i <= b; ++i) cand.mv[i] = (cand.mv[i] + 2) & 3;
+                ok = true;
+            }
+        } else if (op < 85) {
+            int target = select_target(cur, true);
+            int best_at = -1, extra = INF;
+            for (int i = 0; i <= L; ++i) {
+                int x = cur.pos[i];
+                int add = (x == target ? 2 : 2 * dista[x][target]);
+                if (add < extra) {
+                    extra = add;
+                    best_at = i;
+                    if (extra == 2) break;
+                }
+            }
+            if (best_at >= 0 && L + extra <= MAXL) {
+                int x = cur.pos[best_at];
+                if (x == target) {
+                    insert_wiggle(cand.mv, best_at, x);
+                } else {
+                    vector<unsigned char> detour;
+                    detour.reserve(extra);
+                    append_shortest(x, target, detour);
+                    append_shortest(target, x, detour);
+                    cand.mv.insert(cand.mv.begin() + best_at, detour.begin(), detour.end());
+                }
+                ok = true;
+            }
+        } else {
+            if (L) {
+                int target = select_target(cur, false);
+                int a = rnd(0, L - 1);
+                int b = rnd(a + 1, min(L, a + 20));
+                vector<unsigned char> rep;
+                append_shortest(cur.pos[a], target, rep);
+                append_shortest(target, cur.pos[b], rep);
+                if ((int)rep.size() + L - (b - a) <= MAXL) {
+                    cand.mv.erase(cand.mv.begin() + a, cand.mv.begin() + b);
+                    cand.mv.insert(cand.mv.begin() + a, rep.begin(), rep.end());
+                    ok = true;
+                }
+            }
+        }
+
+        if (!ok) continue;
+
+        evaluate(cand);
+        if (cand.score >= 1e90L) continue;
+
+        bool accept = cand.score < cur.score;
+        if (!accept) {
+            double elapsed = chrono::duration<double>(
+                chrono::high_resolution_clock::now() - start).count();
+            double p = min(1.0, max(0.0, elapsed / TL));
+            double temp = start_temp * pow(end_temp / start_temp, p);
+            long double delta = cur.score - cand.score;
+            if (delta / temp > -30.0L && exp((double)(delta / temp)) > rnd01())
+                accept = true;
+        }
+
+        if (accept) {
+            cur = std::move(cand);
+            if (cur.score < best.score) best = cur;
+        }
+    }
+
+    for (unsigned char d : best.mv) cout << CH[d];
+    cout << '\n';
+    return 0;
+}
+# EVOLVE-BLOCK-END
+```

@@ -1,0 +1,146 @@
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+    Approach: greedy seed + local search (moves and swaps) refinement.
+    """
+
+    def kvpr(load, free):
+        if free <= 0:
+            return float('inf')
+        return load / free
+
+    # --- Greedy seed ---
+    sorted_models = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
+
+    placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+    free_mem = [GPU_MEM_SIZE] * gpu_num
+    load = [0.0] * gpu_num  # sum of req_rate/slo
+
+    for model in sorted_models:
+        rps = model.req_rate / model.slo
+        best_idx, best_val = None, float('inf')
+        for g in range(gpu_num):
+            rem = free_mem[g] - model.model_size
+            if rem > 0:
+                v = (load[g] + rps) / rem
+                if v < best_val:
+                    best_val, best_idx = v, g
+        if best_idx is None:
+            # fallback: try to place anywhere with slack (allow == 0? no, need free>0)
+            raise ValueError("Unable to place model")
+        placement[best_idx].append(model)
+        load[best_idx] += rps
+        free_mem[best_idx] -= model.model_size
+
+    # --- Local search refinement ---
+    def max_gpu():
+        return max(range(gpu_num), key=lambda g: kvpr(load[g], free_mem[g]))
+
+    improved = True
+    iterations = 0
+    while improved and iterations < 200:
+        improved = False
+        iterations += 1
+        src = max_gpu()
+        src_kvpr = kvpr(load[src], free_mem[src])
+        # try moving each model on src elsewhere
+        best_gain = 0.0
+        best_action = None
+        for i, m in enumerate(placement[src]):
+            rps = m.req_rate / m.slo
+            for dst in range(gpu_num):
+                if dst == src:
+                    continue
+                if free_mem[dst] - m.model_size <= 0:
+                    continue
+                new_src = kvpr(load[src] - rps, free_mem[src] + m.model_size)
+                new_dst = kvpr(load[dst] + rps, free_mem[dst] - m.model_size)
+                # objective: reduce overall max KVPR
+                cur_max = max([kvpr(load[g], free_mem[g]) for g in range(gpu_num)] + [0])
+                cand_load = load[:]
+                cand_free = free_mem[:]
+                cand_load[src] -= rps; cand_free[src] += m.model_size
+                cand_load[dst] += rps; cand_free[dst] -= m.model_size
+                new_max = max(kvpr(cand_load[g], cand_free[g]) for g in range(gpu_num))
+                gain = cur_max - new_max
+                if gain > best_gain + 1e-12:
+                    best_gain = gain
+                    best_action = ('move', i, dst)
+        if best_action is None:
+            # try swaps between src and other GPUs
+            for j, m2 in enumerate(placement[src]):
+                for dst in range(gpu_num):
+                    if dst == src:
+                        continue
+                    for k, m1 in enumerate(placement[dst]):
+                        rps1 = m1.req_rate / m1.slo
+                        rps2 = m2.req_rate / m2.slo
+                        # swap m2 (src) with m1 (dst)
+                        if free_mem[dst] + m2.model_size - m1.model_size <= 0:
+                            continue
+                        if free_mem[src] + m1.model_size - m2.model_size <= 0:
+                            continue
+                        cand_load = load[:]
+                        cand_free = free_mem[:]
+                        cand_load[src] += rps1 - rps2
+                        cand_load[dst] += rps2 - rps1
+                        cand_free[src] += m1.model_size - m2.model_size
+                        cand_free[dst] += m2.model_size - m1.model_size
+                        cur_max = max(kvpr(load[g], free_mem[g]) for g in range(gpu_num))
+                        new_max = max(kvpr(cand_load[g], cand_free[g]) for g in range(gpu_num))
+                        gain = cur_max - new_max
+                        if gain > best_gain + 1e-12:
+                            best_gain = gain
+                            best_action = ('swap', j, dst, k)
+        if best_action is not None:
+            if best_action[0] == 'move':
+                _, i, dst = best_action
+                m = placement[src].pop(i)
+                rps = m.req_rate / m.slo
+                placement[dst].append(m)
+                load[src] -= rps; free_mem[src] += m.model_size
+                load[dst] += rps; free_mem[dst] -= m.model_size
+            else:
+                _, j, dst, k = best_action
+                m2 = placement[src][j]
+                m1 = placement[dst][k]
+                placement[src][j], placement[dst][k] = m1, m2
+                rps1 = m1.req_rate / m1.slo
+                rps2 = m2.req_rate / m2.slo
+                load[src] += rps1 - rps2
+                load[dst] += rps2 - rps1
+                free_mem[src] += m1.model_size - m2.model_size
+                free_mem[dst] += m2.model_size - m1.model_size
+            improved = True
+
+    return placement
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

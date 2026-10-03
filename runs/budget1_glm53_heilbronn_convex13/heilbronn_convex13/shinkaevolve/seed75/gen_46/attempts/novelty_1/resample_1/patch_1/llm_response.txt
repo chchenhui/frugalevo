@@ -1,0 +1,127 @@
+<NAME>
+anneal_bottleneck_push
+
+</NAME>
+<DESCRIPTION>
+Rewrite of the hybrid optimizer with three main improvements. (1) Proposal distribution: most moves are "bottleneck-directed" — pick a vertex of the currently smallest triangle and push it along the perpendicular away from the opposite edge (with random sign/step), which directly raises the bottleneck area, plus occasional random Gaussian moves for exploration. (2) Proper simulated annealing with adaptive step size and reheat cycles, plus a final deterministic greedy polish that sweeps small step sizes along ±x/±y and the directed perpendicular for bottleneck vertices until no improvement. (3) Robust multi-start over diverse seeds with fixed RNG seeds and a global try/except fallback to the regular 13-gon (per the recommendation: no crash-prone dead lines, gradient-free so no rescale chain-rule issues). Score is affine-invariant, so no rescaling is needed during moves. Time budget ~8s with all evaluation vectorized over the 286 triangles.
+
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import time
+import numpy as np
+from itertools import combinations
+
+_N = 13
+_TRI = np.array(list(combinations(range(_N), 3)))
+_T0 = _TRI[:, 0]
+_T1 = _TRI[:, 1]
+_T2 = _TRI[:, 2]
+
+
+def _hull_area(pts):
+    """Monotone chain convex hull area (0 if degenerate)."""
+    P = sorted(map(tuple, np.round(pts, 12)))
+    P = list(dict.fromkeys(P))
+    if len(P) < 3:
+        return 0.0
+
+    def cross(o, a, b):
+        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+
+    lo, up = [], []
+    for p in P:
+        while len(lo) >= 2 and cross(lo[-2], lo[-1], p) <= 0:
+            lo.pop()
+        lo.append(p)
+    for p in reversed(P):
+        while len(up) >= 2 and cross(up[-2], up[-1], p) <= 0:
+            up.pop()
+        up.append(p)
+    hull = lo[:-1] + up[:-1]
+    if len(hull) < 3:
+        return 0.0
+    H = np.array(hull)
+    x, y = H[:, 0], H[:, 1]
+    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def _min_area_idx(pts):
+    """(min triangle area, argmin row) over all 286 triangles."""
+    A = pts[_T0]
+    u = pts[_T1] - A
+    v = pts[_T2] - A
+    c = np.abs(u[:, 0]*v[:, 1] - u[:, 1]*v[:, 0])
+    k = int(np.argmin(c))
+    return 0.5 * c[k], k
+
+
+def _score(pts):
+    ha = _hull_area(pts)
+    if ha <= 1e-12:
+        return 0.0
+    m, _ = _min_area_idx(pts)
+    return m / ha
+
+
+def _candidate(x, rng, sigma, cur_min_row):
+    """Generate a move proposal. Mostly bottleneck-directed pushes."""
+    cand = x.copy()
+    u = rng.random()
+    if u < 0.15:
+        # random vertex, random gaussian step
+        i = int(rng.integers(_N))
+        cand[i] = cand[i] + rng.normal(0.0, sigma, 2)
+        return cand
+    # bottleneck-directed: push a vertex of the smallest triangle
+    # away from the opposite edge (perpendicular direction).
+    tri = _TRI[cur_min_row]
+    i = int(rng.choice(tri))
+    j, k = [t for t in tri if t != i]
+    d = x[k] - x[j]
+    nd = np.linalg.norm(d)
+    if nd < 1e-9:
+        cand[i] = cand[i] + rng.normal(0.0, sigma, 2)
+        return cand
+    perp = np.array([-d[1], d[0]]) / nd
+    v = x[i] - x[j]
+    if np.dot(perp, v) < 0:
+        perp = -perp
+    step = abs(rng.normal(0.0, sigma))
+    cand[i] = x[i] + perp * step + rng.normal(0.0, 0.25 * sigma, 2)
+    return cand
+
+
+def _anneal(x, rng, deadline, T0=1e-3, sig0=0.04):
+    """Simulated annealing with bottleneck-directed proposals."""
+    x = np.asarray(x, dtype=float).copy()
+    m, row = _min_area_idx(x)
+    ha = _hull_area(x)
+    sc = m / ha if ha > 1e-12 else 0.0
+    best, best_sc = x.copy(), sc
+    T = T0
+    sigma = sig0
+    stall = 0
+    while time.time() < deadline:
+        for _ in range(200):
+            cand = _candidate(x, rng, sigma, row)
+            cha = _hull_area(cand)
+            if cha <= 1e-12:
+                continue
+            cm, crow = _min_area_idx(cand)
+            csc = cm / cha
+            d = csc - sc
+            if d > 0 or rng.random() < np.exp(d / max(T, 1e-12)):
+                x, sc, row = cand, csc, crow
+                if sc > best_sc + 1e-15:
+                    best, best_sc = cand.copy(), sc
+                    stall = 0
+        stall += 1
+        T = max(T * 0.90, 1e-7)
+        if stall > 3:
+            sigma = max(sigma * 0.7, 1e-4)
+            stall = 0
+        else:
+            sigma = min(sigma * 1.1, 0.05)
+        if sigma <= 1.1

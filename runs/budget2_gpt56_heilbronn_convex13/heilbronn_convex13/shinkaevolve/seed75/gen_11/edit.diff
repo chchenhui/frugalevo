@@ -1,0 +1,158 @@
+--- a/original.py
++++ b/original.py
+@@ -1,147 +1,149 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_convex13() -> np.ndarray:
+     """
+     Deterministically construct thirteen points in the unit square.
+ 
+     The square has area one, so the normalized area of a triangle is simply
+     half of its absolute determinant.  Four points are fixed at the square
+     corners and the nine remaining points are optimized using a deterministic
+     annealed maximin search over all 286 triples.
+ 
+     Returns:
+         np.ndarray: Array of shape (13, 2).
+     """
+     n = 13
+     rng = np.random.default_rng(13031957)
+ 
+     # Keeping the corners fixes a convex hull of exactly unit area.  It also
+     # avoids any numerical ambiguity in hull-area normalization downstream.
+     corners = np.array(
+         [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+         dtype=float,
+     )
+ 
+     triples = np.array(
+         [(i, j, k) for i in range(n) for j in range(i + 1, n)
+          for k in range(j + 1, n)],
+         dtype=np.int16,
+     )
+ 
+     def determinants(p: np.ndarray) -> np.ndarray:
+         a = p[triples[:, 0]]
+         b = p[triples[:, 1]]
+         c = p[triples[:, 2]]
+         return np.abs(
+             (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+             - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+         )
+ 
+     def soft_min(values: np.ndarray, width: float) -> float:
+         """Stable soft minimum of the triangle double-areas."""
+         m = float(values.min())
+         return m - width * np.log(np.exp(-(values - m) / width).sum())
+ 
+     best_points = None
+     best_minimum = -np.inf
+ 
+     # A perturbed 3-by-3 interior lattice is much better conditioned than a
+     # fully random initial arrangement, while restart perturbations prevent
+     # persistent lattice collinearities.
+     base_grid = np.array(
+         [[x, y] for y in (0.22, 0.50, 0.78) for x in (0.22, 0.50, 0.78)],
+         dtype=float,
+     )
+ 
+     for restart in range(4):
+         points = np.empty((n, 2), dtype=float)
+         points[:4] = corners
+         points[4:] = np.clip(
+             base_grid + rng.uniform(-0.115, 0.115, size=(9, 2)),
+             0.055,
+             0.945,
+         )
+ 
+         values = determinants(points)
+         current_score = soft_min(values, 0.024)
+ 
+         # Coordinate annealing: the soft-min initially balances many small
+         # triangles, then gradually approaches the true minimum objective.
+         iterations = 18000
+         for it in range(iterations):
+             progress = it / (iterations - 1)
+             width = 0.024 * (1.0 - progress) + 0.0028 * progress
+             step = 0.105 * (1.0 - progress) + 0.0025
+ 
++            # The soft-min changes with width, so evaluate both incumbent and
++            # proposal under the same current continuation objective.
++            current_score = soft_min(values, width)
++
+             # Bias proposals toward vertices participating in poor triangles.
+             if rng.random() < 0.72:
+                 poor = np.argpartition(values, 10)[:10]
+                 tri = triples[poor[rng.integers(len(poor))]]
+-                index = int(tri[rng.integers(3)])
+-                if index < 4:
+-                    index = int(rng.integers(4, n))
++                movable = tri[tri >= 4]
++                index = int(movable[rng.integers(len(movable))])
+             else:
+                 index = int(rng.integers(4, n))
+ 
+             old = points[index].copy()
+             candidate = old + rng.normal(0.0, step, size=2)
+             candidate = np.clip(candidate, 0.045, 0.955)
+             points[index] = candidate
+ 
+             candidate_values = determinants(points)
+             candidate_score = soft_min(candidate_values, width)
+ 
+             # Temperature is expressed in determinant units.
+             temperature = 0.0075 * (1.0 - progress) ** 2 + 0.00004
+             delta = candidate_score - current_score
+             if delta >= 0.0 or rng.random() < np.exp(delta / temperature):
+                 values = candidate_values
+                 current_score = candidate_score
+             else:
+                 points[index] = old
+ 
+         # Strict maximin polishing, using vertices of currently limiting
+         # triangles and increasingly small deterministic random moves.
+         for scale, count in ((0.014, 2600), (0.005, 2200), (0.0018, 1800)):
+             for _ in range(count):
+                 limiting = np.argpartition(values, 6)[:6]
+                 tri = triples[limiting[rng.integers(6)]]
+-                index = int(tri[rng.integers(3)])
+-                if index < 4:
+-                    index = int(rng.integers(4, n))
++                movable = tri[tri >= 4]
++                index = int(movable[rng.integers(len(movable))])
+ 
+                 old = points[index].copy()
+                 points[index] = np.clip(
+                     old + rng.normal(0.0, scale, size=2), 0.04, 0.96
+                 )
+                 candidate_values = determinants(points)
+ 
+                 # Preserve the true bottleneck first, then improve the lower
+                 # tail to avoid exchanging one nearly-degenerate triangle for
+                 # another.
+                 old_key = (float(values.min()), float(np.partition(values, 8)[:9].sum()))
+                 new_key = (
+                     float(candidate_values.min()),
+                     float(np.partition(candidate_values, 8)[:9].sum()),
+                 )
+                 if new_key >= old_key:
+                     values = candidate_values
+                 else:
+                     points[index] = old
+ 
+         minimum = float(values.min())
+         if minimum > best_minimum:
+             best_minimum = minimum
+             best_points = points.copy()
+ 
+     # Defensive fallback is unreachable in normal operation, but ensures a
+     # valid deterministic result if an unexpected numerical failure occurs.
+     if best_points is None or not np.isfinite(best_points).all():
+         best_points = np.vstack((corners, base_grid))
+ 
+     return best_points
+ 
+ 
+ # EVOLVE-BLOCK-END

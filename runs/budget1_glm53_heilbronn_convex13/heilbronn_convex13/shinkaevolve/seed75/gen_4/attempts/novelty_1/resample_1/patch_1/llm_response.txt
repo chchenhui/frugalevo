@@ -1,0 +1,152 @@
+<NAME>
+heilbronn_pipeline_refiner
+</DESCRIPTION>
+Replaces the naive random point generator with a staged optimization pipeline: (1) a CandidateFactory generates diverse deterministic seeds (3-fold symmetric rings, triangular lattice, perturbed lattices), (2) an Evaluator computes the normalized minimum triangle area via fully vectorized cross products, and (3) a greedy coordinate-descent Refiner improves each candidate with shrinking perturbation scales under a fixed RNG seed. The best refined configuration is returned. This architecture separates concerns (generation / evaluation / refinement), improves the primary metric from ~0.00 to a meaningful optimized value, and stays deterministic and fast.
+</CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+class Evaluator:
+    """Computes the normalized minimum triangle area of a point configuration."""
+
+    def __init__(self, n: int = 13):
+        self.n = n
+        i, j, k = np.array(np.meshgrid(np.arange(n), np.arange(n), np.arange(n))).reshape(3, -1)
+        mask = (i < j) & (j < k)
+        self.idx = np.stack([i[mask], j[mask], k[mask]])  # (3, C(n,3))
+
+    def convex_hull_area(self, pts: np.ndarray) -> float:
+        # Shoelace on convex hull (Andrew monotone chain)
+        P = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+        def cross(o, a, b):
+            return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+        lower, upper = [], []
+        for p in P:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+        for p in P[::-1]:
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+        hull = np.array(lower[:-1] + upper[:-1])
+        x, y = hull[:, 0], hull[:, 1]
+        return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+    def score(self, pts: np.ndarray) -> float:
+        T = pts[self.idx]                          # (3, m, 2)
+        a = np.cross(T[1] - T[0], T[2] - T[0])     # signed doubled areas
+        min_tri = 0.5 * np.min(np.abs(a))
+        hull = self.convex_hull_area(pts)
+        if hull <= 0:
+            return 0.0
+        return min_tri / hull
+
+
+class CandidateFactory:
+    """Deterministic generation of diverse initial configurations."""
+
+    def __init__(self, n: int = 13, seed: int = 42):
+        self.n = n
+        self.rng = np.random.default_rng(seed)
+
+    def ring_config(self, rings):
+        pts = [np.array([[0.5, 0.5]])]
+        for count, radius in rings:
+            ang = 2 * np.pi * (np.arange(count) + 0.0) / count
+            pts.append(np.stack([0.5 + radius*np.cos(ang), 0.5 + radius*np.sin(ang)], axis=1))
+        return np.concatenate(pts)[:self.n]
+
+    def lattice_config(self, rows, jitter=0.0):
+        pts = []
+        for r in range(rows):
+            for c in range(rows - r):
+                pts.append((c + 0.5*r, r * np.sqrt(3)/2))
+        pts = np.array(pts)[:self.n]
+        if len(pts) < self.n:
+            pad = pts[-1] + np.arange(self.n - len(pts)) * 0.05
+            pts = np.concatenate([pts, np.stack([pad, pad], axis=1)])
+        if jitter > 0:
+            pts = pts + self.rng.normal(0, jitter, pts.shape)
+        return pts
+
+    def generate(self):
+        cands = [
+            self.ring_config([(3, 0.12), (3, 0.24), (3, 0.36), (3, 0.47)]),
+            self.ring_config([(4, 0.15), (4, 0.30), (4, 0.45)]),
+            self.ring_config([(6, 0.22), (6, 0.45)]),
+            self.lattice_config(5),
+            self.lattice_config(5, jitter=0.02),
+            self.lattice_config(4, jitter=0.03),
+        ]
+        # Pad/trim all to exactly n points, keep inside unit square
+        out = []
+        for p in cands:
+            p = p[:self.n]
+            if len(p) < self.n:
+                extra = self.rng.random((self.n - len(p), 2)) * 0.4 + 0.3
+                p = np.concatenate([p, extra])
+            out.append(np.clip(p, 0.01, 0.99))
+        return out
+
+
+class Refiner:
+    """Greedy coordinate-descent refinement with shrinking step sizes."""
+
+    def __init__(self, evaluator: Evaluator, seed: int = 42):
+        self.ev = evaluator
+        self.rng = np.random.default_rng(seed)
+
+    def refine(self, pts: np.ndarray, scales=(0.05, 0.02, 0.008, 0.003)) -> np.ndarray:
+        best = pts.copy()
+        best_s = self.ev.score(best)
+        for s in scales:
+            improved = True
+            rounds = 0
+            while improved and rounds < 30:
+                improved = False
+                rounds += 1
+                cand = best + self.rng.normal(0, s, best.shape)
+                np.clip(cand, 0.01, 0.99, out=cand)
+                sc = self.ev.score(cand)
+                if sc > best_s + 1e-12:
+                    best, best_s = cand, sc
+                    improved = True
+        return best
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct an arrangement of 13 points on or inside a convex region in order
+    to maximize the area of the smallest triangle formed by these points.
+
+    Returns:
+        points: np.ndarray of shape (13,2) with the x,y coordinates of the points.
+    """
+    n = 13
+    ev = Evaluator(n)
+    factory = CandidateFactory(n, seed=42)
+    refiner = Refiner(ev, seed=42)
+
+    best_pts, best_score = None, -1.0
+    for cand in factory.generate():
+        try:
+            refined = refiner.refine(cand)
+            s = ev.score(refined)
+            if s > best_score:
+                best_score, best_pts = s, refined
+        except Exception:
+            continue
+
+    if best_pts is None or not np.all(np.isfinite(best_pts)):
+        rng = np.random.default_rng(seed=42)
+        best_pts = rng.random((n, 2))
+
+    return best_pts
+
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

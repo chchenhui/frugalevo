@@ -1,0 +1,179 @@
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models
+
+    Returns:
+        A placement of models to GPUs
+    """
+    import random
+    rng = random.Random(12345)
+
+    class GPUState:
+        __slots__ = ("models", "remaining_mem", "load")
+        def __init__(self):
+            self.models = []
+            self.remaining_mem = GPU_MEM_SIZE
+            self.load = 0.0
+
+        def kvpr(self):
+            if self.remaining_mem <= 0:
+                return float('inf')
+            return self.load / self.remaining_mem
+
+    def clone_gpus(gpus):
+        new = []
+        for g in gpus:
+            ng = GPUState()
+            ng.models = list(g.models)
+            ng.remaining_mem = g.remaining_mem
+            ng.load = g.load
+            new.append(ng)
+        return new
+
+    def build_placement(sorted_models, use_post_kvpr):
+        gpus = [GPUState() for _ in range(gpu_num)]
+        for model in sorted_models:
+            req_per_slo = model.req_rate / model.slo
+            best_idx, best_val = None, None
+            for i, g in enumerate(gpus):
+                if model.model_size >= g.remaining_mem:
+                    continue
+                if use_post_kvpr:
+                    val = (g.load + req_per_slo) / (g.remaining_mem - model.model_size)
+                else:
+                    val = g.kvpr()
+                if best_val is None or val < best_val:
+                    best_val, best_idx = val, i
+            if best_idx is None:
+                return None
+            gpus[best_idx].models.append(model)
+            gpus[best_idx].remaining_mem -= model.model_size
+            gpus[best_idx].load += model.req_rate / model.slo
+        return gpus
+
+    def max_kvpr(gpus):
+        return max(g.kvpr() for g in gpus)
+
+    def refine(gpus, rounds=200):
+        for _ in range(rounds):
+            kvs = [g.kvpr() for g in gpus]
+            hot = max(range(len(gpus)), key=lambda i: kvs[i])
+            improved = False
+            for idx in range(len(gpus[hot].models) - 1, -1, -1):
+                model = gpus[hot].models[idx]
+                rps = model.req_rate / model.slo
+                for j, g in enumerate(gpus):
+                    if j == hot:
+                        continue
+                    if model.model_size >= g.remaining_mem:
+                        continue
+                    new_hot = (gpus[hot].load - rps) / (gpus[hot].remaining_mem + model.model_size)
+                    new_other = (g.load + rps) / (g.remaining_mem - model.model_size)
+                    if max(new_hot, new_other) < kvs[hot] - 1e-12:
+                        gpus[hot].models.pop(idx)
+                        gpus[hot].remaining_mem += model.model_size
+                        gpus[hot].load -= rps
+                        g.models.append(model)
+                        g.remaining_mem -= model.model_size
+                        g.load += rps
+                        improved = True
+                        break
+                if improved:
+                    break
+            if not improved:
+                break
+        return gpus
+
+    # multiple greedy candidate constructions
+    key_rs = lambda m: m.req_rate / m.slo
+    key_size = lambda m: m.model_size
+    key_density = lambda m: key_rs(m) / m.model_size
+
+    candidates_specs = [
+        (sorted(models, key=key_rs, reverse=True), True),
+        (sorted(models, key=key_rs, reverse=True), False),
+        (sorted(models, key=key_size, reverse=True), True),
+        (sorted(models, key=key_density, reverse=True), True),
+        (sorted(models, key=key_size, reverse=False), True),
+    ]
+
+    best_gpus = None
+    best_score = float('inf')
+    for sorted_models, use_post in candidates_specs:
+        gpus = build_placement(sorted_models, use_post)
+        if gpus is None:
+            continue
+        gpus = refine(gpus)
+        score = max_kvpr(gpus)
+        if score < best_score:
+            best_score = score
+            best_gpus = gpus
+
+    if best_gpus is None:
+        raise ValueError("Unable to place all models within GPU memory.")
+
+    # Iterated local search: perturb best, repair with refine, keep if better
+    all_model_gpus = [(g, i) for i, g in enumerate(best_gpus) for _ in g.models]
+    for _ in range(200):
+        cand = clone_gpus(best_gpus)
+        # pick a random GPU that has models, move one random model to a random other GPU
+        srcs = [i for i in range(gpu_num) if cand[i].models]
+        if not srcs:
+            break
+        src = rng.choice(srcs)
+        m_idx = rng.randrange(len(cand[src].models))
+        model = cand[src].models.pop(m_idx)
+        cand[src].remaining_mem += model.model_size
+        cand[src].load -= model.req_rate / model.slo
+        dsts = [i for i in range(gpu_num) if i != src and model.model_size < cand[i].remaining_mem]
+        if not dsts:
+            # restore
+            cand[src].models.insert(m_idx, model)
+            cand[src].remaining_mem -= model.model_size
+            cand[src].load += model.req_rate / model.slo
+            continue
+        dst = rng.choice(dsts)
+        cand[dst].models.append(model)
+        cand[dst].remaining_mem -= model.model_size
+        cand[dst].load += model.req_rate / model.slo
+        cand = refine(cand)
+        score = max_kvpr(cand)
+        if score < best_score - 1e-12:
+            best_score = score
+            best_gpus = cand
+
+    return {gpu_id: best_gpus[gpu_id].models for gpu_id in range(gpu_num)}
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

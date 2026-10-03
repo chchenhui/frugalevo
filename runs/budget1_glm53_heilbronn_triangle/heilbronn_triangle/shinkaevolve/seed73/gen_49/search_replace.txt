@@ -1,0 +1,235 @@
+<NAME>
+multi_start_seeded_restarts</NAME>
+<DESCRIPTION>
+The current program runs a single stochastic trajectory from one heuristic seed. Prior generations showed the gains came from exploring multiple distinct starting layouts (lattice, rings, jittered hex, random) and keeping the global best. I wrap the existing soft + hard + polish pipeline in a multi-start loop over several structurally distinct seeds (with fixed RNG seeds for determinism), and track the global best across restarts. This substantially raises the chance of landing in the basin containing the optimum while reusing all existing machinery. I also reduce per-start iteration counts slightly to keep runtime comparable.</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    rng = np.random.default_rng(12345)
+    best = _clip_to_triangle(pts)
+    best_val = _min_area(best)
+
+    cur = best.copy()
+    cur_val = best_val
+
+    # ---- Phase 1: soft-min coarse exploration (smoothed landscape) ----
+    soft_cur = _softmin(cur)
+    for it in range(15000):
+        step = 0.05 * (1.0 - it / 15000) + 1e-3
+        trial = cur.copy()
+        if rng.random() < 0.20:
+            # Coordinated group move: perturb the vertices of the current
+            # smallest-area triangle simultaneously. The soft-min objective
+            # tolerates temporary hard-min worsenings, so these correlated
+            # moves can escape pinning configurations single-point moves
+            # cannot.
+            a_all = _all_areas(cur)
+            t = int(np.argmin(a_all))
+            i0, i1, i2 = _TRIPLETS[t]
+            verts = cur[[i0, i1, i2]]
+            cen = verts.mean(axis=0)
+            # shared translation (keeps most other triangle areas ~invariant)
+            shared = rng.normal(0.0, 0.6 * step, size=2)
+            for vi, v in zip((i0, i1, i2), verts):
+                d = v - cen
+                nd = np.hypot(d[0], d[1])
+                if nd > 1e-12:
+                    d = d / nd
+                else:
+                    d = np.array([0.0, 1.0])
+                # outward expansion along centroid direction + noise
+                delta = shared + d * step * (0.5 + rng.random()) \
+                        + rng.normal(0.0, 0.35 * step, size=2)
+                trial[vi] = trial[vi] + delta
+        else:
+            i = rng.integers(n)
+            trial[i] += rng.normal(0.0, step, size=2)
+        trial = _clip_to_triangle(trial)
+        s_new = _softmin(trial)
+        if s_new >= soft_cur or rng.random() < np.exp((s_new - soft_cur) * 40.0):
+            cur, soft_cur = trial, s_new
+            v = _min_area(cur)
+            if v > best_val:
+                best, best_val = cur.copy(), v
+
+    # Restart hard phase from the soft-phase result
+    cur, cur_val = best.copy(), best_val
+
+    # Deterministic local search with annealing-style shrinking steps.
+    # Bias point selection toward vertices of the currently-smallest
+    # triangles: these are the binding constraints of the objective.
+    step0 = 0.05
+    iters = 30000
+    for it in range(iters):
+        step = step0 * (1.0 - it / iters) + 1e-4
+        if rng.random() < 0.5:
+            a_all = _all_areas(cur)
+            order = np.argsort(a_all)[:8]
+            t = order[rng.integers(len(order))]
+            i = _TRIPLETS[t][rng.integers(3)]
+        else:
+            i = rng.integers(n)
+        delta = rng.normal(0.0, step, size=2)
+        trial = cur.copy()
+        trial[i] += delta
+        trial = _clip_to_triangle(trial)
+        val = _min_area(trial)
+        if val >= cur_val - 1e-12:
+            cur, cur_val = trial, val
+            if val > best_val + 1e-15:
+                best, best_val = trial.copy(), val
+
+    # Final fine polishing around the best configuration
+    cur, cur_val = best.copy(), best_val
+    for it in range(10000):
+        step = 0.002 * (1.0 - it / 10000) + 1e-5
+        i = rng.integers(n)
+        delta = rng.normal(0.0, step, size=2)
+        trial = cur.copy()
+        trial[i] += delta
+        trial = _clip_to_triangle(trial)
+        val = _min_area(trial)
+        if val >= cur_val - 1e-12:
+            cur, cur_val = trial, val
+            if val > best_val + 1e-15:
+                best, best_val = trial.copy(), val
+=======
+    rng = np.random.default_rng(12345)
+
+    # --- Multi-start: several structurally distinct seeds (deterministic) ---
+    def _lattice_seed():
+        q = []
+        rows = [4, 3, 2, 1, 1]
+        for r, cnt in enumerate(rows):
+            y = h * (r + 0.5) / len(rows)
+            xs = np.linspace(0.0, 1.0, cnt + 2)[1:-1]
+            halfw = 0.5 * (1.0 - y / h)
+            for x in xs:
+                q.append((0.5 + (x - 0.5) * (2 * halfw) * 0.98, y))
+        return np.array(q)
+
+    def _rings_seed():
+        out = [(0.0, 0.0), (1.0, 0.0), (0.5, h),
+               (0.5, 0.0), (0.25, h / 2.0), (0.75, h / 2.0)]
+        cx, cy = 0.5, h / 3.0
+        for s in (0.5, 0.25):
+            for (vx, vy) in [(0.0, 0.0), (1.0, 0.0), (0.5, h)]:
+                out.append((cx + s * (vx - cx), cy + s * (vy - cy)))
+        out.append((cx, cy))
+        return np.array(out[:11])
+
+    def _rand_start(seed):
+        r = np.random.default_rng(seed)
+        u, v = r.random(11), r.random(11)
+        su = np.sqrt(u)
+        w1, w2 = su * (1 - v), su * v
+        return np.stack([w1 + 0.5 * w2, h * w2], axis=1)
+
+    starts = [_clip_to_triangle(pts), _clip_to_triangle(_lattice_seed()),
+              _clip_to_triangle(_rings_seed()), _rand_start(777),
+              _rand_start(4242), _rand_start(2024)]
+
+    best = None
+    best_val = -1.0
+
+    for si, start in enumerate(starts):
+        rng = np.random.default_rng(12345 + si)  # per-start deterministic stream
+        cur = _clip_to_triangle(start.copy())
+        cur_val = _min_area(cur)
+        if cur_val > best_val:
+            best, best_val = cur.copy(), cur_val
+
+        # ---- Phase 1: soft-min coarse exploration (smoothed landscape) ----
+        soft_cur = _softmin(cur)
+        for it in range(4000):
+            step = 0.05 * (1.0 - it / 4000) + 1e-3
+            trial = cur.copy()
+            if rng.random() < 0.20:
+                # Coordinated group move: perturb the vertices of the current
+                # smallest-area triangle simultaneously.
+                a_all = _all_areas(cur)
+                t = int(np.argmin(a_all))
+                i0, i1, i2 = _TRIPLETS[t]
+                verts = cur[[i0, i1, i2]]
+                cen = verts.mean(axis=0)
+                shared = rng.normal(0.0, 0.6 * step, size=2)
+                for vi, v in zip((i0, i1, i2), verts):
+                    d = v - cen
+                    nd = np.hypot(d[0], d[1])
+                    if nd > 1e-12:
+                        d = d / nd
+                    else:
+                        d = np.array([0.0, 1.0])
+                    delta = shared + d * step * (0.5 + rng.random()) \
+                            + rng.normal(0.0, 0.35 * step, size=2)
+                    trial[vi] = trial[vi] + delta
+            else:
+                i = rng.integers(n)
+                trial[i] += rng.normal(0.0, step, size=2)
+            trial = _clip_to_triangle(trial)
+            s_new = _softmin(trial)
+            if s_new >= soft_cur or rng.random() < np.exp((s_new - soft_cur) * 40.0):
+                cur, soft_cur = trial, s_new
+                v = _min_area(cur)
+                if v > best_val:
+                    best, best_val = cur.copy(), v
+
+        # ---- Phase 2: hard-min annealed local search ----
+        cur, cur_val = best.copy(), best_val
+        step0 = 0.05
+        iters = 8000
+        for it in range(iters):
+            step = step0 * (1.0 - it / iters) + 1e-4
+            if rng.random() < 0.5:
+                a_all = _all_areas(cur)
+                order = np.argsort(a_all)[:8]
+                t = order[rng.integers(len(order))]
+                i = _TRIPLETS[t][rng.integers(3)]
+            else:
+                i = rng.integers(n)
+            delta = rng.normal(0.0, step, size=2)
+            trial = cur.copy()
+            trial[i] += delta
+            trial = _clip_to_triangle(trial)
+            val = _min_area(trial)
+            if val >= cur_val - 1e-12:
+                cur, cur_val = trial, val
+                if val > best_val + 1e-15:
+                    best, best_val = trial.copy(), val
+
+        # ---- Phase 3: fine polish ----
+        cur, cur_val = best.copy(), best_val
+        for it in range(3000):
+            step = 0.002 * (1.0 - it / 3000) + 1e-5
+            i = rng.integers(n)
+            delta = rng.normal(0.0, step, size=2)
+            trial = cur.copy()
+            trial[i] += delta
+            trial = _clip_to_triangle(trial)
+            val = _min_area(trial)
+            if val >= cur_val - 1e-12:
+                cur, cur_val = trial, val
+                if val > best_val + 1e-15:
+                    best, best_val = trial.copy(), val
+
+    # ---- Global final polish on the winner across all starts ----
+    rng = np.random.default_rng(999)
+    cur, cur_val = best.copy(), best_val
+    for it in range(6000):
+        step = 0.001 * (1.0 - it / 6000) + 1e-5
+        if rng.random() < 0.6:
+            a_all = _all_areas(cur)
+            order = np.argsort(a_all)[:5]
+            t = order[rng.integers(len(order))]
+            i = _TRIPLETS[t][rng.integers(3)]
+        else:
+            i = rng.integers(n)
+        trial = cur.copy()
+        trial[i] += rng.normal(0.0, step, size=2)
+        trial = _clip_to_triangle(trial)
+        val = _min_area(trial)
+        if val >= cur_val - 1e-12:
+            cur, cur_val = trial, val
+            if val > best_val + 1e-15:
+                best, best_val = trial.copy(), val
+>>>>>>> REPLACE
+</DIFF>

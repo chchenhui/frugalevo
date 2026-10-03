@@ -1,0 +1,87 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct a reproducible maximin arrangement for eleven points.
+
+    The internal coordinates (u, v) represent u*(1,0) + v*(.5,sqrt(3)/2).
+    Thus u >= 0, v >= 0, u + v <= 1, and a 2-by-2 determinant is
+    precisely the corresponding area normalized by the outer triangle area.
+    """
+    rng = np.random.default_rng(11031991)
+    triples = np.array(
+        [(i, j, k) for i in range(11) for j in range(i + 1, 11)
+         for k in range(j + 1, 11)],
+        dtype=np.intp,
+    )
+
+    def areas(p: np.ndarray) -> np.ndarray:
+        a = p[triples[:, 1]] - p[triples[:, 0]]
+        b = p[triples[:, 2]] - p[triples[:, 0]]
+        return np.abs(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0])
+
+    def merit(p: np.ndarray) -> tuple[float, float]:
+        values = areas(p)
+        # The tail term gives useful motion when several constraints tie for
+        # the current minimum, while the first component remains dominant.
+        tail = np.partition(values, 11)[:12]
+        return float(values.min()), float(values.min() + 0.075 * tail.mean())
+
+    # The outer vertices are useful extremal points; the other points are
+    # optimized in barycentric coordinates.
+    best = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]] +
+        [[1.0 / 3.0, 1.0 / 3.0]] * 8,
+        dtype=float,
+    )
+    best_min = -1.0
+
+    for restart in range(9):
+        bary = rng.dirichlet((1.15, 1.15, 1.15), size=8)
+        current = np.empty((11, 2), dtype=float)
+        current[:3] = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
+        current[3:, 0] = bary[:, 1]
+        current[3:, 1] = bary[:, 2]
+        current_min, current_merit = merit(current)
+
+        for iteration in range(18000):
+            fraction = iteration / 17999.0
+            # Large moves establish global structure; fine moves resolve the
+            # many nearly active determinant constraints near the end.
+            step = 0.105 * (1.0 - fraction) ** 1.65 + 0.0012
+            thermal = 0.006 * (1.0 - fraction) ** 2 + 0.000015
+            index = int(rng.integers(3, 11))
+
+            candidate = current.copy()
+            weights = np.array(
+                [1.0 - candidate[index, 0] - candidate[index, 1],
+                 candidate[index, 0], candidate[index, 1]]
+            )
+            weights += rng.normal(0.0, step, size=3)
+            # Projection through nonnegative barycentric weights guarantees
+            # every proposed point remains inside the closed triangle.
+            weights = np.maximum(weights, 1.0e-7)
+            weights /= weights.sum()
+            candidate[index] = weights[1:]
+
+            candidate_min, candidate_merit = merit(candidate)
+            delta = candidate_merit - current_merit
+            if delta >= 0.0 or rng.random() < np.exp(delta / thermal):
+                current = candidate
+                current_min, current_merit = candidate_min, candidate_merit
+
+            if current_min > best_min:
+                best_min = current_min
+                best = current.copy()
+
+    # Affine conversion from normalized barycentric coordinates to the
+    # requested Cartesian equilateral triangle.
+    points = np.empty((11, 2), dtype=float)
+    points[:, 0] = best[:, 0] + 0.5 * best[:, 1]
+    points[:, 1] = (np.sqrt(3.0) / 2.0) * best[:, 1]
+    return points
+
+
+# EVOLVE-BLOCK-END

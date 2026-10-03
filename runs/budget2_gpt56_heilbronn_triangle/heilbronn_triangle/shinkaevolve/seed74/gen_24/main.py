@@ -1,0 +1,229 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct a reproducible maximin arrangement of eleven points in the
+    equilateral triangle with vertices (0,0), (1,0), and (.5,sqrt(3)/2).
+
+    Internal coordinates are barycentric affine coordinates (u, v), where
+    u >= 0, v >= 0, u + v <= 1.  A determinant in these coordinates equals
+    the corresponding triangle area normalized by the outer triangle area.
+    """
+    rng = np.random.default_rng(11031991)
+    n = 11
+    triples = np.array(
+        [(i, j, k) for i in range(n) for j in range(i + 1, n)
+         for k in range(j + 1, n)],
+        dtype=np.intp,
+    )
+
+    def determinants(p: np.ndarray) -> np.ndarray:
+        a = p[triples[:, 1]] - p[triples[:, 0]]
+        b = p[triples[:, 2]] - p[triples[:, 0]]
+        return a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+
+    def merit(p: np.ndarray, phase: float = 1.0) -> tuple[float, float]:
+        values = np.abs(determinants(p))
+        minimum = float(values.min())
+
+        # Broad low-tail smoothing is valuable while selecting a promising
+        # order type, but near convergence it must not obscure the actual
+        # bottleneck determinant.  Interpolate both tail width and weight.
+        early_count, late_count = 32, 8
+        count = int(round(early_count + (late_count - early_count) * phase))
+        tail = np.partition(values, count - 1)[:count]
+        tail_weight = 0.040 * (1.0 - phase) + 0.012 * phase
+        return minimum, minimum + tail_weight * float(tail.mean())
+
+    def project_simplex(weights: np.ndarray) -> np.ndarray:
+        weights = np.maximum(weights, 1.0e-8)
+        weights /= weights.sum()
+        return weights[1:]
+
+    best = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]] +
+        [[1.0 / 3.0, 1.0 / 3.0]] * 8,
+        dtype=float,
+    )
+    best_min = -1.0
+
+    # Global search uses both random and deliberately staggered starts.
+    # One extra point near each side is a useful Heilbronn template, while
+    # avoiding a third point exactly on any side (which would give area zero).
+    templates = np.array([
+        [[0.47, 0.00], [0.00, 0.46], [0.53, 0.47],
+         [0.19, 0.18], [0.54, 0.15], [0.15, 0.55],
+         [0.38, 0.29], [0.28, 0.39]],
+        [[0.58, 0.00], [0.00, 0.58], [0.42, 0.58],
+         [0.16, 0.25], [0.61, 0.12], [0.12, 0.61],
+         [0.42, 0.22], [0.25, 0.42]],
+        [[0.38, 0.00], [0.00, 0.38], [0.62, 0.38],
+         [0.23, 0.13], [0.50, 0.22], [0.13, 0.50],
+         [0.34, 0.34], [0.27, 0.46]],
+    ], dtype=float)
+
+    # Global search: independently seeded restarts and decreasing-scale
+    # barycentric mutations efficiently explore different order types.
+    for restart in range(10):
+        current = np.empty((n, 2), dtype=float)
+        current[:3] = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
+
+        if restart < len(templates):
+            q = templates[restart].copy()
+            for row in range(8):
+                weights = np.array([1.0 - q[row, 0] - q[row, 1],
+                                    q[row, 0], q[row, 1]])
+                weights += rng.normal(0.0, 0.018, size=3)
+                q[row] = project_simplex(weights)
+            current[3:] = q
+        else:
+            concentration = 0.52 if restart % 2 else 1.15
+            bary = rng.dirichlet((concentration,) * 3, size=8)
+            current[3:, 0] = bary[:, 1]
+            current[3:, 1] = bary[:, 2]
+        current_min, current_merit = merit(current)
+
+        for iteration in range(15000):
+            fraction = iteration / 14999.0
+            # The merit changes with phase, so score the incumbent using the
+            # same objective that will be used for this proposed mutation.
+            current_min, current_merit = merit(current, fraction)
+            step = 0.115 * (1.0 - fraction) ** 1.7 + 0.0008
+            thermal = 0.0065 * (1.0 - fraction) ** 2.1 + 0.00001
+            index = int(rng.integers(3, n))
+
+            candidate = current.copy()
+            old = candidate[index]
+            weights = np.array([1.0 - old[0] - old[1], old[0], old[1]])
+
+            # A small number of broad early proposals avoids persistent
+            # near-collinear configurations.
+            if iteration < 3500 and rng.random() < 0.035:
+                weights = rng.dirichlet((1.0, 1.0, 1.0))
+            else:
+                weights += rng.normal(0.0, step, size=3)
+
+            candidate[index] = project_simplex(weights)
+            candidate_min, candidate_merit = merit(candidate, fraction)
+            delta = candidate_merit - current_merit
+
+            if delta >= 0.0 or rng.random() < np.exp(delta / thermal):
+                current = candidate
+                current_min = candidate_min
+                current_merit = candidate_merit
+
+            if current_min > best_min:
+                best_min = current_min
+                best = current.copy()
+
+    # Local maximin polish.  For a fixed nonzero orientation pattern,
+    # |det| is represented by signed determinant constraints.  SLSQP can
+    # directly maximize an explicit lower-bound variable for every triple.
+    try:
+        from scipy.optimize import minimize
+
+        def polish(seed: np.ndarray) -> np.ndarray:
+            p0 = seed.copy()
+
+            for _ in range(3):
+                signed = determinants(p0)
+                signs = np.where(signed >= 0.0, 1.0, -1.0)
+                x0 = np.empty(17, dtype=float)
+                x0[:16] = p0[3:].ravel()
+                x0[16] = max(1.0e-8, float(np.abs(signed).min()))
+
+                def unpack(x: np.ndarray) -> np.ndarray:
+                    p = np.empty((n, 2), dtype=float)
+                    p[:3] = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
+                    p[3:] = x[:16].reshape(8, 2)
+                    return p
+
+                def area_constraints(x: np.ndarray) -> np.ndarray:
+                    return signs * determinants(unpack(x)) - x[16]
+
+                def area_jacobian(x: np.ndarray) -> np.ndarray:
+                    p = unpack(x)
+                    jac = np.zeros((len(triples), 17), dtype=float)
+
+                    for row, (i, j, k) in enumerate(triples):
+                        gi = np.array([
+                            p[j, 1] - p[k, 1],
+                            p[k, 0] - p[j, 0],
+                        ])
+                        gj = np.array([
+                            p[k, 1] - p[i, 1],
+                            p[i, 0] - p[k, 0],
+                        ])
+                        gk = np.array([
+                            p[i, 1] - p[j, 1],
+                            p[j, 0] - p[i, 0],
+                        ])
+                        for point, gradient in ((i, gi), (j, gj), (k, gk)):
+                            if point >= 3:
+                                start = 2 * (point - 3)
+                                jac[row, start:start + 2] = signs[row] * gradient
+                        jac[row, 16] = -1.0
+                    return jac
+
+                def simplex_constraints(x: np.ndarray) -> np.ndarray:
+                    q = x[:16].reshape(8, 2)
+                    return 1.0 - q[:, 0] - q[:, 1]
+
+                def simplex_jacobian(x: np.ndarray) -> np.ndarray:
+                    jac = np.zeros((8, 17), dtype=float)
+                    for row in range(8):
+                        jac[row, 2 * row:2 * row + 2] = -1.0
+                    return jac
+
+                result = minimize(
+                    fun=lambda x: -x[16],
+                    x0=x0,
+                    jac=lambda x: np.r_[np.zeros(16), -1.0],
+                    method="SLSQP",
+                    bounds=[(0.0, 1.0)] * 16 + [(0.0, 1.0)],
+                    constraints=[
+                        {"type": "ineq", "fun": area_constraints,
+                         "jac": area_jacobian},
+                        {"type": "ineq", "fun": simplex_constraints,
+                         "jac": simplex_jacobian},
+                    ],
+                    options={"maxiter": 900, "ftol": 1.0e-11, "disp": False},
+                )
+
+                # SLSQP can terminate with a non-success status at a nearly
+                # degenerate active set.  Its last iterate is still useful
+                # when it is genuinely feasible and improves the true
+                # unsigned maximin objective.
+                candidate = unpack(result.x)
+                candidate_min, _ = merit(candidate)
+                old_min, _ = merit(p0)
+                q = candidate[3:]
+                feasible = (
+                    np.all(q >= -1.0e-9) and
+                    np.all(q.sum(axis=1) <= 1.0 + 1.0e-9)
+                )
+                if not feasible or candidate_min <= old_min + 1.0e-10:
+                    break
+                p0 = candidate
+
+            return p0
+
+        polished = polish(best)
+        polished_min, _ = merit(polished)
+        if polished_min > best_min:
+            best = polished
+            best_min = polished_min
+    except Exception:
+        # The annealed arrangement is always valid, including environments
+        # without SciPy or rare optimizer failures.
+        pass
+
+    points = np.empty((n, 2), dtype=float)
+    points[:, 0] = best[:, 0] + 0.5 * best[:, 1]
+    points[:, 1] = (np.sqrt(3.0) / 2.0) * best[:, 1]
+    return points
+
+
+# EVOLVE-BLOCK-END

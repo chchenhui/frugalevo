@@ -1,0 +1,190 @@
+<NAME>
+lp_refined_hex_rows
+</NAME>
+<DESCRIPTION>
+Restructure into a modular pipeline: (1) a staggered hex-row layout generator places 26 centers in 5 rows (5,6,5,6,4 pattern), (2) radii are computed by an exact linear program (maximize Σr subject to pairwise distance and wall constraints) instead of the lossy greedy pairwise scaling — this alone drastically improves the achievable sum, (3) a bounded hill-climbing refinement perturbs center positions and re-solves the LP, accepting only improvements, so edge gaps get filled by naturally larger corner circles. A scipy-free fallback preserves the old pairwise scaling if scipy is unavailable. Same interface (construct_packing returning centers, radii, sum) is maintained.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles.
+
+Architecture:
+  1. layout:  staggered hex-style rows of centers (5,6,5,6,4)
+  2. solve:   exact LP for radii (maximize sum of radii)
+  3. refine:  bounded local search on centers, LP re-solved each step
+"""
+import numpy as np
+
+try:
+    from scipy.optimize import linprog
+    _HAS_SCIPY = True
+except Exception:  # pragma: no cover
+    _HAS_SCIPY = False
+
+
+# ---------------------------------------------------------------- layout ----
+def build_initial_centers():
+    """Staggered rows: counts 5,6,5,6,4 = 26 circles, hex-like offsets."""
+    counts = [5, 6, 5, 6, 4]
+    ys = [0.10, 0.30, 0.50, 0.70, 0.90]
+    centers = []
+    for k, (cnt, y) in enumerate(zip(counts, ys)):
+        # stagger alternate rows by half a spacing
+        x0 = (0.5 / cnt) if (k % 2 == 1) else 0.0
+        xs = x0 + (np.arange(cnt) + 0.5) / cnt
+        for x in xs:
+            centers.append([x, y])
+    return np.array(centers)
+
+
+# ------------------------------------------------------------------ solve ----
+def solve_radii_lp(centers):
+    """Maximize sum(r) s.t. r_i + r_j <= d_ij, r_i <= wall distances."""
+    n = centers.shape[0]
+
+    if _HAS_SCIPY:
+        # wall constraints: r_i <= x, y, 1-x, 1-y
+        A, b = [], []
+        for i in range(n):
+            x, y = centers[i]
+            for bnd in (x, y, 1.0 - x, 1.0 - y):
+                row = np.zeros(n)
+                row[i] = 1.0
+                A.append(row)
+                b.append(bnd)
+        # pairwise constraints
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.hypot(*(centers[i] - centers[j]))
+                row = np.zeros(n)
+                row[i] = 1.0
+                row[j] = 1.0
+                A.append(row)
+                b.append(d)
+        res = linprog(c=-np.ones(n), A_ub=np.array(A), b_ub=np.array(b),
+                      bounds=[(0, None)] * n, method="highs")
+        if res.success:
+            return np.maximum(res.x, 0.0)
+
+    # fallback: greedy pairwise proportional scaling (original method)
+    radii = np.min(np.minimum(centers, 1.0 - centers), axis=1)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(*(centers[i] - centers[j]))
+            if radii[i] + radii[j] > d and radii[i] + radii[j] > 0:
+                s = d / (radii[i] + radii[j])
+                radii[i] *= s
+                radii[j] *= s
+    return radii
+
+
+def ensure_valid(centers, radii):
+    """Hard-clip radii so constraints hold exactly (numerical safety)."""
+    r = np.minimum(radii, np.min(np.minimum(centers, 1.0 - centers), axis=1))
+    n = len(r)
+    for _ in range(3):
+        ok = True
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.hypot(*(centers[i] - centers[j]))
+                s = r[i] + r[j]
+                if s > d:
+                    f = d / s if s > 0 else 1.0
+                    r[i] *= f
+                    r[j] *= f
+                    ok = False
+        if ok:
+            break
+    return r
+
+
+# ---------------------------------------------------------------- refine ----
+def refine_centers(centers, steps=250, step0=0.03, seed=0):
+    """Hill-climb: perturb one center at a time, keep improvements."""
+    rng = np.random.default_rng(seed)
+    best = centers.copy()
+    best_r = ensure_valid(best, solve_radii_lp(best))
+    best_sum = best_r.sum()
+
+    cur, cur_sum = best.copy(), best_sum
+    for t in range(steps):
+        step = step0 * (1.0 - t / steps) + 1e-4
+        cand = cur.copy()
+        i = rng.integers(len(cand))
+        cand[i] = cand[i] + rng.normal(size=2) * step
+        # keep a tiny margin so radius is never degenerate
+        cand[i] = np.clip(cand[i], 0.02, 0.98)
+        r = ensure_valid(cand, solve_radii_lp(cand))
+        s = r.sum()
+        if s > cur_sum:
+            cur, cur_sum = cand, s
+            if s > best_sum:
+                best, best_r, best_sum = cand, r, s
+    return best, best_r
+
+
+# ------------------------------------------------------------- interface ----
+def construct_packing():
+    """
+    Construct an arrangement of 26 circles in a unit square maximizing the
+    sum of radii. Returns (centers, radii, sum_of_radii).
+    """
+    centers = build_initial_centers()
+    centers, radii = refine_centers(centers)
+    radii = ensure_valid(centers, radii)
+    return centers, radii, float(radii.sum())
+
+
+def compute_max_radii(centers):
+    """Backward-compatible helper: radii for given centers."""
+    return ensure_valid(centers, solve_radii_lp(centers))
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)
+```
+</CODE>

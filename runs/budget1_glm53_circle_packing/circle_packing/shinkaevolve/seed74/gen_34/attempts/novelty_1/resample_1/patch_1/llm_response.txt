@@ -1,0 +1,116 @@
+<NAME>
+jitter_multistart_adaptive_anneal</NAME>
+
+<DESCRIPTION>
+Expert insight: for n=26 in a unit square, the optimal packing is close to a hexagonal (triangular) lattice with defect rows near the walls, so the hex-rows seed is by far the strongest basin — but starting all four runs from exact lattice positions makes the annealer rediscover the same trajectory. Following the recommendation, I (1) jitter each start's centers with a small Gaussian perturbation (different seed per start) to decorrelate basins while keeping the strong base layout, (2) bias the annealer's moves toward circles that are "tight" (small radii / active constraints) since those have the most slack to gain, and (3) shrink the per-start step budget gracefully and give the hex seed extra steps. This directly extends the mechanism that produced the best score this round at negligible runtime cost.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def anneal(centers, steps=400, t0=0.02, step0=0.03, seed=0):
+    """Simulated annealing on centers; restarts cur from best on stall."""
+    rng = np.random.default_rng(seed)
+    best = centers.copy()
+    best_r = evaluate(best)
+    best_sum = best_r.sum()
+    cur, cur_sum = best.copy(), best_sum
+    stall = 0
+    for t in range(steps):
+        temp = t0 * (1.0 - t / steps) + 1e-4
+        step = step0 * (1.0 - t / steps) + 1e-4
+        cand = cur.copy()
+        i = rng.integers(len(cand))
+        cand[i] = np.clip(cand[i] + rng.normal(size=2) * step, 0.02, 0.98)
+        r = evaluate(cand)
+        s = r.sum()
+        if s > cur_sum or rng.random() < np.exp((s - cur_sum) / max(temp, 1e-9)):
+            cur, cur_sum = cand, s
+            if s > best_sum:
+                best, best_r, best_sum = cand.copy(), r, s
+                stall = 0
+            else:
+                stall += 1
+        else:
+            stall += 1
+        if stall > 60:  # restart from best
+            cur, cur_sum = best.copy(), best_sum
+            stall = 0
+    return best, best_r
+=======
+def anneal(centers, steps=400, t0=0.02, step0=0.03, seed=0):
+    """Simulated annealing on centers with slack-biased moves.
+
+    Move selection favors circles with small radii (they are tightly
+    constrained, so perturbing their centers frees the most area), and
+    restarts from best on stall. A small initial jitter decorrelates
+    multi-start trajectories from the same lattice base.
+    """
+    rng = np.random.default_rng(seed)
+    best = centers + rng.normal(size=centers.shape) * 0.01
+    best = np.clip(best, 0.02, 0.98)
+    best_r = evaluate(best)
+    best_sum = best_r.sum()
+    cur, cur_sum = best.copy(), best_sum
+    stall = 0
+    for t in range(steps):
+        temp = t0 * (1.0 - t / steps) + 1e-4
+        step = step0 * (1.0 - t / steps) + 1e-4
+        cand = cur.copy()
+        # slack-biased index: prefer small-radius (tight) circles
+        w = 1.0 / (best_r + 1e-3)
+        i = rng.choice(len(cand), p=w / w.sum())
+        cand[i] = np.clip(cand[i] + rng.normal(size=2) * step, 0.02, 0.98)
+        r = evaluate(cand)
+        s = r.sum()
+        if s > cur_sum or rng.random() < np.exp((s - cur_sum) / max(temp, 1e-9)):
+            cur, cur_sum = cand, s
+            if s > best_sum:
+                best, best_r, best_sum = cand.copy(), r, s
+                stall = 0
+            else:
+                stall += 1
+        else:
+            stall += 1
+        if stall > 60:  # restart from best, with fresh jitter to escape
+            cur = np.clip(best + rng.normal(size=best.shape) * 0.005, 0.02, 0.98)
+            cur_sum = evaluate(cur).sum()
+            stall = 0
+    return best, best_r
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+def construct_packing():
+    """Best-of-multi-seed annealed packing. Returns (centers, radii, sum)."""
+    seeds = [seed_hex_rows(), seed_diagonal(), seed_grid(), seed_ring_rows()]
+    best_c, best_r, best_s = None, None, -1.0
+    for k, s in enumerate(seeds):
+        c, r = anneal(s, steps=350, seed=k)
+        if r.sum() > best_s:
+            best_c, best_r, best_s = c, r, r.sum()
+    return best_c, best_r, float(best_s)
+=======
+def construct_packing():
+    """Best-of-multi-seed annealed packing. Returns (centers, radii, sum).
+
+    The hex-rows seed is the strongest basin (optimal 26-packings are
+    near-hexagonal), so it gets extra steps and multiple jittered starts;
+    the other seeds get a shrinking share of the remaining budget.
+    """
+    import time
+    deadline = time.time() + 2.6
+    seed_fns = [seed_hex_rows, seed_hex_rows, seed_hex_rows,
+                seed_ring_rows, seed_diagonal, seed_grid]
+    best_c, best_r, best_s = None, None, -1.0
+    n_starts = len(seed_fns)
+    for k, fn in enumerate(seed_fns):
+        remaining = deadline - time.time()
+        if remaining <= 0.1 and k >= 3:
+            break
+        budget = max(remaining / max(n_starts - k, 1), 0.2)
+        steps = int(np.clip(budget / 0.007, 120, 600))
+        c, r = anneal(fn(), steps=steps, seed=1000 + k)
+        if r.sum() > best_s:
+            best_c, best_r, best_s = c, r, r.sum()
+    return best_c, best_r, float(best_s)
+>>>>>>> REPLACE
+</DIFF>

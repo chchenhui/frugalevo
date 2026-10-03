@@ -1,0 +1,66 @@
+<NAME>
+vectorize_balanced_packing
+</NAME>
+
+<DESCRIPTION>
+Replace the nested Python loop over layers and groups in `balanced_packing` with a batched greedy packing loop. The original algorithm independently performs the same greedy choice for every layer, but executes tensor indexing, Python `min`, generator construction, and scalar updates once per `(layer, group)` pair.
+
+The replacement keeps the same descending-weight greedy policy and exact per-pack capacity constraint, while processing all layers simultaneously at each sorted-group position. This substantially reduces Python overhead, avoids CPU scalar/tensor synchronization, and allows PyTorch to efficiently execute the per-layer pack selection and updates. Better algorithm execution time directly improves the speed component without changing the placement policy or its load-balancing semantics.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    # Every layer follows the same greedy policy independently.  Batch the
+    # per-layer decisions to avoid Python loops over layers and tensor scalars.
+    indices = weight.float().sort(-1, descending=True).indices
+    pack_index = torch.empty_like(weight, dtype=torch.int64)
+    rank_in_pack = torch.empty_like(pack_index)
+    pack_weights = torch.zeros((num_layers, num_packs),
+                               dtype=torch.float32,
+                               device=weight.device)
+    pack_items = torch.zeros((num_layers, num_packs),
+                             dtype=torch.int64,
+                             device=weight.device)
+    unavailable = torch.finfo(pack_weights.dtype).max
+
+    for position in range(num_groups):
+        group = indices[:, position]
+        # `min` returns the first pack on ties, matching the original Python
+        # min(..., key=...) behavior.
+        pack = pack_weights.masked_fill(
+            pack_items >= groups_per_pack, unavailable).min(dim=-1).indices
+        current_rank = pack_items.gather(-1, pack.unsqueeze(-1)).squeeze(-1)
+
+        pack_index.scatter_(-1, group.unsqueeze(-1), pack.unsqueeze(-1))
+        rank_in_pack.scatter_(-1, group.unsqueeze(-1),
+                              current_rank.unsqueeze(-1))
+        group_weight = weight.gather(-1, group.unsqueeze(-1)).float()
+        pack_weights.scatter_add_(-1, pack.unsqueeze(-1), group_weight)
+        pack_items.scatter_add_(-1, pack.unsqueeze(-1),
+                                torch.ones_like(pack.unsqueeze(-1)))
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

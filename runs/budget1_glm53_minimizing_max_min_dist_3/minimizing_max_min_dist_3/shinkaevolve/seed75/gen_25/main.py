@@ -1,0 +1,254 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _score(points: np.ndarray) -> float:
+    """Evaluator metric: (dmin / dmax)^2."""
+    d = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=-1)
+    iu = np.triu_indices(len(points), k=1)
+    dm = d[iu]
+    dmin = dm.min()
+    dmax = dm.max()
+    if dmax <= 0:
+        return 0.0
+    return (dmin / dmax) ** 2
+
+
+def _refine_on_sphere(points: np.ndarray, iters: int = 400,
+                      cutoff_frac: float = 1.15) -> np.ndarray:
+    """Force-directed refinement: repel pairs closer than a cutoff,
+    then renormalize onto the unit sphere each step."""
+    pts = points / np.linalg.norm(points, axis=1, keepdims=True)
+    n = len(pts)
+    for it in range(iters):
+        diff = pts[:, None, :] - pts[None, :, :]
+        dist = np.sqrt((diff ** 2).sum(-1) + 1e-12)
+        iu = np.triu_indices(n, k=1)
+        du = dist[iu]
+
+        # adaptively shrinking cutoff around the current minimum
+        target = max(du.min(), 1e-6)
+        cutoff = min(target * cutoff_frac, du.max() * 0.99)
+
+        grad = np.zeros_like(pts)
+        close = du < cutoff
+        idx_i, idx_j = iu[0][close], iu[1][close]
+        w = (cutoff - du[close]) / cutoff
+        push = (w / du[close])[:, None] * diff[idx_i, idx_j]
+        np.add.at(grad, idx_i, push)
+        np.add.at(grad, idx_j, -push)
+
+        # also mild global repulsion to prevent clustering
+        w_all = 1.0 / (du ** 2 + 1e-3)
+        push_all = (w_all / du)[:, None] * diff[iu[0], iu[1]]
+        np.add.at(grad, iu[0], push_all * 0.002)
+        np.add.at(grad, iu[1], -push_all * 0.002)
+
+        step = 0.05 / (1.0 + it * 0.01)
+        pts = pts + step * grad
+        norms = np.linalg.norm(pts, axis=1, keepdims=True)
+        pts = pts / norms
+    return pts
+
+
+def _soft_ratio_anneal(points: np.ndarray,
+                       taus=(0.05, 0.02, 0.01, 0.005, 0.002, 0.001),
+                       iters_per_tau: int = 250,
+                       lr: float = 0.02) -> np.ndarray:
+    """Gradient ascent on a smooth soft-min/soft-max ratio surrogate.
+
+    soft_min(d) = -tau * log sum exp(-d/tau)   (<= dmin)
+    soft_max(d) =  tau * log sum exp(+d/tau)   (>= dmax)
+    The ratio soft_min/soft_max is a differentiable lower bound on
+    dmin/dmax that sharpens as tau -> 0. Exp arguments are clipped to
+    +-50 to avoid overflow at the smallest taus.
+    """
+    pts = points / np.linalg.norm(points, axis=1, keepdims=True)
+    n = len(pts)
+    best_pts = pts.copy()
+    best_hard = _score(pts)
+    for tau in taus:
+        for it in range(iters_per_tau):
+            diff = pts[:, None, :] - pts[None, :, :]
+            d = np.sqrt((diff ** 2).sum(-1) + 1e-12)
+            iu = np.triu_indices(n, k=1)
+            du = d[iu]
+            ii, jj = iu[0], iu[1]
+            # soft-min weights (softmax of -d/tau)
+            a = -du / tau
+            a -= a.min()
+            wa = np.exp(np.clip(a, -50, 50))
+            wa /= wa.sum()
+            smin = -tau * np.log(np.exp(np.clip((-du / tau) - a.max(), -50, 50)).sum()) - tau * a.max() * 0.0
+            smin = -tau * (np.log(wa.sum() * 0 + 1) * 0 + np.log(np.exp(np.clip(-du / tau - (-du / tau).max(), -50, 50)).sum()) + (-du / tau).max())
+            # soft-max weights
+            b = du / tau
+            b -= b.max()
+            wb = np.exp(np.clip(b, -50, 50))
+            wb /= wb.sum()
+            smax = tau * (np.log(np.exp(np.clip(du / tau - (du / tau).max(), -50, 50)).sum()) + (du / tau).max())
+            # gradient of smin/smax wrt each pairwise distance
+            gs_min = wa / tau   # d smin / d du  (approximately +wa/tau)
+            gs_max = wb / tau   # d smax / d du
+            # d(du)/d pts: pull along unit vectors
+            uij = diff[ii, jj] / du[:, None]
+            # maximize smin/smax => ascend smin - (smin0/smax0)*smax approx:
+            # use current ratio weight
+            r_now = max(smin / max(smax, 1e-9), 1e-6)
+            coef = gs_min - r_now * gs_max
+            gpair = coef[:, None] * uij
+            grad = np.zeros_like(pts)
+            np.add.at(grad, ii, gpair)
+            np.add.at(grad, jj, -gpair)
+            # tangential projection to stay on sphere
+            rad = pts / np.maximum(np.linalg.norm(pts, axis=1, keepdims=True), 1e-12)
+            grad_t = grad - rad * np.sum(grad * rad, axis=1, keepdims=True)
+            step = lr * (1.0 / (1.0 + it * 0.01))
+            sn = np.linalg.norm(grad_t, axis=1, keepdims=True).max()
+            if sn > 1e-12 and np.isfinite(sn):
+                grad_t = grad_t / sn
+            pts = pts + step * grad_t
+            pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+            hard = _score(pts)
+            if hard > best_hard:
+                best_hard = hard
+                best_pts = pts.copy()
+        # restart each tau block from the best found so far
+        pts = best_pts.copy()
+    return best_pts
+
+
+def _initial_candidates(rng: np.random.Generator, n: int, k: int = 6):
+    """Generate diverse starting configurations: random spheres,
+    slightly perturbed shells, and one from a low-discrepancy set."""
+    cands = []
+    for _ in range(k - 1):
+        p = rng.standard_normal((n, 3))
+        p /= np.linalg.norm(p, axis=1, keepdims=True)
+        cands.append(p)
+    # low-discrepancy-ish start (Fibonacci spiral)
+    g = np.pi * (3 - np.sqrt(5))
+    t = (np.arange(n) + 0.5) / n
+    z = 1 - 2 * t
+    r = np.sqrt(np.maximum(0.0, 1 - z ** 2))
+    phi = g * np.arange(n)
+    fib = np.stack([r * np.cos(phi), r * np.sin(phi), z], axis=1)
+    cands.append(fib)
+    return cands
+
+
+def _free_space_polish(points: np.ndarray) -> np.ndarray:
+    """SLSQP maximin in free space: max t s.t. d^2 >= t^2 and d^2 <= 1.
+
+    Since the ratio is scale-invariant, bounding dmax <= 1 loses nothing
+    and gives a well-posed maximin program that can leave the sphere.
+    """
+    from scipy.optimize import minimize
+    n = len(points)
+    X = points - points.mean(axis=0)
+    d2m = ((X[:, None, :] - X[None, :, :]) ** 2).sum(-1)[np.triu_indices(n, 1)].max()
+    X = X / np.sqrt(d2m)
+    IJ = np.triu_indices(n, k=1)
+
+    def d2(Xa):
+        return ((Xa[IJ[0]] - Xa[IJ[1]]) ** 2).sum(1)
+
+    t0 = np.sqrt(d2(X).min())
+    z0 = np.concatenate([X.ravel(), [t0]])
+
+    def cons(z):
+        Xz = z[:3 * n].reshape(n, 3)
+        dd = d2(Xz)
+        return np.concatenate([z[-1] ** 2 - dd, dd - 1.0])
+
+    res = minimize(lambda z: -z[-1], z0, method="SLSQP",
+                   constraints=[{"type": "ineq", "fun": cons}],
+                   options={"maxiter": 400, "ftol": 1e-12})
+    Xp = res.x[:3 * n].reshape(n, 3)
+    if not np.isfinite(Xp).all():
+        return X
+    return Xp
+
+
+def _fallback() -> np.ndarray:
+    rng = np.random.default_rng(0)
+    p = rng.standard_normal((14, 3))
+    return p / np.linalg.norm(p, axis=1, keepdims=True)
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Constructs 14 points in 3D maximizing (dmin/dmax)^2 via
+    multi-restart force-directed optimization on the unit sphere,
+    followed by free-space SLSQP maximin polish.
+    """
+    try:
+        n = 14
+        rng = np.random.default_rng(12345)
+
+        best_pts = None
+        best_sc = -1.0
+        for cand in _initial_candidates(rng, n):
+            for jitter_seed in range(3):
+                jrng = np.random.default_rng(1000 + jitter_seed)
+                p = cand + 0.05 * jrng.standard_normal(cand.shape)
+                p = _refine_on_sphere(p)
+                sc = _score(p)
+                if sc > best_sc:
+                    best_sc = sc
+                    best_pts = p.copy()
+
+        # soft-min/soft-max annealing sharpening of the best config
+        try:
+            soft = _soft_ratio_anneal(best_pts)
+            s = _score(soft)
+            if s > best_sc and np.isfinite(soft).all():
+                best_sc, best_pts = s, soft.copy()
+        except Exception:
+            pass
+
+        # final gentle polish on the best configuration
+        polished = _refine_on_sphere(best_pts, iters=300, cutoff_frac=1.05)
+        if _score(polished) >= best_sc:
+            best_pts = polished
+            best_sc = _score(polished)
+
+        # free-space SLSQP polish (can escape the sphere, which the
+        # sphere-projected dynamics cannot do)
+        try:
+            pol = _free_space_polish(best_pts)
+            s = _score(pol)
+            if s > best_sc and np.isfinite(pol).all():
+                best_sc, best_pts = s, pol.copy()
+        except Exception:
+            pass
+
+        # a couple of perturb -> relax -> polish rounds around the best
+        for rep in range(3):
+            jrng = np.random.default_rng(7000 + rep)
+            p = best_pts + 0.03 * jrng.standard_normal(best_pts.shape)
+            p = _refine_on_sphere(p, iters=150, cutoff_frac=1.10)
+            try:
+                p = _free_space_polish(p)
+            except Exception:
+                pass
+            s = _score(p)
+            if s > best_sc and np.isfinite(p).all():
+                best_sc, best_pts = s, p.copy()
+
+        if best_pts is None or not np.isfinite(best_pts).all() \
+                or best_pts.shape != (n, 3):
+            return _fallback()
+
+        # normalize so dmax = 1 (ratio invariant, keeps output tidy)
+        iu = np.triu_indices(n, k=1)
+        dmx = np.linalg.norm(
+            best_pts[:, None, :] - best_pts[None, :, :], axis=-1)[iu].max()
+        if dmx > 0:
+            best_pts = best_pts / dmx
+        return np.asarray(best_pts, dtype=float)
+    except Exception:
+        return _fallback()
+
+
+# EVOLVE-BLOCK-END

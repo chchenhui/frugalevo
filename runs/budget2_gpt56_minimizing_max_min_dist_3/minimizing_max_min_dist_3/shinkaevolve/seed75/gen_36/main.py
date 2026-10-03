@@ -1,0 +1,259 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct 14 points in R^3 with a large minimum-pair-distance to
+    diameter ratio.  Translation and uniform scaling are normalized away.
+    """
+    n = 14
+    rng = np.random.default_rng(918273645)
+    ii, jj = np.triu_indices(n, 1)
+
+    def normalize(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        x = x - x.mean(axis=0, keepdims=True)
+        scale = np.sqrt(np.mean(np.sum(x * x, axis=1)))
+        return x / max(scale, 1.0e-14)
+
+    def distances_sq(x: np.ndarray) -> np.ndarray:
+        d = x[ii] - x[jj]
+        return np.einsum("ij,ij->i", d, d)
+
+    def ratio_sq(x: np.ndarray) -> float:
+        q = distances_sq(x)
+        return float(q.min() / q.max())
+
+    def sphere_start() -> np.ndarray:
+        x = rng.normal(size=(n, 3))
+        x /= np.linalg.norm(x, axis=1, keepdims=True)
+        return normalize(x)
+
+    def gaussian_start() -> np.ndarray:
+        return normalize(rng.normal(size=(n, 3)))
+
+    def free_radial_cube_start() -> np.ndarray:
+        # Eight cube-like points and six axis-like points are a productive
+        # contact-graph scaffold, but the independent radial perturbations
+        # deliberately remove their antipodal and octahedral constraints.
+        cube = np.array(
+            [[a, b, c] for a in (-1.0, 1.0)
+             for b in (-1.0, 1.0) for c in (-1.0, 1.0)],
+            dtype=float,
+        )
+        cube *= rng.uniform(0.78, 1.22, size=(8, 1))
+        cube *= rng.uniform(0.82, 1.18)
+
+        axes = np.vstack((np.eye(3), -np.eye(3)))
+        axes *= rng.uniform(1.15, 2.05, size=(6, 1))
+        # Independent transverse offsets and noise permit the optimizer to
+        # reach entirely non-symmetric free-coordinate configurations.
+        axes += rng.normal(scale=0.11, size=(6, 3))
+        points = np.vstack((cube, axes))
+        points += rng.normal(scale=0.055, size=points.shape)
+        return normalize(points)
+
+    def antiprism_start(phase: float, height: float) -> np.ndarray:
+        k = np.arange(7, dtype=float)
+        a = 2.0 * np.pi * k / 7.0
+        r = np.sqrt(max(1.0e-12, 1.0 - height * height))
+        top = np.column_stack((r * np.cos(a), r * np.sin(a),
+                               np.full(7, height)))
+        bottom = np.column_stack((r * np.cos(a + phase),
+                                  r * np.sin(a + phase),
+                                  np.full(7, -height)))
+        return normalize(np.vstack((top, bottom)))
+
+    def fibonacci_start(offset: float) -> np.ndarray:
+        k = np.arange(n, dtype=float)
+        z = 1.0 - 2.0 * (k + 0.5) / n
+        r = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+        phi = np.pi * (3.0 - np.sqrt(5.0))
+        a = phi * k + offset
+        return normalize(np.column_stack((r * np.cos(a), r * np.sin(a), z)))
+
+    starts = [
+        fibonacci_start(0.0),
+        fibonacci_start(0.31),
+        fibonacci_start(0.73),
+        antiprism_start(np.pi / 7.0, 0.34),
+        antiprism_start(np.pi / 7.0, 0.48),
+        antiprism_start(np.pi / 6.0, 0.39),
+    ]
+    starts.extend(sphere_start() for _ in range(7))
+    starts.extend(free_radial_cube_start() for _ in range(3))
+    starts.extend(gaussian_start() for _ in range(2))
+
+    best = starts[0].copy()
+    best_value = ratio_sq(best)
+
+    # Explicit contact-graph relaxation.  At early stages broad bands of
+    # near-short and near-long pairs are used; later stages approach the
+    # nonsmooth exact min/max objective.
+    stages = [
+        (0.24, 260),
+        (0.15, 330),
+        (0.085, 420),
+        (0.042, 500),
+        (0.018, 600),
+        (0.007, 650),
+    ]
+
+    for start_index, start in enumerate(starts):
+        x = start.copy()
+        momentum = np.zeros_like(x)
+        velocity_sq = np.zeros_like(x)
+
+        for band, steps in stages:
+            for step_index in range(steps):
+                q = distances_sq(x)
+                qlo = float(np.min(q))
+                qhi = float(np.max(q))
+
+                # Active lower and upper contact sets.  The inverse-distance
+                # factors are the subgradient of log(qlo / qhi).
+                low = q <= qlo * (1.0 + band)
+                high = q >= qhi * (1.0 - band)
+
+                coeff = np.zeros(len(ii), dtype=float)
+                coeff[low] = 1.0 / (max(1, int(np.sum(low))) * qlo)
+                coeff[high] -= 1.0 / (max(1, int(np.sum(high))) * qhi)
+
+                # Assemble graph-Laplacian contact forces without pairwise
+                # scatter operations.
+                cmat = np.zeros((n, n), dtype=float)
+                cmat[ii, jj] = coeff
+                cmat[jj, ii] = coeff
+                grad = 2.0 * ((cmat.sum(axis=1)[:, None] * x) - cmat @ x)
+
+                # Remove translation/radial components before the projected
+                # update; normalization handles the remaining scale freedom.
+                grad -= grad.mean(axis=0, keepdims=True)
+                grad -= np.sum(grad * x) / np.sum(x * x) * x
+
+                momentum = 0.88 * momentum + 0.12 * grad
+                velocity_sq = 0.992 * velocity_sq + 0.008 * grad * grad
+
+                local_t = step_index / max(1, steps - 1)
+                step_size = (0.038 * (1.0 - local_t) + 0.004) * (
+                    0.65 + 0.35 * band / 0.24
+                )
+                x = normalize(
+                    x + step_size * momentum / (np.sqrt(velocity_sq) + 2.0e-8)
+                )
+
+                # Small reproducible basin changes only while broad contact
+                # sets are active.
+                if band >= 0.085 and step_index % 95 == 0 and step_index > 0:
+                    kick = rng.normal(size=x.shape)
+                    kick -= kick.mean(axis=0, keepdims=True)
+                    x = normalize(x + 0.010 * band / 0.24 * kick)
+
+                if step_index % 35 == 0:
+                    value = ratio_sq(x)
+                    if value > best_value:
+                        best_value = value
+                        best = x.copy()
+
+        value = ratio_sq(x)
+        if value > best_value:
+            best_value = value
+            best = x.copy()
+
+    # Exact objective polishing: accepted coordinate perturbations are judged
+    # exclusively by the evaluator's squared ratio, not by a surrogate.
+    x = best.copy()
+    current = best_value
+    sigma = 0.030
+
+    for trial in range(5500):
+        candidate = x.copy()
+        point = trial % n
+        candidate[point] += rng.normal(scale=sigma, size=3)
+        candidate = normalize(candidate)
+        value = ratio_sq(candidate)
+
+        if value > current:
+            x = candidate
+            current = value
+            if value > best_value:
+                best_value = value
+                best = value * 0.0 + x
+        if (trial + 1) % 550 == 0:
+            sigma *= 0.66
+
+    # Joint exact-objective polishing.  With the diameter constrained to one,
+    # maximize the common lower bound on all squared pair distances.  This is
+    # the evaluator's squared ratio itself and lets all limiting contacts move
+    # simultaneously, unlike single-coordinate perturbations.
+    try:
+        from scipy.optimize import minimize
+
+        qbest = distances_sq(best)
+        scale = np.sqrt(float(np.max(qbest)))
+        anchored = best / scale
+        anchored -= anchored[0]
+        z0 = np.concatenate((
+            anchored[1:].ravel(),
+            [0.999999 * float(np.min(qbest) / np.max(qbest))],
+        ))
+
+        def unpack(z: np.ndarray) -> np.ndarray:
+            points = np.zeros((n, 3), dtype=float)
+            points[1:] = z[:-1].reshape(n - 1, 3)
+            return points
+
+        def constraints(z: np.ndarray) -> np.ndarray:
+            points = unpack(z)
+            difference = points[ii] - points[jj]
+            q = np.einsum("ij,ij->i", difference, difference)
+            return np.concatenate((q - z[-1], 1.0 - q))
+
+        def constraints_jacobian(z: np.ndarray) -> np.ndarray:
+            points = unpack(z)
+            difference = points[ii] - points[jj]
+            m = len(ii)
+            jac = np.zeros((2 * m, 3 * (n - 1) + 1), dtype=float)
+            rows = np.arange(m)
+            valid_i = ii != 0
+            valid_j = jj != 0
+            for coordinate in range(3):
+                jac[rows[valid_i], 3 * (ii[valid_i] - 1) + coordinate] = (
+                    2.0 * difference[valid_i, coordinate]
+                )
+                jac[rows[valid_j], 3 * (jj[valid_j] - 1) + coordinate] = (
+                    -2.0 * difference[valid_j, coordinate]
+                )
+            jac[:m, -1] = -1.0
+            jac[m:, :-1] = -jac[:m, :-1]
+            return jac
+
+        result = minimize(
+            lambda z: -z[-1],
+            z0,
+            jac=lambda z: np.r_[np.zeros(3 * (n - 1)), -1.0],
+            constraints={
+                "type": "ineq",
+                "fun": constraints,
+                "jac": constraints_jacobian,
+            },
+            bounds=[(None, None)] * (3 * (n - 1)) + [(0.0, 1.0)],
+            method="SLSQP",
+            options={"maxiter": 900, "ftol": 1.0e-13, "disp": False},
+        )
+        if result.success:
+            polished = normalize(unpack(result.x))
+            polished_value = ratio_sq(polished)
+            if polished_value > best_value:
+                best_value = polished_value
+                best = polished
+    except Exception:
+        # Retain the deterministic search result when SciPy is unavailable or
+        # a constrained solve terminates unexpectedly.
+        pass
+
+    return np.asarray(best, dtype=float)
+
+
+# EVOLVE-BLOCK-END

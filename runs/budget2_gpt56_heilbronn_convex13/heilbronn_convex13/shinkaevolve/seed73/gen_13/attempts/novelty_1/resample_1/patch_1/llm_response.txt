@@ -1,0 +1,187 @@
+<NAME>
+bottleneck_simplex13
+</NAME>
+
+<DESCRIPTION>
+This implementation replaces the purely random point set with a deterministic bottleneck-optimization search inside a fixed unit-area-equivalent simplex. Three points are held at the simplex vertices, guaranteeing a convex hull of known area, while the remaining ten points are optimized using a reproducible annealed local search.
+
+The search uses all 286 triangle areas simultaneously. It combines a soft-min objective during exploration, which improves clusters of nearly-degenerate triangles rather than only the single worst one, with a final strict minimum-area objective. Candidate moves preferentially perturb points occurring in the currently smallest triangles, providing a targeted bottleneck-repair mechanism. The returned configuration is deterministic because all randomness is generated from a fixed seed.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Deterministically construct 13 points in a triangular convex region.
+
+    The three fixed corner points make the convex hull the reference simplex
+    with area 1/2.  Consequently, maximizing twice the minimum raw triangle
+    area is exactly the normalized Heilbronn objective for this construction.
+    """
+    n = 13
+    rng = np.random.default_rng(13031957)
+
+    # Unit reference simplex.  Its hull is fixed and has area 1/2.
+    points = np.empty((n, 2), dtype=np.float64)
+    points[:3] = np.array(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    # Stratified barycentric initialization: much less degenerate than
+    # independent uniform samples, while retaining deterministic diversity.
+    seed_barycentric = np.array(
+        [
+            [0.12, 0.15],
+            [0.42, 0.10],
+            [0.70, 0.09],
+            [0.11, 0.43],
+            [0.34, 0.31],
+            [0.58, 0.24],
+            [0.18, 0.66],
+            [0.39, 0.48],
+            [0.12, 0.77],
+            [0.66, 0.18],
+        ],
+        dtype=np.float64,
+    )
+    points[3:] = seed_barycentric
+
+    triples = np.array(
+        [(i, j, k) for i in range(n - 2) for j in range(i + 1, n - 1)
+         for k in range(j + 1, n)],
+        dtype=np.int16,
+    )
+
+    def areas(p: np.ndarray) -> np.ndarray:
+        a = p[triples[:, 0]]
+        b = p[triples[:, 1]]
+        c = p[triples[:, 2]]
+        return 0.5 * np.abs(
+            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+        )
+
+    def project_to_simplex(q: np.ndarray) -> np.ndarray:
+        # Keep free points strictly in the simplex; hull vertices remain fixed.
+        eps = 2.0e-5
+        x = max(eps, float(q[0]))
+        y = max(eps, float(q[1]))
+        total = x + y
+        limit = 1.0 - eps
+        if total > limit:
+            scale = limit / total
+            x *= scale
+            y *= scale
+        return np.array([x, y], dtype=np.float64)
+
+    current_areas = areas(points)
+    current_min = float(np.min(current_areas))
+    best_points = points.copy()
+    best_min = current_min
+
+    # Multiscale deterministic annealing.  Soft-min continuation initially
+    # rewards improving several small triangles, then progressively focuses
+    # on the true bottleneck.
+    stages = (
+        (0.055, 0.0030, 3600),
+        (0.024, 0.0012, 4200),
+        (0.010, 0.00045, 4600),
+        (0.0035, 0.00012, 5000),
+    )
+
+    for move_scale, soft_temperature, iterations in stages:
+        for step in range(iterations):
+            order = np.argsort(current_areas)
+            # Draw a point from one of the most restrictive triangles.
+            # This is a bottleneck-exchange step rather than unguided search.
+            critical_rank = int(rng.integers(0, min(18, len(order))))
+            critical_triangle = triples[order[critical_rank]]
+            movable = critical_triangle[critical_triangle >= 3]
+
+            if movable.size:
+                point_index = int(movable[rng.integers(movable.size)])
+            else:
+                point_index = int(rng.integers(3, n))
+
+            candidate = points.copy()
+            local_scale = move_scale * (
+                0.35 + 0.65 * (1.0 - step / max(1, iterations - 1))
+            )
+            displacement = rng.normal(0.0, local_scale, size=2)
+            candidate[point_index] = project_to_simplex(
+                candidate[point_index] + displacement
+            )
+
+            candidate_areas = areas(candidate)
+
+            # Numerically stable soft minimum of all triangle areas.
+            def soft_min(v: np.ndarray) -> float:
+                m = float(np.min(v))
+                z = np.exp(-(v - m) / soft_temperature).sum()
+                return m - soft_temperature * np.log(z)
+
+            old_soft = soft_min(current_areas)
+            new_soft = soft_min(candidate_areas)
+
+            # Temperature decreases within every scale level.  A small amount
+            # of controlled uphill movement avoids local collinearity traps.
+            acceptance_temperature = (
+                0.0018 * (1.0 - step / max(1, iterations - 1)) + 0.000015
+            )
+
+            accept = new_soft >= old_soft
+            if not accept:
+                accept = rng.random() < np.exp(
+                    max(-60.0, (new_soft - old_soft) / acceptance_temperature)
+                )
+
+            if accept:
+                points = candidate
+                current_areas = candidate_areas
+                current_min = float(np.min(current_areas))
+
+                if current_min > best_min:
+                    best_min = current_min
+                    best_points = points.copy()
+
+    # A short strict bottleneck polish: only accept genuine min-area gains.
+    points = best_points.copy()
+    current_areas = areas(points)
+    current_min = float(np.min(current_areas))
+
+    for step in range(2200):
+        smallest = triples[np.argmin(current_areas)]
+        movable = smallest[smallest >= 3]
+        point_index = (
+            int(movable[rng.integers(movable.size)])
+            if movable.size
+            else int(rng.integers(3, n))
+        )
+
+        candidate = points.copy()
+        scale = 0.005 * (1.0 - step / 2200.0) + 0.00025
+        candidate[point_index] = project_to_simplex(
+            candidate[point_index] + rng.normal(0.0, scale, size=2)
+        )
+        candidate_areas = areas(candidate)
+        candidate_min = float(np.min(candidate_areas))
+
+        if candidate_min > current_min:
+            points = candidate
+            current_areas = candidate_areas
+            current_min = candidate_min
+
+    return points
+
+
+# EVOLVE-BLOCK-END
+```

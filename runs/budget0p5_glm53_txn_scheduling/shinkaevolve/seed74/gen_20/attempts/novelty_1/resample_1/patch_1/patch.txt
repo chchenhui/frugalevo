@@ -1,0 +1,153 @@
+--- a/original.py
++++ b/original.py
+@@ -1,112 +1,142 @@
+ import random
+ 
+ from txn_simulator import Workload
+ from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+ 
+ # EVOLVE-BLOCK-START
+ 
+ def get_best_schedule(workload, num_seqs):
+     """
+     Get optimal schedule using greedy cost sampling strategy.
+ 
+     Returns:
+         Tuple of (lowest makespan, corresponding schedule)
+     """
+     import time
+ 
+     def get_full_greedy(perturb_rate):
+         # Full greedy: at each step evaluate ALL remaining transactions
+         # with the true makespan cost and append the cheapest one.
+         start_txn = random.randint(0, workload.num_txns - 1)
+         txn_seq = [start_txn]
+         remaining_txns = [x for x in range(0, workload.num_txns)
+                           if x != start_txn]
+         while remaining_txns:
+             min_cost = None
+             min_txn = -1
+             # occasionally accept a random (non-best) candidate to
+             # diversify across restarts
+             if random.random() < perturb_rate:
+                 idx = random.randint(0, len(remaining_txns) - 1)
+                 min_txn = remaining_txns[idx]
+                 test_seq = txn_seq + [min_txn]
+                 min_cost = workload.get_opt_seq_cost(test_seq)
+             else:
+                 for t in remaining_txns:
+                     test_seq = txn_seq + [t]
+                     cost = workload.get_opt_seq_cost(test_seq)
+                     if min_cost is None or cost < min_cost:
+                         min_cost = cost
+                         min_txn = t
+             txn_seq.append(min_txn)
+             remaining_txns.remove(min_txn)
+         assert len(set(txn_seq)) == workload.num_txns
+         return workload.get_opt_seq_cost(txn_seq), txn_seq
+ 
+     def local_search(seq, cost, deadline, max_moves_per_pass=200):
+         # Relocation + swap local search on the full-sequence cost.
+         n = workload.num_txns
+         improved = True
+         while improved and time.time() < deadline:
+             improved = False
+             moves = []
+             for _ in range(min(max_moves_per_pass, n * 2)):
+                 i = random.randint(0, n - 1)
+                 j = random.randint(0, n - 1)
+                 if i != j:
+                     moves.append((i, j))
+             for i, j in moves:
+                 if time.time() >= deadline:
+                     break
+                 cand = seq[:]
+                 if random.random() < 0.5:
+                     # relocation: move txn at i to position j
+                     t = cand.pop(i)
+                     cand.insert(j, t)
+                 else:
+                     # swap positions i and j
+                     cand[i], cand[j] = cand[j], cand[i]
+                 c = workload.get_opt_seq_cost(cand)
+                 if c < cost:
+                     seq = cand
+                     cost = c
+                     improved = True
+         return cost, seq
+ 
++    def perturb_best(seq):
++        # Ruin-and-recreate: remove a random contiguous segment of
++        # transactions from the incumbent and greedily reinsert each
++        # at the position that minimizes the true makespan. This keeps
++        # the candidate close to the best solution while providing
++        # enough diversification for the local search to escape optima.
++        n = workload.num_txns
++        k = random.randint(3, min(8, n - 1))
++        start = random.randint(0, n - k)
++        removed = seq[start:start + k]
++        cand = seq[:start] + seq[start + k:]
++        for t in removed:
++            best_c = None
++            best_pos = 0
++            for pos in range(len(cand) + 1):
++                trial = cand[:pos] + [t] + cand[pos:]
++                c = workload.get_opt_seq_cost(trial)
++                if best_c is None or c < best_c:
++                    best_c = c
++                    best_pos = pos
++                if time.time() >= deadline:
++                    best_pos = pos
++                    break
++            cand = cand[:best_pos] + [t] + cand[best_pos:]
++        return cand
++
+     time_budget = 20.0  # seconds per workload
+     deadline = time.time() + time_budget
+-    best_cost = None
+-    best_seq = None
+-    # Greedy construction followed by local search, repeated with
+-    # randomized restarts under a time budget.
++    # Initial construction: greedy + local search.
++    best_cost, best_seq = get_full_greedy(0.05)
++    best_cost, best_seq = local_search(best_seq, best_cost, deadline)
++    # Iterated local search: perturb the incumbent and re-polish,
++    # accepting only improvements, under the time budget.
+     while time.time() < deadline:
+-        cost, seq = get_full_greedy(0.05)
+-        cost, seq = local_search(seq, cost, deadline)
+-        if best_cost is None or cost < best_cost:
++        cand = perturb_best(best_seq)
++        cost = workload.get_opt_seq_cost(cand)
++        # give each candidate a bounded slice of the remaining budget
++        slice_deadline = min(deadline, time.time() + 2.0)
++        cost, cand = local_search(cand, cost, slice_deadline)
++        if cost < best_cost:
+             best_cost = cost
+-            best_seq = seq
++            best_seq = cand
+     return best_cost, best_seq
+ 
+ # EVOLVE-BLOCK-END
+ 
+ def get_random_costs():
+     workload_size = 100
+     workload = Workload(WORKLOAD_1)
+ 
+     makespan1, schedule1 = get_best_schedule(workload, 10)
+     cost1 = workload.get_opt_seq_cost(schedule1)
+ 
+     workload2 = Workload(WORKLOAD_2)
+     makespan2, schedule2 = get_best_schedule(workload2, 10)
+     cost2 = workload2.get_opt_seq_cost(schedule2)
+ 
+     workload3 = Workload(WORKLOAD_3)
+     makespan3, schedule3 = get_best_schedule(workload3, 10)
+     cost3 = workload3.get_opt_seq_cost(schedule3)
+     print(cost1, cost2, cost3)
+     return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+ 
+ 
+ if __name__ == "__main__":
+     makespan, schedule = get_random_costs()
+     print(f"Makespan: {makespan}")

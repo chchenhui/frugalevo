@@ -1,0 +1,350 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Expert parallelism load balancer (EPLB) for vLLM.
+
+This module builds hierarchical node-aware and GPU-aware placements for MoE
+experts using greedy replica allocation and refined equal-cardinality packing.
+"""
+
+# EVOLVE-BLOCK-START
+
+import torch
+
+
+def _inverse_permutation(permutation: torch.Tensor) -> torch.Tensor:
+    """Return inverse row-wise permutations."""
+    inverse = torch.empty_like(permutation)
+    positions = torch.arange(
+        permutation.size(1),
+        dtype=torch.int64,
+        device=permutation.device,
+    ).expand_as(permutation)
+    inverse.scatter_(1, permutation, positions)
+    return inverse
+
+
+def _refine_slot_layout(
+    slot_to_item: torch.Tensor,
+    item_weight: torch.Tensor,
+    num_packs: int,
+    rounds: int = 3,
+) -> torch.Tensor:
+    """
+    Improve an equal-cardinality layout through bounded load-reducing swaps.
+
+    Every iteration considers only the heaviest and lightest pack in each row.
+    It selects the swap whose transferred load is closest to half of their
+    current load gap. This preserves the exact number of items assigned to each
+    pack while reducing makespan whenever a profitable swap exists.
+    """
+    if num_packs <= 1 or rounds <= 0:
+        return slot_to_item
+
+    num_rows, num_items = slot_to_item.shape
+    capacity = num_items // num_packs
+    if capacity <= 1:
+        return slot_to_item
+
+    row_ids = torch.arange(num_rows, device=item_weight.device)
+    local_positions = torch.arange(capacity, device=item_weight.device)
+
+    for _ in range(rounds):
+        slot_weight = item_weight.gather(1, slot_to_item)
+        pack_load = slot_weight.reshape(num_rows, num_packs, capacity).sum(2)
+
+        high_pack = pack_load.argmax(1)
+        low_pack = pack_load.argmin(1)
+        gap = pack_load[row_ids, high_pack] - pack_load[row_ids, low_pack]
+
+        high_slots = high_pack.unsqueeze(1) * capacity + local_positions
+        low_slots = low_pack.unsqueeze(1) * capacity + local_positions
+        high_weight = slot_weight.gather(1, high_slots)
+        low_weight = slot_weight.gather(1, low_slots)
+
+        # Moving delta from the heavy pack to the light pack is beneficial
+        # only when it is strictly between zero and the existing gap.
+        delta = high_weight.unsqueeze(2) - low_weight.unsqueeze(1)
+        valid = (delta > 0) & (delta < gap.view(-1, 1, 1))
+
+        # The ideal swap transfers half the difference between the packs.
+        score = (gap.view(-1, 1, 1) - 2.0 * delta).abs()
+        score.masked_fill_(~valid, float("inf"))
+        selected = score.flatten(1).argmin(1)
+        best_score = score.flatten(1).gather(1, selected.unsqueeze(1)).squeeze(1)
+        active = torch.isfinite(best_score)
+
+        if not bool(active.any()):
+            break
+
+        high_position = selected // capacity
+        low_position = selected % capacity
+        chosen_high_slot = high_slots[row_ids, high_position]
+        chosen_low_slot = low_slots[row_ids, low_position]
+
+        high_item = slot_to_item[row_ids, chosen_high_slot]
+        low_item = slot_to_item[row_ids, chosen_low_slot]
+
+        active_rows = row_ids[active]
+        slot_to_item[active_rows, chosen_high_slot[active]] = low_item[active]
+        slot_to_item[active_rows, chosen_low_slot[active]] = high_item[active]
+
+    return slot_to_item
+
+
+def _equal_cardinality_layout(
+    weight: torch.Tensor,
+    num_packs: int,
+    refine_rounds: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Return a refined physical-slot layout for equal-cardinality packs.
+
+    Returns:
+        item_to_slot: destination physical slot for each original item.
+        slot_to_item: original item stored at each physical slot.
+    """
+    num_rows, num_items = weight.shape
+    assert num_items % num_packs == 0
+    capacity = num_items // num_packs
+
+    if capacity == 1:
+        item_to_slot = torch.arange(
+            num_items, dtype=torch.int64, device=weight.device
+        ).expand(num_rows, -1)
+        return item_to_slot, item_to_slot
+
+    order = torch.argsort(weight, dim=1, descending=True)
+    loads = torch.zeros(
+        (num_rows, num_packs), dtype=torch.float32, device=weight.device
+    )
+    counts = torch.zeros(
+        (num_rows, num_packs), dtype=torch.int64, device=weight.device
+    )
+    item_to_slot = torch.empty(
+        (num_rows, num_items), dtype=torch.int64, device=weight.device
+    )
+
+    for position in range(num_items):
+        eligible_loads = loads.masked_fill(counts >= capacity, float("inf"))
+        destination = eligible_loads.argmin(1)
+        item = order[:, position]
+        slot_rank = counts.gather(1, destination.unsqueeze(1)).squeeze(1)
+        slot = destination * capacity + slot_rank
+
+        item_to_slot.scatter_(1, item.unsqueeze(1), slot.unsqueeze(1))
+        loads.scatter_add_(
+            1,
+            destination.unsqueeze(1),
+            weight.gather(1, item.unsqueeze(1)),
+        )
+        counts.scatter_add_(
+            1,
+            destination.unsqueeze(1),
+            torch.ones((num_rows, 1), dtype=torch.int64, device=weight.device),
+        )
+
+    slot_to_item = _inverse_permutation(item_to_slot)
+    slot_to_item = _refine_slot_layout(
+        slot_to_item,
+        weight,
+        num_packs,
+        rounds=refine_rounds,
+    )
+    return _inverse_permutation(slot_to_item), slot_to_item
+
+
+def _allocate_replicas(
+    weight: torch.Tensor,
+    num_physical: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Allocate replica counts using greedy discrete water filling.
+
+    The highest current per-copy load receives each additional physical slot.
+    """
+    num_rows, num_logical = weight.shape
+    assert num_physical >= num_logical
+
+    device = weight.device
+    physical_to_logical = torch.empty(
+        (num_rows, num_physical), dtype=torch.int64, device=device
+    )
+    replica_rank = torch.zeros_like(physical_to_logical)
+    logical_count = torch.ones(
+        (num_rows, num_logical), dtype=torch.int64, device=device
+    )
+
+    physical_to_logical[:, :num_logical] = torch.arange(
+        num_logical, dtype=torch.int64, device=device
+    ).expand(num_rows, -1)
+
+    row_ids = torch.arange(num_rows, device=device)
+    for slot in range(num_logical, num_physical):
+        selected = (weight / logical_count).argmax(1)
+        physical_to_logical[:, slot] = selected
+        replica_rank[:, slot] = logical_count[row_ids, selected]
+        logical_count[row_ids, selected] += 1
+
+    return physical_to_logical, replica_rank, logical_count
+
+
+def _hierarchical_plan(
+    weight: torch.Tensor,
+    num_physical: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Plan group placement, local replication, and refined GPU placement."""
+    num_layers, num_logical = weight.shape
+    assert num_logical % num_groups == 0
+    assert num_groups % num_nodes == 0
+    assert num_gpus % num_nodes == 0
+    assert num_physical % num_gpus == 0
+
+    group_size = num_logical // num_groups
+    groups_per_node = num_groups // num_nodes
+    logical_per_node = num_logical // num_nodes
+    physical_per_node = num_physical // num_nodes
+    gpus_per_node = num_gpus // num_nodes
+    physical_per_gpu = num_physical // num_gpus
+
+    # Stage 1: assign whole expert groups to nodes.
+    group_weight = weight.reshape(num_layers, num_groups, group_size).sum(2)
+    group_to_node_slot, _ = _equal_cardinality_layout(
+        group_weight,
+        num_nodes,
+        refine_rounds=2,
+    )
+
+    group_node = group_to_node_slot // groups_per_node
+    group_slot = group_to_node_slot % groups_per_node
+    logical_to_node_order = (
+        (group_node * groups_per_node + group_slot).unsqueeze(-1) * group_size
+        + torch.arange(group_size, dtype=torch.int64, device=weight.device)
+    ).flatten(1)
+    node_order_to_logical = _inverse_permutation(logical_to_node_order)
+
+    # Stage 2: independently allocate each node's fixed physical capacity.
+    node_weight = weight.gather(1, node_order_to_logical).reshape(
+        num_layers * num_nodes,
+        logical_per_node,
+    )
+    local_physical_to_logical, local_rank, local_count = _allocate_replicas(
+        node_weight,
+        physical_per_node,
+    )
+
+    replica_weight = (node_weight / local_count).gather(
+        1,
+        local_physical_to_logical,
+    )
+
+    # Stage 3: place replicas into fixed GPU-sized physical slot ranges.
+    _, gpu_slot_to_local_physical = _equal_cardinality_layout(
+        replica_weight,
+        gpus_per_node,
+        refine_rounds=3,
+    )
+
+    packed_local_logical = local_physical_to_logical.gather(
+        1,
+        gpu_slot_to_local_physical,
+    )
+    packed_rank = local_rank.gather(1, gpu_slot_to_local_physical)
+
+    node_offsets = (
+        torch.arange(num_nodes, dtype=torch.int64, device=weight.device)
+        .view(1, num_nodes, 1)
+        * logical_per_node
+    )
+    node_order_logical = (
+        packed_local_logical.reshape(num_layers, num_nodes, physical_per_node)
+        + node_offsets
+    ).flatten(1)
+
+    physical_to_logical = node_order_to_logical.gather(1, node_order_logical)
+    physical_rank = packed_rank.reshape(num_layers, num_physical)
+    logical_count = local_count.reshape(num_layers, num_logical).gather(
+        1,
+        logical_to_node_order,
+    )
+    return physical_to_logical, physical_rank, logical_count
+
+
+def _materialize_reverse_map(
+    physical_to_logical: torch.Tensor,
+    physical_rank: torch.Tensor,
+    logical_count: torch.Tensor,
+) -> torch.Tensor:
+    """Materialize padded logical-expert to physical-slot mappings."""
+    num_layers, num_physical = physical_to_logical.shape
+    num_logical = logical_count.size(1)
+    max_replicas = num_physical - num_logical + 1
+
+    logical_to_physical = torch.full(
+        (num_layers, num_logical, max_replicas),
+        -1,
+        dtype=torch.int64,
+        device=physical_to_logical.device,
+    )
+    physical_slots = torch.arange(
+        num_physical,
+        dtype=torch.int64,
+        device=physical_to_logical.device,
+    ).expand(num_layers, -1)
+
+    logical_to_physical.flatten(1).scatter_(
+        1,
+        physical_to_logical * max_replicas + physical_rank,
+        physical_slots,
+    )
+    return logical_to_physical
+
+
+def rebalance_experts(
+    weight: torch.Tensor,
+    num_replicas: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Rebalance logical MoE experts across physical expert slots.
+
+    Returns:
+        physical_to_logical_map: [layers, num_replicas]
+        logical_to_physical_map: [layers, num_logical_experts, X]
+        expert_count: [layers, num_logical_experts]
+    """
+    _, num_logical = weight.shape
+    assert num_replicas >= num_logical
+
+    planning_weight = weight.float().cpu()
+
+    if num_groups % num_nodes == 0:
+        plan_groups = num_groups
+        plan_nodes = num_nodes
+    else:
+        # Global placement remains valid when group/node partitioning is not.
+        plan_groups = 1
+        plan_nodes = 1
+
+    physical_to_logical, physical_rank, logical_count = _hierarchical_plan(
+        planning_weight,
+        num_replicas,
+        plan_groups,
+        plan_nodes,
+        num_gpus,
+    )
+    logical_to_physical = _materialize_reverse_map(
+        physical_to_logical,
+        physical_rank,
+        logical_count,
+    )
+    return physical_to_logical, logical_to_physical, logical_count
+
+
+# EVOLVE-BLOCK-END
+
+__all__ = ["rebalance_experts"]

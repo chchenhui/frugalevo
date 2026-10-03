@@ -1,0 +1,164 @@
+<NAME>
+adaptive_island_de</NAME>
+
+<DESCRIPTION>
+Replace the basic `DE/rand/1` loop with a larger deterministic current-to-pbest differential-evolution search.  The smallest-area objective is highly nonsmooth: once a candidate has a few active limiting triangles, ordinary crossover frequently loses all useful structure.  Current-to-pbest mutation preserves good configurations while still using population differences for exploration.  Per-candidate mutation factors and crossover probabilities prevent the whole population from following one search scale.  Periodic replacement of only the weakest candidates provides deterministic restart behavior without discarding the best geometric arrangements found so far.
+
+The additional evaluations are worthwhile because the former 72-member, 420-generation search explores only a small portion of the 20-dimensional barycentric parameter space.  The return value remains reproducible because every operation uses the existing seeded generator.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _differential_evolution(rng: np.random.Generator) -> np.ndarray:
+    """
+    Global deterministic search using one-to-one DE selection.  All expensive
+    geometry calls operate on batches rather than individual candidates.
+    """
+    population_size = 72
+    generations = 420
+    dimension = 20
+
+    population = _initial_population(rng, population_size)
+    scores = _population_scores(population)
+
+    for generation in range(generations):
+        donors = np.empty_like(population)
+        for index in range(population_size):
+            choices = np.arange(population_size)
+            choices = choices[choices != index]
+            a, b, c = rng.choice(choices, size=3, replace=False)
+            scale = 0.72 if generation < generations * 0.65 else 0.48
+            donors[index] = population[a] + scale * (population[b] - population[c])
+
+        donors = np.clip(donors, -7.0, 7.0)
+        mask = rng.random((population_size, dimension)) < 0.84
+        forced = rng.integers(0, dimension, size=population_size)
+        mask[np.arange(population_size), forced] = True
+        trials = np.where(mask, donors, population)
+
+        trial_scores = _population_scores(trials)
+        accepted = trial_scores > scores
+        population[accepted] = trials[accepted]
+        scores[accepted] = trial_scores[accepted]
+
+    return population[np.argmax(scores)].copy()
+=======
+def _differential_evolution(rng: np.random.Generator) -> np.ndarray:
+    """
+    Deterministic current-to-pbest DE for the nonsmooth maximin objective.
+
+    The pbest term retains the geometry of good arrangements, whereas the two
+    difference vectors and occasional replacement of weak members continue to
+    explore distinct combinatorial sets of limiting triangles.
+    """
+    population_size = 144
+    generations = 1050
+    dimension = 20
+    pbest_count = 18
+
+    population = _initial_population(rng, population_size)
+    scores = _population_scores(population)
+
+    for generation in range(generations):
+        ranking = np.argsort(scores)[::-1]
+        elite = ranking[:pbest_count]
+        donors = np.empty_like(population)
+
+        # Individual F and CR values avoid committing the whole search to one
+        # perturbation scale as the active minimum-area triangles change.
+        progress = generation / max(1, generations - 1)
+        scales = rng.uniform(0.42, 0.86 - 0.22 * progress, population_size)
+        crossover = rng.uniform(0.62, 0.94 - 0.10 * progress, population_size)
+
+        for index in range(population_size):
+            available = np.arange(population_size)
+            available = available[available != index]
+            a, b = rng.choice(available, size=2, replace=False)
+            target = population[rng.choice(elite)]
+            scale = scales[index]
+            donors[index] = (
+                population[index]
+                + scale * (target - population[index])
+                + scale * (population[a] - population[b])
+            )
+
+        donors = np.clip(donors, -7.0, 7.0)
+        mask = rng.random((population_size, dimension)) < crossover[:, None]
+        forced = rng.integers(0, dimension, size=population_size)
+        mask[np.arange(population_size), forced] = True
+        trials = np.where(mask, donors, population)
+        trial_scores = _population_scores(trials)
+
+        accepted = trial_scores > scores
+        population[accepted] = trials[accepted]
+        scores[accepted] = trial_scores[accepted]
+
+        # A deterministic island restart prevents a single early maximin basin
+        # from consuming the population.  The best half is never modified.
+        if (generation + 1) % 175 == 0 and generation + 1 < generations:
+            weakest = np.argsort(scores)[:population_size // 4]
+            fresh = _initial_population(rng, weakest.size)
+            fresh_scores = _population_scores(fresh)
+            population[weakest] = fresh
+            scores[weakest] = fresh_scores
+
+    return population[np.argmax(scores)].copy()
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+denser_local_polish</NAME>
+
+<DESCRIPTION>
+Increase local-refinement batch width and add finer perturbation scales.  Near a useful maximin arrangement, improvements generally require finding a perturbation that increases several nearly active triangle areas simultaneously.  Sampling a wider batch around the current incumbent is substantially more effective than accepting a sequence of individual coordinate perturbations, while the strictly improving rule retains deterministic monotonic behavior.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _local_refinement(seed: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """
+    Batched stochastic hill climbing around the best global candidate.
+    Strict improvement only keeps the result deterministic and monotonic.
+    """
+    best = seed.copy()
+    best_score = float(_population_scores(best)[0])
+
+    for stage, sigma in enumerate((0.32, 0.18, 0.095, 0.045, 0.020, 0.009)):
+        iterations = 45 if stage < 3 else 65
+        for _ in range(iterations):
+            candidates = best[None, :] + rng.normal(0.0, sigma, size=(40, best.size))
+            candidates = np.clip(candidates, -7.0, 7.0)
+            scores = _population_scores(candidates)
+            winner = int(np.argmax(scores))
+            if scores[winner] > best_score:
+                best = candidates[winner]
+                best_score = float(scores[winner])
+
+    return best
+=======
+def _local_refinement(seed: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """
+    Batched stochastic hill climbing around the best global candidate.
+
+    The final small scales are important because the objective is determined
+    by a changing set of nearly equal limiting triangles.
+    """
+    best = seed.copy()
+    best_score = float(_population_scores(best)[0])
+
+    for stage, sigma in enumerate(
+        (0.30, 0.16, 0.080, 0.038, 0.018, 0.008, 0.0035, 0.0015)
+    ):
+        iterations = 55 if stage < 4 else 85
+        for _ in range(iterations):
+            candidates = best[None, :] + rng.normal(0.0, sigma, size=(88, best.size))
+            candidates = np.clip(candidates, -7.0, 7.0)
+            scores = _population_scores(candidates)
+            winner = int(np.argmax(scores))
+            if scores[winner] > best_score:
+                best = candidates[winner]
+                best_score = float(scores[winner])
+
+    return best
+>>>>>>> REPLACE
+</DIFF>

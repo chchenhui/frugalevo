@@ -1,0 +1,380 @@
+# EVOLVE-BLOCK-START
+import math
+import os
+from typing import Dict, List, Optional, Tuple
+
+import networkx as nx
+import pandas as pd
+
+
+# Broadcast-tree tuning parameters.  These are deliberately conservative:
+# billing cost remains the primary optimization objective.
+MAX_ROUTE_STRETCH = 0.02
+TREE_SEEDS = 4
+COST_EPSILON = 1e-12
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]
+
+
+class BroadCastTopology:
+    def __init__(
+        self,
+        src: str,
+        dsts: List[str],
+        num_partitions: int = 4,
+        paths: Dict[str, SingleDstPath] = None,
+    ):
+        self.src = src
+        self.dsts = dsts
+        self.num_partitions = num_partitions
+
+        if paths is not None:
+            self.paths = paths
+            self.set_graph()
+        else:
+            self.paths = {
+                dst: {str(i): None for i in range(num_partitions)}
+                for dst in dsts
+            }
+
+    def set_graph(self):
+        """Compatibility hook for callers constructing a topology from paths."""
+        return self.paths
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        partition = str(partition)
+        self.paths[dst][partition] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+
+def _valid_cost(data) -> Optional[float]:
+    """Return a usable non-negative edge cost, or None for unusable links."""
+    value = data.get("cost")
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def _edge_cost(graph: nx.DiGraph, u, v) -> float:
+    return _valid_cost(graph[u][v]) or 0.0
+
+
+def _path_cost(graph: nx.DiGraph, path: List[str]) -> float:
+    return sum(_edge_cost(graph, u, v) for u, v in zip(path, path[1:]))
+
+
+def _union_cost(graph: nx.DiGraph, paths: Dict[str, List[str]]) -> float:
+    seen = set()
+    total = 0.0
+    for path in paths.values():
+        for u, v in zip(path, path[1:]):
+            if (u, v) not in seen:
+                seen.add((u, v))
+                total += _edge_cost(graph, u, v)
+    return total
+
+
+def _shortest_path(graph: nx.DiGraph, src: str, dst: str) -> Optional[List[str]]:
+    """
+    Cost-first shortest path.  For equal-cost routes, prefer higher-throughput
+    links through a tiny deterministic penalty.
+    """
+    def weight(u, v, data):
+        cost = _valid_cost(data)
+        if cost is None:
+            return None
+        throughput = data.get("throughput", 0.0)
+        try:
+            throughput = float(throughput)
+        except (TypeError, ValueError):
+            throughput = 0.0
+        # The penalty is far below normal billing precision and only breaks ties.
+        return cost + (1e-15 / max(throughput, 1e-15))
+
+    try:
+        return nx.dijkstra_path(graph, src, dst, weight=weight)
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return None
+
+
+def _shared_tree_path(
+    graph: nx.DiGraph,
+    src: str,
+    dst: str,
+    tree_edges: set,
+) -> Optional[List[str]]:
+    """
+    Find the cheapest marginal path to a destination.  Existing tree edges
+    have zero incremental broadcast cost, so the search naturally reuses
+    already selected trunks and only pays for new branches.
+    """
+    def marginal_weight(u, v, data):
+        cost = _valid_cost(data)
+        if cost is None:
+            return None
+        if (u, v) in tree_edges:
+            return 0.0
+        return cost
+
+    try:
+        return nx.dijkstra_path(graph, src, dst, weight=marginal_weight)
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return None
+
+
+def _build_shared_tree(
+    graph: nx.DiGraph,
+    src: str,
+    destinations: List[str],
+    first_destination: Optional[str] = None,
+) -> Dict[str, List[str]]:
+    """
+    Greedily grow a directed multicast tree.  At every step the destination
+    requiring the least additional paid network edges is attached next.
+    """
+    remaining = set(destinations)
+    routes: Dict[str, List[str]] = {}
+    tree_edges = set()
+
+    if first_destination in remaining:
+        path = _shared_tree_path(graph, src, first_destination, tree_edges)
+        if path is not None:
+            routes[first_destination] = path
+            tree_edges.update(zip(path, path[1:]))
+        remaining.remove(first_destination)
+
+    while remaining:
+        best_dst = None
+        best_path = None
+        best_incremental_cost = math.inf
+
+        for dst in sorted(remaining, key=str):
+            path = _shared_tree_path(graph, src, dst, tree_edges)
+            if path is None:
+                continue
+
+            incremental = sum(
+                _edge_cost(graph, u, v)
+                for u, v in zip(path, path[1:])
+                if (u, v) not in tree_edges
+            )
+
+            if (
+                incremental < best_incremental_cost - COST_EPSILON
+                or (
+                    abs(incremental - best_incremental_cost) <= COST_EPSILON
+                    and (best_dst is None or str(dst) < str(best_dst))
+                )
+            ):
+                best_dst = dst
+                best_path = path
+                best_incremental_cost = incremental
+
+        if best_dst is None:
+            # Preserve compatibility for partially connected graphs.
+            break
+
+        routes[best_dst] = best_path
+        tree_edges.update(zip(best_path, best_path[1:]))
+        remaining.remove(best_dst)
+
+    return routes
+
+
+def _path_to_edge_records(graph: nx.DiGraph, path: Optional[List[str]]) -> List[List]:
+    if not path:
+        return []
+    return [[u, v, dict(graph[u][v])] for u, v in zip(path, path[1:])]
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Construct a low-cost broadcast topology.
+
+    A conventional independent shortest-path solution is retained as a safe
+    baseline.  Multiple shared-tree candidates are then evaluated; a candidate
+    is selected when it reduces total unique broadcast-edge cost without
+    materially increasing any destination's own route cost.
+    """
+    h = G.copy()
+
+    if src not in h:
+        return BroadCastTopology(src, dsts, num_partitions)
+
+    # Input should not be reintroduced at the source, and self loops cannot
+    # help a non-negative-cost shortest-path or broadcast-tree solution.
+    h.remove_edges_from(list(h.in_edges(src)))
+    h.remove_edges_from(list(nx.selfloop_edges(h)))
+
+    # Remove links with absent/invalid costs.  The original graph may contain
+    # cost=None for pairs not present in the pricing table.
+    invalid_edges = [
+        (u, v)
+        for u, v, data in h.edges(data=True)
+        if _valid_cost(data) is None
+    ]
+    h.remove_edges_from(invalid_edges)
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Baseline: individually minimum-cost routes.
+    baseline_routes = {
+        dst: _shortest_path(h, src, dst)
+        for dst in dsts
+    }
+    reachable_dsts = [dst for dst in dsts if baseline_routes[dst] is not None]
+
+    if not reachable_dsts:
+        for dst in dsts:
+            for partition in range(num_partitions):
+                bc_topology.set_dst_partition_paths(dst, partition, [])
+        return bc_topology
+
+    baseline_costs = {
+        dst: _path_cost(h, baseline_routes[dst])
+        for dst in reachable_dsts
+    }
+    baseline_union = _union_cost(
+        h, {dst: baseline_routes[dst] for dst in reachable_dsts}
+    )
+
+    # Evaluate several seeds because greedy multicast-tree construction can
+    # depend on the first attached destination.
+    seed_order = sorted(
+        reachable_dsts,
+        key=lambda dst: (baseline_costs[dst], str(dst)),
+    )
+    seeds = [None]
+    seeds.extend(seed_order[:TREE_SEEDS])
+    seeds.extend(reversed(seed_order[-TREE_SEEDS:]))
+
+    selected_routes = dict(baseline_routes)
+    selected_union = baseline_union
+    selected_total = sum(baseline_costs.values())
+
+    for seed in seeds:
+        candidate = _build_shared_tree(h, src, reachable_dsts, seed)
+        if set(candidate) != set(reachable_dsts):
+            continue
+
+        # Do not choose a shared tree that makes a receiver significantly more
+        # expensive than its direct cost-optimal route.
+        candidate_costs = {
+            dst: _path_cost(h, candidate[dst])
+            for dst in reachable_dsts
+        }
+        if any(
+            candidate_costs[dst]
+            > baseline_costs[dst] * (1.0 + MAX_ROUTE_STRETCH) + COST_EPSILON
+            for dst in reachable_dsts
+        ):
+            continue
+
+        candidate_union = _union_cost(h, candidate)
+        candidate_total = sum(candidate_costs.values())
+
+        # Primary criterion: one-time shared broadcast transfer cost.
+        # Secondary criterion: aggregate receiver route cost.
+        is_better = (
+            candidate_union < selected_union - COST_EPSILON
+            or (
+                abs(candidate_union - selected_union) <= COST_EPSILON
+                and candidate_total < selected_total - COST_EPSILON
+            )
+        )
+        if is_better:
+            selected_routes = dict(baseline_routes)
+            selected_routes.update(candidate)
+            selected_union = candidate_union
+            selected_total = candidate_total
+
+    # Every partition carries a distinct data slice, but follows the selected
+    # low-cost multicast route.  Shared edges can therefore be transmitted in
+    # parallel and reused across all destination branches.
+    for dst in dsts:
+        edge_records = _path_to_edge_records(h, selected_routes.get(dst))
+        for partition in range(num_partitions):
+            bc_topology.set_dst_partition_paths(dst, partition, list(edge_records))
+
+    return bc_topology
+
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    """
+    Build a directed cloud-network graph.
+
+    Per edge:
+      throughput: aggregate available throughput in Gbps
+      cost: transfer price per GB
+      flow: optionally populated by downstream scheduling code
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if cost_path is None:
+        cost = pd.read_csv(os.path.join(current_dir, "profiles/cost.csv"))
+    else:
+        cost = pd.read_csv(cost_path)
+
+    if throughput_path is None:
+        throughput = pd.read_csv(os.path.join(current_dir, "profiles/throughput.csv"))
+    else:
+        throughput = pd.read_csv(throughput_path)
+
+    G = nx.DiGraph()
+
+    for _, row in throughput.iterrows():
+        if row["src_region"] == row["dst_region"]:
+            continue
+        G.add_edge(
+            row["src_region"],
+            row["dst_region"],
+            cost=None,
+            throughput=num_vms * float(row["throughput_sent"]) / 1e9,
+            flow=0.0,
+        )
+
+    for _, row in cost.iterrows():
+        src = row["src"]
+        dst = row["dest"]
+        if src in G and dst in G[src]:
+            G[src][dst]["cost"] = row["cost"]
+
+    no_cost_pairs = [
+        (src, dst)
+        for src, dst, data in G.edges(data=True)
+        if _valid_cost(data) is None
+    ]
+    print("Unable to get costs for: ", no_cost_pairs)
+
+    return G
+
+
+# EVOLVE-BLOCK-END
+
+# Helper functions that won't be evolved
+def create_broadcast_topology(src: str, dsts: List[str], num_partitions: int = 4):
+    """Create a broadcast topology instance"""
+    return BroadCastTopology(src, dsts, num_partitions)
+
+def run_search_algorithm(src: str, dsts: List[str], G, num_partitions: int):
+    """Run the search algorithm and return the topology"""
+    return search_algorithm(src, dsts, G, num_partitions)

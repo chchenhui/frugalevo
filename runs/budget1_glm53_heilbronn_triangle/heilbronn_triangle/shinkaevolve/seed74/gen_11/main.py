@@ -1,0 +1,111 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+def _min_area(points):
+    """Vectorized minimum (doubled) triangle area over all triplets, normalized by triangle area."""
+    n = len(points)
+    i, j = np.triu_indices(n, k=1)
+    # vectors from point i to point j
+    d = points[j] - points[i]      # (m,2)
+    m = len(d)
+    best = np.inf
+    # for each k, area = |d x (p_k - p_i)| / 2 over pairs (i,j)
+    # chunk over k to limit memory
+    for k0 in range(n):
+        v = points[k0] - points[i]         # (m,2)
+        cross = np.abs(d[:,0]*v[:,1] - d[:,1]*v[:,0])
+        # exclude triplets where k equals i or j
+        mask = (i != k0) & (j != k0)
+        if mask.any():
+            best = min(best, cross[mask].min())
+    return best  # doubled area; divide by 2*sqrt(3)/2 for normalized
+
+def heilbronn_triangle11() -> np.ndarray:
+    n = 11
+    verts = np.array([[0.0,0.0],[1.0,0.0],[0.5, np.sqrt(3)/2]])
+    TRI_AREA = np.sqrt(3)/2
+
+    rng = np.random.default_rng(12345)
+
+    # Start: vertices + ring structure for remaining 8 points
+    pts = np.vstack([verts, np.zeros((8,2))])
+    # initial guess: points on a scaled inner triangle grid (feels good for Heilbronn)
+    # barycentric candidates
+    bary = np.array([
+        [1/3,1/3,1/3],
+        [0.5,0.25,0.25],[0.25,0.5,0.25],[0.25,0.25,0.5],
+        [2/3,1/6,1/6],[1/6,2/3,1/6],[1/6,1/6,2/3],
+        [0.5,0.5,0.0],
+    ])
+    for idx in range(8):
+        pts[3+idx] = bary[idx,0]*verts[0] + bary[idx,1]*verts[1] + bary[idx,2]*verts[2]
+
+    def objective(P):
+        return _min_area(P)  # larger is better
+
+    cur = pts.copy()
+    cur_val = objective(cur)
+    best, best_val = cur.copy(), cur_val
+
+    # Simulated annealing on the 8 free interior/boundary points
+    T0, T1 = 5e-3, 1e-5
+    iters = 4000
+    for t in range(iters):
+        T = T0 * (T1/T0) ** (t/iters)
+        cand = cur.copy()
+        k = 3 + rng.integers(0, 8)
+        step = rng.normal(0, T, size=2)
+        cand[k] += step
+        # project back inside triangle via barycentric clamping
+        v0 = verts[1]-verts[0]; v1 = verts[2]-verts[0]; v2 = cand[k]-verts[0]
+        d00 = v0@v0; d01 = v0@v1; d11 = v1@v1; d20 = v2@v0; d21 = v2@v1
+        den = d00*d11 - d01*d01
+        a = (d11*d20 - d01*d21)/den; b = (d00*d21 - d01*d20)/den
+        # clamp barycentric coords to [0,1], renormalize
+        bc = np.array([1-a-b, a, b])
+        bc = np.clip(bc, 0.0, 1.0); bc /= bc.sum()
+        cand[k] = bc[0]*verts[0] + bc[1]*verts[1] + bc[2]*verts[2]
+        val = objective(cand)
+        if val >= cur_val or rng.random() < np.exp((val-cur_val)/(T*TRI_AREA*2+1e-12)):
+            cur, cur_val = cand, val
+            if val > best_val:
+                best, best_val = cand.copy(), val
+
+    # Greedy polish: coordinate descent on the point participating in the worst triangle
+    P = best.copy()
+    for _ in range(300):
+        improved = False
+        # find worst triangle
+        areas = []
+        idx3 = np.array(list(itertools.combinations(range(n),3))) if False else None
+        # recompute worst via manual loop (cheap, 165 triplets)
+        worst_val, worst_tri = np.inf, None
+        for a in range(n):
+            for b in range(a+1,n):
+                for c in range(b+1,n):
+                    ar = abs(np.cross(P[b]-P[a], P[c]-P[a]))
+                    if ar < worst_val:
+                        worst_val, worst_tri = ar, (a,b,c)
+        for k in worst_tri:
+            for ax in range(2):
+                for s in (1,-1):
+                    for h in (3e-3, 1e-3, 3e-4):
+                        cand = P.copy()
+                        cand[k,ax] += s*h
+                        # clamp into triangle
+                        v0 = verts[1]-verts[0]; v1 = verts[2]-verts[0]; v2 = cand[k]-verts[0]
+                        d00=v0@v0; d01=v0@v1; d11=v1@v1; d20=v2@v0; d21=v2@v1
+                        den=d00*d11-d01*d01
+                        a2=(d11*d20-d01*d21)/den; b2=(d00*d21-d01*d20)/den
+                        bc=np.clip(np.array([1-a2-b2,a2,b2]),0,1); bc/=bc.sum()
+                        cand[k]=bc[0]*verts[0]+bc[1]*verts[1]+bc[2]*verts[2]
+                        if objective(cand) > objective(P) + 1e-15:
+                            P = cand; improved = True; break
+                    if improved: break
+            if improved: break
+        if not improved:
+            break
+
+    return P
+
+# EVOLVE-BLOCK-END

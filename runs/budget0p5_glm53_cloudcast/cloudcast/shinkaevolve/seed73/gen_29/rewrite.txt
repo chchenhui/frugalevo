@@ -1,0 +1,181 @@
+# EVOLVE-BLOCK-START
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+
+DEFAULT_FALLBACK_COST = 1e9
+REUSE_EPSILON = 1e-9   # near-zero marginal cost on already-paid tree edges
+SAFETY_MARGIN = 0.0    # a reuse path must beat the baseline by this margin
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    # Sanitized graph: no self loops, no in-edges of src
+    h = G.copy()
+    h.remove_edges_from(list(nx.selfloop_edges(h)))
+    h.remove_edges_from(list(h.in_edges(src)))
+
+    def _weight(u, v, data):
+        c = data.get("cost")
+        return DEFAULT_FALLBACK_COST if c is None else c
+
+    # Baseline shortest paths from src (shared single-source computation)
+    try:
+        lengths, paths_tree = nx.single_source_dijkstra(h, src, weight=_weight)
+    except Exception:
+        lengths, paths_tree = {}, {}
+
+    # Order destinations by descending baseline cost: expensive destinations
+    # build shared trunks first so cheaper ones can latch on at a discount.
+    ordered = []
+    for dst in dsts:
+        if dst == src:
+            continue
+        if dst not in h or dst not in paths_tree:
+            continue
+        ordered.append((lengths.get(dst, DEFAULT_FALLBACK_COST), dst))
+    ordered.sort(reverse=True)
+
+    # Working copy with mutable costs for reuse-aware Steiner routing
+    w = h.copy()
+    for u, v in w.edges():
+        c = w[u][v].get("cost")
+        w[u][v]["cost"] = DEFAULT_FALLBACK_COST if c is None else c
+
+    paid_edges = set()
+    chosen = {}
+
+    for _, dst in ordered:
+        baseline_path = paths_tree[dst]
+        baseline_cost = lengths.get(dst, DEFAULT_FALLBACK_COST)
+
+        # Try reuse-discounted route over the shared trunk
+        best_path, best_cost = baseline_path, baseline_cost
+        try:
+            r_path = nx.dijkstra_path(w, src, dst, weight="cost")
+            r_cost = sum(w[r_path[i]][r_path[i + 1]]["cost"]
+                         for i in range(len(r_path) - 1))
+            # Accept only if it is at least as cheap as the baseline
+            if r_cost <= baseline_cost + SAFETY_MARGIN:
+                best_path, best_cost = r_path, r_cost
+        except (nx.NetworkXNoPath, nx.NetworkXError, nx.NodeNotFound):
+            pass
+
+        # Mark trunk edges as paid; future destinations get them nearly free
+        for i in range(len(best_path) - 1):
+            key = (best_path[i], best_path[i + 1])
+            if key not in paid_edges:
+                paid_edges.add(key)
+                if w.has_edge(*key):
+                    w[key[0]][key[1]]["cost"] = REUSE_EPSILON
+
+        chosen[dst] = best_path
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        if dst == src:
+            continue
+        if dst in chosen:
+            path = chosen[dst]
+        elif dst in paths_tree:
+            path = paths_tree[dst]
+        else:
+            try:
+                path = nx.dijkstra_path(h, src, dst, weight=_weight)
+            except Exception:
+                print(f"Warning: no path found from {src} to {dst}; skipping.")
+                continue
+
+        for i in range(len(path) - 1):
+            s, t = path[i], path[i + 1]
+            edge_data = G[s][t]
+            for j in range(num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, edge_data])
+
+    return bc_topology
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]  # [[src, dst, edge data]]
+
+
+class BroadCastTopology:
+    def __init__(self, src: str, dsts: List[str], num_partitions: int = 4, paths: Dict[str, SingleDstPath] = None):
+        self.src = src
+        self.dsts = dsts
+        self.num_partitions = num_partitions
+
+        # dict(dst) --> dict(partition) --> list(nx.edges)
+        if paths is not None:
+            self.paths = paths
+        else:
+            self.paths = {dst: {str(i): None for i in range(num_partitions)} for dst in dsts}
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        partition = str(partition)
+        self.paths[dst][partition] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    """
+    Default graph with capacity constraints and cost info
+    nodes: regions, edges: links
+    per edge:
+        throughput: max tput achievable (gbps)
+        cost: $/GB
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if cost_path is None:
+        cost = pd.read_csv(os.path.join(current_dir, "profiles/cost.csv"))
+    else:
+        cost = pd.read_csv(cost_path)
+
+    if throughput_path is None:
+        throughput = pd.read_csv(os.path.join(current_dir, "profiles/throughput.csv"))
+    else:
+        throughput = pd.read_csv(throughput_path)
+
+    G = nx.DiGraph()
+    for _, row in throughput.iterrows():
+        if row["src_region"] == row["dst_region"]:
+            continue
+        G.add_edge(row["src_region"], row["dst_region"], cost=None,
+                   throughput=num_vms * row["throughput_sent"] / 1e9)
+
+    for _, row in cost.iterrows():
+        if row["src"] in G and row["dest"] in G[row["src"]]:
+            G[row["src"]][row["dest"]]["cost"] = row["cost"]
+
+    no_cost_pairs = [(u, v) for u, v, d in G.edges(data=True) if d["cost"] is None]
+    print("Unable to get costs for: ", no_cost_pairs)
+
+    return G
+
+
+# EVOLVE-BLOCK-END
+
+# Helper functions that won't be evolved
+def create_broadcast_topology(src: str, dsts: List[str], num_partitions: int = 4):
+    """Create a broadcast topology instance"""
+    return BroadCastTopology(src, dsts, num_partitions)
+
+def run_search_algorithm(src: str, dsts: List[str], G, num_partitions: int):
+    """Run the search algorithm and return the topology"""
+    return search_algorithm(src, dsts, G, num_partitions)

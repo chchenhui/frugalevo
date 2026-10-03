@@ -1,0 +1,50 @@
+<NAME>
+local_adaptive_snap_threshold</NAME>
+<DESCRIPTION>
+Replace the fixed 5-tap binomial post-smoothing with a locally adaptive "snap" stage. The key weakness (lag_error 0.33, slope_changes 108) comes from globally applying a smoothing kernel: clean dynamic segments get over-smoothed (lag) while noisy segments may still jitter. Instead: (1) compute robust local noise scale σ via sliding_window_view on the diff of the pre-filtered signal (fully vectorized, efficiency stays ~1.00); (2) where consecutive output differences are below the local threshold (0.5·σ), snap them toward the local median slope (aggressive de-jitter in noisy segments); (3) where diffs exceed the threshold (genuine dynamics), leave them untouched (no added lag). This preserves responsiveness (0.75 has margin) while cutting spurious slope changes and false reversals.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Light 5-tap binomial post-smoothing to reduce spurious slope changes /
+    # false reversals with negligible added phase delay (binomial kernel is
+    # zero-phase in the interior and near-zero-lag overall).
+    if output_length >= 5:
+        k = np.array([1.0, 4.0, 6.0, 4.0, 1.0]) / 16.0
+        y_pad = np.concatenate(([y[0], y[0]], y, [y[-1], y[-1]]))
+        y = np.convolve(y_pad, k, mode="valid")[:output_length]
+
+    return y
+=======
+    # Locally adaptive snap stage: robust local noise scale over rolling
+    # blocks of the pre-filtered signal's first differences. Small
+    # sample-to-sample changes that fall below the local threshold are
+    # attributed to residual noise and snapped toward the local median
+    # slope (removing spurious reversals), while changes above the
+    # threshold are treated as genuine dynamics and left untouched
+    # (no added lag, dynamics preserved). Fully vectorized.
+    if output_length >= 9:
+        block = 25  # rolling +/- ~25 samples for local scale estimation
+        dy = np.diff(y)
+        # Robust sigma of diffs over rolling blocks (vectorized)
+        pad = block // 2
+        dy_pad = np.concatenate((np.full(pad, dy[0]), dy, np.full(pad, dy[-1])))
+        win_dy = np.lib.stride_tricks.sliding_window_view(dy_pad, 2 * pad + 1)
+        local_med = np.median(win_dy, axis=1)
+        local_mad = np.median(np.abs(win_dy - local_med[:, None]), axis=1) / 0.6745
+        local_sigma = np.maximum(local_mad, 1e-9)
+
+        # Median-of-diffs slope used as the "clean" local slope for snapping
+        dy_snap = local_med
+        threshold = 0.5 * local_sigma
+
+        # Snap diffs below local threshold toward the local median slope,
+        # blending 50% to avoid over-flattening genuine micro-dynamics.
+        small = np.abs(dy - local_med) < threshold
+        dy_adj = np.where(small, 0.5 * dy_snap + 0.5 * dy, dy)
+
+        # Re-integrate; anchor to y[0] so no global offset/phase is added.
+        y = np.concatenate(([y[0]], y[0] + np.cumsum(dy_adj)))
+
+    return y
+>>>>>>> REPLACE
+</DIFF>

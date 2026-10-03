@@ -1,0 +1,482 @@
+--- a/original.py
++++ b/original.py
+@@ -1,167 +1,344 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_convex13() -> np.ndarray:
+     """
+-    Deterministically search for a 13-point Heilbronn configuration.
+-
+-    The returned points lie in the unit square.  Since the objective is divided
+-    by convex-hull area, restricting the search to this fixed convex container
+-    does not impose a meaningful scale restriction.
++    Deterministic active-set search for a 13 point Heilbronn configuration.
++
++    Points are kept in the unit square, a convex region.  The reported score is
++    scale invariant because triangle areas are normalized by the area of the
++    resulting convex hull.
+     """
+     n = 13
+-    rng = np.random.default_rng(13051957)
++    seed = 13051957
++    rng = np.random.default_rng(seed)
++
+     triples = np.asarray(
+-        [(i, j, k) for i in range(n - 2) for j in range(i + 1, n - 1)
++        [(i, j, k)
++         for i in range(n - 2)
++         for j in range(i + 1, n - 1)
+          for k in range(j + 1, n)],
+         dtype=np.intp,
+     )
+ 
+-    def hull_area(p: np.ndarray) -> float:
+-        """Twice-area monotone-chain hull, with a harmless zero-area guard."""
+-        ordered = p[np.lexsort((p[:, 1], p[:, 0]))]
++    cardinal_directions = np.asarray(
++        [
++            [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
++            [0.7071067811865476, 0.7071067811865476],
++            [0.7071067811865476, -0.7071067811865476],
++            [-0.7071067811865476, 0.7071067811865476],
++            [-0.7071067811865476, -0.7071067811865476],
++        ],
++        dtype=float,
++    )
++
++    def clamp(points: np.ndarray) -> np.ndarray:
++        np.clip(points, 0.0, 1.0, out=points)
++        return points
++
++    def hull_area(points: np.ndarray) -> float:
++        """Monotone-chain convex hull area."""
++        order = np.lexsort((points[:, 1], points[:, 0]))
++        ordered = points[order]
++
+         lower = []
+-        for q in ordered:
++        for point in ordered:
+             while len(lower) >= 2:
+-                a, b = lower[-2], lower[-1]
+-                if (b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0]) > 1e-12:
++                a = lower[-2]
++                b = lower[-1]
++                turn = ((b[0] - a[0]) * (point[1] - a[1]) -
++                        (b[1] - a[1]) * (point[0] - a[0]))
++                if turn > 1.0e-12:
+                     break
+                 lower.pop()
+-            lower.append(q)
++            lower.append(point)
++
+         upper = []
+-        for q in ordered[::-1]:
++        for point in ordered[::-1]:
+             while len(upper) >= 2:
+-                a, b = upper[-2], upper[-1]
+-                if (b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0]) > 1e-12:
++                a = upper[-2]
++                b = upper[-1]
++                turn = ((b[0] - a[0]) * (point[1] - a[1]) -
++                        (b[1] - a[1]) * (point[0] - a[0]))
++                if turn > 1.0e-12:
+                     break
+                 upper.pop()
+-            upper.append(q)
++            upper.append(point)
++
+         polygon = np.asarray(lower[:-1] + upper[:-1])
+         if len(polygon) < 3:
+             return 0.0
+-        return abs(np.dot(polygon[:, 0], np.roll(polygon[:, 1], -1)) -
+-                   np.dot(polygon[:, 1], np.roll(polygon[:, 0], -1))) * 0.5
+-
+-    def evaluate(p: np.ndarray) -> tuple[float, float]:
+-        a, b, c = p[triples[:, 0]], p[triples[:, 1]], p[triples[:, 2]]
+-        areas = 0.5 * np.abs(
+-            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+-            (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
++
++        return 0.5 * abs(
++            np.dot(polygon[:, 0], np.roll(polygon[:, 1], -1)) -
++            np.dot(polygon[:, 1], np.roll(polygon[:, 0], -1))
+         )
+-        area_hull = hull_area(p)
+-        if area_hull <= 1e-10:
+-            return 0.0, 0.0
+-        normalized = areas / area_hull
+-        # The lower-tail term makes moves that improve several critical
+-        # triangles acceptable before the strict minimum itself changes.
+-        tail = np.partition(normalized, 11)[:12]
+-        return float(normalized.min()), float(normalized.min() + 0.12 * tail.mean())
+-
+-    def critical_vertex_weights(p: np.ndarray) -> np.ndarray:
+-        """Sampling weights concentrated on vertices of active small triangles."""
+-        a, b, c = p[triples[:, 0]], p[triples[:, 1]], p[triples[:, 2]]
+-        double_areas = np.abs(
+-            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
+-            (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
++
++    def determinants(points: np.ndarray) -> np.ndarray:
++        a = points[triples[:, 0]]
++        b = points[triples[:, 1]]
++        c = points[triples[:, 2]]
++        return ((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) -
++                (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
++
++    def assess(points: np.ndarray) -> tuple[float, float, np.ndarray]:
++        det = determinants(points)
++        hull = hull_area(points)
++        if hull <= 1.0e-12:
++            return 0.0, 0.0, det
++
++        normalized = 0.5 * np.abs(det) / hull
++        tail = np.partition(normalized, 15)[:16]
++        minimum = float(tail[0])
++
++        # This surrogate protects a modest active set rather than chasing a
++        # single triangle that would immediately exchange with another one.
++        energy = minimum + 0.135 * float(tail.mean())
++        return minimum, energy, det
++
++    def better(
++        score_a: float,
++        energy_a: float,
++        score_b: float,
++        energy_b: float,
++    ) -> bool:
++        return (
++            score_a > score_b + 1.0e-14 or
++            (abs(score_a - score_b) <= 1.0e-14 and
++             energy_a > energy_b + 1.0e-14)
+         )
+-        active = triples[np.argpartition(double_areas, 17)[:18]].ravel()
+-        weights = np.bincount(active, minlength=n).astype(float)
+-        # Preserve occasional exploration of non-critical vertices.
+-        weights += 0.4
+-        return weights / weights.sum()
++
++    def active_data(det: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++        """Return low-area triangle ids and vertex sampling probabilities."""
++        count = 22
++        active_ids = np.argpartition(np.abs(det), count - 1)[:count]
++        active_vertices = triples[active_ids].ravel()
++        weights = np.bincount(active_vertices, minlength=n).astype(float)
++        weights += 0.32
++        return active_ids, weights / weights.sum()
++
++    def triangle_gradient_move(
++        points: np.ndarray,
++        det: np.ndarray,
++        scale: float,
++    ) -> np.ndarray:
++        """
++        Correlated two-vertex proposal.  For an active triangle, push one
++        vertex along its signed area gradient and give another vertex a smaller
++        tangential displacement.  This helps cross active-set barriers that
++        one-vertex proposals commonly cannot cross.
++        """
++        proposal = points.copy()
++        active_ids, _ = active_data(det)
++        tid = int(active_ids[rng.integers(len(active_ids))])
++        i, j, k = triples[tid]
++        ids = np.asarray((i, j, k), dtype=np.intp)
++
++        primary_slot = int(rng.integers(3))
++        primary = int(ids[primary_slot])
++        other = ids[(primary_slot + 1) % 3]
++        third = ids[(primary_slot + 2) % 3]
++
++        edge = points[other] - points[third]
++        gradient = np.asarray((edge[1], -edge[0]), dtype=float)
++        length = float(np.hypot(gradient[0], gradient[1]))
++        if length < 1.0e-14:
++            gradient = rng.normal(size=2)
++            length = float(np.hypot(gradient[0], gradient[1]))
++
++        gradient /= max(length, 1.0e-14)
++        if det[tid] < 0.0:
++            gradient *= -1.0
++
++        proposal[primary] += scale * gradient
++        secondary = int(other if rng.random() < 0.5 else third)
++        tangent = np.asarray((-gradient[1], gradient[0]))
++        proposal[secondary] += (
++            0.30 * scale * tangent * (1.0 if rng.random() < 0.5 else -1.0)
++            + rng.normal(scale=0.13 * scale, size=2)
++        )
++        return clamp(proposal)
++
++    def random_active_move(
++        points: np.ndarray,
++        det: np.ndarray,
++        scale: float,
++    ) -> np.ndarray:
++        proposal = points.copy()
++        _, weights = active_data(det)
++
++        two_point = rng.random() < 0.18
++        changed = 2 if two_point else 1
++
++        if rng.random() < 0.84:
++            indices = rng.choice(n, size=changed, replace=False, p=weights)
++        else:
++            indices = rng.choice(n, size=changed, replace=False)
++
++        displacement = rng.normal(scale=scale, size=(changed, 2))
++        if two_point:
++            # Mild correlation improves the chance of changing an incidence
++            # pattern without destroying all nearby active triangles.
++            displacement[1] += 0.28 * displacement[0]
++
++        proposal[indices] += displacement
++        return clamp(proposal)
++
++    def make_proposal(
++        points: np.ndarray,
++        det: np.ndarray,
++        scale: float,
++    ) -> np.ndarray:
++        # Preserve ordinary proposals as the dominant mechanism, with the
++        # requested active two-vertex moves used regularly during refinement.
++        if rng.random() < 0.14:
++            return triangle_gradient_move(points, det, scale)
++        return random_active_move(points, det, scale)
++
++    def anneal(
++        initial: np.ndarray,
++        iterations: int,
++        initial_sigma: float,
++        initial_temperature: float,
++    ) -> tuple[np.ndarray, float, float]:
++        current = clamp(initial.copy())
++        current_score, current_energy, current_det = assess(current)
++
++        local_best = current.copy()
++        local_score = current_score
++        local_energy = current_energy
++
++        for step in range(iterations):
++            fraction = step / max(1.0, iterations - 1.0)
++            sigma = initial_sigma * (1.0 - fraction) ** 1.72 + 0.0018
++            temperature = (
++                initial_temperature * (1.0 - fraction) ** 2.15 + 1.25e-5
++            )
++
++            candidate = make_proposal(current, current_det, sigma)
++            candidate_score, candidate_energy, candidate_det = assess(candidate)
++
++            delta = candidate_energy - current_energy
++            if (delta >= 0.0 or
++                    rng.random() < np.exp(max(-55.0, delta / temperature))):
++                current = candidate
++                current_score = candidate_score
++                current_energy = candidate_energy
++                current_det = candidate_det
++
++            if better(current_score, current_energy, local_score, local_energy):
++                local_best = current.copy()
++                local_score = current_score
++                local_energy = current_energy
++
++        return local_best, local_score, local_energy
++
++    def polish(points: np.ndarray) -> np.ndarray:
++        """Deterministic active-set one- and two-coordinate pattern search."""
++        current = points.copy()
++        current_score, current_energy, current_det = assess(current)
++
++        for level in range(38):
++            radius = 0.016 * (0.865 ** level) + 5.0e-5
++            improved = False
++            active_ids, weights = active_data(current_det)
++            order = np.argsort(-weights)
++
++            for index in order:
++                chosen = None
++                chosen_score = current_score
++                chosen_energy = current_energy
++                chosen_det = current_det
++
++                for direction in cardinal_directions:
++                    candidate = current.copy()
++                    candidate[index] += radius * direction
++                    clamp(candidate)
++                    score, energy, det = assess(candidate)
++
++                    if better(score, energy, chosen_score, chosen_energy):
++                        chosen = candidate
++                        chosen_score, chosen_energy, chosen_det = score, energy, det
++
++                if chosen is not None:
++                    current = chosen
++                    current_score = chosen_score
++                    current_energy = chosen_energy
++                    current_det = chosen_det
++                    improved = True
++
++            # A small deterministic set of correlated repairs complements
++            # coordinate polling near a nonsmooth active constraint junction.
++            if level < 20:
++                for tid in active_ids[:8]:
++                    i, j, k = triples[tid]
++                    for primary, secondary in ((i, j), (j, k), (k, i)):
++                        candidate = current.copy()
++                        edge = current[secondary] - current[
++                            k if primary != k and secondary != k else i
++                        ]
++                        direction = np.asarray((edge[1], -edge[0]))
++                        norm = float(np.hypot(direction[0], direction[1]))
++                        if norm <= 1.0e-14:
++                            continue
++                        direction /= norm
++                        candidate[primary] += radius * direction
++                        candidate[secondary] -= 0.28 * radius * direction
++                        clamp(candidate)
++                        score, energy, det = assess(candidate)
++                        if better(score, energy, current_score, current_energy):
++                            current = candidate
++                            current_score = score
++                            current_energy = energy
++                            current_det = det
++                            improved = True
++
++            if not improved and radius < 2.5e-4:
++                break
++
++        return current
+ 
+     best_points = None
+     best_score = -np.inf
+-
+-    # Use several independent basin-discovery runs, then spend the remaining
+-    # budget reheating the strongest configuration found.  For this highly
+-    # nonsmooth objective, a good active-triangle sign pattern is much more
+-    # valuable than another completely unrelated late random restart.
+-    for restart in range(6):
+-        exploratory = restart < 4
+-        if exploratory:
+-            current = rng.random((n, 2))
+-            iterations = 12000
+-            initial_sigma = 0.115
+-            initial_temperature = 0.0035
+-        else:
+-            # A deterministic small perturbation makes the two continuations
+-            # explore distinct neighboring sign-pattern changes.
+-            current = best_points + rng.normal(0.0, 0.010, size=(n, 2))
+-            np.clip(current, 0.0, 1.0, out=current)
+-            iterations = 18000
+-            initial_sigma = 0.058
+-            initial_temperature = 0.0019
+-
+-        current_score, current_energy = evaluate(current)
+-
+-        for step in range(iterations):
+-            progress = step / (iterations - 1.0)
+-            sigma = initial_sigma * (1.0 - progress) ** 1.7 + 0.0025
+-            candidate = current.copy()
+-            changed = 1 if rng.random() < 0.82 else 2
+-            # Most successful improvements repair one of the triangles that
+-            # currently realizes (or nearly realizes) the minimum area.
+-            if rng.random() < 0.78:
+-                indices = rng.choice(
+-                    n, size=changed, replace=False,
+-                    p=critical_vertex_weights(current),
+-                )
+-            else:
+-                indices = rng.choice(n, size=changed, replace=False)
+-            candidate[indices] += rng.normal(0.0, sigma, size=(changed, 2))
+-            np.clip(candidate, 0.0, 1.0, out=candidate)
+-
+-            candidate_score, candidate_energy = evaluate(candidate)
+-            temperature = initial_temperature * (1.0 - progress) ** 2 + 0.000015
+-            if (candidate_energy >= current_energy or
+-                    rng.random() < np.exp((candidate_energy - current_energy) / temperature)):
+-                current = candidate
+-                current_score, current_energy = candidate_score, candidate_energy
+-
+-            if current_score > best_score:
+-                best_score = current_score
+-                best_points = current.copy()
+-
+-    # Deterministic pattern search is considerably more reliable than random
+-    # last-mile moves on the piecewise-linear minimum-area landscape.
+-    current = best_points.copy()
+-    current_score, current_energy = evaluate(current)
+-    directions = np.array(
+-        [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
+-         [1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0]],
+-        dtype=float,
+-    )
+-    directions[4:] /= np.sqrt(2.0)
+-
+-    for level in range(42):
+-        sigma = 0.018 * (0.87 ** level) + 0.00008
+-        improved = False
+-        # Prioritize the vertices that participate in active constraints.
+-        order = np.argsort(-critical_vertex_weights(current))
+-        for index in order:
+-            local_best = None
+-            local_score, local_energy = current_score, current_energy
+-            for direction in directions:
+-                candidate = current.copy()
+-                candidate[index] += sigma * direction
+-                np.clip(candidate, 0.0, 1.0, out=candidate)
+-                candidate_score, candidate_energy = evaluate(candidate)
+-                if (candidate_score > local_score + 1e-14 or
+-                        (abs(candidate_score - local_score) <= 1e-14 and
+-                         candidate_energy > local_energy + 1e-14)):
+-                    local_best = candidate
+-                    local_score, local_energy = candidate_score, candidate_energy
+-            if local_best is not None:
+-                current = local_best
+-                current_score, current_energy = local_score, local_energy
+-                improved = True
+-        # At very fine scales, one complete non-improving poll is sufficient.
+-        if not improved and sigma < 0.0003:
+-            break
+-
+-    return current
++    best_energy = -np.inf
++
++    try:
++        # Diverse basin discovery.
++        for _ in range(4):
++            start = rng.random((n, 2))
++            candidate, score, energy = anneal(
++                start,
++                iterations=12500,
++                initial_sigma=0.118,
++                initial_temperature=0.0038,
++            )
++            if better(score, energy, best_score, best_energy):
++                best_points, best_score, best_energy = candidate, score, energy
++
++        # Survivor continuations dedicate the remaining stochastic work to
++        # changing nearby active-triangle sign patterns.
++        for continuation in range(2):
++            start = best_points + rng.normal(
++                scale=0.009 + 0.002 * continuation,
++                size=(n, 2),
++            )
++            candidate, score, energy = anneal(
++                clamp(start),
++                iterations=17000,
++                initial_sigma=0.054,
++                initial_temperature=0.0019,
++            )
++            if better(score, energy, best_score, best_energy):
++                best_points, best_score, best_energy = candidate, score, energy
++
++        return polish(best_points)
++
++    except (FloatingPointError, ValueError, np.linalg.LinAlgError):
++        # A deterministic valid fallback is retained for hostile numerical
++        # environments rather than returning an invalid partial configuration.
++        fallback_rng = np.random.default_rng(seed)
++        return fallback_rng.random((n, 2))
+ 
+ 
+ # EVOLVE-BLOCK-END

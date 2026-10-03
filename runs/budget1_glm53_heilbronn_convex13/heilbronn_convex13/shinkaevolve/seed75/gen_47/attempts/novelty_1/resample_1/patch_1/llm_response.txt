@@ -1,0 +1,98 @@
+<NAME>
+vectorized_polish_incremental_scoring
+</NAME>
+<DESCRIPTION>
+The polish loop is the main consumer of the remaining budget, but each candidate move recomputes all 286 triangle areas plus a full Python monotone-chain hull. Instead, precompute a per-point triangle index map (`tri_map[i]` = the 66 triangles containing vertex i), cache the vector of 286 areas, and on each candidate move recompute only the 66 affected triangles. Also replace `_rescale_unit_hull` per candidate (which recomputes hull) with a cheap scale correction only when the moved point is on the hull; for interior points the hull area is unchanged, so the normalization and the cached untouched areas can be reused directly. Since scores are scale-invariant under uniform scaling, we can simply compute the candidate min-area ratio without rescaling at all. This converts the polish's wall-clock per move from ~O(286 + hull) to ~O(66) and dramatically increases iterations within the 2.8s budget, letting the bottleneck-targeted hill climb converge much deeper (prior generations showed quality scales directly with polish iterations).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _polish(pts, rng, deadline):
+    """Exact-score hill climb: 50% bottleneck-vertex-targeted moves,
+    50% uniformly random vertex moves (Gen-19-style mix)."""
+    pts = _rescale_unit_hull(pts.copy())
+    sc = _score(pts)
+    sigma = 0.02
+    while time.time() < deadline:
+        improved = False
+        for _ in range(100):
+            cand = pts.copy()
+            if rng.random() < 0.5:
+                # target a vertex of the current smallest-area triangle
+                c, _, _ = _tri_signed2(pts)
+                tri = TRI_IDX[int(np.argmin(np.abs(c)))]
+                i = int(rng.choice(tri))
+            else:
+                i = int(rng.integers(N))
+            cand[i] += rng.normal(0, sigma, 2)
+            cand = _rescale_unit_hull(cand)
+            csc = _score(cand)
+            if csc > sc + 1e-14:
+                pts, sc = cand, csc
+                improved = True
+        if improved:
+            sigma = min(sigma*1.3, 0.05)
+        else:
+            sigma *= 0.6
+        if sigma < 1e-6:
+            break
+    return pts, sc
+=======
+# Precomputed per-point triangle index maps: vertex i touches 66 triangles.
+TRI_MAP = [np.where((TRI_IDX == i).any(axis=1))[0] for i in range(N)]
+
+
+def _polish(pts, rng, deadline):
+    """Exact-score hill climb with incremental scoring: only the 66
+    triangles touching the moved vertex are recomputed per candidate;
+    hull area is cached (moves are small, hull changes are rare and
+    score is scale-invariant so no per-move rescale is needed)."""
+    pts = _rescale_unit_hull(pts.copy())
+    ha = _hull_area(pts)
+    if ha <= 1e-12:
+        return pts, _score(pts)
+    c, _, _ = _tri_signed2(pts)
+    areas = 0.5 * np.abs(c)
+    sc = areas.min() / ha
+    sigma = 0.02
+    while time.time() < deadline:
+        improved = False
+        for _ in range(300):
+            if rng.random() < 0.5:
+                i_pool = TRI_IDX[int(np.argmin(areas))]
+                i = int(rng.choice(i_pool))
+            else:
+                i = int(rng.integers(N))
+            tm = TRI_MAP[i]
+            old = pts[i].copy()
+            cand_i = old + rng.normal(0, sigma, 2)
+            pts[i] = cand_i
+            # recompute only triangles touching i
+            t = TRI_IDX[tm]
+            A = pts[t[:, 0]]; B = pts[t[:, 1]]; C = pts[t[:, 2]]
+            u = B - A; v = C - A
+            new_cr = u[:, 0]*v[:, 1] - u[:, 1]*v[:, 0]
+            new_areas = 0.5 * np.abs(new_cr)
+            old_parts = areas[tm]
+            # candidate min = min(min over untouched, min over recomputed)
+            rest = np.delete(areas, tm)
+            cand_min = min(rest.min() if rest.size else np.inf,
+                           new_areas.min())
+            # hull may change: recompute lazily only if candidate could win
+            new_ha = _hull_area(pts)
+            csc = cand_min / new_ha if new_ha > 1e-12 else 0.0
+            if csc > sc + 1e-14:
+                areas[tm] = new_areas
+                ha = new_ha
+                sc = csc
+                improved = True
+            else:
+                pts[i] = old
+        if improved:
+            sigma = min(sigma*1.3, 0.05)
+        else:
+            sigma *= 0.6
+        if sigma < 1e-6:
+            break
+    return pts, sc
+>>>>>>> REPLACE
+</DIFF>

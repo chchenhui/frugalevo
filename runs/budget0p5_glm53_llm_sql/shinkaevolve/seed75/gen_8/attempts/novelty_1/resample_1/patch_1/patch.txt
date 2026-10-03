@@ -1,0 +1,640 @@
+--- a/original.py
++++ b/original.py
+@@ -1,365 +1,303 @@
+ # EVOLVE-BLOCK-START
+ import pandas as pd
++import numpy as np
+ from solver import Algorithm
+ from typing import Tuple, List, Dict
+-from concurrent.futures import ThreadPoolExecutor, as_completed
+-from functools import lru_cache
+ from collections import Counter
+-import networkx as nx
+ 
+ 
+ class Evolved(Algorithm):
+     """
+-    GGR algorithm
++    Prefix-cache optimized column reordering.
++
++    Strategy: build a handful of cheap candidate per-row column orderings,
++    measure each with the exact ideal character-Trie reuse objective
++    (sum of adjacent LCP lengths over the sorted serialized rows), and return
++    the best. Data values and row identity are fully preserved.
+     """
+ 
+     def __init__(self, df: pd.DataFrame = None):
+         self.df = df
+ 
+-        self.dep_graph = None  # NOTE: not used, for one way dependency
+-
+-        self.num_rows = 0
+-        self.num_cols = 0
+-        self.column_stats = None
+-        self.val_len = None
+-        self.row_stop = None
+-        self.col_stop = None
+-        self.base = 2000
+-
+-    def find_max_group_value(self, df: pd.DataFrame, value_counts: Dict, early_stop: int = 0) -> str:
+-        # NOTE: recalculate value counts and length for each value
+-        value_counts = Counter(df.stack())
+-        weighted_counts = {val: self.val_len[val] * (count - 1) for val, count in value_counts.items()}  # if count > 1
+-        if not weighted_counts:
+-            return None
+-        max_group_val, max_weighted_count = max(weighted_counts.items(), key=lambda x: x[1])
+-        if max_weighted_count < early_stop:
+-            return None
+-        return max_group_val
+-
+-    def reorder_columns_for_value(self, row, value, column_names, grouped_rows_len: int = 1):
+-        # cols_with_value will now use attribute access instead of indexing with row[]
+-        cols_with_value = []
+-        for idx, col in enumerate(column_names):
+-            if hasattr(row, col) and getattr(row, col) == value:
+-                cols_with_value.append(col)
+-            elif hasattr(row, col.replace(" ", "_")) and getattr(row, col.replace(" ", "_")) == value:
+-                cols_with_value.append(col)
++    # ------------------------------------------------------------------ #
++    # Serialization helpers (exactly matching the evaluator's scoring
++    # representation; stored cell values are never modified).
++    # ------------------------------------------------------------------ #
++    @staticmethod
++    def _cell_str(v) -> str:
++        if v is None:
++            return ""
++        if isinstance(v, float) and np.isnan(v):
++            return ""
++        try:
++            if v is not None and pd.isna(v):
++                return ""
++        except (TypeError, ValueError):
++            pass
++        if isinstance(v, bool):
++            return "True" if v else "False"
++        return str(v)
++
++    def _serialize_matrix(self, df: pd.DataFrame) -> np.ndarray:
++        """Return an (n_rows, n_cols) object array of serialized cell strings."""
++        n, m = df.shape
++        mat = np.empty((n, m), dtype=object)
++        cols = df.columns.tolist()
++        for j in range(m):
++            col_vals = df.iloc[:, j].tolist()
++            mat[:, j] = [self._cell_str(v) for v in col_vals]
++        return mat
++
++    # ------------------------------------------------------------------ #
++    # Exact objective: sum of adjacent LCP lengths of sorted strings.
++    # ------------------------------------------------------------------ #
++    @staticmethod
++    def _lcp(a: str, b: str) -> int:
++        if a == b:
++            return len(a)
++        hi = len(a) if len(a) < len(b) else len(b)
++        if hi == 0:
++            return 0
++        if a[0] != b[0]:
++            return 0
++        lo = 0
++        while lo < hi:
++            mid = (lo + hi + 1) // 2
++            if a[:mid] == b[:mid]:
++                lo = mid
+             else:
+-                attr_name = f"_{idx}"
+-                if hasattr(row, attr_name) and getattr(row, attr_name) == value:
+-                    cols_with_value.append(attr_name)
+-
+-        if self.dep_graph is not None and grouped_rows_len > 1:
+-            # NOTE: experimental
+-            reordered_cols = []
+-            for col in cols_with_value:
+-                dependent_cols = self.get_dependent_columns(col)
+-
+-                # check if dependent columns are in row, and if column exists in row attributes
+-                valid_dependent_cols = []
+-                for idx, dep_col in enumerate(dependent_cols):
+-                    if hasattr(row, dep_col):
+-                        valid_dependent_cols.append(dep_col)
+-                    elif hasattr(row, dep_col.replace(" ", "_")):
+-                        valid_dependent_cols.append(dep_col)
+-                    else:
+-                        attr_name = f"_{idx}"
+-                        if hasattr(row, attr_name):
+-                            valid_dependent_cols.append(dep_col)
+-
+-                reordered_cols.extend([col] + valid_dependent_cols)
+-            cols_without_value = [col for col in column_names if col not in reordered_cols]
+-            reordered_cols.extend(cols_without_value)
+-            assert len(reordered_cols) == len(
+-                column_names
+-            ), f"Reordered cols len: {len(reordered_cols)}  Original cols len: {len(column_names)}"
+-            return [getattr(row, col) for col in reordered_cols], cols_with_value
+-        else:
+-            cols_without_value = []
+-            for idx, col in enumerate(column_names):
+-                if hasattr(row, col) and getattr(row, col) != value:
+-                    cols_without_value.append(col)
+-                elif hasattr(row, col.replace(" ", "_")) and getattr(row, col.replace(" ", "_")) != value:
+-                    cols_without_value.append(col)
++                hi = mid - 1
++        return lo
++
++    def _trie_score(self, strings: List[str]) -> int:
++        if len(strings) <= 1:
++            return 0
++        s = sorted(strings)
++        total = 0
++        prev = s[0]
++        for i in range(1, len(s)):
++            cur = s[i]
++            if cur == prev:
++                total += len(prev)
++            else:
++                total += self._lcp(prev, cur)
++            prev = cur
++        return total
++
++    def _row_strings(self, ser: np.ndarray, row_ids: np.ndarray, order: List[int]) -> List[str]:
++        """Serialized strings for the given rows under a column order."""
++        out = []
++        for r in row_ids:
++            row = ser[r]
++            out.append("".join(row[c] for c in order))
++        return out
++
++    # ------------------------------------------------------------------ #
++    # Candidate A: global frequency-ranked order.
++    # Score per column: sum over serialized values v of
++    # len(v) * count(v) * (count(v) - 1); deterministic tie break.
++    # ------------------------------------------------------------------ #
++    def _candidate_global(self, ser: np.ndarray, col_names: List[str],
++                          n_rows: int, max_cands: int = 200) -> List[int]:
++        m = ser.shape[1]
++        scores = []
++        for j in range(m):
++            col = ser[:, j]
++            cnt = Counter(col)
++            sc = 0
++            for v, c in cnt.items():
++                if c > 1:
++                    sc += len(v) * c * (c - 1)
++            scores.append(sc)
++        order = sorted(range(m), key=lambda j: (-scores[j], col_names[j]))
++        if m > max_cands:
++            # wide table: keep cheap deterministic tail
++            head = order[:max_cands]
++            tail = order[max_cands:]
++            order = head + tail
++        return order
++
++    # ------------------------------------------------------------------ #
++    # Candidate B: recursive conditional partition tree producing
++    # per-row column orders.
++    # ------------------------------------------------------------------ #
++    def _candidate_conditional(self, ser: np.ndarray, col_names: List[str],
++                               row_stop=None, col_stop=None,
++                               distinct_value_threshold: float = 0.8) -> List[List[int]]:
++        n, m = ser.shape
++        max_depth = col_stop if col_stop else min(m, 12)
++        min_group = 2
++        orders = [None] * n
++
++        # Pre-factorize each column once: codes and value lengths.
++        col_codes = []
++        col_val_len = []
++        for j in range(m):
++            mapping = {}
++            codes = np.empty(n, dtype=np.int64)
++            lens = []
++            vals = []
++            col = ser[:, j]
++            for i in range(n):
++                v = col[i]
++                if v not in mapping:
++                    mapping[v] = len(vals)
++                    vals.append(v)
++                    lens.append(len(v))
++                codes[i] = mapping[v]
++            col_codes.append(codes)
++            col_val_len.append((np.array(lens, dtype=np.int64), len(vals)))
++
++        nunique_limit = n * distinct_value_threshold
++
++        def recurse(rows: np.ndarray, remaining: List[int], depth: int):
++            if len(rows) < min_group or depth >= max_depth or not remaining:
++                tail = list(remaining)
++                for r in rows:
++                    orders[r] = tail
++                return
++            # choose best column by length-weighted pair repetition
++            best_col = -1
++            best_gain = 0
++            for j in remaining:
++                codes = col_codes[j][rows]
++                lens, nvals = col_val_len[j]
++                if nvals > nunique_limit and nvals > 1:
++                    continue  # too distinct to help grouping
++                cnt = np.bincount(codes, minlength=nvals)
++                rep = cnt * (cnt - 1)
++                gain = int(np.dot(rep, lens[:len(cnt)])) if len(cnt) else 0
++                if gain > best_gain:
++                    best_gain = gain
++                    best_col = j
++            if best_col < 0:
++                tail = list(remaining)
++                for r in rows:
++                    orders[r] = tail
++                return
++            rest = [c for c in remaining if c != best_col]
++            codes = col_codes[best_col][rows]
++            # partition rows by value of best_col
++            groups = {}
++            for idx, r in enumerate(rows):
++                groups.setdefault(codes[idx], []).append(r)
++            for _, grp in groups.items():
++                sub = np.array(grp, dtype=np.int64)
++                for r in sub:
++                    orders[r] = [best_col]
++                # recurse; prepend chosen col on return
++                before = {int(r): orders[r] for r in sub}
++                if len(sub) >= min_group and rest and depth + 1 < max_depth:
++                    recurse(sub, rest, depth + 1)
++                    for r in sub:
++                        orders[r] = [best_col] + before_ours(before, r, orders)
+                 else:
+-                    # Handle some edge cases
+-                    attr_name = f"_{idx}"
+-                    if hasattr(row, attr_name) and getattr(row, attr_name) != value:
+-                        cols_without_value.append(attr_name)
+-
+-            reordered_cols = cols_with_value + cols_without_value
+-            assert len(reordered_cols) == len(
+-                column_names
+-            ), f"Reordered cols len: {len(reordered_cols)}  Original cols len: {len(column_names)}"
+-            return [getattr(row, col) for col in reordered_cols], cols_with_value
+-
+-    def get_dependent_columns(self, col: str) -> List[str]:
+-        if self.dep_graph is None or not self.dep_graph.has_node(col):
+-            return []
+-        return list(nx.descendants(self.dep_graph, col))
+-
+-    @lru_cache(maxsize=None)
+-    def get_cached_dependent_columns(self, col: str) -> List[str]:
+-        return self.get_dependent_columns(col)
+-
+-    def fixed_reorder(self, df: pd.DataFrame, row_sort: bool = True) -> Tuple[pd.DataFrame, List[List[str]]]:
+-        num_rows, column_stats = self.calculate_col_stats(df, enable_index=True)
+-        reordered_columns = [col for col, _, _, _ in column_stats]
+-        reordered_df = df[reordered_columns]
+-
+-        assert reordered_df.shape == df.shape
+-        column_orderings = [reordered_columns] * num_rows
+-
+-        if row_sort:
+-            reordered_df = reordered_df.sort_values(by=reordered_columns, axis=0)
+-
+-        return reordered_df, column_orderings
+-
+-    def column_recursion(self, result_df, max_value, grouped_rows, row_stop, col_stop, early_stop):
+-        cols_settled = []
+-        with ThreadPoolExecutor() as executor:
+-            futures = [
+-                executor.submit(self.reorder_columns_for_value, row, max_value, grouped_rows.columns.tolist(), len(grouped_rows))
+-                for row in grouped_rows.itertuples(index=False)
+-            ]
+-            for i, future in enumerate(as_completed(futures)):
+-                reordered_row, cols_settled = future.result()
+-                result_df.loc[i] = reordered_row
+-
+-        grouped_value_counts = Counter()
+-
+-        if not result_df.empty:
+-            # Group by the first column
+-            grouped_result_df = result_df.groupby(result_df.columns[0])
+-            grouped_value_counts = Counter(grouped_rows.stack())  # this is still faster than updating from cached value counts
+-
+-            for _, group in grouped_result_df:
+-                if group[group.columns[0]].iloc[0] != max_value:
+-                    continue
+-
+-                dependent_cols = self.get_cached_dependent_columns(group.columns[0])
+-                length_of_settle_cols = len(cols_settled)
+-
+-                if dependent_cols:
+-                    assert length_of_settle_cols >= 1, f"Dependent columns should be no less than 1, but got {length_of_settle_cols}"
+-
+-                    # test the first length_of_settle_cols columns, each column has nunique == 1
+-                    for col in group.columns[:length_of_settle_cols]:
+-                        assert group[col].nunique() == 1, f"Column {col} should have nunique == 1, but got {group[col].nunique()}"
+-
+-                    # drop all the settled columns and reorder the rest
+-                    group_remainder = group.iloc[:, length_of_settle_cols:]
+-                else:
+-                    group_remainder = group.iloc[:, 1:]
+-
+-                grouped_remainder_value_counts = Counter(group_remainder.stack())
+-
+-                reordered_group_remainder, _ = self.recursive_reorder(
+-                    group_remainder, grouped_remainder_value_counts, early_stop=early_stop, row_stop=row_stop, col_stop=col_stop + 1
+-                )
+-                # Update the group with the reordered columns
+-                if dependent_cols:
+-                    group.iloc[:, length_of_settle_cols:] = reordered_group_remainder.values
+-                else:
+-                    group.iloc[:, 1:] = reordered_group_remainder.values
+-
+-                result_df.update(group)
+-                break
+-
+-        return result_df, grouped_value_counts
+-
+-    def recursive_reorder(
+-        self,
+-        df: pd.DataFrame,
+-        value_counts: Dict,
+-        early_stop: int = 0,
+-        original_columns: List[str] = None,
+-        row_stop: int = 0,
+-        col_stop: int = 0,
+-    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+-        if df.empty or len(df.columns) == 0 or len(df) == 0:
+-            return df, []
+-
+-        if self.row_stop is not None and row_stop >= self.row_stop:
+-            return self.fixed_reorder(df)
+-
+-        if self.col_stop is not None and col_stop >= self.col_stop:
+-            return self.fixed_reorder(df)
+-
+-        if original_columns is None:
+-            original_columns = df.columns.tolist()
+-
+-        # Find the max group value using updated counts
+-        max_value = self.find_max_group_value(df, value_counts, early_stop=early_stop)
+-        if max_value is None:
+-            # If there is no max value, then fall back to fixed reorder
+-            return self.fixed_reorder(df)
+-
+-        grouped_rows = df[df.isin([max_value]).any(axis=1)]
+-        remaining_rows = df[~df.isin([max_value]).any(axis=1)]
+-
+-        # If there is no grouped rows, return the original DataFrame
+-        if grouped_rows.empty:
+-            return self.fixed_reorder(df)
+-
+-        result_df = pd.DataFrame(columns=df.columns)
+-
+-        reordered_remaining_rows = pd.DataFrame(columns=df.columns)  # Initialize empty dataframe first
+-
+-        # Column Recursion
+-        result_df, grouped_value_counts = self.column_recursion(result_df, max_value, grouped_rows, row_stop, col_stop, early_stop)
+-
+-        remaining_value_counts = value_counts - grouped_value_counts  # Approach 1 - update remaining value counts with subtraction
+-
+-        # Row Recursion
+-        reordered_remaining_rows, _ = self.recursive_reorder(
+-            remaining_rows, remaining_value_counts, early_stop=early_stop, row_stop=row_stop + 1, col_stop=col_stop
+-        )
+-        old_column_names = result_df.columns.tolist()
+-        result_cols_reset = result_df.reset_index(drop=True)
+-        result_rows_reset = reordered_remaining_rows.reset_index(drop=True)
+-        final_result_df = pd.DataFrame(result_cols_reset.values.tolist() + result_rows_reset.values.tolist())
+-
+-        if row_stop == 0 and col_stop == 0:
+-            final_result_df.columns = old_column_names
+-            final_result_df.columns = final_result_df.columns.tolist()[:-1] + ["original_index"]
+-
+-        return final_result_df, []
+-
+-    def recursive_split_and_reorder(self, df: pd.DataFrame, original_columns: List[str] = None, early_stop: int = 0):
+-        """
+-        Recursively split the DataFrame into halves until the size is <= 1000, then apply the recursive reorder function.
+-        """
+-        if len(df) <= self.base:
+-            initial_value_counts = Counter(df.stack())
+-            return self.recursive_reorder(df, initial_value_counts, early_stop, original_columns, row_stop=0, col_stop=0)[0]
+-
+-        mid_index = len(df) // 2
+-        df_top_half = df.iloc[:mid_index]
+-        df_bottom_half = df.iloc[mid_index:]
+-
+-        with ThreadPoolExecutor() as executor:
+-            future_top = executor.submit(self.recursive_split_and_reorder, df_top_half, original_columns, early_stop)
+-            future_bottom = executor.submit(self.recursive_split_and_reorder, df_bottom_half, original_columns, early_stop)
+-
+-        reordered_top_half = future_top.result()
+-        reordered_bottom_half = future_bottom.result()
+-
+-        assert reordered_bottom_half.shape == df_bottom_half.shape
+-        reordered_df = pd.concat([reordered_top_half, reordered_bottom_half], axis=0, ignore_index=True)
+-
+-        assert reordered_df.shape == df.shape
+-
+-        return reordered_df
+-
+-    @lru_cache(maxsize=None)
+-    def calculate_length(self, value):
+-        if isinstance(value, bool):
+-            return 4**2
+-        if isinstance(value, (int, float)):
+-            return len(str(value)) ** 2
+-        if isinstance(value, str):
+-            return len(value) ** 2
+-        return 0
+-
++                    for r in sub:
++                        orders[r] = [best_col] + list(rest)
++
++        def before_ours(before, r, orders):
++            # suffix order computed by the recursive call for row r
++            return list(orders[r])
++
++        root = np.arange(n, dtype=np.int64)
++        recurse(root, list(range(m)), 0)
++        for r in range(n):
++            if orders[r] is None:
++                orders[r] = list(range(m))
++        return orders
++
++    # ------------------------------------------------------------------ #
++    # Public API
++    # ------------------------------------------------------------------ #
+     def reorder(
+         self,
+         df: pd.DataFrame,
+         early_stop: int = 0,
+         row_stop: int = None,
+         col_stop: int = None,
+         col_merge: List[List[str]] = [],
+         one_way_dep: List[Tuple[str, str]] = [],
+         distinct_value_threshold: float = 0.8,
+         parallel: bool = True,
+     ) -> Tuple[pd.DataFrame, List[List[str]]]:
+-        # Prepare
+-        initial_df = df.copy()
++        if df is None or len(df.columns) == 0:
++            return df.copy() if df is not None else df, []
++
++        work = df.copy()
++        work.columns = [str(c) for c in work.columns]
++
++        # ---- honor column merges: combine member columns into one column --
+         if col_merge:
+-            self.num_rows, self.column_stats = self.calculate_col_stats(df, enable_index=True)
+-            reordered_columns = [col for col, _, _, _ in self.column_stats]
+-            for col_to_merge in col_merge:
+-                final_col_order = [col for col in reordered_columns if col in col_to_merge]
+-                df = self.merging_columns(df, final_col_order, prepended=False)
+-        self.num_rows, self.column_stats = self.calculate_col_stats(df, enable_index=True)
+-        self.column_stats = {col: (num_groups, avg_len, score) for col, num_groups, avg_len, score in self.column_stats}
+-
+-        # One way dependency statistics [not used]
+-        if one_way_dep is not None and len(one_way_dep) > 0:
+-            self.dep_graph = nx.DiGraph()
+-            for dep in one_way_dep:
+-                col1 = [col for col in df.columns if dep[0] in col]
+-                col2 = [col for col in df.columns if dep[1] in col]
+-                assert len(col1) == 1, f"Expected one column to match {dep[0]}, but got {len(col1)}"
+-                assert len(col2) == 1, f"Expected one column to match {dep[1]}, but got {len(col2)}"
+-                col1 = col1[0]
+-                col2 = col2[0]
+-                self.dep_graph.add_edge(col1, col2)
+-
+-        # Discard too distinct columns by threshold [optional]
+-        nunique_threshold = len(df) * distinct_value_threshold
+-        columns_to_discard = [col for col in df.columns if df[col].nunique() > nunique_threshold]
+-        columns_to_discard = sorted(columns_to_discard, key=lambda x: self.column_stats[x][2], reverse=True)
+-        columns_to_recurse = [col for col in df.columns if col not in columns_to_discard]
+-        df["original_index"] = range(len(df))
+-        discarded_columns_df = df[columns_to_discard + ["original_index"]]
+-        df_to_recurse = df[columns_to_recurse + ["original_index"]]
+-        recurse_df = df_to_recurse
+-
+-        self.column_stats = {col: stats for col, stats in self.column_stats.items() if col not in columns_to_discard}
+-        initial_value_counts = Counter(recurse_df.stack())
+-        self.val_len = {val: self.calculate_length(val) for val in initial_value_counts.keys()}
+-
+-        self.row_stop = row_stop if row_stop else len(recurse_df)
+-        self.col_stop = col_stop if col_stop else len(recurse_df.columns.tolist())
+-        print("*" * 80)
+-        print(f"DF columns = {df.columns}")
+-        # print(f"Early stop = {early_stop}")
+-        # print(f"Row recursion stop depth = {self.row_stop}, Column recursion stop depth = {self.col_stop}")
+-        print("*" * 80)
+-
+-        # Eary stop and fall back
+-        recurse_df, _ = self.fixed_reorder(recurse_df)
+-
+-        # Recursive reordering
+-        self.num_cols = len(recurse_df.columns)
+-        if parallel:
+-            reordered_df = self.recursive_split_and_reorder(recurse_df, original_columns=columns_to_recurse, early_stop=early_stop)
++            for group in col_merge:
++                members = [str(c) for c in group if str(c) in work.columns.tolist()]
++                if len(members) <= 1:
++                    continue
++                merged_name = "__merged__" + "|".join(members)
++                ser_members = self._serialize_matrix(work[members])
++                merged_vals = ["".join(ser_members[i]) for i in range(ser_members.shape[0])]
++                work = work.drop(columns=members)
++                work.insert(0, merged_name, merged_vals)
++                # fill NaN with "" ? No — keep exactly the concatenated strings.
++
++        col_names = work.columns.tolist()
++        n, m = work.shape
++
++        if n == 0 or m == 0:
++            return work, [list(col_names) for _ in range(n)]
++
++        ser = self._serialize_matrix(work)
++        all_rows = np.arange(n, dtype=np.int64)
++
++        # ---- Candidate A: global frequency-ranked order ------------------
++        order_a = self._candidate_global(ser, col_names, n)
++        strings_a = self._row_strings(ser, all_rows, order_a)
++        score_a = self._trie_score(strings_a)
++
++        # ---- Candidate C: original column order --------------------------
++        order_c = list(range(m))
++        score_c = self._trie_score(self._row_strings(ser, all_rows, order_c))
++
++        best_score = score_a if score_a >= score_c else score_c
++        best_kind = "a" if score_a >= score_c else "c"
++
++        # ---- Candidate B: conditional per-row partition orders -----------
++        # Only run when the table size is bounded (cheap, deterministic).
++        budget = 4_000_000
++        if n * m <= budget:
++            try:
++                orders_b = self._candidate_conditional(
++                    ser, col_names, row_stop=row_stop, col_stop=col_stop,
++                    distinct_value_threshold=distinct_value_threshold)
++                strings_b = [
++                    "".join(ser[i][c] for c in orders_b[i]) for i in range(n)
++                ]
++                score_b = self._trie_score(strings_b)
++                if score_b > best_score:
++                    best_score = score_b
++                    best_kind = "b"
++            except Exception:
++                pass
++
++        # ---- Build output according to the selected candidate -------------
++        out_values = []
++        orderings = []
++        if best_kind == "b":
++            orders_b_final = orders_b
++            for i in range(n):
++                ordi = orders_b_final[i]
++                out_values.append([work.iat[i, c] for c in ordi])
++                orderings.append([col_names[c] for c in ordi])
+         else:
+-            reordered_df, _ = self.recursive_reorder(
+-                recurse_df,
+-                initial_value_counts,
+-                early_stop=early_stop,
+-            )
+-
+-        assert (
+-            reordered_df.shape == recurse_df.shape
+-        ), f"Reordered DataFrame shape {reordered_df.shape} does not match original DataFrame shape {recurse_df.shape}"
+-        assert recurse_df["original_index"].is_unique, "Passed in recurse index contains duplicates!"
+-        assert reordered_df["original_index"].is_unique, "Reordered index contains duplicates!"
+-
+-        if len(columns_to_discard) > 0:
+-            final_df = pd.merge(reordered_df, discarded_columns_df, on="original_index", how="left")
+-        else:
+-            final_df = reordered_df
+-
+-        final_df = final_df.drop(columns=["original_index"])
+-
+-        if not col_merge:
+-            assert (
+-                final_df.shape == initial_df.shape
+-            ), f"Final DataFrame shape {final_df.shape} does not match original DataFrame shape {initial_df.shape}"
+-        else:
+-            assert (
+-                final_df.shape[0] == initial_df.shape[0]
+-            ), f"Final DataFrame shape {final_df.shape} does not match original DataFrame shape {initial_df.shape}"
+-            assert (
+-                final_df.shape[1] == recurse_df.shape[1] + len(columns_to_discard) - 1
+-            ), f"Final DataFrame shape {final_df.shape} does not match original DataFrame shape {recurse_df.shape}"
+-
+-        # sort by the first column to get the final order
+-        final_df = final_df.sort_values(by=final_df.columns.to_list(), axis=0)
+-        return final_df, []
++            order = order_a if best_kind == "a" else order_c
++            for i in range(n):
++                out_values.append([work.iat[i, c] for c in order])
++                orderings.append([col_names[c] for c in order])
++
++        out_df = pd.DataFrame(out_values, columns=col_names, dtype=object)
++        out_df.index = df.index[: n] if len(df.index) == n else None
++
++        # sanity: shape preserved
++        assert out_df.shape == (n, m), "Output shape mismatch"
++        return out_df, orderings
+ 
+ # EVOLVE-BLOCK-END

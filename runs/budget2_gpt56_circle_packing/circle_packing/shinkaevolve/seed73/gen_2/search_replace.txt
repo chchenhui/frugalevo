@@ -1,0 +1,149 @@
+<NAME>
+multistart_nonlinear_packing
+</NAME>
+
+<DESCRIPTION>
+Replace the clipped ring layout with a deterministic multistart nonlinear optimization of both circle centers and radii. The prior outer ring is heavily clipped, producing coincident or near-coincident centers and therefore very small radii.
+
+The new constructor starts from several feasible staggered row patterns, including transposed versions and small deterministic perturbations. For each start, SLSQP maximizes the total radius subject directly to every boundary constraint and every pairwise non-overlap constraint. This permits the expected boundary-layer effect: small circles can occupy constrained corners and edges while larger circles develop in less restricted interior gaps.
+
+A final uniform radius safety scaling independently verifies all wall and pair constraints, protecting validity from optimizer tolerances. The public interface and returned array shapes remain unchanged.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def construct_packing():
+    """
+    Construct a specific arrangement of 26 circles in a unit square
+    that attempts to maximize the sum of their radii.
+
+    Returns:
+        Tuple of (centers, radii, sum_of_radii)
+        centers: np.array of shape (26, 2) with (x, y) coordinates
+        radii: np.array of shape (26) with radius of each circle
+        sum_of_radii: Sum of all radii
+    """
+    # Initialize arrays for 26 circles
+    n = 26
+    centers = np.zeros((n, 2))
+
+    # Place circles in a structured pattern
+    # This is a simple pattern - evolution will improve this
+
+    # First, place a large circle in the center
+    centers[0] = [0.5, 0.5]
+
+    # Place 8 circles around it in a ring
+    for i in range(8):
+        angle = 2 * np.pi * i / 8
+        centers[i + 1] = [0.5 + 0.3 * np.cos(angle), 0.5 + 0.3 * np.sin(angle)]
+
+    # Place 16 more circles in an outer ring
+    for i in range(16):
+        angle = 2 * np.pi * i / 16
+        centers[i + 9] = [0.5 + 0.7 * np.cos(angle), 0.5 + 0.7 * np.sin(angle)]
+
+    # Additional positioning adjustment to make sure all circles
+    # are inside the square and don't overlap
+    # Clip to ensure everything is inside the unit square
+    centers = np.clip(centers, 0.01, 0.99)
+
+    # Compute maximum valid radii for this configuration
+    radii = compute_max_radii(centers)
+
+    # Calculate the sum of radii
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+=======
+def construct_packing():
+    """
+    Numerically refine several staggered, boundary-aware 26-circle layouts.
+
+    The optimization variables are the 52 center coordinates and the 26
+    individual radii.  Thus radii are not artificially tied together: circles
+    adjacent to corners or narrow boundary gaps may become small while useful
+    interior circles remain large.
+    """
+    from scipy.optimize import minimize
+
+    n = 26
+    ii, jj = np.triu_indices(n, 1)
+
+    # Five staggered rows give a feasible, relatively dense initial state.
+    # The unequal row populations are intentional: they avoid forcing a
+    # rectangular grid and let the optimizer form a nonuniform outer layer.
+    row_sizes = (5, 6, 5, 6, 4)
+
+    def row_start(transpose=False, jitter=None):
+        points = []
+        for row, count in enumerate(row_sizes):
+            y = 0.10 + 0.20 * row
+            xs = np.linspace(1.0 / (count + 1), count / (count + 1), count)
+            points.extend((x, y) for x in xs)
+        points = np.asarray(points, dtype=float)
+        if transpose:
+            points = points[:, ::-1]
+        if jitter is not None:
+            points = np.clip(points + jitter, 0.025, 0.975)
+        return points
+
+    def constraints(z):
+        c = z[:2 * n].reshape(n, 2)
+        r = z[2 * n:]
+        delta = c[ii] - c[jj]
+        distances_squared = np.einsum("ij,ij->i", delta, delta)
+        # Four wall inequalities per circle followed by all pair inequalities.
+        return np.concatenate((
+            c[:, 0] - r, 1.0 - c[:, 0] - r,
+            c[:, 1] - r, 1.0 - c[:, 1] - r,
+            distances_squared - (r[ii] + r[jj]) ** 2
+        ))
+
+    rng = np.random.default_rng(260319)
+    starts = [row_start(False), row_start(True)]
+    # Small perturbations break row symmetries without sacrificing feasibility
+    # of the deliberately conservative initial radii.
+    for transpose in (False, True):
+        for _ in range(2):
+            starts.append(row_start(transpose, rng.uniform(-0.018, 0.018, (n, 2))))
+
+    bounds = [(0.0, 1.0)] * (2 * n) + [(1.0e-7, 0.5)] * n
+    best_centers = starts[0]
+    best_radii = np.full(n, 0.035)
+    best_value = np.sum(best_radii)
+
+    for initial_centers in starts:
+        initial = np.concatenate((initial_centers.ravel(), np.full(n, 0.035)))
+        result = minimize(
+            lambda z: -np.sum(z[2 * n:]),
+            initial,
+            method="SLSQP",
+            bounds=bounds,
+            constraints={"type": "ineq", "fun": constraints},
+            options={"maxiter": 900, "ftol": 2.0e-11, "disp": False},
+        )
+        if result.x is None:
+            continue
+        candidate_centers = result.x[:2 * n].reshape(n, 2)
+        candidate_radii = result.x[2 * n:]
+        # SLSQP can report a useful point even if it ends on its iteration
+        # limit, so assess candidates after the same conservative validation.
+        candidate_radii = np.maximum(candidate_radii, 0.0)
+        wall = np.minimum.reduce((
+            candidate_centers[:, 0], candidate_centers[:, 1],
+            1.0 - candidate_centers[:, 0], 1.0 - candidate_centers[:, 1]
+        ))
+        scale = np.min(wall / np.maximum(candidate_radii, 1.0e-15))
+        delta = candidate_centers[ii] - candidate_centers[jj]
+        distance = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+        pair_sum = candidate_radii[ii] + candidate_radii[jj]
+        scale = min(scale, np.min(distance / np.maximum(pair_sum, 1.0e-15)))
+        candidate_radii *= min(1.0, scale) * (1.0 - 2.0e-10)
+        value = np.sum(candidate_radii)
+        if value > best_value:
+            best_centers, best_radii, best_value = candidate_centers, candidate_radii, value
+
+    return best_centers, best_radii, float(best_value)
+>>>>>>> REPLACE
+</DIFF>

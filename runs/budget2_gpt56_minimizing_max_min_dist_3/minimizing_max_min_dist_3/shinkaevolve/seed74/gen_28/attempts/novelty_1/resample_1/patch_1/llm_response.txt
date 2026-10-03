@@ -1,0 +1,256 @@
+<NAME>
+portfolio_contact_polish
+</NAME>
+
+<DESCRIPTION>
+The current approach uses 8 perturbed/geometric seeds, 3 sharpness schedules, 1450 surrogate-gradient iterations per trajectory, momentum 0.82, initial step size 0.046, and periodic exact-score checkpointing with restart on regressions. The revised implementation keeps the successful multi-basin continuation stage but changes its schedules, shortens it to 1250 iterations, and adds a final portfolio of exact-monotone contact-polishing branches from the globally best checkpoint.
+
+The new final branches use distinct sharpness ranges (220→650, 320→980, and 500→1450), lower local step sizes, exact evaluation of several line-search candidates at every iteration, and occasional deterministic small perturbation candidates. This separates basin discovery from high-precision active-contact optimization: surrogate dynamics can still cross contact-graph transitions early, while the final stage only retains evaluator-equivalent improvements.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+_N_POINTS = 14
+_PAIR_I, _PAIR_J = np.triu_indices(_N_POINTS, 1)
+
+
+def _normalize(points: np.ndarray) -> np.ndarray:
+    """Remove translation and uniform scale without changing the objective."""
+    points = points - points.mean(axis=0, keepdims=True)
+    radius = np.sqrt(np.mean(np.sum(points * points, axis=1)))
+    return points / max(radius, 1.0e-14)
+
+
+def _pair_squared(points: np.ndarray) -> np.ndarray:
+    delta = points[_PAIR_I] - points[_PAIR_J]
+    return np.einsum("ij,ij->i", delta, delta)
+
+
+def _exact_score(points: np.ndarray) -> float:
+    """The evaluator's squared minimum-distance / diameter-squared ratio."""
+    squared = _pair_squared(points)
+    return float(np.min(squared) / np.max(squared))
+
+
+def _batch_scores(points: np.ndarray) -> np.ndarray:
+    """Exact scores for a small batch of configurations."""
+    delta = points[:, _PAIR_I] - points[:, _PAIR_J]
+    squared = np.sum(delta * delta, axis=2)
+    return np.min(squared, axis=1) / np.max(squared, axis=1)
+
+
+def _contact_direction(points: np.ndarray, sharpness: float) -> np.ndarray:
+    """
+    Gradient of a log-soft-min minus log-soft-max contact objective.
+    Logarithmic pair lengths give comparable influence to short and long
+    contact classes during continuation.
+    """
+    delta = points[_PAIR_I] - points[_PAIR_J]
+    squared = np.einsum("ij,ij->i", delta, delta)
+    logs = np.log(np.maximum(squared, 1.0e-15))
+
+    lo = float(np.min(logs))
+    hi = float(np.max(logs))
+    low = np.exp(-sharpness * (logs - lo))
+    high = np.exp(sharpness * (logs - hi))
+    weights = low / np.sum(low) - high / np.sum(high)
+
+    force = 2.0 * weights[:, None] * delta / squared[:, None]
+    direction = np.zeros_like(points)
+    np.add.at(direction, _PAIR_I, force)
+    np.add.at(direction, _PAIR_J, -force)
+
+    direction -= direction.mean(axis=0, keepdims=True)
+    norm = np.sqrt(np.mean(np.sum(direction * direction, axis=1)))
+    if norm > 1.0e-14:
+        direction /= norm
+    return direction
+
+
+def _continuation_sharpness(progress: float, schedule: int) -> float:
+    """Three deliberately different contact-graph continuation paths."""
+    if schedule == 0:
+        return 5.0 + 145.0 * progress ** 1.75
+    if schedule == 1:
+        return 7.0 + 255.0 * progress ** 1.30
+    if progress < 0.58:
+        return 8.0 + 66.0 * (progress / 0.58) ** 1.45
+    return 74.0 + 310.0 * ((progress - 0.58) / 0.42) ** 2.15
+
+
+def _refine(seed: np.ndarray, schedule: int, iterations: int = 1250) -> np.ndarray:
+    """
+    Surrogate continuation for basin discovery.  Exact checkpoints remain
+    authoritative and sustained loss returns to the best contact structure.
+    """
+    points = _normalize(seed)
+    best = points.copy()
+    best_score = _exact_score(points)
+    velocity = np.zeros_like(points)
+
+    regressions = 0
+    step_factor = 1.0
+    damped = 0
+
+    for step in range(iterations):
+        progress = step / float(iterations - 1)
+        direction = _contact_direction(
+            points, _continuation_sharpness(progress, schedule)
+        )
+
+        persistence = 0.80 if damped == 0 else 0.58
+        velocity = persistence * velocity + (1.0 - persistence) * direction
+        step_size = step_factor * 0.044 * (1.0 - 0.70 * progress)
+        points = _normalize(points + step_size * velocity)
+        damped = max(0, damped - 1)
+
+        if step % 10 == 9 or step == iterations - 1:
+            score = _exact_score(points)
+            if score > best_score:
+                best_score = score
+                best = points.copy()
+                regressions = 0
+            elif score < best_score * (1.0 - 2.5e-4):
+                regressions += 1
+            else:
+                regressions = max(0, regressions - 1)
+
+            if regressions >= 3:
+                points = best.copy()
+                velocity.fill(0.0)
+                step_factor *= 0.74
+                damped = 75
+                regressions = 0
+
+    return best
+
+
+def _portfolio_polish(seed: np.ndarray) -> np.ndarray:
+    """
+    Run several exact-monotone high-sharpness branches from the best global
+    checkpoint.  Branches differ in their contact sharpness and step decay,
+    which is useful when nearly tied constraints switch active status.
+    """
+    branches = (
+        (220.0, 650.0, 0.0140, 0.00024, 480),
+        (320.0, 980.0, 0.0100, 0.00016, 500),
+        (500.0, 1450.0, 0.0070, 0.00009, 540),
+    )
+    rng = np.random.default_rng(160419)
+    global_best = _normalize(seed)
+    global_score = _exact_score(global_best)
+
+    for start_sharp, end_sharp, start_step, end_step, iterations in branches:
+        points = global_best.copy()
+        score = global_score
+
+        for step in range(iterations):
+            progress = step / float(iterations - 1)
+            sharpness = start_sharp * (end_sharp / start_sharp) ** progress
+            direction = _contact_direction(points, sharpness)
+            step_size = start_step * (end_step / start_step) ** progress
+
+            # Multiple scales make every accepted update an exact line-search
+            # improvement rather than a surrogate-only improvement.
+            multipliers = np.array([1.0, 0.55, 0.28, 0.12], dtype=float)
+            trials = points[None, :, :] + (
+                step_size * multipliers[:, None, None] * direction[None, :, :]
+            )
+
+            # Small reproducible transverse proposals help at nonsmooth
+            # active-contact transitions; they can never lower the incumbent.
+            if step % 23 == 0:
+                noise = rng.standard_normal((2, _N_POINTS, 3))
+                noise -= noise.mean(axis=1, keepdims=True)
+                noise_norm = np.sqrt(np.mean(np.sum(noise * noise, axis=2), axis=1))
+                noise /= noise_norm[:, None, None]
+                noise_scale = 0.18 * step_size
+                trials = np.concatenate((trials, points[None, :, :] + noise_scale * noise))
+
+            trials = np.asarray([_normalize(trial) for trial in trials])
+            scores = _batch_scores(trials)
+            choice = int(np.argmax(scores))
+
+            if scores[choice] > score + 1.0e-15:
+                points = trials[choice]
+                score = float(scores[choice])
+
+        if score > global_score:
+            global_best = points
+            global_score = score
+
+    return global_best
+
+
+def _layer_seed(radius: float, height: float, twist: float, pole: float) -> np.ndarray:
+    """Two staggered hexagonal rings and two axial points."""
+    angles = np.arange(6, dtype=float) * (np.pi / 3.0)
+    lower = np.column_stack(
+        (radius * np.cos(angles), radius * np.sin(angles), -height * np.ones(6))
+    )
+    upper = np.column_stack(
+        (
+            radius * np.cos(angles + twist),
+            radius * np.sin(angles + twist),
+            height * np.ones(6),
+        )
+    )
+    return np.vstack((lower, upper, [[0.0, 0.0, -pole], [0.0, 0.0, pole]]))
+
+
+def _initializers() -> list:
+    """Reproducible geometric and nonsymmetric basin initializers."""
+    seeds = [
+        _layer_seed(0.946, 0.405, np.pi / 6.0, 1.000),
+        _layer_seed(0.920, 0.385, np.pi / 6.0, 0.980),
+        _layer_seed(0.975, 0.430, np.pi / 6.0, 1.030),
+        _layer_seed(0.950, 0.415, 0.455, 1.000),
+        _layer_seed(0.955, 0.400, 0.585, 1.000),
+    ]
+
+    cube = np.array(
+        [[x, y, z] for x in (-1.0, 1.0)
+         for y in (-1.0, 1.0)
+         for z in (-1.0, 1.0)],
+        dtype=float,
+    )
+    axes = np.array(
+        [
+            [1.55, 0.0, 0.0], [-1.55, 0.0, 0.0],
+            [0.0, 1.67, 0.0], [0.0, -1.67, 0.0],
+            [0.0, 0.0, 1.60], [0.0, 0.0, -1.60],
+        ],
+        dtype=float,
+    )
+    seeds.append(np.vstack((cube, axes)))
+
+    rng = np.random.default_rng(482917)
+    starts = [seed + 0.018 * rng.standard_normal(seed.shape) for seed in seeds]
+    starts.append(rng.standard_normal((_N_POINTS, 3)))
+    starts.append(rng.standard_normal((_N_POINTS, 3)))
+    return starts
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """Return exactly fourteen finite points in three-dimensional space."""
+    best_points = None
+    best_score = -np.inf
+
+    for seed in _initializers():
+        for schedule in range(3):
+            candidate = _refine(seed, schedule)
+            score = _exact_score(candidate)
+            if score > best_score:
+                best_score = score
+                best_points = candidate
+
+    best_points = _portfolio_polish(best_points)
+    return np.asarray(best_points, dtype=float)
+
+
+# EVOLVE-BLOCK-END
+```

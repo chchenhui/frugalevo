@@ -1,0 +1,387 @@
+<NAME>
+hybrid_reachable_strips
+</NAME>
+
+<DESCRIPTION>
+This crossover keeps the stronger current-program behavior of prioritizing nearby wall construction with Manhattan distance, while incorporating the inspiration program's BFS reachability check. The hybrid avoids selecting wall-adjacent standing positions that are geometrically close but already disconnected by constructed partitions. This preserves the efficient strip-enclosure strategy and improves recovery from partition-induced dead ends.
+
+The implementation also uses fixed-size board arrays for tentative walls and BFS visitation, reducing repeated vector scans while maintaining the same interactive protocol and legal action handling.
+</DESCRIPTION>
+
+<CODE>
+```cpp
+# EVOLVE-BLOCK-START
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <queue>
+#include <cstring>
+#include <limits>
+
+constexpr int GRID_SIZE = 30;
+constexpr int NUM_TURNS = 300;
+constexpr int INF = std::numeric_limits<int>::max();
+constexpr int STAND_OUTSIDE_INNER_SAFE_PENALTY = 1000;
+constexpr int MAX_STUCK_TURNS = 10;
+
+struct Point {
+    int r, c;
+    bool operator==(const Point& o) const { return r == o.r && c == o.c; }
+    bool operator<(const Point& o) const {
+        return r != o.r ? r < o.r : c < o.c;
+    }
+};
+
+const Point INVALID_POINT{-1, -1};
+const Point DIRS[4] = {{-1,0}, {1,0}, {0,-1}, {0,1}};
+const char BUILD_CH[4] = {'u','d','l','r'};
+const char MOVE_CH[4] = {'U','D','L','R'};
+
+struct Pet {
+    Point pos;
+    int type;
+};
+
+struct Human {
+    Point pos;
+    int id;
+    int rs, re;
+    Point safe_ul, safe_br, final_pos;
+    std::vector<Point> walls;
+    int stuck = 0;
+};
+
+int N, M;
+std::vector<Pet> pets;
+std::vector<Human> humans;
+
+bool wall_grid[31][31];
+bool tentative_wall[31][31];
+bool used_move_target[31][31];
+int visit_stamp[31][31];
+Point parent_cell[31][31];
+int stamp_counter = 0;
+
+inline bool valid(int r, int c) {
+    return 1 <= r && r <= GRID_SIZE && 1 <= c && c <= GRID_SIZE;
+}
+
+inline int manhattan(Point a, Point b) {
+    return std::abs(a.r - b.r) + std::abs(a.c - b.c);
+}
+
+inline int dir_from_char(char ch) {
+    for (int d = 0; d < 4; ++d) {
+        if (BUILD_CH[d] == ch || MOVE_CH[d] == ch) return d;
+    }
+    return -1;
+}
+
+bool can_build(Point p, int builder) {
+    if (!valid(p.r, p.c) || wall_grid[p.r][p.c] || tentative_wall[p.r][p.c]) return false;
+
+    for (const auto& pet : pets) {
+        if (pet.pos == p || manhattan(pet.pos, p) == 1) return false;
+    }
+    for (const auto& h : humans) {
+        if (h.id != builder && h.pos == p) return false;
+    }
+    return true;
+}
+
+bool reachable(Point start, Point goal) {
+    if (!valid(start.r, start.c) || !valid(goal.r, goal.c)) return false;
+    if (start == goal) return true;
+
+    ++stamp_counter;
+    std::queue<Point> q;
+    q.push(start);
+    visit_stamp[start.r][start.c] = stamp_counter;
+
+    while (!q.empty()) {
+        Point cur = q.front();
+        q.pop();
+        for (int d = 0; d < 4; ++d) {
+            Point nx{cur.r + DIRS[d].r, cur.c + DIRS[d].c};
+            if (!valid(nx.r, nx.c)) continue;
+            if (wall_grid[nx.r][nx.c] || tentative_wall[nx.r][nx.c]) continue;
+            if (visit_stamp[nx.r][nx.c] == stamp_counter) continue;
+            if (nx == goal) return true;
+            visit_stamp[nx.r][nx.c] = stamp_counter;
+            q.push(nx);
+        }
+    }
+    return false;
+}
+
+char bfs_move(Point start, Point goal) {
+    if (start == goal || !valid(start.r, start.c) || !valid(goal.r, goal.c)) return '.';
+
+    ++stamp_counter;
+    std::queue<Point> q;
+    q.push(start);
+    visit_stamp[start.r][start.c] = stamp_counter;
+    parent_cell[start.r][start.c] = INVALID_POINT;
+
+    bool found = false;
+    while (!q.empty() && !found) {
+        Point cur = q.front();
+        q.pop();
+
+        for (int d = 0; d < 4; ++d) {
+            Point nx{cur.r + DIRS[d].r, cur.c + DIRS[d].c};
+            if (!valid(nx.r, nx.c)) continue;
+            if (wall_grid[nx.r][nx.c] || tentative_wall[nx.r][nx.c]) continue;
+            if (visit_stamp[nx.r][nx.c] == stamp_counter) continue;
+
+            visit_stamp[nx.r][nx.c] = stamp_counter;
+            parent_cell[nx.r][nx.c] = cur;
+            if (nx == goal) {
+                found = true;
+                break;
+            }
+            q.push(nx);
+        }
+    }
+
+    if (!found) return '.';
+
+    Point cur = goal;
+    while (!(parent_cell[cur.r][cur.c] == start)) {
+        cur = parent_cell[cur.r][cur.c];
+    }
+
+    for (int d = 0; d < 4; ++d) {
+        if (start.r + DIRS[d].r == cur.r && start.c + DIRS[d].c == cur.c) {
+            return MOVE_CH[d];
+        }
+    }
+    return '.';
+}
+
+void initialize() {
+    std::cin >> N;
+    pets.resize(N);
+    for (int i = 0; i < N; ++i) {
+        std::cin >> pets[i].pos.r >> pets[i].pos.c >> pets[i].type;
+    }
+
+    std::cin >> M;
+    humans.resize(M);
+    std::memset(wall_grid, 0, sizeof(wall_grid));
+
+    int base_h = GRID_SIZE / M;
+    int extra = GRID_SIZE % M;
+    int current_row = 1;
+
+    for (int i = 0; i < M; ++i) {
+        Human& h = humans[i];
+        h.id = i;
+        std::cin >> h.pos.r >> h.pos.c;
+
+        int height = base_h + (i < extra);
+        h.rs = current_row;
+        h.re = current_row + height - 1;
+        current_row = h.re + 1;
+
+        h.safe_ul = {h.rs + 1, 2};
+        h.safe_br = {h.re - 1, 29};
+        if (h.safe_ul.r > h.safe_br.r) h.safe_ul.r = h.safe_br.r = h.rs;
+        h.final_pos = {
+            (h.safe_ul.r + h.safe_br.r) / 2,
+            (h.safe_ul.c + h.safe_br.c) / 2
+        };
+
+        if (i == 0) {
+            for (int c = 1; c <= 30; ++c) h.walls.push_back({h.rs, c});
+        } else {
+            for (int c = 16; c <= 30; ++c) h.walls.push_back({h.rs, c});
+        }
+
+        if (i == M - 1) {
+            for (int c = 1; c <= 30; ++c) h.walls.push_back({h.re, c});
+        } else {
+            for (int c = 1; c <= 15; ++c) h.walls.push_back({h.re, c});
+        }
+
+        for (int r = h.rs + 1; r < h.re; ++r) {
+            h.walls.push_back({r, 1});
+            h.walls.push_back({r, 30});
+        }
+
+        std::sort(h.walls.begin(), h.walls.end());
+        h.walls.erase(std::unique(h.walls.begin(), h.walls.end(),
+            [](const Point& a, const Point& b) { return a == b; }), h.walls.end());
+    }
+}
+
+std::string decide_actions() {
+    std::memset(tentative_wall, 0, sizeof(tentative_wall));
+    std::memset(used_move_target, 0, sizeof(used_move_target));
+
+    std::string actions(M, '.');
+
+    for (int i = 0; i < M; ++i) {
+        Human& h = humans[i];
+
+        int remaining = 0;
+        for (const Point& p : h.walls) {
+            if (!wall_grid[p.r][p.c]) ++remaining;
+        }
+
+        if (remaining == 0) {
+            char mv = bfs_move(h.pos, h.final_pos);
+            actions[i] = mv;
+            if (mv != '.') {
+                int d = dir_from_char(mv);
+                Point to{h.pos.r + DIRS[d].r, h.pos.c + DIRS[d].c};
+                if (!tentative_wall[to.r][to.c] && !used_move_target[to.r][to.c]) {
+                    used_move_target[to.r][to.c] = true;
+                } else {
+                    actions[i] = '.';
+                }
+            }
+            continue;
+        }
+
+        if (h.stuck >= MAX_STUCK_TURNS) {
+            h.stuck = 0;
+            char mv = bfs_move(h.pos, h.final_pos);
+            actions[i] = mv;
+            if (mv != '.') {
+                int d = dir_from_char(mv);
+                Point to{h.pos.r + DIRS[d].r, h.pos.c + DIRS[d].c};
+                if (!tentative_wall[to.r][to.c] && !used_move_target[to.r][to.c]) {
+                    used_move_target[to.r][to.c] = true;
+                } else {
+                    actions[i] = '.';
+                }
+            }
+            continue;
+        }
+
+        Point best_wall = INVALID_POINT;
+        Point best_stand = INVALID_POINT;
+        int best_score = INF;
+
+        for (const Point& wp : h.walls) {
+            if (!can_build(wp, i)) continue;
+
+            for (int d = 0; d < 4; ++d) {
+                Point stand{wp.r + DIRS[d].r, wp.c + DIRS[d].c};
+                if (!valid(stand.r, stand.c)) continue;
+                if (wall_grid[stand.r][stand.c] || tentative_wall[stand.r][stand.c]) continue;
+                if (used_move_target[stand.r][stand.c]) continue;
+
+                // Crossover: retain Manhattan ordering but reject isolated targets.
+                if (!reachable(h.pos, stand)) continue;
+
+                int score = manhattan(h.pos, stand);
+                bool inside =
+                    h.safe_ul.r <= stand.r && stand.r <= h.safe_br.r &&
+                    h.safe_ul.c <= stand.c && stand.c <= h.safe_br.c;
+                if (!inside) score += STAND_OUTSIDE_INNER_SAFE_PENALTY;
+
+                if (score < best_score ||
+                    (score == best_score &&
+                     (best_wall.r == -1 || wp < best_wall ||
+                      (wp == best_wall && stand < best_stand)))) {
+                    best_score = score;
+                    best_wall = wp;
+                    best_stand = stand;
+                }
+            }
+        }
+
+        if (best_wall.r == -1) {
+            ++h.stuck;
+            char mv = bfs_move(h.pos, h.final_pos);
+            actions[i] = mv;
+            if (mv != '.') {
+                int d = dir_from_char(mv);
+                Point to{h.pos.r + DIRS[d].r, h.pos.c + DIRS[d].c};
+                if (!tentative_wall[to.r][to.c] && !used_move_target[to.r][to.c]) {
+                    used_move_target[to.r][to.c] = true;
+                } else {
+                    actions[i] = '.';
+                }
+            }
+            continue;
+        }
+
+        h.stuck = 0;
+        if (h.pos == best_stand) {
+            for (int d = 0; d < 4; ++d) {
+                if (h.pos.r + DIRS[d].r == best_wall.r &&
+                    h.pos.c + DIRS[d].c == best_wall.c) {
+                    actions[i] = BUILD_CH[d];
+                    tentative_wall[best_wall.r][best_wall.c] = true;
+                    break;
+                }
+            }
+        } else {
+            char mv = bfs_move(h.pos, best_stand);
+            actions[i] = mv;
+            if (mv != '.') {
+                int d = dir_from_char(mv);
+                Point to{h.pos.r + DIRS[d].r, h.pos.c + DIRS[d].c};
+                if (!tentative_wall[to.r][to.c] && !used_move_target[to.r][to.c]) {
+                    used_move_target[to.r][to.c] = true;
+                } else {
+                    actions[i] = '.';
+                }
+            }
+        }
+    }
+
+    return actions;
+}
+
+void apply_and_read(const std::string& actions) {
+    for (int i = 0; i < M; ++i) {
+        char a = actions[i];
+        if ('a' <= a && a <= 'z' && a != '.') {
+            int d = dir_from_char(a);
+            Point w{humans[i].pos.r + DIRS[d].r, humans[i].pos.c + DIRS[d].c};
+            if (valid(w.r, w.c)) wall_grid[w.r][w.c] = true;
+        }
+    }
+
+    for (int i = 0; i < M; ++i) {
+        char a = actions[i];
+        if ('A' <= a && a <= 'Z') {
+            int d = dir_from_char(a);
+            Point to{humans[i].pos.r + DIRS[d].r, humans[i].pos.c + DIRS[d].c};
+            if (valid(to.r, to.c) && !wall_grid[to.r][to.c]) humans[i].pos = to;
+        }
+    }
+
+    for (int i = 0; i < N; ++i) {
+        std::string moves;
+        std::cin >> moves;
+        for (char ch : moves) {
+            if (ch == '.') continue;
+            int d = dir_from_char(ch);
+            pets[i].pos.r += DIRS[d].r;
+            pets[i].pos.c += DIRS[d].c;
+        }
+    }
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    initialize();
+
+    for (int turn = 0; turn < NUM_TURNS; ++turn) {
+        std::string actions = decide_actions();
+        std::cout << actions << std::endl;
+        apply_and_read(actions);
+    }
+    return 0;
+}
+# EVOLVE-BLOCK-END
+``` 
+</CODE>

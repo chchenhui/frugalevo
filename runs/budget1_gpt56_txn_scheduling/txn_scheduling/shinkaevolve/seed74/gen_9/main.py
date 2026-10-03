@@ -1,0 +1,272 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Return a low-conflict transaction ordering.
+
+    Small workloads are solved exactly.  Larger workloads are processed by a
+    conflict-aware beam constructor followed by variable-neighborhood descent.
+    All search decisions use get_opt_seq_cost(), the authoritative simulator
+    makespan, rather than transaction-size or write-count proxies.
+    """
+    num_txns = workload.num_txns
+    if num_txns == 0:
+        return 0, []
+
+    all_txns = tuple(range(num_txns))
+    cost_cache = {}
+
+    def evaluate(sequence):
+        """Memoized simulator evaluation for both prefixes and full schedules."""
+        key = tuple(sequence)
+        cached = cost_cache.get(key)
+        if cached is None:
+            cached = workload.get_opt_seq_cost(list(key))
+            cost_cache[key] = cached
+        return cached
+
+    def exact_search():
+        """Enumerate all orders when exhaustive optimization is practical."""
+        import itertools
+
+        best_cost = float("inf")
+        best_order = None
+
+        for order in itertools.permutations(all_txns):
+            cost = evaluate(order)
+            if cost < best_cost or (
+                cost == best_cost and (best_order is None or order < best_order)
+            ):
+                best_cost = cost
+                best_order = order
+
+        return best_cost, list(best_order)
+
+    # Nine transactions require 362,880 evaluations, which remains practical
+    # and produces a guaranteed optimum instead of a heuristic schedule.
+    if num_txns <= 9:
+        return exact_search()
+
+    def build_beam():
+        """
+        Construct complete orders from low-makespan prefixes.
+
+        The used-transaction bitmask avoids repeatedly allocating sets for
+        every beam expansion.  Prefix makespan comes directly from the
+        workload simulator, preserving actual read/write conflict behavior.
+        """
+        beam_width = max(32, min(128, max(1, num_seqs) * 12))
+        beam = []
+
+        for txn in all_txns:
+            order = (txn,)
+            beam.append((evaluate(order), order, 1 << txn))
+
+        beam.sort(key=lambda state: (state[0], state[1]))
+        beam = beam[:beam_width]
+
+        for _depth in range(1, num_txns):
+            expanded = []
+
+            for _cost, prefix, used_mask in beam:
+                for txn in all_txns:
+                    txn_bit = 1 << txn
+                    if used_mask & txn_bit:
+                        continue
+
+                    candidate = prefix + (txn,)
+                    expanded.append((
+                        evaluate(candidate),
+                        candidate,
+                        used_mask | txn_bit,
+                    ))
+
+            expanded.sort(key=lambda state: (state[0], state[1]))
+            beam = expanded[:beam_width]
+
+        return beam
+
+    def best_standard_move(order, current_cost):
+        """
+        Search insertion, exchange, and reversal neighborhoods.
+
+        These moves respectively alter one precedence relationship over a
+        long distance, exchange opposing conflict regions, and change all
+        relative orders inside a dense interval.
+        """
+        size = len(order)
+        best_cost = current_cost
+        best_order = None
+
+        # Relocate one transaction anywhere in the schedule.
+        for source in range(size):
+            moved = order[source]
+            stripped = order[:source] + order[source + 1:]
+
+            for destination in range(size):
+                if destination == source:
+                    continue
+
+                candidate = (
+                    stripped[:destination]
+                    + [moved]
+                    + stripped[destination:]
+                )
+                candidate_cost = evaluate(candidate)
+
+                if candidate_cost < best_cost:
+                    best_cost = candidate_cost
+                    best_order = candidate
+
+        # Exchange two transactions whose conflict directions disagree.
+        for left in range(size - 1):
+            for right in range(left + 1, size):
+                candidate = order.copy()
+                candidate[left], candidate[right] = (
+                    candidate[right],
+                    candidate[left],
+                )
+                candidate_cost = evaluate(candidate)
+
+                if candidate_cost < best_cost:
+                    best_cost = candidate_cost
+                    best_order = candidate
+
+        # Reverse intervals of length at least three.  Length-two reversals
+        # are already covered by the exchange neighborhood.
+        for left in range(size - 2):
+            for right in range(left + 2, size):
+                candidate = (
+                    order[:left]
+                    + order[left:right + 1][::-1]
+                    + order[right + 1:]
+                )
+                candidate_cost = evaluate(candidate)
+
+                if candidate_cost < best_cost:
+                    best_cost = candidate_cost
+                    best_order = candidate
+
+        return best_cost, best_order
+
+    def best_block_move(order, current_cost):
+        """
+        Relocate adjacent pairs and triples as intact units.
+
+        A useful conflict ordering can require two transactions to move
+        together; neither individual insertion may be improving, so this
+        neighborhood is deliberately applied after ordinary local search
+        reaches a local optimum.
+        """
+        size = len(order)
+        best_cost = current_cost
+        best_order = None
+
+        max_block = min(3, size - 1)
+        for block_size in range(2, max_block + 1):
+            for source in range(size - block_size + 1):
+                block = order[source:source + block_size]
+                stripped = order[:source] + order[source + block_size:]
+
+                for destination in range(len(stripped) + 1):
+                    # Reinserting at its original coordinate changes nothing.
+                    if destination == source:
+                        continue
+
+                    candidate = (
+                        stripped[:destination]
+                        + block
+                        + stripped[destination:]
+                    )
+                    candidate_cost = evaluate(candidate)
+
+                    if candidate_cost < best_cost:
+                        best_cost = candidate_cost
+                        best_order = candidate
+
+        return best_cost, best_order
+
+    def refine(seed, seed_cost):
+        """
+        Variable-neighborhood descent.
+
+        Standard moves are preferred because they are cheaper and precise.
+        Once none improves the schedule, block moves provide a controlled
+        escape from insertion/swap/reversal local minima.
+        """
+        current = list(seed)
+        current_cost = seed_cost
+        max_rounds = max(4, min(num_txns * 2, 24))
+
+        for _round in range(max_rounds):
+            standard_cost, standard_order = best_standard_move(
+                current,
+                current_cost,
+            )
+
+            if standard_order is not None:
+                current = standard_order
+                current_cost = standard_cost
+                continue
+
+            block_cost, block_order = best_block_move(current, current_cost)
+            if block_order is None:
+                break
+
+            current = block_order
+            current_cost = block_cost
+
+        return current_cost, current
+
+    beam = build_beam()
+
+    # Refine several independently constructed complete schedules.  Beam
+    # candidates frequently differ in early ordering decisions, which is
+    # valuable because local search otherwise converges to the same basin.
+    seed_count = min(len(beam), max(6, min(14, num_seqs * 2)))
+    best_cost = float("inf")
+    best_schedule = None
+
+    for seed_cost, seed_order, _mask in beam[:seed_count]:
+        refined_cost, refined_schedule = refine(seed_order, seed_cost)
+
+        if refined_cost < best_cost or (
+            refined_cost == best_cost
+            and (
+                best_schedule is None
+                or tuple(refined_schedule) < tuple(best_schedule)
+            )
+        ):
+            best_cost = refined_cost
+            best_schedule = refined_schedule
+
+    return best_cost, best_schedule
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

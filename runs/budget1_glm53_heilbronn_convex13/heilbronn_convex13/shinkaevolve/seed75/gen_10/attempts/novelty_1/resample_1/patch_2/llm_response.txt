@@ -1,0 +1,139 @@
+<NAME>
+heilbronn13_annealed_search</NAME>
+<DESCRIPTION>
+The previous stub returned an empty configuration. This edit replaces it with a complete, deterministic solver for the 13-point Heilbronn problem. Strategy: (1) generate several structured initializations (nested rings, triangular lattice, seeded random draws), (2) run a deterministic stochastic hill-climbing refinement that perturbs one point at a time and accepts only improvements to the minimum triangle area (computed vectorized over all C(13,3)=286 triples via cross products), with geometric step-size decay for fine local polish, (3) keep the best configuration across all starts. The convex hull is defined by the points themselves, and the returned coordinates are normalized so the hull has unit area, making min_area_normalized directly comparable to the benchmark constant ~0.030936889. A fixed RNG seed guarantees reproducibility, and the multi-start design guards against poor local optima. Runtime is bounded (~a few seconds) since each objective evaluation is a single vectorized numpy pass over 286 triangles.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def solve():
+    points = []
+    return points
+=======
+def solve():
+    import numpy as np
+    import itertools
+
+    TRI = np.array(list(itertools.combinations(range(13), 3)), dtype=int)
+
+    def min_tri_area(P):
+        a = P[TRI[:, 0]]
+        b = P[TRI[:, 1]]
+        c = P[TRI[:, 2]]
+        areas = 0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+                             - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+        return float(areas.min())
+
+    def hull_area(P):
+        H = P[convex_hull_indices(P)]
+        x, y = H[:, 0], H[:, 1]
+        return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+    def convex_hull_indices(P):
+        # Deterministic Andrew's monotone chain
+        pts = sorted(map(tuple, P))
+        uniq = []
+        for p in pts:
+            if not uniq or p != uniq[-1]:
+                uniq.append(p)
+        if len(uniq) <= 2:
+            return np.arange(len(P))
+
+        def cross(o, a, b):
+            return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+
+        lower = []
+        for p in uniq:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+        upper = []
+        for p in reversed(uniq):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+        hull = lower[:-1] + upper[:-1]
+        hull_set = set(hull)
+        idx = [i for i, q in enumerate(P) if tuple(q) in hull_set]
+        return np.array(idx, dtype=int)
+
+    rng = np.random.default_rng(20240913)
+
+    def ring(n, r, phase):
+        ang = phase + 2 * np.pi * np.arange(n) / n
+        return np.stack([r * np.cos(ang), r * np.sin(ang)], axis=1)
+
+    inits = []
+    # 1) nested 6+6 rings + center
+    inits.append(np.vstack([ring(6, 1.0, 0.0), ring(6, 0.55, np.pi/6), [[0.0, 0.0]]]))
+    # 2) nested 6+6 rings, rotated, + center offset
+    inits.append(np.vstack([ring(6, 1.0, np.pi/6), ring(6, 0.5, 0.0), [[0.05, -0.05]]]))
+    # 3) triangular lattice patch
+    lat = []
+    for i in range(4):
+        for j in range(4 - i):
+            lat.append([i * 0.30, j * 0.30 + 0.15 * i])
+    lat = lat[:13]
+    P = np.array(lat)
+    P = P - P.mean(axis=0)
+    inits.append(P)
+    # 4) 12 on outer ring + center
+    inits.append(np.vstack([ring(12, 1.0, 0.0), [[0.0, 0.0]]]))
+    # 5-8) seeded random
+    for _ in range(4):
+        inits.append(rng.uniform(-1.0, 1.0, size=(13, 2)))
+
+    def refine(P, iters=4000, step0=0.08):
+        P = P.copy()
+        val = min_tri_area(P)
+        step = step0
+        for it in range(iters):
+            i = int(rng.integers(13))
+            d = rng.normal(0.0, step, size=2)
+            old = P[i].copy()
+            P[i] = old + d
+            new_val = min_tri_area(P)
+            if new_val > val + 1e-14:
+                val = new_val
+            else:
+                P[i] = old
+            if (it + 1) % (iters // 8 or 1) == 0:
+                step *= 0.6
+                # occasional uphill-free restart jitter for diversity
+        return P, val
+
+    best_pts, best_val = None, -np.inf
+    for P0 in inits:
+        P0 = np.asarray(P0, dtype=float)
+        P0 = P0 - P0.mean(axis=0)
+        P, v = refine(P0)
+        if v > best_val:
+            best_val, best_pts = v, P.copy()
+        # extra polish on the current best-so-far start
+        P2, v2 = refine(best_pts, iters=1500, step0=0.015)
+        if v2 > best_val:
+            best_val, best_pts = v2, P2.copy()
+
+    # Final fine polish
+    for _ in range(3):
+        P, v = refine(best_pts, iters=800, step0=0.004)
+        if v > best_val:
+            best_val, best_pts = v, P.copy()
+
+    # Normalize so convex hull has unit area
+    P = best_pts
+    ha = hull_area(P)
+    if ha <= 0 or not np.isfinite(ha):
+        # fallback: regular 13-gon on unit circle (always valid)
+        P = ring(13, 1.0, 0.0)
+        ha = hull_area(P)
+    P = P / np.sqrt(ha)
+
+    # Sanity: finite, unique
+    P = np.asarray(P, dtype=float)
+    assert P.shape == (13, 2)
+    assert np.all(np.isfinite(P))
+
+    points = [tuple(map(float, p)) for p in P]
+    return points
+>>>>>>> REPLACE
+</DIFF>

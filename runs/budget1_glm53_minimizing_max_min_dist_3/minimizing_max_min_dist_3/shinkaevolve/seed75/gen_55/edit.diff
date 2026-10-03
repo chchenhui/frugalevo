@@ -1,0 +1,407 @@
+--- a/original.py
++++ b/original.py
+@@ -1,210 +1,254 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def min_max_dist_dim3_14() -> np.ndarray:
+     """
+     Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
+ 
+     Returns
+         points: np.ndarray of shape (14,3) containing the (x,y) coordinates of the 14 points.
+ 
+     """
+-
+-    n = 14
+-    d = 3
+-
+-    np.random.seed(42)
+-
+-    # Start from an icosahedron (12 well-spread vertices) + 2 extra points
+-    phi = (1 + np.sqrt(5)) / 2
+-    verts = []
+-    for a, b in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+-        pass
+-    base = np.array([
+-        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+-        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+-        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+-    ], dtype=float)
+-    base /= np.linalg.norm(base, axis=1, keepdims=True)
+-    # two extra points near opposite poles, slightly perturbed to break symmetry
+-    extra = np.array([[0.0, 0.0, 1.05], [0.1, -0.1, -1.05]])
+-    points = np.vstack([base, extra])
+-
+-    # Structured seeds: D6h family (two staggered hexagonal rings + 2 axial poles),
+-    # the suspected optimal symmetry class for 14 points in 3D.
+-    seeds = [points.copy()]
+-    th = np.arange(6) * (np.pi / 3.0)
+-    for R, h, z0 in [(1.0, 0.55, 1.15), (1.0, 0.75, 1.35),
+-                     (1.0, 0.95, 1.55), (1.0, 0.35, 1.05)]:
++    from scipy.optimize import minimize
++    from scipy.special import logsumexp
++
++    n, d = 14, 3
++    iu = np.triu_indices(n, 1)
++
++    def dists(p):
++        diff = p[:, None, :] - p[None, :, :]
++        D2 = (diff * diff).sum(-1)
++        return np.sqrt(np.maximum(D2[iu], 1e-12))
++
++    def ratio(p):
++        D = dists(p)
++        return D.min() / D.max()
++
++    def normalize(P):
++        P = P - P.mean(axis=0)
++        return P / dists(P).max()
++
++    def d6_family(R, h, z0):
++        th = np.arange(6) * (np.pi / 3.0)
+         r1 = np.stack([R * np.cos(th), R * np.sin(th), np.full(6, h)], axis=1)
+         r2 = np.stack([R * np.cos(th + np.pi / 6), R * np.sin(th + np.pi / 6),
+                        np.full(6, -h)], axis=1)
+         poles = np.array([[0.0, 0.0, z0], [0.0, 0.0, -z0]])
+-        seeds.append(np.vstack([r1, r2, poles]))
+-
+-    def pairwise(pts):
+-        diff = pts[:, None, :] - pts[None, :, :]
+-        return np.sqrt(np.sum(diff * diff, axis=-1) + 1e-12)
+-
+-    def objective(flat, tau):
+-        P = flat.reshape(n, d)
+-        D = pairwise(P)
+-        iu = np.triu_indices(n, 1)
+-        dv = D[iu]
+-        smin = -tau * np.log(np.sum(np.exp(-dv / tau)))
+-        smax = tau * np.log(np.sum(np.exp(dv / tau)))
+-        return -(smin / smax)
+-
+-    # Coordinate descent over annealed temperatures with local random restarts
+-    best_pts = points.copy()
+-    def true_ratio(P):
+-        D = pairwise(P)[np.triu_indices(n, 1)]
+-        return D.min() / D.max()
+-
+-    def normalize(P):
+-        P = P - P.mean(axis=0)
+-        Dm = pairwise(P)[np.triu_indices(n, 1)].max()
+-        return P / Dm
+-
+-    best_pts = normalize(best_pts)
+-    best_val = true_ratio(best_pts)
+-    rng = np.random.RandomState(0)
+-    # second, different basin: jittered points on the unit sphere
+-    alt = rng.randn(n, d)
+-    alt /= np.linalg.norm(alt, axis=1, keepdims=True)
+-    try:
+-        from scipy.optimize import minimize
+-        n_struct = len(seeds)
+-        for trial in range(12):
+-            if trial < n_struct:
+-                P0 = normalize(seeds[trial].copy())
+-            elif trial == n_struct:
+-                P0 = normalize(alt)
+-            else:
+-                P0 = normalize(best_pts + 0.08 * rng.randn(n, d))
+-            for tau in [0.1, 0.05, 0.02, 0.01, 0.005]:
+-                res = minimize(objective, P0.ravel(), args=(tau,),
+-                               method="L-BFGS-B",
+-                               options={"maxiter": 600})
+-                P0 = normalize(res.x.reshape(n, d))
+-            v = true_ratio(P0)
+-            if v > best_val:
+-                best_val = v
+-                best_pts = P0.copy()
+-    except Exception:
+-        # scipy unavailable: fall back to simple centroid-based relaxation
+-        for _ in range(200):
+-            D = pairwise(best_pts)
+-            iu = np.triu_indices(n, 1)
+-            dmin = D[iu].min()
+-            dmax = D[iu].max()
+-            for i in range(n):
+-                d_i = np.delete(D[i], i)
+-                nearest = np.argmin(np.delete(D[i], i))
+-                others = np.delete(np.arange(n), i)
+-                best_pts[i] += 0.02 * (best_pts[i] - best_pts[others[nearest]]) / max(dmin, 1e-9)
+-
+-    points = best_pts
+-
+-    # Greedy hill-climbing polish directly on the true ratio
+-    best_pts = normalize(best_pts)
+-    best_val = true_ratio(best_pts)
+-    step = 0.01
+-    while step > 1e-4:
+-        improved = False
+-        for i in range(n):
+-            for axis in range(d):
+-                for sgn in (1, -1):
+-                    cand = best_pts.copy()
+-                    cand[i, axis] += sgn * step
+-                    cand = normalize(cand)
+-                    v = true_ratio(cand)
+-                    if v > best_val + 1e-9:
+-                        best_val = v
+-                        best_pts = cand
++        return np.vstack([r1, r2, poles])
++
++    def tammes14_seed():
++        h = 1.0 / np.sqrt(5.0)
++        r = 2.0 / np.sqrt(5.0)
++        pts = [[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]]
++        for k in range(6):
++            a = k * (np.pi / 3.0)
++            pts.append([r * np.cos(a), r * np.sin(a), h])
++            pts.append([r * np.cos(a + np.pi / 6.0), r * np.sin(a + np.pi / 6.0), -h])
++        return np.array(pts, dtype=float)
++
++    rng = np.random.default_rng(0)
++
++    # ---- Stage 1: seeds ----
++    seeds = [tammes14_seed()]
++    # fine grid over the D6 family (contains the near-optimal symmetry class)
++    grid_best_r, grid_best = -1.0, None
++    for h in np.linspace(0.15, 1.4, 20):
++        for z0 in np.linspace(max(h, 0.2) + 0.05, 2.6, 36):
++            P = d6_family(1.0, h, z0)
++            r = ratio(P)
++            if r > grid_best_r:
++                grid_best_r, grid_best = r, P
++    if grid_best is not None:
++        seeds.append(grid_best.copy())
++    # a few specific structured parameters
++    for R, h, z0 in [(1.0, 0.55, 1.15), (1.0, 0.75, 1.35), (1.0, 0.95, 1.55)]:
++        seeds.append(d6_family(R, h, z0))
++    for _ in range(4):
++        p = rng.normal(size=(n, d))
++        seeds.append(p / np.linalg.norm(p, axis=1, keepdims=True))
++
++    def unit(x):
++        p = x.reshape(n, d)
++        return p / np.maximum(np.linalg.norm(p, axis=1, keepdims=True), 1e-12)
++
++    def anneal_chain(pts, Ts=(0.08, 0.03, 0.012, 0.005, 0.002)):
++        for T in Ts:
++            def loss(x, T=T):
++                p = unit(x)
++                D = dists(p)
++                return T * logsumexp(-D / T)
++            res = minimize(loss, pts.ravel(), method="L-BFGS-B",
++                           options={"maxiter": 400, "maxfun": 1500})
++            if np.isfinite(res.x).all():
++                pts = unit(res.x)
++        # free-space soft-min/soft-max refinement (scale-invariant)
++        def loss2(x, tau_lo=0.002, tau_hi=0.005):
++            p = x.reshape(n, d)
++            p = p - p.mean(0)
++            D = dists(p)
++            return tau_lo * logsumexp(-D / tau_lo) + tau_hi * logsumexp(D / tau_hi)
++        res = minimize(loss2, pts.ravel(), method="L-BFGS-B",
++                       options={"maxiter": 600, "maxfun": 2500})
++        p2 = res.x.reshape(n, d) if np.isfinite(res.x).all() else pts
++        p2 = p2 - p2.mean(0)
++        return p2
++
++    # ---- Stage 2: anneal each seed, keep global best on true ratio ----
++    best_pts, best_r = None, -1.0
++    for pts in seeds:
++        try:
++            p2 = anneal_chain(pts.copy())
++        except Exception:
++            p2 = normalize(pts.copy())
++        r = ratio(p2)
++        if r > best_r:
++            best_r, best_pts = r, p2.copy()
++        pts_n = normalize(pts.copy())
++        r = ratio(pts_n)
++        if r > best_r:
++            best_r, best_pts = r, pts_n.copy()
++    if best_pts is None:
++        best_pts = normalize(tammes14_seed())
++
++    # ---- Stage 3: greedy hill-climb on the true ratio ----
++    def climb(P, steps=(0.02, 0.006, 0.002, 6e-4, 2e-4, 8e-5)):
++        P = normalize(P.copy())
++        best = ratio(P)
++        for step in steps:
++            for _ in range(600):
++                D = dists(P)
++                imin = int(np.argmin(D))
++                imax = int(np.argmax(D))
++                i0, j0 = int(iu[0][imin]), int(iu[1][imin])
++                i1, j1 = int(iu[0][imax]), int(iu[1][imax])
++                cands = []
++                u = P[j0] - P[i0]
++                nu = np.linalg.norm(u)
++                if nu > 1e-12:
++                    u = u / nu
++                    Q = P.copy(); Q[i0] -= 0.5 * step * u; Q[j0] += 0.5 * step * u
++                    cands.append(Q)
++                    Q = P.copy(); Q[i0] -= step * u; cands.append(Q)
++                    Q = P.copy(); Q[j0] += step * u; cands.append(Q)
++                v = P[j1] - P[i1]
++                nv = np.linalg.norm(v)
++                if nv > 1e-12:
++                    v = v / nv
++                    Q = P.copy(); Q[i1] += 0.5 * step * v; Q[j1] -= 0.5 * step * v
++                    cands.append(Q)
++                    Q = P.copy(); Q[i1] += step * v; cands.append(Q)
++                    Q = P.copy(); Q[j1] -= step * v; cands.append(Q)
++                for a in range(n):
++                    for c in range(d):
++                        for s in (step, -step):
++                            Q = P.copy(); Q[a, c] += s
++                            cands.append(Q)
++                improved = False
++                for Q in cands:
++                    r = ratio(Q)
++                    if r > best + 1e-15:
++                        best = r
++                        P = Q
+                         improved = True
+-        if not improved:
+-            step *= 0.5
+-    points = best_pts
+-
+-    # Targeted pair-separation hill-climb with tangential variants:
+-    # separate the closest pair along its connecting axis AND with a tangential
+-    # component so it can slide around blocking third neighbors; also pull the
+-    # farthest pair inward. Directly attacks the min/max pair bottleneck.
+-    def pair_hillclimb(P, iters=250, step0=0.01):
+-        P = normalize(P)
+-        r_best = true_ratio(P)
+-        iu = np.triu_indices(n, 1)
++                        break
++                if not improved:
++                    break
++        return P, best
++
++    Pc, rc = climb(best_pts)
++    if rc > best_r:
++        best_r, best_pts = rc, Pc
++
++    # ---- Stage 4: tangential pair hill-climb (escape blocked pairs) ----
++    def pair_hillclimb(P, iters=200, step0=0.01):
++        P = normalize(P.copy())
++        r_best = ratio(P)
+         step = step0
+         for _ in range(iters):
+-            dv = pairwise(P)[iu]
+-            imin, imax = dv.argmin(), dv.argmax()
+-            ia, ib = iu[0][imin], iu[1][imin]
+-            ja, jb = iu[0][imax], iu[1][imax]
++            dv = dists(P)
++            imin, imax = int(dv.argmin()), int(dv.argmax())
++            ia, ib = int(iu[0][imin]), int(iu[1][imin])
++            ja, jb = int(iu[0][imax]), int(iu[1][imax])
+             improved = False
+             u = P[ia] - P[ib]
+             nu = np.linalg.norm(u)
+             if nu < 1e-12:
+                 break
+             u = u / nu
+-            # tangential direction within the pair's local tangent plane
+             t0 = np.array([1.0, 0.0, 0.0]) if abs(u[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+             t = np.cross(u, t0)
+             nt = np.linalg.norm(t)
+-            if nt > 1e-12:
+-                t = t / nt
+-            else:
+-                t = np.zeros(3)
++            t = t / nt if nt > 1e-12 else np.zeros(3)
+             for mag in (step, step / 2, step / 4):
++                done = False
+                 for dirv in (u, u + 0.3 * t, u - 0.3 * t):
+                     nv = np.linalg.norm(dirv)
+                     if nv < 1e-12:
+                         continue
+                     dvec = dirv / nv
+                     Q = P.copy()
+                     Q[ia] += mag * dvec
+                     Q[ib] -= mag * dvec
+                     Q = normalize(Q)
+-                    r = true_ratio(Q)
++                    r = ratio(Q)
+                     if r > r_best + 1e-12:
+-                        P, r_best, improved = Q, r, True
++                        P, r_best, improved, done = Q, r, True, True
+                         break
+-                if improved:
+-                    break
+-                # pull the farthest pair inward
++                if done:
++                    break
+                 w = P[ja] - P[jb]
+                 nw = np.linalg.norm(w)
+                 if nw > 1e-12:
+                     w = w / nw
+                     Q = P.copy()
+                     Q[ja] -= mag * w
+                     Q[jb] += mag * w
+                     Q = normalize(Q)
+-                    r = true_ratio(Q)
++                    r = ratio(Q)
+                     if r > r_best + 1e-12:
+-                        P, r_best, improved = Q, r, True
++                        P, r_best, improved, done = Q, r, True, True
+                         break
++                if done:
++                    break
+             if not improved:
+                 step *= 0.6
+                 if step < 1e-7:
+                     break
+         return P, r_best
+ 
+-    for k in range(4):
+-        Q, r = pair_hillclimb(points, step0=0.01 * (0.7 ** k))
+-        if r > best_val + 1e-14:
+-            best_val, points = r, Q
+-        else:
+-            break
+-    best_pts = points
+-
+-    # Normalize: translate centroid to origin, scale so max distance = 1
+-    points = points - points.mean(axis=0)
+-    D = pairwise(points)[np.triu_indices(n, 1)]
+-    points = points / D.max()
+-
++    Q, r = pair_hillclimb(best_pts)
++    if r > best_r:
++        best_r, best_pts = r, Q
++
++    # ---- Stage 5: perturb-and-reanneal restarts around incumbent ----
++    for rep in range(6):
++        prng = np.random.default_rng(1000 + rep)
++        mag = 0.08 * (0.7 ** (rep % 3))
++        start = best_pts + mag * prng.normal(size=best_pts.shape)
++        try:
++            p2 = anneal_chain(start, Ts=(0.06, 0.02, 0.008, 0.003))
++        except Exception:
++            p2 = normalize(start)
++        r = ratio(p2)
++        if r > best_r:
++            best_r, best_pts = r, p2.copy()
++        Qc, rc = climb(p2, steps=(0.006, 0.002, 6e-4, 2e-4))
++        if rc > best_r:
++            best_r, best_pts = rc, Qc
++        Qc, rc = pair_hillclimb(p2, iters=120)
++        if rc > best_r:
++            best_r, best_pts = rc, Qc
++
++    # ---- final fine polish ----
++    Qc, rc = climb(best_pts, steps=(0.002, 6e-4, 2e-4, 8e-5, 3e-5))
++    if rc > best_r:
++        best_r, best_pts = rc, Qc
++
++    points = np.asarray(normalize(best_pts), dtype=float)
++    assert points.shape == (n, d) and np.isfinite(points).all()
++    assert dists(points).max() > 0
+     return points
+ 
+ 
+ # EVOLVE-BLOCK-END

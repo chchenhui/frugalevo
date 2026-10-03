@@ -1,0 +1,103 @@
+<NAME>
+vectorized_snake_packing
+
+<DESCRIPTION>
+The dominant cost of the current algorithm is `balanced_packing`, which runs a pure-Python double loop (layers × groups) with a `min()` over packs per item. This makes the algorithm itself slow (times_algorithm 0.58, times_inference 1.01, speed_score 0.00), which dominates the combined score.
+
+I replace the greedy per-item packing with a fully vectorized "snake deal" (zig-zag) packing:
+1. Sort each layer's groups by descending weight.
+2. Reshape into `groups_per_pack` chunks of `num_packs` items; each chunk contributes exactly one group to every pack, so every pack receives exactly `groups_per_pack` groups (same hard constraint as before).
+3. Reverse the item order of every odd chunk (snake), so the pack that received the largest items in one chunk receives the smallest in the next — this is the classic near-optimal heuristic for balanced dealing with exact cardinality constraints, and generally matches or beats the greedy's balancedness while being O(n log n) per layer with zero Python loops.
+4. `pack_index` and `rank_in_pack` are produced with two `scatter_` calls instead of element-wise writes.
+
+The per-layer greedy inner loop (O(num_layers × num_groups × num_packs) Python operations, each with tensor indexing overhead) becomes a handful of vectorized tensor kernels, which should dramatically reduce algorithm execution time and inference warm-up time while maintaining or improving the pack balancedness. The `groups_per_pack == 1` and `num_packs == 1` special cases are preserved/handled, and the function signature and output semantics (pack index + rank within pack, matching what `rebalance_experts_hierarchical` expects) are unchanged, so the rest of the pipeline works as-is.
+
+<DIFF>
+<<<<<<< SEARCH
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    if groups_per_pack == 1:
+        pack_index = torch.arange(weight.size(-1),
+                                  dtype=torch.int64,
+                                  device=weight.device).expand(weight.shape)
+        rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
+        return pack_index, rank_in_pack
+
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    if groups_per_pack == 1:
+        # Each pack holds exactly one group: identity assignment.
+        pack_index = torch.arange(
+            weight.size(-1), dtype=torch.int64,
+            device=weight.device).expand(weight.shape)
+        rank_in_pack = torch.zeros_like(pack_index)
+        return pack_index, rank_in_pack
+
+    if num_packs == 1:
+        # Single pack: order groups by descending weight.
+        order = weight.argsort(-1, descending=True)
+        rank_in_pack = torch.empty_like(order)
+        rank_in_pack.scatter_(
+            -1, order,
+            torch.arange(num_groups, dtype=torch.int64,
+                         device=weight.device).expand(weight.shape))
+        return torch.zeros_like(order), rank_in_pack
+
+    # Vectorized "snake deal" (zig-zag) packing:
+    # 1) sort groups by descending weight,
+    # 2) split into `groups_per_pack` chunks of `num_packs` items, where each
+    #    chunk assigns exactly one group to every pack,
+    # 3) reverse the item order of every odd chunk so that the pack which
+    #    received the heaviest items in one chunk receives the lightest ones
+    #    in the next. This keeps pack cardinalities exact while keeping the
+    #    pack weights balanced, without any Python-level loops.
+    indices = weight.argsort(-1, descending=True)
+    indices = indices.view(num_layers, groups_per_pack, num_packs)
+    odd_chunks = torch.arange(groups_per_pack,
+                              device=weight.device) % 2 == 1
+    if odd_chunks.any():
+        indices[:, odd_chunks] = indices[:, odd_chunks].flip(-1)
+
+    flat_indices = indices.reshape(num_layers, num_groups)
+    positions = torch.arange(num_groups, device=weight.device)
+    # flat position k corresponds to (chunk = k // num_packs, slot = k % num_packs)
+    pack_vals = (positions % num_packs).expand(num_layers, -1)
+    rank_vals = torch.div(positions, num_packs,
+                          rounding_mode="floor").expand(num_layers, -1)
+
+    pack_index = torch.empty(num_layers,
+                             num_groups,
+                             dtype=torch.int64,
+                             device=weight.device)
+    rank_in_pack = torch.empty_like(pack_index)
+    pack_index.scatter_(-1, flat_indices, pack_vals)
+    rank_in_pack.scatter_(-1, flat_indices, rank_vals)
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

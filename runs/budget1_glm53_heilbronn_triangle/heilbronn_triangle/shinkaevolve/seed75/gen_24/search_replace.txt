@@ -1,0 +1,156 @@
+<NAME>
+vectorized_jac_and_batched_polish
+
+<DESCRIPTION>
+Two changes: (1) The current `_optimize` gradient uses a Python loop over all 165 triples inside every SLSQP jacobian call, which caused the huge 3.23s eval time while yielding only 0.03 score (and the polish phase was dropped, explaining the collapse from 0.46). Replace the loop with a fully vectorized `np.add.at` scatter-add gradient — mathematically identical but orders of magnitude faster, freeing time budget. (2) Re-introduce the batched worst-triplet guided random polish (the component that produced the 0.46 result in only 0.39s), applied after projecting the SLSQP solution into the triangle. The polish moves points belonging to the currently-worst triplets, evaluates a whole batch of candidate moves at once via vectorized min-area computation, and includes occasional global teleport escapes. This combination of fast SLSQP refinement plus guided stochastic polish is the best-performing architecture among the prior programs.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+            def jac(xx):
+                ar = _areas(xx.reshape(-1, 2)) / TRI_AREA
+                m = ar.min()
+                w = np.exp(-p * (ar - m))
+                w = w / w.sum()
+                pts = xx.reshape(-1, 2)
+                a = pts[TRIPLES[:, 0]]
+                b = pts[TRIPLES[:, 1]]
+                c = pts[TRIPLES[:, 2]]
+                cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+                s = np.sign(cross)
+                # gradient of |cross|/2 / TRI_AREA wrt all coords
+                g = np.zeros_like(pts)
+                # d area / d a = -s*(c-b)/2 etc.
+                for t in range(len(TRIPLES)):
+                    if w[t] < 1e-14:
+                        continue
+                    i, j, k = TRIPLES[t]
+                    co = 0.5 * s[t] * w[t] / TRI_AREA
+                    g[i, 0] += co * (a[t, 1] - c[t, 1])
+                    g[i, 1] += co * (c[t, 0] - a[t, 0])
+                    g[j, 0] += co * (c[t, 1] - b[t, 1])
+                    g[j, 1] += co * (b[t, 0] - c[t, 0])
+                    g[k, 0] += co * (b[t, 1] - a[t, 1])
+                    g[k, 1] += co * (a[t, 0] - b[t, 0])
+                return -g.flatten()  # obj returns -softmin (to be minimized)
+=======
+            def jac(xx):
+                ar = _areas(xx.reshape(-1, 2)) / TRI_AREA
+                m = ar.min()
+                w = np.exp(-p * (ar - m))
+                w = w / w.sum()
+                pts = xx.reshape(-1, 2)
+                a = pts[TRIPLES[:, 0]]
+                b = pts[TRIPLES[:, 1]]
+                c = pts[TRIPLES[:, 2]]
+                cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+                s = np.sign(cross)
+                # vectorized scatter-add gradient of |cross|/2 / TRI_AREA
+                co = (0.5 * s * w / TRI_AREA)[:, None]
+                g = np.zeros_like(pts)
+                I = TRIPLES[:, 0]
+                J = TRIPLES[:, 1]
+                K = TRIPLES[:, 2]
+                np.add.at(g, (I, np.zeros_like(I)),
+                          co * np.stack([a[:, 1] - c[:, 1], c[:, 0] - a[:, 0]], axis=1))
+                np.add.at(g, (J, np.zeros_like(J)),
+                          co * np.stack([c[:, 1] - b[:, 1], b[:, 0] - c[:, 0]], axis=1))
+                np.add.at(g, (K, np.zeros_like(K)),
+                          co * np.stack([b[:, 1] - a[:, 1], a[:, 0] - b[:, 0]], axis=1))
+                return -g.flatten()  # obj returns -softmin (to be minimized)
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    pts = best_x.reshape(n, 2)
+    # project into triangle to guarantee feasibility
+    pts[:, 1] = np.clip(pts[:, 1], 0.0, None)
+    pts[:, 1] = np.minimum(pts[:, 1], np.minimum(SQRT3 * pts[:, 0], SQRT3 * (1 - pts[:, 0])))
+    return pts
+=======
+    pts = best_x.reshape(n, 2)
+    # project into triangle to guarantee feasibility
+    pts[:, 1] = np.clip(pts[:, 1], 0.0, None)
+    pts[:, 1] = np.minimum(pts[:, 1], np.minimum(SQRT3 * pts[:, 0], SQRT3 * (1 - pts[:, 0])))
+
+    # ---- k-worst-triplet guided batched polish ----
+    def _clip_pt(p):
+        x = np.clip(p[0], 0.0, 1.0)
+        yhi = SQRT3 * x if x <= 0.5 else SQRT3 * (1.0 - x)
+        return np.array([x, np.clip(p[1], 0.0, yhi)])
+
+    def _min_area_batch(base_pts, move_idx, move_pts):
+        """Min area over a batch of candidates, each moving one point."""
+        B = move_idx.shape[0]
+        P = np.broadcast_to(base_pts, (B, n, 2)).copy()
+        P[np.arange(B), move_idx] = move_pts
+        A = P[:, TRIPLES[:, 0]]
+        Bv = P[:, TRIPLES[:, 1]]
+        Cv = P[:, TRIPLES[:, 2]]
+        cross = (Bv[:, :, 0] - A[:, :, 0]) * (Cv[:, :, 1] - A[:, :, 1]) - \
+                (Bv[:, :, 1] - A[:, :, 1]) * (Cv[:, :, 0] - A[:, :, 0])
+        return 0.5 * np.abs(cross).min(axis=1) / TRI_AREA
+
+    cur = _min_area(pts)
+    best_pts = pts.copy()
+    best_val = cur
+    step = 0.02
+    stall = 0
+    total = 0
+    max_polish = 600
+    batch = 24
+    while total < max_polish and step > 1e-5:
+        total += 1
+        areas = _areas(pts) / TRI_AREA
+        order = np.argsort(areas)
+        # hot points: vertices of worst triplet, sometimes bottom-10 union
+        if rng.random() < 0.35:
+            hot = np.unique(TRIPLES[order[:10]].ravel())
+        else:
+            hot = np.unique(TRIPLES[order[:1]].ravel())
+        reps = max(1, batch // len(hot))
+        move_idx = np.tile(hot, reps)[:batch]
+        noise = rng.normal(0.0, step, size=(move_idx.shape[0], 2))
+        move_pts = np.array([_clip_pt(pts[i] + d) for i, d in zip(move_idx, noise)])
+        dmin = np.array([
+            np.min(np.linalg.norm(np.delete(pts, i, axis=0) - mp, axis=1))
+            for i, mp in zip(move_idx, move_pts)
+        ])
+        ok = dmin > 1e-7
+        if np.any(ok):
+            mi, mp = move_idx[ok], move_pts[ok]
+            vals = _min_area_batch(pts, mi, mp)
+            b = int(np.argmax(vals))
+            if vals[b] > cur + 1e-14:
+                pts = pts.copy()
+                pts[mi[b]] = mp[b]
+                cur = float(vals[b])
+                stall = 0
+                if cur > best_val:
+                    best_val = cur
+                    best_pts = pts.copy()
+                continue
+        stall += 1
+        # occasional global relocation: teleport a worst-triplet point
+        if stall % 15 == 0 and step < 5e-2:
+            wi = int(TRIPLES[order[0]][rng.integers(3)])
+            u, v = rng.random(), rng.random()
+            if u + v > 1.0:
+                u, v = 1.0 - u, 1.0 - v
+            cand = pts.copy()
+            cand[wi] = [v + 0.5 * (1 - u - v), (1 - u - v) * SQRT3 / 2.0]
+            a = _min_area(cand)
+            if a > cur:
+                pts, cur = cand, a
+                step = max(step, 0.02)
+                stall = 0
+                if cur > best_val:
+                    best_val = cur
+                    best_pts = pts.copy()
+        if stall % 10 == 0 and stall > 0:
+            step *= 0.7
+    pts = best_pts
+    # final feasibility projection
+    pts = np.array([_clip_pt(p) for p in pts])
+    return pts
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,74 @@
+<NAME>
+greedy_broadcast_tree
+</NAME>
+
+<DESCRIPTION>
+Replace independent shortest-path selection with a shared, incremental broadcast-tree construction. The previous implementation finds one path per destination, which duplicates expensive source-side transfers whenever several destinations can share an upstream route.
+
+The new strategy grows a directed multicast tree from the source. At each step it uses multi-source Dijkstra from every node already reached by the tree and connects the remaining destination with the lowest additional network cost. Newly added relay nodes can then serve subsequent destinations, allowing the topology to reuse paid inter-cloud links and branch close to destination regions. Every partition receives the same tree-derived route, so partitions may be transferred in parallel on independent tree branches while avoiding redundant upstream transfers.
+
+This is a practical greedy directed-Steiner approximation: it is substantially less expensive than independent unicast paths while remaining efficient and compatible with BroadCastTopology’s existing per-destination path representation.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    """Build a low-cost shared multicast tree rooted at ``src``."""
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    h.remove_edges_from(
+        [(u, v) for u, v, data in h.edges(data=True) if data.get("cost") is None]
+    )
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Grow a directed Steiner-like tree.  A destination is attached from the
+    # cheapest already-reached relay, allowing later destinations to reuse the
+    # expensive portion of earlier transfers.
+    tree = nx.DiGraph()
+    tree.add_node(src)
+    reached = {src}
+    remaining = set(dsts)
+
+    while remaining:
+        distances, paths = nx.multi_source_dijkstra(h, reached, weight="cost")
+        reachable = [dst for dst in remaining if dst in distances]
+        if not reachable:
+            raise nx.NetworkXNoPath(
+                "No broadcast path exists from the current multicast tree to "
+                f"{sorted(remaining)}"
+            )
+
+        dst = min(reachable, key=lambda node: distances[node])
+        path = paths[dst]
+        for s, t in zip(path, path[1:]):
+            tree.add_edge(s, t)
+            reached.add(s)
+            reached.add(t)
+        remaining.remove(dst)
+
+    # Materialize each destination's root-to-leaf tree path for every data
+    # partition.  Shared prefixes are represented by identical edges and can
+    # therefore be scheduled once and fan out at the branch point.
+    for dst in dsts:
+        path = nx.shortest_path(tree, src, dst)
+        edge_path = [[s, t, G[s][t]] for s, t in zip(path, path[1:])]
+        for partition in range(bc_topology.num_partitions):
+            bc_topology.set_dst_partition_paths(dst, partition, list(edge_path))
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

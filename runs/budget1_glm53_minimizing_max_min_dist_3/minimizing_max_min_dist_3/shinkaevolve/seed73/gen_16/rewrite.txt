@@ -1,0 +1,133 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+from scipy.optimize import minimize
+
+N, D = 14, 3
+PAIRS_I, PAIRS_J = np.triu_indices(N, k=1)
+
+
+def _pair_dists(flat_or_pts):
+    P = flat_or_pts.reshape(N, D) if flat_or_pts.ndim == 1 else flat_or_pts
+    return np.linalg.norm(P[PAIRS_I] - P[PAIRS_J], axis=1)
+
+
+def _ratio(pts):
+    ds = _pair_dists(pts)
+    dmax = ds.max()
+    if dmax <= 0:
+        return -1.0
+    return ds.min() / dmax
+
+
+def _repulsion_stage(pts, iters=400, step=0.03):
+    """Cheap pre-optimizer: normalize diameter to 1, repel close pairs."""
+    pts = pts.copy()
+    for _ in range(iters):
+        ds = _pair_dists(pts)
+        dmax = ds.max()
+        if dmax <= 0:
+            break
+        pts /= dmax
+        diff = pts[PAIRS_I] - pts[PAIRS_J]
+        dist = np.linalg.norm(diff, axis=1)
+        w = 1.0 / np.maximum(dist, 1e-6) ** 12
+        forces = (w[:, None] * diff) / np.maximum(dist, 1e-6)[:, None]
+        grad = np.zeros_like(pts)
+        np.add.at(grad, PAIRS_I, forces)
+        np.add.at(grad, PAIRS_J, -forces)
+        norm = np.linalg.norm(grad, axis=1, keepdims=True)
+        norm[norm == 0] = 1.0
+        pts += step * grad / norm
+        step *= 0.997
+    return pts
+
+
+def _slsqp_stage(pts):
+    """Polish: maximize dmin subject to dmax <= 1."""
+    def objective(flat):
+        return -_pair_dists(flat).min()
+
+    def constraint(flat):
+        return 1.0 - _pair_dists(flat).max()
+
+    ds = _pair_dists(pts)
+    dmax = ds.max()
+    if dmax > 0:
+        pts = pts / dmax
+    res = minimize(
+        objective,
+        pts.ravel(),
+        method='SLSQP',
+        constraints={'type': 'ineq', 'fun': constraint},
+        options={'maxiter': 400, 'ftol': 1e-12},
+    )
+    return res.x.reshape(N, D)
+
+
+def _icosahedron():
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    ico = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+    ], dtype=float)
+    return ico / np.linalg.norm(ico, axis=1, keepdims=True)
+
+
+def _fibonacci_sphere(offset=0.0):
+    k = np.arange(N) + 0.5
+    ph = np.arccos(1.0 - 2.0 * k / N)
+    th = np.pi * (1.0 + 5.0 ** 0.5) * k + offset
+    return np.stack([np.cos(th) * np.sin(ph),
+                     np.sin(th) * np.sin(ph),
+                     np.cos(ph)], axis=1)
+
+
+def _unit(v):
+    return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+
+
+def _seeds(rng):
+    seeds = []
+    # icosahedron + 2 perturbed poles
+    ico = _icosahedron()
+    for _ in range(3):
+        extra = np.array([[0, 0, 1], [0, 0, -1]]) + 0.05 * rng.standard_normal((2, 3))
+        seeds.append(np.vstack([ico, _unit(extra)]))
+    # Fibonacci variants
+    for off in (0.0, 0.7, 1.9):
+        seeds.append(_fibonacci_sphere(off))
+    # random on sphere
+    for _ in range(4):
+        seeds.append(_unit(rng.standard_normal((N, D))))
+    return seeds
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3 dimensions in order to maximize the ratio of
+    minimum to maximum pairwise distance.
+
+    Returns
+        points: np.ndarray of shape (14, 3)
+    """
+    rng = np.random.default_rng(42)
+    best_pts, best_ratio = None, -1.0
+
+    for init in _seeds(rng):
+        pre = _repulsion_stage(init)
+        for cand in (pre, init):
+            polished = _slsqp_stage(cand)
+            r = _ratio(polished)
+            if r > best_ratio:
+                best_ratio, best_pts = r, polished
+
+    if best_pts is None:
+        np.random.seed(42)
+        best_pts = np.random.randn(N, D)
+
+    return best_pts
+
+
+# EVOLVE-BLOCK-END

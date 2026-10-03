@@ -1,0 +1,387 @@
+# EVOLVE-BLOCK-START
+#include <bits/stdc++.h>
+using namespace std;
+
+struct Oracle {
+    int n, q, used = 0;
+    char one[105][105]{};
+    char two[105][105][105]{};
+
+    Oracle(int n_, int q_) : n(n_), q(q_) {}
+
+    static char rev(char c) {
+        return c == '<' ? '>' : c == '>' ? '<' : '=';
+    }
+
+    char ask(const vector<int>& l, const vector<int>& r) {
+        ++used;
+        cout << l.size() << ' ' << r.size();
+        for (int x : l) cout << ' ' << x;
+        for (int x : r) cout << ' ' << x;
+        cout << endl;
+        char z;
+        cin >> z;
+        return z;
+    }
+
+    char cmp1(int a, int b) {
+        if (a == b) return '=';
+        if (one[a][b]) return one[a][b];
+        if (used >= q) return '=';
+        char z = ask({a}, {b});
+        one[a][b] = z;
+        one[b][a] = rev(z);
+        return z;
+    }
+
+    char cmp12(int a, int b, int c) {
+        int x = min(b, c), y = max(b, c);
+        if (two[a][x][y]) return two[a][x][y];
+        if (used >= q) return '=';
+        char z = ask({a}, {b, c});
+        two[a][x][y] = z;
+        return z;
+    }
+
+    char cmp_sets(const vector<int>& a, const vector<int>& b) {
+        if (used >= q) return '=';
+        return ask(a, b);
+    }
+};
+
+static mt19937 rng((uint32_t)chrono::steady_clock::now().time_since_epoch().count());
+static const long long BASE = 100000;
+
+int estimate_cost(int n, int k) {
+    if (k <= 1) return n - 1;
+    double z = k * log2((double)k);
+    z += (n - k) * log2((double)k);
+    for (int i = 1; i < k - 1; ++i) z += log2((double)i);
+    return (int)ceil(z);
+}
+
+struct WeightEstimator {
+    int n, d;
+    Oracle& oracle;
+    vector<long long> w;
+
+    WeightEstimator(int n_, int d_, Oracle& o) : n(n_), d(d_), oracle(o), w(n_, BASE) {}
+
+    void merge_sort(vector<int>& a, vector<int>& tmp, int l, int r) {
+        if (r - l <= 1) return;
+        int m = (l + r) >> 1;
+        merge_sort(a, tmp, l, m);
+        merge_sort(a, tmp, m, r);
+        int i = l, j = m, p = l;
+        while (i < m && j < r) {
+            char z = oracle.cmp1(a[i], a[j]);
+            if (z == '<' || z == '=') tmp[p++] = a[i++];
+            else tmp[p++] = a[j++];
+        }
+        while (i < m) tmp[p++] = a[i++];
+        while (j < r) tmp[p++] = a[j++];
+        for (i = l; i < r; ++i) a[i] = tmp[i];
+    }
+
+    long long estimate_delta(const vector<int>& piv, int j) {
+        int cur = piv[j], prev = piv[j - 1];
+        int lo = 0, hi = j - 2;
+        bool have_lo = false, have_hi = false;
+        long long lv = 1;
+        long long hv = BASE * (n / max(1, d) + 12);
+
+        while (lo <= hi && oracle.used < oracle.q) {
+            int m = (lo + hi) >> 1;
+            char z = oracle.cmp12(cur, prev, piv[m]);
+            if (z == '=') return max(1LL, w[piv[m]]);
+            if (z == '>') {
+                have_lo = true;
+                lv = w[piv[m]];
+                lo = m + 1;
+            } else {
+                have_hi = true;
+                hv = w[piv[m]];
+                hi = m - 1;
+            }
+        }
+
+        if (have_lo && have_hi) return max(1LL, (lv + hv) / 2);
+        if (have_lo) return max(1LL, lv * 2);
+        if (have_hi) return max(1LL, hv / 2);
+        return max(1LL, w[prev]);
+    }
+
+    vector<long long> run(int budget) {
+        int k = 1;
+        for (int z = n; z >= 1; --z) {
+            if (estimate_cost(n, z) <= budget) {
+                k = z;
+                break;
+            }
+        }
+
+        vector<int> ids(n);
+        iota(ids.begin(), ids.end(), 0);
+        shuffle(ids.begin(), ids.end(), rng);
+
+        // A randomized initial sample is retained, but shuffled pivot order
+        // prevents index-correlated sampling artifacts.
+        vector<int> piv(ids.begin(), ids.begin() + k), tmp(k);
+        merge_sort(piv, tmp, 0, k);
+
+        vector<char> is_pivot(n, false);
+        for (int x : piv) is_pivot[x] = true;
+
+        w[piv[0]] = BASE;
+        for (int j = 1; j < k; ++j) {
+            char adjacent = oracle.cmp1(piv[j], piv[j - 1]);
+            if (adjacent == '=') {
+                w[piv[j]] = w[piv[j - 1]];
+            } else {
+                long long delta;
+                if (j == 1) delta = max(1LL, w[piv[0]]);
+                else delta = estimate_delta(piv, j);
+                w[piv[j]] = w[piv[j - 1]] + delta;
+            }
+        }
+
+        for (int x = 0; x < n; ++x) {
+            if (is_pivot[x]) continue;
+
+            int lo = 0, hi = k - 1, eq = -1;
+            while (lo <= hi && oracle.used < budget) {
+                int m = (lo + hi) >> 1;
+                char z = oracle.cmp1(x, piv[m]);
+                if (z == '=') {
+                    eq = m;
+                    break;
+                }
+                if (z == '<') hi = m - 1;
+                else lo = m + 1;
+            }
+
+            if (eq >= 0) {
+                w[x] = w[piv[eq]];
+            } else if (lo == 0) {
+                long long a = w[piv[0]];
+                long long b = k >= 2 ? w[piv[1]] : a * 2;
+                w[x] = max(1LL, b > a ? a * a / b : a / 2);
+            } else if (lo == k) {
+                long long a = w[piv[k - 1]];
+                long long b = k >= 2 ? w[piv[k - 2]] : max(1LL, a / 2);
+                w[x] = max(1LL, a > b ? a * a / b : a * 2);
+            } else {
+                long long a = w[piv[lo - 1]], b = w[piv[lo]];
+                w[x] = max(a, min(b, (long long)sqrt((long double)a * b)));
+            }
+        }
+        return w;
+    }
+};
+
+struct Partition {
+    int n, d;
+    const vector<long long>& w;
+    vector<int> g;
+    vector<long long> sum;
+
+    Partition(int n_, int d_, const vector<long long>& w_) : n(n_), d(d_), w(w_), g(n_), sum(d_, 0) {}
+
+    static long double sq(long long x) {
+        return (long double)x * x;
+    }
+
+    long double energy() const {
+        long double z = 0;
+        for (long long x : sum) z += sq(x);
+        return z;
+    }
+
+    void initial_lpt() {
+        vector<int> ord(n);
+        iota(ord.begin(), ord.end(), 0);
+        sort(ord.begin(), ord.end(), [&](int a, int b) {
+            return w[a] != w[b] ? w[a] > w[b] : a < b;
+        });
+
+        for (int x : ord) {
+            int b = min_element(sum.begin(), sum.end()) - sum.begin();
+            g[x] = b;
+            sum[b] += w[x];
+        }
+    }
+
+    void deterministic_improve() {
+        for (int round = 0; round < 250; ++round) {
+            long double best = 0;
+            int typ = -1, xbest = -1, ybest = -1;
+
+            for (int x = 0; x < n; ++x) {
+                int a = g[x];
+                for (int b = 0; b < d; ++b) if (a != b) {
+                    long long na = sum[a] - w[x], nb = sum[b] + w[x];
+                    long double delta = sq(na) + sq(nb) - sq(sum[a]) - sq(sum[b]);
+                    if (delta < best) {
+                        best = delta;
+                        typ = 0;
+                        xbest = x;
+                        ybest = b;
+                    }
+                }
+            }
+
+            for (int x = 0; x < n; ++x) for (int y = x + 1; y < n; ++y) {
+                int a = g[x], b = g[y];
+                if (a == b) continue;
+                long long na = sum[a] - w[x] + w[y];
+                long long nb = sum[b] - w[y] + w[x];
+                long double delta = sq(na) + sq(nb) - sq(sum[a]) - sq(sum[b]);
+                if (delta < best) {
+                    best = delta;
+                    typ = 1;
+                    xbest = x;
+                    ybest = y;
+                }
+            }
+
+            if (typ < 0) break;
+            if (typ == 0) {
+                int a = g[xbest], b = ybest;
+                sum[a] -= w[xbest];
+                sum[b] += w[xbest];
+                g[xbest] = b;
+            } else {
+                int a = g[xbest], b = g[ybest];
+                sum[a] += w[ybest] - w[xbest];
+                sum[b] += w[xbest] - w[ybest];
+                swap(g[xbest], g[ybest]);
+            }
+        }
+    }
+
+    vector<int> anneal(chrono::steady_clock::time_point start) {
+        vector<int> best = g;
+        long double cur = energy(), best_e = cur;
+        long double temp = max((long double)1.0, cur / max(1, d) * 0.03L);
+        uniform_real_distribution<double> real01(0.0, 1.0);
+
+        for (long long it = 1;; ++it) {
+            if ((it & 2047) == 0) {
+                auto ms = chrono::duration_cast<chrono::milliseconds>(
+                    chrono::steady_clock::now() - start).count();
+                if (ms >= 1820) break;
+                temp = max((long double)1e-5, temp * 0.9992L);
+            }
+
+            long double delta;
+            if (rng() % 3 != 0) {
+                int x = rng() % n;
+                int a = g[x], b = rng() % d;
+                if (a == b) continue;
+                long long na = sum[a] - w[x], nb = sum[b] + w[x];
+                delta = sq(na) + sq(nb) - sq(sum[a]) - sq(sum[b]);
+                if (delta > 0 && real01(rng) >= exp((double)(-delta / temp))) continue;
+                sum[a] = na;
+                sum[b] = nb;
+                g[x] = b;
+            } else {
+                int x = rng() % n, y = rng() % n;
+                if (x == y || g[x] == g[y]) continue;
+                int a = g[x], b = g[y];
+                long long na = sum[a] - w[x] + w[y];
+                long long nb = sum[b] - w[y] + w[x];
+                delta = sq(na) + sq(nb) - sq(sum[a]) - sq(sum[b]);
+                if (delta > 0 && real01(rng) >= exp((double)(-delta / temp))) continue;
+                sum[a] = na;
+                sum[b] = nb;
+                swap(g[x], g[y]);
+            }
+
+            cur += delta;
+            if (cur < best_e) {
+                best_e = cur;
+                best = g;
+            }
+        }
+        return best;
+    }
+};
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int N, D, Q;
+    cin >> N >> D >> Q;
+    auto start = chrono::steady_clock::now();
+
+    // Direct polishing is only worthwhile on query-rich instances.
+    int reserve = 0;
+    if (Q >= 8 * N) reserve = min(Q / 8, max(8, 2 * D));
+    int estimation_budget = Q - reserve;
+
+    Oracle oracle(N, Q);
+    WeightEstimator estimator(N, D, oracle);
+    vector<long long> w = estimator.run(estimation_budget);
+
+    Partition part(N, D, w);
+    part.initial_lpt();
+    part.deterministic_improve();
+    vector<int> answer = part.anneal(start);
+
+    // Restore sums from the best estimated partition.
+    vector<vector<int>> members(D);
+    vector<long long> estsum(D, 0);
+    for (int i = 0; i < N; ++i) {
+        members[answer[i]].push_back(i);
+        estsum[answer[i]] += w[i];
+    }
+
+    // Actual-balance polish: only perform transfers certified not to overshoot.
+    while (oracle.used < Q) {
+        int hi = max_element(estsum.begin(), estsum.end()) - estsum.begin();
+        int lo = min_element(estsum.begin(), estsum.end()) - estsum.begin();
+        if (members[hi].empty()) break;
+
+        vector<int> left = members[hi], right = members[lo];
+        char whole = oracle.cmp_sets(left, right);
+        if (whole != '>') break;
+
+        vector<int> cand = members[hi];
+        sort(cand.begin(), cand.end(), [&](int a, int b) { return w[a] > w[b]; });
+
+        bool moved = false;
+        for (int x : cand) {
+            if (oracle.used >= Q) break;
+            vector<int> a, b = members[lo];
+            for (int y : members[hi]) if (y != x) a.push_back(y);
+            b.push_back(x);
+            if (a.empty()) continue;
+
+            char z = oracle.cmp_sets(a, b);
+            if (z == '>') {
+                answer[x] = lo;
+                members[hi].erase(find(members[hi].begin(), members[hi].end(), x));
+                members[lo].push_back(x);
+                estsum[hi] -= w[x];
+                estsum[lo] += w[x];
+                moved = true;
+                break;
+            }
+        }
+        if (!moved) break;
+    }
+
+    while (oracle.used < Q) {
+        int b = (oracle.used % (N - 1)) + 1;
+        oracle.ask({0}, {b});
+    }
+
+    for (int i = 0; i < N; ++i) {
+        if (i) cout << ' ';
+        cout << answer[i];
+    }
+    cout << endl;
+    return 0;
+}
+# EVOLVE-BLOCK-END

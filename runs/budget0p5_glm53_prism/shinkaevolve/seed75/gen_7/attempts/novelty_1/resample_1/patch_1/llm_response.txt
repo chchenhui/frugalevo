@@ -1,0 +1,105 @@
+<NAME>
+best_fit_with_local_search
+</NAME>
+<DESCRIPTION>
+The current greedy places each model on the GPU with the lowest current load ratio, ignoring the memory the model will consume — this yields poor KVPR. Replace with a best-fit greedy that directly evaluates the resulting KVPR after placement, plus a local-search refinement that moves models off the worst GPU when it lowers the global max KVPR. This matches the previously best-performing program (score 1.00 on max_kvpr).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # 3) Assign each model to the GPU that minimizes current KVPR while fitting in memory
+    for model in sorted_models:
+        best_idx = None
+        best_ratio = float('inf')
+
+        for gpu_id in range(gpu_num):
+            if model.model_size <= shared_kv[gpu_id] and shared_kv[gpu_id] > 0:
+                current_ratio = weighted_req_rate[gpu_id] / shared_kv[gpu_id]
+                if current_ratio < best_ratio:
+                    best_ratio = current_ratio
+                    best_idx = gpu_id
+
+        # Failure: if no GPU can fit, raise an error instead of overcommitting
+        if best_idx is None:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on any GPU. "
+                f"Remaining per-GPU memory: {shared_kv}"
+            )
+
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    return placement
+=======
+    # 3) Best-fit greedy: choose the GPU minimizing the resulting KVPR
+    for model in sorted_models:
+        best_idx = None
+        best_val = float('inf')
+        for gpu_id in range(gpu_num):
+            if model.model_size > shared_kv[gpu_id]:
+                continue
+            denom = GPU_MEM_SIZE - (shared_kv[gpu_id] - model.model_size)
+            if denom <= 0:
+                continue
+            val = (weighted_req_rate[gpu_id] + model.req_rate / model.slo) / denom
+            if val < best_val:
+                best_val = val
+                best_idx = gpu_id
+
+        if best_idx is None:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on any GPU. "
+                f"Remaining per-GPU memory: {shared_kv}"
+            )
+
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    # 4) Local search: move models off the worst GPU if it lowers max KVPR
+    def kvpr(g):
+        denom = GPU_MEM_SIZE - shared_kv[g]
+        if denom <= 0:
+            return float('inf') if weighted_req_rate[g] > 0 else 0.0
+        return weighted_req_rate[g] / denom
+
+    def max_kvpr(exclude=None):
+        vals = [kvpr(g) for g in range(gpu_num) if g != exclude]
+        return max(vals) if vals else 0.0
+
+    improved = True
+    it = 0
+    while improved and it < 200:
+        improved = False
+        it += 1
+        worst = max(range(gpu_num), key=lambda g: kvpr(g))
+        cur_max = max_kvpr()
+        for m_idx in range(len(placement[worst])):
+            model = placement[worst][m_idx]
+            for g in range(gpu_num):
+                if g == worst or model.model_size > shared_kv[g]:
+                    continue
+                # simulate move
+                del placement[worst][m_idx]
+                shared_kv[worst] += model.model_size
+                weighted_req_rate[worst] -= model.req_rate / model.slo
+                shared_kv[g] -= model.model_size
+                weighted_req_rate[g] += model.req_rate / model.slo
+                new_max = max_kvpr()
+                if new_max < cur_max - 1e-12:
+                    placement[g].append(model)
+                    improved = True
+                    break
+                # revert
+                shared_kv[g] += model.model_size
+                weighted_req_rate[g] -= model.req_rate / model.slo
+                shared_kv[worst] -= model.model_size
+                weighted_req_rate[worst] += model.req_rate / model.slo
+                placement[worst].insert(m_idx, model)
+            else:
+                continue
+            break
+
+    return placement
+>>>>>>> REPLACE
+</DIFF>

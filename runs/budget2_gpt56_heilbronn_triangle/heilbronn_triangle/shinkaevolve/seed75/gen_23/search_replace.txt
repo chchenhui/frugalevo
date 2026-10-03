@@ -1,0 +1,114 @@
+<NAME>
+active_set_joint_repair
+</NAME>
+
+<DESCRIPTION>
+Add a late-stage active-set repair batch. The smallest determinants in strong 11-point layouts are coupled: moving only one point often cannot improve one active triangle without worsening another. During the final quarter, this edit identifies all free points participating in near-active triples and proposes coordinated multi-point perturbations at several decreasing amplitudes. The incumbent remains in the candidate batch, so the existing monotone selection behavior is retained.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+                candidates[:, moving, :] = project_simplex(
+                    candidates[:, moving, :]
+                )
+
+                candidate_areas = areas_for_batch(candidates)
+=======
+                candidates[:, moving, :] = project_simplex(
+                    candidates[:, moving, :]
+                )
+
+                # The final bottleneck is normally a coupled collection of
+                # near-zero-slack determinants.  Repair those constraints by
+                # moving every participating free point simultaneously rather
+                # than relying exclusively on coordinate-wise changes.
+                if step >= (3 * iterations) // 4 and len(active_triples):
+                    involved = np.unique(active_triples[active_triples >= 3]) - 3
+                    if len(involved):
+                        repair_count = 10
+                        scales = np.linspace(0.28, 1.35, repair_count) * sigma
+                        repairs = np.repeat(
+                            state[None, :, :], repair_count, axis=0
+                        )
+                        repairs[:, involved, :] += (
+                            rng.normal(
+                                0.0, 1.0, size=(repair_count, len(involved), 2)
+                            )
+                            * scales[:, None, None]
+                        )
+                        candidates[:repair_count] = project_simplex(repairs)
+
+                candidate_areas = areas_for_batch(candidates)
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+oriented_maximin_polish
+</NAME>
+
+<DESCRIPTION>
+Add an exact local maximin polish after the stochastic search. Once a promising configuration has determined the orientation of every triple, maximizing a common determinant lower bound subject to those fixed orientations is a smooth constrained optimization problem. SLSQP can substantially tighten the coupled active constraints that remain after annealed random repair. The candidate is independently re-evaluated and accepted only if its actual unsigned minimum area improves; missing SciPy or a numerical failure leaves the searched result unchanged.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        if best_bc is None or not np.all(np.isfinite(best_bc)):
+            raise RuntimeError("search did not produce a feasible simplex state")
+
+        result = np.empty((11, 2), dtype=float)
+=======
+        if best_bc is None or not np.all(np.isfinite(best_bc)):
+            raise RuntimeError("search did not produce a feasible simplex state")
+
+        # With the orientation pattern fixed by the discrete search, the
+        # remaining local problem is a conventional smooth maximin program.
+        # This is particularly effective after joint repair has exposed the
+        # small set of genuinely active determinant constraints.
+        try:
+            from scipy.optimize import minimize
+
+            simplex_corners = np.array(
+                ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)), dtype=float
+            )
+
+            def signed_determinants(tail):
+                uv = np.vstack((simplex_corners, tail))
+                q = uv[triples]
+                return (
+                    (q[:, 1, 0] - q[:, 0, 0]) * (q[:, 2, 1] - q[:, 0, 1])
+                    - (q[:, 1, 1] - q[:, 0, 1]) * (q[:, 2, 0] - q[:, 0, 0])
+                )
+
+            signed0 = signed_determinants(best_bc)
+            orientations = np.sign(signed0)
+            orientations[orientations == 0.0] = 1.0
+
+            def polish_constraints(w):
+                tail = w[:-1].reshape(8, 2)
+                return np.concatenate((
+                    orientations * signed_determinants(tail) - w[-1],
+                    1.0 - tail.sum(axis=1),
+                ))
+
+            polished = minimize(
+                lambda w: -w[-1],
+                np.r_[best_bc.ravel(), best_minimum],
+                method="SLSQP",
+                bounds=[(0.0, 1.0)] * 16 + [(0.0, 1.0)],
+                constraints={"type": "ineq", "fun": polish_constraints},
+                options={"maxiter": 1800, "ftol": 2.0e-12, "disp": False},
+            )
+            if polished.success and np.all(np.isfinite(polished.x)):
+                candidate = project_simplex(polished.x[:-1].reshape(8, 2))
+                candidate_minimum = float(
+                    np.min(areas_for_batch(candidate[None, :, :])[0])
+                )
+                if candidate_minimum > best_minimum + 1.0e-11:
+                    best_bc = candidate
+                    best_minimum = candidate_minimum
+        except Exception:
+            pass
+
+        result = np.empty((11, 2), dtype=float)
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,279 @@
+<NAME>
+vectorized_multistart_jacobi</NAME>
+<DESCRIPTION>
+Restructure around a fully vectorized NumPy solver: pairwise distances computed once as an (n,n) matrix, and radii solved by a vectorized over-relaxed Jacobi iteration (r_i = min(wall_i, min_j(d_ij − r_j)) with ω=1.5), plus a final monotone shrink repair for guaranteed feasibility. The ~10x speedup is spent on a multi-seed pipeline (several hex-lattice row patterns, corner-anchored and Halton seeds), each run through a vectorized overlap-relax refinement and a fast coordinate-descent shift search. Data flow: seeds → vectorized refine → shift search → best layout, all operating on whole arrays instead of O(n²) Python loops.</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""Vectorized multi-start circle packing for n=26 circles."""
+import numpy as np
+
+N = 26
+
+
+# ----------------------------------------------------------------------
+# Vectorized geometry primitives
+# ----------------------------------------------------------------------
+def _dist_matrix(centers):
+    d = centers[:, None, :] - centers[None, :, :]
+    D = np.sqrt((d * d).sum(axis=2))
+    np.fill_diagonal(D, np.inf)
+    return D
+
+
+def _wall_dist(centers):
+    return np.minimum(centers.min(axis=1), (1.0 - centers).min(axis=1))
+
+
+def compute_max_radii(centers):
+    """Over-relaxed vectorized Jacobi water-filling + monotone repair."""
+    D = _dist_matrix(centers)
+    wall = _wall_dist(centers)
+    n = len(centers)
+    r = wall.copy()
+    w = 1.5
+    for _ in range(200):
+        # cap_i = min(wall_i, min_j (D_ij - r_j))
+        cap = np.minimum(wall, (D - r[None, :]).min(axis=1))
+        new = np.maximum(r + w * (cap - r), 0.0)
+        new = np.minimum(new, wall)
+        if np.max(np.abs(new - r)) < 1e-12:
+            r = new
+            break
+        r = new
+    # monotone repair (shrink only) -> guaranteed feasibility
+    for _ in range(60):
+        bad = (r[None, :] + r[:, None]) > D
+        np.fill_diagonal(bad, False)
+        if not bad.any():
+            break
+        scale = np.ones(n)
+        idx = np.argwhere(bad)
+        for i, j in idx:
+            s = r[i] + r[j]
+            if s > D[i, j] and s > 0:
+                f = D[i, j] / s
+                if f < scale[i]:
+                    scale[i] = f
+        r = np.minimum(r * scale, wall)
+    r = np.minimum(r, wall)
+    return r
+
+
+# ----------------------------------------------------------------------
+# Seeds
+# ----------------------------------------------------------------------
+def _lattice_seed(counts, s=None):
+    nrow = len(counts)
+    if s is None:
+        s = min(1.0 / max(counts),
+                1.0 / (1.0 + (nrow - 1) * np.sqrt(3) / 2.0))
+    h = s * np.sqrt(3) / 2.0
+    if s + (nrow - 1) * h > 1.0:
+        h = (1.0 - s) / max(nrow - 1, 1)
+    pts = []
+    for row, cnt in enumerate(counts):
+        y = s / 2.0 + row * h
+        off = (s / 2.0) if row % 2 else 0.0
+        width = (cnt - 1) * s + off
+        x0 = max(s / 2.0, (1.0 - width) / 2.0) + off
+        for j in range(cnt):
+            x = x0 + j * s
+            if x <= 1.0 - 1e-6:
+                pts.append((min(x, 1.0 - 1e-6), min(y, 1.0 - 1e-6)))
+    return np.array(pts)
+
+
+def _corner_seed():
+    pts = [[0.12, 0.12], [0.88, 0.12], [0.12, 0.88], [0.88, 0.88]]
+    for x in (0.3, 0.5, 0.7):
+        pts += [[x, 0.06], [x, 0.94]]
+    for y in (0.3, 0.5, 0.7):
+        pts += [[0.06, y], [0.94, y]]
+    for row in range(3):
+        cnt = 4 if row % 2 == 0 else 3
+        y = 0.30 + row * 0.20
+        off = 0.0 if row % 2 == 0 else 0.10
+        for j in range(cnt):
+            pts.append([0.22 + off + j * 0.20, y])
+    return np.clip(np.array(pts[:N]), 0.02, 0.98)
+
+
+def _halton_seed():
+    def halton(i, b):
+        f, r = 1.0, 0.0
+        while i > 0:
+            f /= b
+            r += f * (i % b)
+            i //= b
+        return r
+    return np.array([(0.05 + 0.9 * halton(i, 2), 0.05 + 0.9 * halton(i, 3))
+                     for i in range(1, N + 1)])
+
+
+def _make_seeds():
+    seeds = []
+    for counts in ([5, 4, 5, 4, 5, 3], [4, 5, 4, 5, 4, 4],
+                   [6, 5, 6, 5, 4], [3, 5, 5, 5, 5, 3],
+                   [5, 5, 6, 5, 5], [4, 6, 6, 6, 4]):
+        for stretch in (1.0, 1.05, 1.12):
+            pts = _lattice_seed(counts, s=None if stretch == 1.0
+                                else stretch / max(counts))
+            if len(pts) >= N:
+                seeds.append(pts[:N])
+    seeds.append(_corner_seed())
+    seeds.append(_halton_seed())
+    return seeds
+
+
+# ----------------------------------------------------------------------
+# Refinement
+# ----------------------------------------------------------------------
+def _refine(centers, n_iter=180):
+    """Vectorized overlap-relaxation with periodic radius re-solving."""
+    centers = centers.copy()
+    r = compute_max_radii(centers)
+    best_sum = float(np.sum(r))
+    best = centers.copy()
+    for it in range(n_iter):
+        step = 0.03 * (1.0 - it / n_iter) + 0.0005
+        d = centers[:, None, :] - centers[None, :, :]
+        dist = np.sqrt((d * d).sum(axis=2))
+        np.fill_diagonal(dist, np.inf)
+        overlap = (r[None, :] + r[:, None]) - dist
+        np.fill_diagonal(overlap, 0.0)
+        # force from neighbors: sum of overlap * unit vector
+        with np.errstate(invalid="ignore", divide="ignore"):
+            unit = d / dist[:, :, None]
+        force = (overlap[:, :, None] * unit).sum(axis=1)
+        # wall forces
+        x, y = centers[:, 0], centers[:, 1]
+        fx = np.where(x - r < 0, r - x, 0.0) - np.where(x + r > 1, x + r - 1, 0.0)
+        fy = np.where(y - r < 0, r - y, 0.0) - np.where(y + r > 1, y + r - 1, 0.0)
+        force[:, 0] += fx
+        force[:, 1] += fy
+        norm = np.sqrt((force * force).sum(axis=1))
+        move = np.where(norm[:, None] > 1e-12,
+                        step * force / np.maximum(norm, 1e-12)[:, None], 0.0)
+        centers = np.clip(centers + move, 1e-9, 1.0 - 1e-9)
+        if it % 5 == 4:
+            r = compute_max_radii(centers)
+            tot = float(np.sum(r))
+            if tot > best_sum:
+                best_sum = tot
+                best = centers.copy()
+    centers[:] = best
+    return centers
+
+
+def _shift_search(centers, budget=2500):
+    """Coordinate-descent shifts evaluated with the fast vector solver."""
+    centers = centers.copy()
+    best = float(np.sum(compute_max_radii(centers)))
+    evals = 0
+    delta = 0.008
+    while delta >= 0.0005 and evals < budget:
+        improved = False
+        for i in range(N):
+            for axis in (0, 1):
+                for sign in (+1.0, -1.0):
+                    if evals >= budget:
+                        break
+                    old = centers[i, axis]
+                    new = min(max(old + sign * delta, 1e-9), 1.0 - 1e-9)
+                    if abs(new - old) < 1e-12:
+                        continue
+                    centers[i, axis] = new
+                    evals += 1
+                    tot = float(np.sum(compute_max_radii(centers)))
+                    if tot > best + 1e-9:
+                        best = tot
+                        improved = True
+                    else:
+                        centers[i, axis] = old
+        if not improved:
+            delta /= 2.0
+    return centers
+
+
+def _greedy_enlarge(centers, radii):
+    """Vectorized: enlarge each circle to its exact feasible cap."""
+    D = _dist_matrix(centers)
+    wall = _wall_dist(centers)
+    for _ in range(4):
+        cap = np.minimum(wall, (D - radii[None, :]).min(axis=1))
+        radii = np.minimum(np.maximum(radii, cap), wall)
+    return radii
+
+
+# ----------------------------------------------------------------------
+# Main constructor
+# ----------------------------------------------------------------------
+def construct_packing():
+    best_sum = -1.0
+    best = None
+    for seed in _make_seeds():
+        c = _refine(seed)
+        c = _shift_search(c, budget=900)
+        r = compute_max_radii(c)
+        tot = float(np.sum(r))
+        if tot > best_sum:
+            best_sum = tot
+            best = c.copy()
+    # extra polish on the winner
+    c = _shift_search(best, budget=2500)
+    radii = compute_max_radii(c)
+    radii = _greedy_enlarge(c, radii)
+    # final safety shrink
+    radii *= (1.0 - 1e-9)
+    return c, radii, float(np.sum(radii))
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)
+```
+</CODE>

@@ -1,0 +1,287 @@
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a memory-feasible model placement minimizing maximum KV cache pressure.
+
+    Returns:
+        Dictionary mapping GPU ids to lists of assigned models.
+    """
+    if gpu_num <= 0:
+        raise ValueError("gpu_num must be positive")
+
+    models = list(models)
+    model_count = len(models)
+
+    if not models:
+        return {gpu: [] for gpu in range(gpu_num)}
+
+    sizes = []
+    weights = []
+
+    for model in models:
+        if model.slo == 0:
+            raise ValueError("model.slo must be non-zero")
+        if model.model_size > GPU_MEM_SIZE:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on a "
+                f"{GPU_MEM_SIZE} GB GPU"
+            )
+        sizes.append(float(model.model_size))
+        weights.append(float(model.req_rate / model.slo))
+
+    def pressure(load, remaining):
+        if remaining > 0:
+            return load / remaining
+        if load > 0:
+            return float("inf")
+        return 0.0
+
+    class State:
+        def __init__(self):
+            self.groups = [[] for _ in range(gpu_num)]
+            self.loads = [0.0] * gpu_num
+            self.remaining = [float(GPU_MEM_SIZE)] * gpu_num
+
+        def pressures(self):
+            return [
+                pressure(self.loads[gpu], self.remaining[gpu])
+                for gpu in range(gpu_num)
+            ]
+
+        def objective(self):
+            # Lexicographic minimization permits useful plateau moves:
+            # max KVPR is primary, then the next highest KVPR, etc.
+            return tuple(sorted(self.pressures(), reverse=True))
+
+        def projected_objective(self, updates):
+            values = self.pressures()
+            for gpu, load, remaining in updates:
+                values[gpu] = pressure(load, remaining)
+            return tuple(sorted(values, reverse=True))
+
+        def add(self, gpu, item):
+            self.groups[gpu].append(item)
+            self.loads[gpu] += weights[item]
+            self.remaining[gpu] -= sizes[item]
+
+        def move(self, source, target, item):
+            self.groups[source].remove(item)
+            self.groups[target].append(item)
+            self.loads[source] -= weights[item]
+            self.remaining[source] += sizes[item]
+            self.loads[target] += weights[item]
+            self.remaining[target] -= sizes[item]
+
+        def swap(self, left_gpu, right_gpu, left_item, right_item):
+            left_pos = self.groups[left_gpu].index(left_item)
+            right_pos = self.groups[right_gpu].index(right_item)
+
+            self.groups[left_gpu][left_pos] = right_item
+            self.groups[right_gpu][right_pos] = left_item
+
+            self.loads[left_gpu] += weights[right_item] - weights[left_item]
+            self.loads[right_gpu] += weights[left_item] - weights[right_item]
+            self.remaining[left_gpu] += sizes[left_item] - sizes[right_item]
+            self.remaining[right_gpu] += sizes[right_item] - sizes[left_item]
+
+        def result(self):
+            return {
+                gpu: [models[item] for item in self.groups[gpu]]
+                for gpu in range(gpu_num)
+            }
+
+    item_ids = list(range(model_count))
+
+    # Different sort orders produce placements with distinct memory layouts.
+    orderings = [
+        sorted(item_ids, key=lambda i: (weights[i], sizes[i]), reverse=True),
+        sorted(item_ids, key=lambda i: (sizes[i], weights[i]), reverse=True),
+        sorted(item_ids, key=lambda i: weights[i] * sizes[i], reverse=True),
+        sorted(
+            item_ids,
+            key=lambda i: weights[i] / sizes[i] if sizes[i] > 0 else float("inf"),
+            reverse=True,
+        ),
+        sorted(item_ids, key=lambda i: (sizes[i], -weights[i]), reverse=True),
+        sorted(item_ids, key=lambda i: (weights[i] + 1.0) / (GPU_MEM_SIZE - sizes[i] + 1.0), reverse=True),
+    ]
+
+    def construct(order, pack_memory):
+        state = State()
+
+        for item in order:
+            best_choice = None
+
+            for gpu in range(gpu_num):
+                if sizes[item] > state.remaining[gpu]:
+                    continue
+
+                new_remaining = state.remaining[gpu] - sizes[item]
+                candidate_objective = state.projected_objective([
+                    (
+                        gpu,
+                        state.loads[gpu] + weights[item],
+                        new_remaining,
+                    )
+                ])
+
+                # For equivalent KVPR vectors, either preserve large empty
+                # regions or pack tightly; both are useful on different inputs.
+                memory_tie = new_remaining if pack_memory else -new_remaining
+                choice = (candidate_objective, memory_tie, gpu)
+
+                if best_choice is None or choice < best_choice:
+                    best_choice = choice
+
+            if best_choice is None:
+                return None
+
+            state.add(best_choice[2], item)
+
+        return state
+
+    def improve(state):
+        # Each accepted step strictly improves the complete ordered pressure
+        # vector. Therefore max-KVPR plateaus are allowed but cannot cycle.
+        max_iterations = max(12, model_count * 4)
+
+        for _ in range(max_iterations):
+            current_objective = state.objective()
+            best_objective = current_objective
+            best_action = None
+
+            # Relocations.
+            for source in range(gpu_num):
+                for item in list(state.groups[source]):
+                    for target in range(gpu_num):
+                        if source == target or sizes[item] > state.remaining[target]:
+                            continue
+
+                        candidate = state.projected_objective([
+                            (
+                                source,
+                                state.loads[source] - weights[item],
+                                state.remaining[source] + sizes[item],
+                            ),
+                            (
+                                target,
+                                state.loads[target] + weights[item],
+                                state.remaining[target] - sizes[item],
+                            ),
+                        ])
+
+                        if candidate < best_objective:
+                            best_objective = candidate
+                            best_action = ("move", source, target, item)
+
+            # Single-item swaps repair layouts where a direct relocation
+            # cannot fit because of memory fragmentation.
+            for left_gpu in range(gpu_num):
+                for right_gpu in range(left_gpu + 1, gpu_num):
+                    for left_item in state.groups[left_gpu]:
+                        for right_item in state.groups[right_gpu]:
+                            left_remaining = (
+                                state.remaining[left_gpu]
+                                + sizes[left_item]
+                                - sizes[right_item]
+                            )
+                            right_remaining = (
+                                state.remaining[right_gpu]
+                                + sizes[right_item]
+                                - sizes[left_item]
+                            )
+
+                            if left_remaining < 0 or right_remaining < 0:
+                                continue
+
+                            candidate = state.projected_objective([
+                                (
+                                    left_gpu,
+                                    state.loads[left_gpu]
+                                    - weights[left_item]
+                                    + weights[right_item],
+                                    left_remaining,
+                                ),
+                                (
+                                    right_gpu,
+                                    state.loads[right_gpu]
+                                    - weights[right_item]
+                                    + weights[left_item],
+                                    right_remaining,
+                                ),
+                            ])
+
+                            if candidate < best_objective:
+                                best_objective = candidate
+                                best_action = (
+                                    "swap",
+                                    left_gpu,
+                                    right_gpu,
+                                    left_item,
+                                    right_item,
+                                )
+
+            if best_action is None:
+                break
+
+            if best_action[0] == "move":
+                _, source, target, item = best_action
+                state.move(source, target, item)
+            else:
+                _, left_gpu, right_gpu, left_item, right_item = best_action
+                state.swap(left_gpu, right_gpu, left_item, right_item)
+
+        return state
+
+    best_state = None
+    best_objective = None
+
+    for order in orderings:
+        for pack_memory in (False, True):
+            state = construct(order, pack_memory)
+            if state is None:
+                continue
+
+            state = improve(state)
+            objective = state.objective()
+
+            if best_objective is None or objective < best_objective:
+                best_state = state
+                best_objective = objective
+
+    if best_state is None:
+        raise ValueError(
+            f"Unable to place all models on {gpu_num} GPUs of "
+            f"{GPU_MEM_SIZE} GB each"
+        )
+
+    return best_state.result()
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

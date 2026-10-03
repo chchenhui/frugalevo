@@ -1,0 +1,313 @@
+<NAME>
+hybrid_slsqp_escape_polish
+</NAME>
+<DESCRIPTION>
+Crossover combining the best elements of both programs: (1) the vectorized batched k-worst-triplet polish from the faster parent, (2) the analytic perpendicular "escape direction" candidates from the current program (which gave the best score 0.49), and (3) a new hybrid loop that alternates local polish with additional SLSQP soft-min re-refinement passes seeded from the polished configuration. This lets the smooth-min optimizer escape basins the pure polish gets stuck in, while the polish repairs the sharp min-area that SLSQP's soft-min underestimates. The final configuration always passes feasibility projection, and all randomness is seeded for determinism.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+SQRT3 = np.sqrt(3.0)
+TRI_AREA = SQRT3 / 4.0  # area of the unit equilateral triangle
+
+
+def _all_triples(n):
+    idxs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            for k in range(j + 1, n):
+                idxs.append((i, j, k))
+    return np.array(idxs)
+
+
+TRIPLES = _all_triples(11)
+N = 11
+I_, J_, K_ = TRIPLES[:, 0], TRIPLES[:, 1], TRIPLES[:, 2]
+
+
+def _areas(pts):
+    a = pts[I_]
+    b = pts[J_]
+    c = pts[K_]
+    cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    return 0.5 * np.abs(cross)
+
+
+def _constraints_flat(x):
+    """Linear inequality constraints keeping all points inside the triangle."""
+    p = x.reshape(-1, 2)
+    xs, ys = p[:, 0], p[:, 1]
+    return np.concatenate([
+        ys,                              # y >= 0
+        SQRT3 * xs - ys,                 # below left edge
+        SQRT3 * (1.0 - xs) - ys,         # below right edge
+    ])
+
+
+def _min_area(x):
+    return _areas(x.reshape(-1, 2)).min() / TRI_AREA
+
+
+def _optimize(start, iters):
+    from scipy.optimize import minimize
+    x = np.asarray(start, dtype=float).flatten().copy()
+    best_x, best_val = x.copy(), _min_area(x)
+    try:
+        for p in (10.0, 30.0, 100.0):
+            def obj(xx):
+                ar = _areas(xx.reshape(-1, 2)) / TRI_AREA
+                m = ar.min()
+                return (np.log(np.sum(np.exp(-p * (ar - m)))) - p * m) / (-p)
+
+            def jac(xx):
+                ar = _areas(xx.reshape(-1, 2)) / TRI_AREA
+                m = ar.min()
+                w = np.exp(-p * (ar - m))
+                w = w / w.sum()
+                pts = xx.reshape(-1, 2)
+                a = pts[I_]
+                b = pts[J_]
+                c = pts[K_]
+                cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+                s = np.sign(cross)
+                co = (0.5 * s * w / TRI_AREA)[:, None]
+                g = np.zeros_like(pts)
+                z = np.zeros_like(I_)
+                np.add.at(g, (I_, z), co * np.stack([a[:, 1] - c[:, 1], c[:, 0] - a[:, 0]], axis=1))
+                np.add.at(g, (J_, z), co * np.stack([c[:, 1] - b[:, 1], b[:, 0] - c[:, 0]], axis=1))
+                np.add.at(g, (K_, z), co * np.stack([b[:, 1] - a[:, 1], a[:, 0] - b[:, 0]], axis=1))
+                return -g.flatten()
+
+            cons = {'type': 'ineq', 'fun': _constraints_flat, 'jac': None}
+            res = minimize(obj, x, jac=jac, method='SLSQP',
+                           constraints=[cons],
+                           bounds=[(0.0, 1.0)] * 22,
+                           options={'maxiter': iters, 'ftol': 1e-12})
+            if np.isfinite(res.x).all():
+                x = res.x
+            v = _min_area(x)
+            if v > best_val:
+                best_val, best_x = v, x.copy()
+    except Exception:
+        pass
+    return best_x, best_val
+
+
+def _lattice_starts():
+    """Deterministic starting layouts inside the triangle."""
+    starts = []
+    lat = []
+    for r in range(5):
+        y = r * (SQRT3 / 2) / 4
+        for c in range(r + 1):
+            x = 0.5 * (1 - r / 4) + c * (1.0 / 4)
+            lat.append((x, y))
+    lat = np.array(lat)
+    keep = [0, 1, 2, 3, 4, 5, 6, 8, 9, 12, 14]
+    starts.append(lat[keep])
+    t = np.linspace(0, 1, 13)
+    ring = []
+    for f in t:
+        ring.append((f, 0.0))
+    for f in t[1:-1]:
+        ring.append((0.5 * (1 - f) + 1.0 * f, SQRT3 / 2 * f))
+    for f in t[1:-1]:
+        ring.append((0.5 * (1 - f), SQRT3 / 2 * f))
+    ring = np.array(ring)
+    sel = [0, 2, 4, 6, 8, 10, 12, 16, 20, 23, 26]
+    starts.append(ring[sel][:11] if len(ring) > 26 else ring[:11])
+    g = []
+    for yy in [0.1, 0.3, 0.5, 0.7]:
+        for xx in [0.15, 0.5, 0.85]:
+            if yy <= SQRT3 * xx and yy <= SQRT3 * (1 - xx):
+                g.append((xx, yy))
+    g = np.array(g)
+    starts.append(g[:11] if len(g) >= 11 else np.vstack([g, lat[:11 - len(g)]]))
+    return starts
+
+
+def _clip_pts(P):
+    """Vectorized feasibility projection of an (M,2) array into the triangle."""
+    X = np.clip(P[:, 0], 0.0, 1.0)
+    yhi = np.where(X <= 0.5, SQRT3 * X, SQRT3 * (1.0 - X))
+    Y = np.clip(P[:, 1], 0.0, yhi)
+    return np.stack([X, Y], axis=1)
+
+
+def _min_area_batch(base_pts, move_idx, move_pts):
+    """Min area over a batch of candidates, each moving one point."""
+    B = move_idx.shape[0]
+    P = np.broadcast_to(base_pts, (B, N, 2)).copy()
+    P[np.arange(B), move_idx] = move_pts
+    A = P[:, I_]
+    Bv = P[:, J_]
+    Cv = P[:, K_]
+    cross = (Bv[:, :, 0] - A[:, :, 0]) * (Cv[:, :, 1] - A[:, :, 1]) - \
+            (Bv[:, :, 1] - A[:, :, 1]) * (Cv[:, :, 0] - A[:, :, 0])
+    return 0.5 * np.abs(cross).min(axis=1) / TRI_AREA
+
+
+def _escape_dirs(pts, areas, hot):
+    """Analytic perpendicular escape directions for hot points away from the
+    line through the other two vertices of that point's worst triplet."""
+    dirs, idxs = [], []
+    for pi in hot:
+        pi = int(pi)
+        mask = (I_ == pi) | (J_ == pi) | (K_ == pi)
+        tmask = np.where(mask)[0]
+        if not len(tmask):
+            continue
+        t = tmask[np.argmin(areas[tmask])]
+        i, j, k = TRIPLES[t]
+        others = [q for q in (i, j, k) if q != pi]
+        o1, o2 = pts[others[0]], pts[others[1]]
+        d = o2 - o1
+        L = np.hypot(*d)
+        if L < 1e-12:
+            continue
+        perp = np.array([-d[1], d[0]]) / L
+        sgn = np.sign(perp @ (pts[pi] - o1))
+        if sgn == 0:
+            sgn = 1.0
+        dirs.append(sgn * perp)
+        idxs.append(pi)
+    if not dirs:
+        return np.empty(0, dtype=int), np.empty((0, 2))
+    return np.array(idxs), np.array(dirs)
+
+
+def _polish(pts, rng, max_polish=500, batch=24):
+    """k-worst-triplet guided batched polish with directed escapes + teleports."""
+    def clip_one(p):
+        return _clip_pts(p[None, :])[0]
+
+    cur = _min_area(pts)
+    best_pts = pts.copy()
+    best_val = cur
+    step = 0.02
+    stall = 0
+    total = 0
+    while total < max_polish and step > 1e-5:
+        total += 1
+        areas = _areas(pts) / TRI_AREA
+        order = np.argsort(areas)
+        if rng.random() < 0.35:
+            hot = np.unique(TRIPLES[order[:10]].ravel())
+        else:
+            hot = np.unique(TRIPLES[order[:1]].ravel())
+        n_rand = max(1, batch // 2)
+        n_dir = batch - n_rand
+        reps = max(1, n_rand // len(hot))
+        rand_idx = np.tile(hot, reps)[:n_rand]
+        noise = rng.normal(0.0, step, size=(rand_idx.shape[0], 2))
+        rand_pts = _clip_pts(pts[rand_idx] + noise)
+        # directed candidates at several scales
+        esc_idx, esc_dir = _escape_dirs(pts, areas, hot)
+        dir_idx = np.empty(0, dtype=int)
+        dir_pts = np.empty((0, 2))
+        if len(esc_idx) > 0 and n_dir > 0:
+            scales = np.array([step, 0.5 * step, 2.0 * step, 0.25 * step])
+            combos = [(int(pi), sc) for pi in range(len(esc_idx)) for sc in scales]
+            rng.shuffle(combos)
+            combos = combos[:n_dir]
+            d_idx = np.array([esc_idx[c[0]] for c in combos])
+            d_off = np.array([esc_dir[c[0]] * c[1] for c in combos])
+            dir_idx = d_idx
+            dir_pts = _clip_pts(pts[d_idx] + d_off)
+        move_idx = np.concatenate([rand_idx, dir_idx]).astype(int)
+        move_pts = np.vstack([rand_pts, dir_pts])
+        # collision rejection (vectorized)
+        others = pts[move_idx]
+        dists = np.linalg.norm(pts[None, :, :] - move_pts[:, None, :], axis=2)
+        dists[np.arange(len(move_idx)), move_idx] = np.inf
+        ok = dists.min(axis=1) > 1e-7
+        improved = False
+        if np.any(ok):
+            mi, mp = move_idx[ok], move_pts[ok]
+            vals = _min_area_batch(pts, mi, mp)
+            b = int(np.argmax(vals))
+            if vals[b] > cur + 1e-14:
+                pts = pts.copy()
+                pts[mi[b]] = mp[b]
+                cur = float(vals[b])
+                stall = 0
+                improved = True
+                if cur > best_val:
+                    best_val = cur
+                    best_pts = pts.copy()
+        if not improved:
+            stall += 1
+            # global relocation: teleport a worst-triplet point (batched)
+            if stall % 15 == 0 and step < 5e-2:
+                tworst = TRIPLES[order[0]]
+                wis = tworst[rng.integers(0, 3, size=8)]
+                u, v = rng.random(8), rng.random(8)
+                flip = (u + v) > 1.0
+                u[flip], v[flip] = 1.0 - u[flip], 1.0 - v[flip]
+                tp = np.stack([v + 0.5 * (1 - u - v), (1 - u - v) * SQRT3 / 2.0], axis=1)
+                tp = _clip_pts(tp)
+                vals = _min_area_batch(pts, wis, tp)
+                b = int(np.argmax(vals))
+                if vals[b] > cur:
+                    pts = pts.copy()
+                    pts[wis[b]] = tp[b]
+                    cur = float(vals[b])
+                    step = max(step, 0.02)
+                    stall = 0
+                    if cur > best_val:
+                        best_val = cur
+                        best_pts = pts.copy()
+        if stall % 10 == 0 and stall > 0:
+            step *= 0.7
+    return best_pts, best_val
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    n = N
+    rng = np.random.default_rng(12345)
+
+    starts = _lattice_starts()
+    for _ in range(3):
+        pts = rng.random((n, 2))
+        pts[:, 1] *= np.minimum(SQRT3 * pts[:, 0], SQRT3 * (1 - pts[:, 0])) * 0.99 + 1e-4
+        starts.append(pts)
+
+    best_x, best_val = None, -1.0
+    for s in starts:
+        try:
+            x, v = _optimize(np.asarray(s, dtype=float), iters=120)
+        except Exception:
+            continue
+        if v > best_val:
+            best_val, best_x = v, x
+
+    if best_x is None:
+        best_x = np.asarray(_lattice_starts()[0], dtype=float).flatten()
+
+    pts = _clip_pts(best_x.reshape(n, 2))
+
+    # ---- hybrid loop: polish <-> SLSQP re-refinement ----
+    try:
+        pts, cur = _polish(pts, rng)
+        for _ in range(3):
+            if cur <= best_val + 1e-15 and _polish.__defaults__:
+                pass
+            x2, v2 = _optimize(pts, iters=80)
+            p2 = _clip_pts(x2.reshape(n, 2))
+            p2, v2 = _polish(p2, rng, max_polish=250)
+            if v2 > cur:
+                pts, cur = p2, v2
+            else:
+                break
+    except Exception:
+        pass
+
+    pts = _clip_pts(pts)
+    return pts
+
+
+# EVOLVE-BLOCK-END
+```
+</CODE>

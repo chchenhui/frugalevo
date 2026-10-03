@@ -1,0 +1,176 @@
+--- a/original.py
++++ b/original.py
+@@ -1,19 +1,163 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
++def _hull_area(pts):
++    p = pts[np.argsort(pts[:, 0] + pts[:, 1] * 0.001)]
++    # Andrew's monotone chain
++    def cross(o, a, b):
++        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
++    lower = []
++    for q in p:
++        while len(lower) >= 2 and cross(lower[-2], lower[-1], q) <= 0:
++            lower.pop()
++        lower.append(q)
++    upper = []
++    for q in reversed(p):
++        while len(upper) >= 2 and cross(upper[-2], upper[-1], q) <= 0:
++            upper.pop()
++        upper.append(q)
++    hull = lower[:-1] + upper[:-1]
++    if len(hull) < 3:
++        return 1.0, pts
++    h = np.array(hull)
++    A = 0.5 * abs(np.sum(h[:, 0]*np.roll(h[:, 1], -1) - np.roll(h[:, 0], -1)*h[:, 1]))
++    # convexity: only hull points matter; interior points stay inside automatically
++    return A, h
++
++
++def _softmin_grad(pts, beta):
++    """Smooth min of all triangle areas + analytic gradient wrt points."""
++    n = len(pts)
++    idx = np.array([(i, j, k) for i in range(n) for j in range(i+1, n)
++                    for k in range(j+1, n)])
++    a = pts[idx[:, 0]]
++    b = pts[idx[:, 1]]
++    c = pts[idx[:, 2]]
++    # area*2 (cross product) signed; use abs handled by orientation-invariant form:
++    # cross = (b-a) x (c-a)
++    cr = (b[:, 0]-a[:, 0])*(c[:, 1]-a[:, 1]) - (b[:, 1]-a[:, 1])*(c[:, 0]-a[:, 0])
++    A2 = np.abs(cr)  # twice area
++    sgn = np.sign(cr); sgn[sgn == 0] = 1.0
++    w = np.exp(-beta * A2)
++    w /= w.sum()
++    softmin = -np.log(np.sum(np.exp(-beta * A2))) / beta
++    # gradient of |cr| wrt each point
++    ga = np.zeros_like(pts); gb = np.zeros_like(pts); gc = np.zeros_like(pts)
++    d_cx = sgn * (b[:, 1]-a[:, 1])
++    d_cy = sgn * (a[:, 0]-b[:, 0])
++    d_bx = sgn * (a[:, 1]-c[:, 1])
++    d_by = sgn * (c[:, 0]-a[:, 0])
++    d_ax = sgn * (c[:, 1]-b[:, 1])
++    d_ay = sgn * (b[:, 0]-c[:, 0])
++    for t in range(len(idx)):
++        i, j, k = idx[t]
++        wt = w[t] * beta  # weight for softmin gradient ascent direction
++        ga[i] += wt * d_ax[t]; ga[i+0] = ga[i]  # noqa (placeholder)
++        ga[i] -= wt * d_ax[t]  # undo placeholder
++        ga[i] += wt * d_ax[t]
++        gb[j] += wt * d_bx[t]
++        gc[k] += wt * d_cx[t]
++    # clean recompute (vectorized accumulation)
++    ga = np.zeros_like(pts); gb = np.zeros_like(pts); gc = np.zeros_like(pts)
++    np.add.at(ga, idx[:, 0], w * beta * np.stack([d_ax, d_ay], 1))
++    np.add.at(gb, idx[:, 1], w * beta * np.stack([d_bx, d_by], 1))
++    np.add.at(gc, idx[:, 2], w * beta * np.stack([d_cx, d_cy], 1))
++    # gradient of softmin wrt A2 is (w*beta); chain through dA2 -> ascent:
++    grad = ga + gb + gc  # note: we want to ASCEND softmin, so use +
++    return softmin, grad
++
++
++def _true_min_area2(pts):
++    n = len(pts)
++    idx = np.array([(i, j, k) for i in range(n) for j in range(i+1, n)
++                    for k in range(j+1, n)])
++    a = pts[idx[:, 0]]; b = pts[idx[:, 1]]; c = pts[idx[:, 2]]
++    cr = np.abs((b[:, 0]-a[:, 0])*(c[:, 1]-a[:, 1]) - (b[:, 1]-a[:, 1])*(c[:, 0]-a[:, 0]))
++    return cr.min()
++
++
++def _init_configs():
++    cfgs = []
++    # Big triangle vertices + concentric rings of 3 and 4 + center-ish points
++    ang = np.array([np.pi/2, np.pi/2 + 2*np.pi/3, np.pi/2 + 4*np.pi/3])
++    V = np.stack([np.cos(ang), np.sin(ang)], 1) * 1.0
++    for r1, r2, r3 in [(0.55, 0.30, 0.10), (0.6, 0.33, 0.0),
++                       (0.5, 0.25, 0.12), (0.65, 0.35, 0.0)]:
++        pts = [V[0], V[1], V[2]]
++        for rr, cnt in [(r1, 3), (r2, 3), (r3, 3)]:
++            off = np.random.default_rng(1).uniform(0, 2*np.pi) if False else 0.3
++            for t in range(cnt):
++                th = off + 2*np.pi*t/cnt + (rr * 0.7)
++                pts.append([rr*np.cos(th), rr*np.sin(th)])
++        # 13th point: near center offset
++        pts.append([0.05, -0.04])
++        cfgs.append(np.array(pts))
++    # Triangular lattice
++    lat = []
++    for i in range(3):
++        for j in range(3):
++            lat.append([i*0.5, j*0.87])
++    lat.append([1.0, 0.87]); lat.append([1.0, 0.0]); lat.append([0.5, 1.74])
++    lat.append([0.25, 0.435])
++    cfgs.append(np.array(lat))
++    return cfgs
++
++
+ def heilbronn_convex13() -> np.ndarray:
+-    """
+-    Construct an arrangement of n points on or inside a convex region in order to maximize the area of the
+-    smallest triangle formed by these points. Here n = 13.
+-
+-    Returns:
+-        points: np.ndarray of shape (13,2) with the x,y coordinates of the points.
+-    """
+     n = 13
+-    rng = np.random.default_rng(seed=42)
+-    points = rng.random((n, 2))
+-    return points
++    rng = np.random.default_rng(12345)
++    best_pts, best_val = None, -1.0
++    cfgs = _init_configs()
++    for ci, pts in enumerate(cfgs):
++        pts = pts.astype(float).copy()
++        beta = 60.0
++        lr = 0.02
++        for it in range(400):
++            soft, grad = _softmin_grad(pts, beta)
++            step = lr * grad
++            # normalize step scale
++            gn = np.linalg.norm(step)
++            if gn > 0.4:
++                step *= 0.4 / gn
++            pts += step
++            # keep points inside a bounding box and gently pull extremes outward
++            pts = np.clip(pts, -1.2, 1.2)
++            if it % 100 == 99:
++                beta *= 1.5
++                lr *= 0.6
++        # deterministic annealing polish
++        for it in range(300):
++            soft, grad = _softmin_grad(pts, 300.0)
++            noise = rng.normal(0, 0.004 * (1 - it/300), pts.shape)
++            pts += 0.01 * grad / (np.linalg.norm(grad) + 1e-9) + noise
++        val = _true_min_area2(pts)
++        if val > best_val:
++            best_val, best_pts = val, pts.copy()
++    # final hard local refine on true min triangle (coordinate ascent style)
++    pts = best_pts.copy()
++    for it in range(250):
++        improved = False
++        base = _true_min_area2(pts)
++        for i in range(n):
++            for dxy in [(0.002, 0), (-0.002, 0), (0, 0.002), (0, -0.002)]:
++                cand = pts.copy()
++                cand[i] += dxy
++                v = _true_min_area2(cand)
++                if v > base + 1e-12:
++                    pts = cand
++                    improved = True
++                    break
++            if improved:
++                break
++        if not improved:
++            break
++    # Normalize: convex hull to unit area, centered
++    A, hull = _hull_area(pts)
++    if A > 0:
++        cx = hull.mean(0)
++        pts = (pts - cx) / np.sqrt(A)
++    return pts.astype(float)
+ 
+ 
+ # EVOLVE-BLOCK-END

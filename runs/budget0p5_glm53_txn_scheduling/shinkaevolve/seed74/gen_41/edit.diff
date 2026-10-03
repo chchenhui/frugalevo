@@ -1,0 +1,417 @@
+--- a/original.py
++++ b/original.py
+@@ -1,148 +1,307 @@
+ import random
+ 
+ from txn_simulator import Workload
+ from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+ 
+ # EVOLVE-BLOCK-START
+ 
+ def get_best_schedule(workload, num_seqs):
+     """
+-    Get optimal schedule using greedy cost sampling strategy.
+-
+-    Returns:
+-        Tuple of (lowest makespan, corresponding schedule)
++    Adaptive Large Neighborhood Search (ALNS) over transaction orderings.
++    Multiple destroy/repair operators compete; their selection weights
++    adapt based on which operators recently produced improving solutions.
+     """
+     import time
+-
+-    def get_full_greedy(perturb_rate):
+-        # Full greedy: at each step evaluate ALL remaining transactions
+-        # with the true makespan cost and append the cheapest one.
+-        start_txn = random.randint(0, workload.num_txns - 1)
+-        txn_seq = [start_txn]
+-        remaining_txns = [x for x in range(0, workload.num_txns)
+-                          if x != start_txn]
+-        while remaining_txns:
+-            min_cost = None
+-            min_txn = -1
+-            # occasionally accept a random (non-best) candidate to
+-            # diversify across restarts
++    from collections import deque
++
++    n = workload.num_txns
++
++    # Build conflict adjacency: which txns touch at least one common key.
++    # Reconstructed cheaply via per-txn key sets from operation strings.
++    # We access keys via workload ops if available; fall back gracefully.
++    def build_conflict_neighbors():
++        try:
++            key_map = workload.get_key_map()  # dict txn -> list of keys
++            sets = [set(key_map[i]) for i in range(n)]
++        except Exception:
++            try:
++                ops = workload.get_ops()  # txn -> list of (op, key)
++                sets = []
++                for i in range(n):
++                    ks = set()
++                    for _, k in ops[i]:
++                        ks.add(k)
++                    sets.append(ks)
++            except Exception:
++                return [set() for _ in range(n)]
++        neigh = [set() for _ in range(n)]
++        key_owner = {}
++        for i in range(n):
++            for k in sets[i]:
++                key_owner.setdefault(k, []).append(i)
++        for k, owners in key_owner.items():
++            if len(owners) > 1:
++                for i in owners:
++                    neigh[i].update(owners)
++        for i in range(n):
++            neigh[i].discard(i)
++        return neigh
++
++    neigh = build_conflict_neighbors()
++
++    def cost_of(seq):
++        return workload.get_opt_seq_cost(seq)
++
++    # ---------- construction operators ----------
++
++    def greedy_construct(perturb_rate):
++        """Cheapest-insertion greedy with occasional random picks."""
++        start = random.randint(0, n - 1)
++        seq = [start]
++        remaining = [x for x in range(n) if x != start]
++        while remaining:
+             if random.random() < perturb_rate:
+-                idx = random.randint(0, len(remaining_txns) - 1)
+-                min_txn = remaining_txns[idx]
+-                test_seq = txn_seq + [min_txn]
+-                min_cost = workload.get_opt_seq_cost(test_seq)
++                t = remaining[random.randint(0, len(remaining) - 1)]
++                seq.append(t)
++                remaining.remove(t)
+             else:
+-                for t in remaining_txns:
+-                    test_seq = txn_seq + [t]
+-                    cost = workload.get_opt_seq_cost(test_seq)
+-                    if min_cost is None or cost < min_cost:
+-                        min_cost = cost
+-                        min_txn = t
+-            txn_seq.append(min_txn)
+-            remaining_txns.remove(min_txn)
+-        assert len(set(txn_seq)) == workload.num_txns
+-        return workload.get_opt_seq_cost(txn_seq), txn_seq
+-
+-    def ruin_and_recreate(seq, cost, deadline):
+-        # Remove k random transactions, greedily reinsert each at its
+-        # best position. Accept improvements only; repeat until budget.
+-        n = workload.num_txns
+-        while time.time() < deadline:
+-            k = random.randint(3, min(8, n - 1))
+-            removed_idx = random.sample(range(n), k)
+-            removed = [seq[i] for i in removed_idx]
+-            base = [seq[i] for i in range(n) if i not in set(removed_idx)]
+-            cur_cost = workload.get_opt_seq_cost(base)
+-            ok = True
+-            random.shuffle(removed)
+-            for t in removed:
+-                best_c = None
+-                best_pos = -1
+-                for pos in range(len(base) + 1):
+-                    cand = base[:pos] + [t] + base[pos:]
+-                    c = workload.get_opt_seq_cost(cand)
++                best_c, best_t = None, -1
++                for t in remaining:
++                    c = cost_of(seq + [t])
+                     if best_c is None or c < best_c:
+-                        best_c = c
+-                        best_pos = pos
+-                if time.time() >= deadline:
+-                    ok = False
+-                    break
+-                base.insert(best_pos, t)
+-                cur_cost = best_c
+-            if not ok:
+-                break
+-            if cur_cost < cost:
+-                seq = base
+-                cost = cur_cost
+-            # else: keep original seq and perturb again
+-        return cost, seq
+-
+-    def local_search(seq, cost, deadline, max_moves_per_pass=200):
+-        # Relocation + swap local search on the full-sequence cost.
+-        n = workload.num_txns
+-        improved = True
+-        while improved and time.time() < deadline:
+-            improved = False
+-            moves = []
+-            for _ in range(min(max_moves_per_pass, n * 2)):
+-                i = random.randint(0, n - 1)
+-                j = random.randint(0, n - 1)
+-                if i != j:
+-                    moves.append((i, j))
+-            for i, j in moves:
+-                if time.time() >= deadline:
+-                    break
+-                cand = seq[:]
+-                if random.random() < 0.5:
+-                    # relocation: move txn at i to position j
+-                    t = cand.pop(i)
+-                    cand.insert(j, t)
+-                else:
+-                    # swap positions i and j
+-                    cand[i], cand[j] = cand[j], cand[i]
+-                c = workload.get_opt_seq_cost(cand)
+-                if c < cost:
+-                    seq = cand
+-                    cost = c
+-                    improved = True
+-        return cost, seq
+-
+-    time_budget = 20.0  # seconds per workload
++                        best_c, best_t = c, t
++                seq.append(best_t)
++                remaining.remove(best_t)
++        return cost_of(seq), seq
++
++    def greedy_insert_all(base, removed):
++        """Insert each removed txn at its best position (order shuffled)."""
++        random.shuffle(removed)
++        cur = cost_of(base)
++        for t in removed:
++            blen = len(base)
++            # restrict position scan for speed on large instances
++            step = max(1, blen // 40)
++            positions = list(range(0, blen + 1, step))
++            if blen not in positions:
++                positions.append(blen)
++            best_c, best_p = None, -1
++            for p in positions:
++                cand = base[:p] + [t] + base[p:]
++                c = cost_of(cand)
++                if best_c is None or c < best_c:
++                    best_c, best_p = c, p
++            base.insert(best_p, t)
++            cur = best_c
++        return cur, base
++
++    # ---------- destroy operators ----------
++
++    def destroy_random(seq, k):
++        idx = random.sample(range(len(seq)), k)
++        rem = sorted(idx, reverse=True)
++        removed = [seq[i] for i in rem]
++        base = [s for i, s in enumerate(seq) if i not in set(rem)]
++        return base, removed
++
++    def destroy_conflict_cluster(seq, k):
++        """Remove a seed txn plus txns sharing keys with it (transitively
++        up to a small depth), taken from current positions."""
++        seed = random.randint(0, len(seq) - 1)
++        cluster = {seed}
++        frontier = [seed]
++        while len(cluster) < k and frontier:
++            nxt = []
++            for t in frontier:
++                cand = [c for c in neigh[t] if c not in cluster]
++                random.shuffle(cand)
++                for c in cand:
++                    if len(cluster) >= k:
++                        break
++                    cluster.add(c)
++                    nxt.append(c)
++            frontier = nxt
++            if not frontier and len(cluster) < k:
++                # pad with random others
++                others = [i for i in range(n) if i not in cluster]
++                random.shuffle(others)
++                for o in others:
++                    if len(cluster) >= k:
++                        break
++                    cluster.add(o)
++        removed = list(cluster)
++        base = [s for s in seq if s not in cluster]
++        return base, removed
++
++    def destroy_segment(seq, k):
++        """Remove a contiguous random slice."""
++        start = random.randint(0, len(seq) - k)
++        removed = seq[start:start + k]
++        base = seq[:start] + seq[start + k:]
++        return base, removed
++
++    # ---------- repair operators ----------
++
++    def repair_best_insert(base, removed):
++        return greedy_insert_all(base, removed)
++
++    def repair_greedy_append_rebuild(base, removed):
++        """Rebuild by appending removed txns greedily one at a time,
++        then optionally relocating them within a small window."""
++        cur, base2 = greedy_insert_all(base, removed)
++        return cur, base2
++
++    def repair_random_place_then_polish(base, removed):
++        """Fast random placement then a short relocation pass on the
++        inserted txns only."""
++        for t in removed:
++            base.insert(random.randint(0, len(base)), t)
++        cur = cost_of(base)
++        # polish: relocate each inserted txn locally
++        for t in removed:
++            i = base.index(t)
++            base.pop(i)
++            lo = max(0, i - 5)
++            hi = min(len(base), i + 6)
++            best_c, best_p = None, -1
++            for p in range(lo, hi):
++                cand = base[:p] + [t] + base[p:]
++                c = cost_of(cand)
++                if best_c is None or c < best_c:
++                    best_c, best_p = c, p
++            base.insert(best_p, t)
++            cur = best_c
++        return cur, base
++
++    # ---------- ALNS setup ----------
++
++    destroys = [
++        ("rand", destroy_random, (3, 10)),
++        ("cluster", destroy_conflict_cluster, (4, 10)),
++        ("segment", destroy_segment, (3, 8)),
++    ]
++    repairs = [
++        ("bestins", repair_best_insert),
++        ("randpolish", repair_random_place_then_polish),
++    ]
++    d_w = [1.0] * len(destroys)
++    r_w = [1.0] * len(repairs)
++    d_hist = [deque(maxlen=20) for _ in destroys]
++    r_hist = [deque(maxlen=20) for _ in repairs]
++
++    def pick(weights, hist):
++        # adaptive: weight = base + recent success rate (reward improving)
++        adj = []
++        for i, w in enumerate(weights):
++            h = hist[i]
++            succ = sum(h) / len(h) if len(h) else 0.5
++            adj.append(w * (0.5 + succ))
++        total = sum(adj)
++        r = random.random() * total
++        acc = 0.0
++        for i, a in enumerate(adj):
++            acc += a
++            if r <= acc:
++                return i
++        return len(adj) - 1
++
++    time_budget = 20.0
+     deadline = time.time() + time_budget
+-    best_cost = None
+-    best_seq = None
+-    # Greedy construction followed by local search, repeated with
+-    # randomized restarts under a time budget.
++
++    # initial solution
++    best_cost, best_seq = greedy_construct(0.0)
++    cur_cost, cur_seq = best_cost, best_seq[:]
++
++    # simulated-annealing-ish acceptance on top of ALNS
++    T0 = max(1.0, best_cost * 0.02)
++    alpha = 0.9997
++    T = T0
++    restart_counter = 0
++
+     while time.time() < deadline:
+-        cost, seq = get_full_greedy(0.05)
+-        cost, seq = local_search(seq, cost, min(deadline,
+-                                                time.time() + 3.0))
+-        cost, seq = ruin_and_recreate(seq, cost, deadline)
+-        if best_cost is None or cost < best_cost:
+-            best_cost = cost
+-            best_seq = seq
++        # operator selection
++        di = pick(d_w, d_hist)
++        ri = pick(r_w, r_hist)
++        dname, dfn, (klo, khi) = destroys[di]
++        rfn = repairs[ri][1]
++
++        k = random.randint(klo, max(klo, min(khi, n - 1)))
++        if k >= n:
++            continue
++
++        if random.random() < 0.5 and dname == "rand":
++            k = random.randint(2, 4)  # small-perturbation mode half the time
++
++        base, removed = dfn(cur_seq, k)
++        if not base and not removed:
++            continue
++        new_cost, new_seq = rfn(base, removed)
++        if new_seq is None or len(new_seq) != n:
++            continue
++
++        d_ok = new_cost < cur_cost
++        r_ok = new_cost < cur_cost
++        d_hist[di].append(1.0 if d_ok else 0.0)
++        r_hist[ri].append(1.0 if r_ok else 0.0)
++
++        delta = new_cost - cur_cost
++        accept = False
++        if delta < 0:
++            accept = True
++        else:
++            accept = random.random() < pow(2.718281828, -delta / max(T, 0.01))
++
++        if accept:
++            cur_cost, cur_seq = new_cost, new_seq
++            if new_cost < best_cost:
++                best_cost, best_seq = new_cost, new_seq[:]
++                restart_counter = 0
++        else:
++            restart_counter += 1
++
++        T = max(0.05, T * alpha)
++
++        # occasionally restart from best with perturbation to re-diversify
++        if restart_counter > 400:
++            restart_counter = 0
++            if random.random() < 0.5:
++                # fresh perturbed greedy
++                c, s = greedy_construct(0.10)
++            else:
++                # perturb best via segment shuffle
++                base, removed = destroy_segment(best_seq[:], random.randint(4, 10))
++                c, s = greedy_insert_all(base, removed)
++            if s is not None and len(s) == n:
++                cur_cost, cur_seq = c, s
++                if c < best_cost:
++                    best_cost, best_seq = c, s[:]
++
++        # make sure current never drifts far above best
++        if cur_cost > best_cost * 1.15:
++            cur_cost, cur_seq = best_cost, best_seq[:]
++
+     return best_cost, best_seq
+ 
+ # EVOLVE-BLOCK-END
+ 
+ def get_random_costs():
+     workload_size = 100
+     workload = Workload(WORKLOAD_1)
+ 
+     makespan1, schedule1 = get_best_schedule(workload, 10)
+     cost1 = workload.get_opt_seq_cost(schedule1)
+ 
+     workload2 = Workload(WORKLOAD_2)
+     makespan2, schedule2 = get_best_schedule(workload2, 10)
+     cost2 = workload2.get_opt_seq_cost(schedule2)
+ 
+     workload3 = Workload(WORKLOAD_3)
+     makespan3, schedule3 = get_best_schedule(workload3, 10)
+     cost3 = workload3.get_opt_seq_cost(schedule3)
+     print(cost1, cost2, cost3)
+     return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+ 
+ 
+ if __name__ == "__main__":
+     makespan, schedule = get_random_costs()
+     print(f"Makespan: {makespan}")

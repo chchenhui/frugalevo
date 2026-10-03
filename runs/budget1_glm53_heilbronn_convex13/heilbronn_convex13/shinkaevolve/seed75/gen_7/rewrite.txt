@@ -1,0 +1,71 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _tri_areas(pts):
+    # areas of all C(13,3)=286 triangles, vectorized
+    n = len(pts)
+    i, j, k = np.triu_indices(n, 3)[:1][0], None, None
+    idxs = np.array([(a, b, c) for a in range(n) for b in range(a + 1, n) for c in range(b + 1, n)])
+    p = pts[idxs]  # (286,3,2)
+    area2 = np.abs((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+                   - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
+    return area2 / 2.0, idxs
+
+
+def _optimize(pts, steps=(0.05, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002), iters=60):
+    pts = pts.copy()
+    for step in steps:
+        for _ in range(iters):
+            a, idxs = _tri_areas(pts)
+            beta = 400.0 / max(a.min(), 1e-9)
+            # smooth-min weights (softmax of -beta*area)
+            w = np.exp(-beta * (a - a.min()))
+            w /= w.sum()
+            # gradient of LogSumExp smooth min: -beta * w per triangle
+            grad = np.zeros_like(pts)
+            for t in range(len(idxs)):
+                ia, ib, ic = idxs[t]
+                p0, p1, p2 = pts[ia], pts[ib], pts[ic]
+                s = np.sign((p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]))
+                if s == 0:
+                    continue
+                g = w[t] * beta * s
+                # gradient of signed area wrt each vertex
+                grad[ia] += g * 0.5 * np.array([-(p2[1] - p1[1]), (p2[0] - p1[0])])
+                grad[ib] += g * 0.5 * np.array([(p2[1] - p0[1]), -(p2[0] - p0[0])])
+                grad[ic] += g * 0.5 * np.array([(p1[1] - p0[1]), -(p1[0] - p0[0])])
+            nrm = np.linalg.norm(grad)
+            if nrm < 1e-12:
+                break
+            pts += step * grad / nrm
+            # project back into unit disk (convex region of unit area)
+            r = np.linalg.norm(pts, axis=1, keepdims=True)
+            pts = np.where(r > 1.0, pts / np.maximum(r, 1e-12), pts)
+    return pts
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Arrange 13 points inside a convex region (unit-area disk) maximizing the smallest
+    triangle area. Deterministic: fixed symmetric init + gradient-based smooth-min ascent.
+    """
+    n = 13
+    # 12 points on circle (radius 1/sqrt(pi) gives disk area 1) + center
+    R = 1.0 / np.sqrt(np.pi)
+    ang = 2 * np.pi * np.arange(12) / 12
+    pts = np.zeros((n, 2))
+    pts[:12, 0] = R * np.cos(ang)
+    pts[:12, 0] = R * np.cos(ang)
+    pts[:12, 1] = R * np.sin(ang)
+    # offset center point slightly to break ties, deterministic
+    pts[12] = [0.0, 0.0]
+    pts = _optimize(pts)
+    # safety: ensure all finite and distinct
+    if not np.all(np.isfinite(pts)):
+        ang = 2 * np.pi * np.arange(n) / n
+        pts = np.stack([R * np.cos(ang), R * np.sin(ang)], axis=1)
+    return pts
+
+
+# EVOLVE-BLOCK-END

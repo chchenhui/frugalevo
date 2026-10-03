@@ -1,0 +1,179 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+_SQRT3 = np.sqrt(3.0)
+_TRIPLETS = np.array(list(combinations(range(11), 3)), dtype=int)
+
+
+def _to_xy(b):
+    """Barycentric (u toward B(1,0), v toward C(0.5,sqrt3/2)) -> xy."""
+    return np.column_stack([b[:, 0] + 0.5 * b[:, 1], 0.5 * _SQRT3 * b[:, 1]])
+
+
+def _clamp_simplex(b):
+    """Project rows of b onto simplex u>=0, v>=0, u+v<=1."""
+    b = np.clip(b, 0.0, 1.0)
+    s = b.sum(axis=1)
+    over = s > 1.0
+    if np.any(over):
+        b[over] *= (1.0 / s[over])[:, None]
+    return b
+
+
+def _bottleneck(b):
+    """Return (min doubled area, worst triplet index)."""
+    xy = _to_xy(b)
+    p = xy[_TRIPLETS[:, 0]]
+    q = xy[_TRIPLETS[:, 1]]
+    r = xy[_TRIPLETS[:, 2]]
+    cross = np.abs((q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1])
+                   - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0]))
+    k = int(np.argmin(cross))
+    return float(cross[k]), k
+
+
+def _min_doubled_area(b):
+    return _bottleneck(b)[0]
+
+
+def _relief_move(cur, cur_val, tri, h, rng=None):
+    """Push all three vertices of the bottleneck triangle away from its centroid."""
+    cand = cur.copy()
+    idx = _TRIPLETS[tri]
+    c = cand[idx].mean(axis=0)
+    for k in idx:
+        d = cand[k] - c
+        n = np.linalg.norm(d)
+        if n < 1e-12:
+            d = rng.normal(size=2) if rng is not None else np.array([0.3, 0.3])
+            n = np.linalg.norm(d) or 1.0
+        cand[k] = cand[k] + h * d / n
+    return _clamp_simplex(cand)
+
+
+def _polish(b, rounds=400):
+    """Greedy multi-scale moves targeting the points of the bottleneck triangle."""
+    cur = _clamp_simplex(b.copy())
+    cur_val, tri = _bottleneck(cur)
+    steps = [0.01, 0.003, 0.001, 3e-4, 1e-4, 3e-5, 1e-5]
+    for _ in range(rounds):
+        improved = False
+        for k in _TRIPLETS[tri]:
+            for comp in range(2):
+                for s in (+1, -1):
+                    for h in steps:
+                        cand = cur.copy()
+                        cand[k, comp] += s * h
+                        cand = _clamp_simplex(cand)
+                        val, t2 = _bottleneck(cand)
+                        if val > cur_val + 1e-14:
+                            cur, cur_val, tri = cand, val, t2
+                            improved = True
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+        if not improved:
+            break
+    return cur, cur_val
+
+
+def _local_search(b, rng, iters=1500):
+    """Randomized jitter descent at decreasing scales + bottleneck relief escapes."""
+    cur = _clamp_simplex(b.copy())
+    cur_val, tri = _bottleneck(cur)
+    scales = [0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002, 0.0001]
+    for sc in scales:
+        stuck = 0
+        for _ in range(iters // len(scales) + 200):
+            cand = cur.copy()
+            if rng.random() < 0.15:
+                # bottleneck-relief escape move
+                cand = _relief_move(cur, cur_val, tri, sc, rng)
+            else:
+                k = int(rng.integers(0, 11))
+                cand[k] += rng.normal(0.0, sc, 2)
+                if rng.random() < 0.2:
+                    k2 = int(rng.integers(0, 11))
+                    cand[k2] += rng.normal(0.0, sc, 2)
+                cand = _clamp_simplex(cand)
+            val, t2 = _bottleneck(cand)
+            if val > cur_val + 1e-15:
+                cur, cur_val, tri = cand, val, t2
+                stuck = 0
+            else:
+                stuck += 1
+                if stuck > 300:
+                    break
+    return cur, cur_val
+
+
+def _seed_config(seed):
+    rng = np.random.default_rng(seed)
+    b = rng.random((11, 2)) * 0.9
+    b[0] = [0.0, 0.0]
+    b[1] = [1.0, 0.0]
+    b[2] = [0.0, 1.0]
+    return _clamp_simplex(b)
+
+
+def _lattice_seed(jitter, seed):
+    """Near-uniform lattice seed with vertices pinned — strong for Heilbronn."""
+    rng = np.random.default_rng(seed)
+    pts = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+    # subdivide edges and interior in a triangular lattice pattern
+    edge = [(t, 0.0) for t in (0.2, 0.4, 0.6, 0.8)]
+    edge += [(t, 1.0 - t) for t in (0.2, 0.4, 0.6, 0.8)]
+    edge += [(0.0, t) for t in (0.25, 0.5, 0.75)]
+    inner = [(0.33, 0.33), (0.4, 0.2), (0.2, 0.4), (0.5, 0.25)]
+    pts.extend(edge + inner)
+    b = np.array(pts[:11], dtype=float)
+    b += rng.normal(0.0, jitter, b.shape)
+    b[0] = [0.0, 0.0]
+    b[1] = [1.0, 0.0]
+    b[2] = [0.0, 1.0]
+    return _clamp_simplex(b)
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of 11 points on or inside the equilateral triangle
+    (0,0),(1,0),(0.5,sqrt(3)/2) maximizing the smallest triangle area.
+    """
+    try:
+        best_b, best_val = None, -1.0
+        # structured lattice seeds first (best starting basins)
+        for j, sd in ((0.02, 11), (0.05, 22), (0.0, 33)):
+            rng = np.random.default_rng(sd)
+            b0 = _lattice_seed(j, sd)
+            b, val = _local_search(b0, rng)
+            b, val = _polish(b)
+            if val > best_val:
+                best_b, best_val = b, val
+        # random multistart for diversity
+        for seed in (1, 7, 42):
+            rng = np.random.default_rng(seed)
+            b0 = _seed_config(seed)
+            b, val = _local_search(b0, rng)
+            b, val = _polish(b)
+            if val > best_val:
+                best_b, best_val = b, val
+        if best_b is None or not np.isfinite(best_val):
+            raise RuntimeError("search failed")
+        return _to_xy(_clamp_simplex(best_b))
+    except Exception:
+        # Fallback: deterministic feasible configuration
+        b = np.array([
+            [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+            [0.5, 0.0], [0.25, 0.25], [0.5, 0.5],
+            [0.0, 0.5], [0.25, 0.0], [0.75, 0.25],
+            [0.0, 0.25], [0.5, 0.25],
+        ])
+        return _to_xy(b)
+
+
+# EVOLVE-BLOCK-END

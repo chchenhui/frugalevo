@@ -1,0 +1,436 @@
+--- a/original.py
++++ b/original.py
+@@ -1,424 +1,424 @@
+ # SPDX-License-Identifier: Apache-2.0
+ """
+ Expert parallelism load balancer (EPLB) for vLLM.
+ 
+ This module implements the core rearrangement algorithm.
+ 
+ The rearrangement algorithm is adapted from
+ [DeepSeek EPLB](https://github.com/deepseek-ai/eplb).
+ 
+ Please find at [#12](https://github.com/deepseek-ai/EPLB/issues/12) an example
+ on how the EPLB algorithm works.
+ """
+ 
+ # EVOLVE-BLOCK-START
+ 
+ import torch
+ 
+ 
+ def _inverse_permutation(permutation: torch.Tensor) -> torch.Tensor:
+     """Return inverses for a batch of row-wise permutations."""
+     inverse = torch.empty_like(permutation)
+     inverse.scatter_(
+         1,
+         permutation,
+         torch.arange(
+             permutation.size(1),
+             dtype=torch.int64,
+             device=permutation.device,
+         ).expand_as(permutation),
+     )
+     return inverse
+ 
+ 
+ def _targeted_exchange(
+     weight: torch.Tensor,
+     pack_index: torch.Tensor,
+     rank_in_pack: torch.Tensor,
+     num_packs: int,
+     items_per_pack: int,
+     rounds: int = 2,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """
+     Improve a cardinality-constrained packing through targeted exchanges.
+ 
+     For every pair of packs, the desired exchanged load is half of their load
+     gap. Candidate items in the lighter pack are found with binary search
+     against this target instead of enumerating all item-pair swaps.
+     """
+     if num_packs <= 1 or items_per_pack <= 1:
+         return pack_index, rank_in_pack
+ 
+     rows, num_items = weight.shape
+     device = weight.device
+     row_ids = torch.arange(rows, device=device)
+     slots = torch.arange(num_items, device=device).expand(rows, -1)
+ 
+     for _ in range(rounds):
+         slot_id = pack_index * items_per_pack + rank_in_pack
+         slot_to_item = torch.empty_like(pack_index)
+         slot_to_item.scatter_(1, slot_id, slots)
+ 
+         slot_weight = weight.gather(1, slot_to_item).view(
+             rows, num_packs, items_per_pack
+         )
+         pack_load = slot_weight.sum(dim=2)
+ 
+         best_gain = torch.zeros(rows, dtype=weight.dtype, device=device)
+         best_a = torch.zeros(rows, dtype=torch.int64, device=device)
+         best_b = torch.zeros(rows, dtype=torch.int64, device=device)
+         best_pack_a = torch.zeros(rows, dtype=torch.int64, device=device)
+         best_pack_b = torch.zeros(rows, dtype=torch.int64, device=device)
+ 
+         # Number of GPU packs is normally small. Each pair uses O(K log K)
+         # work, where K is the number of physical slots per GPU.
+         for first_pack in range(num_packs - 1):
+             for second_pack in range(first_pack + 1, num_packs):
+                 first_load = pack_load[:, first_pack]
+                 second_load = pack_load[:, second_pack]
+                 first_is_heavy = first_load >= second_load
+ 
+                 high_pack = torch.where(
+                     first_is_heavy,
+                     torch.full_like(best_pack_a, first_pack),
+                     torch.full_like(best_pack_a, second_pack),
+                 )
+                 low_pack = torch.where(
+                     first_is_heavy,
+                     torch.full_like(best_pack_a, second_pack),
+                     torch.full_like(best_pack_a, first_pack),
+                 )
+ 
+                 high_weight = torch.where(
+                     first_is_heavy[:, None],
+                     slot_weight[:, first_pack],
+                     slot_weight[:, second_pack],
+                 )
+                 low_weight = torch.where(
+                     first_is_heavy[:, None],
+                     slot_weight[:, second_pack],
+                     slot_weight[:, first_pack],
+                 )
+                 gap = (first_load - second_load).abs()
+ 
+                 # Exchanging high item h and low item l transfers h-l load.
+                 # The ideal transfer is gap / 2.
+                 target_low = high_weight - gap[:, None] * 0.5
+                 sorted_low, low_order = low_weight.sort(dim=1)
+ 
+                 insert = torch.searchsorted(
+                     sorted_low,
+                     target_low,
+                     right=False,
+                 ).clamp_(0, items_per_pack - 1)
+                 previous = (insert - 1).clamp_(0, items_per_pack - 1)
+ 
+                 insert_value = sorted_low.gather(1, insert)
+                 previous_value = sorted_low.gather(1, previous)
+                 use_previous = (
+                     (previous_value - target_low).abs()
+                     < (insert_value - target_low).abs()
+                 )
+                 chosen_sorted = torch.where(use_previous, previous, insert)
+                 low_slot = low_order.gather(1, chosen_sorted)
+                 chosen_low = low_weight.gather(1, low_slot)
+ 
+                 transfer = high_weight - chosen_low
+                 # Squared-load reduction for two packs is proportional to:
+                 # transfer * (gap - transfer). Positive values improve balance.
+                 gain_per_high = transfer * (gap[:, None] - transfer)
+                 gain_per_high.masked_fill_(
+                     (transfer <= 0) | (transfer >= gap[:, None]),
+                     0,
+                 )
+                 pair_gain, high_slot = gain_per_high.max(dim=1)
+                 selected_low_slot = low_slot.gather(
+                     1, high_slot[:, None]
+                 ).squeeze(1)
+ 
+                 improve = pair_gain > best_gain
+                 if improve.any():
+                     high_item = slot_to_item[
+                         row_ids, high_pack * items_per_pack + high_slot
+                     ]
+                     low_item = slot_to_item[
+                         row_ids,
+                         low_pack * items_per_pack + selected_low_slot,
+                     ]
+                     best_gain = torch.where(improve, pair_gain, best_gain)
+                     best_a = torch.where(improve, high_item, best_a)
+                     best_b = torch.where(improve, low_item, best_b)
+                     best_pack_a = torch.where(
+                         improve, high_pack, best_pack_a
+                     )
+                     best_pack_b = torch.where(
+                         improve, low_pack, best_pack_b
+                     )
+ 
+         active = best_gain > 0
+         if not active.any():
+             break
+ 
+         old_rank_a = rank_in_pack[row_ids, best_a]
+         old_rank_b = rank_in_pack[row_ids, best_b]
+ 
+         pack_index[row_ids, best_a] = torch.where(
+             active, best_pack_b, pack_index[row_ids, best_a]
+         )
+         rank_in_pack[row_ids, best_a] = torch.where(
+             active, old_rank_b, rank_in_pack[row_ids, best_a]
+         )
+         pack_index[row_ids, best_b] = torch.where(
+             active, best_pack_a, pack_index[row_ids, best_b]
+         )
+         rank_in_pack[row_ids, best_b] = torch.where(
+             active, old_rank_a, rank_in_pack[row_ids, best_b]
+         )
+ 
+     return pack_index, rank_in_pack
+ 
+ 
+ def balanced_packing(
+     weight: torch.Tensor,
+     num_packs: int,
+     refine: bool = False,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """
+     Equally-sized load-aware packing using batched LPT plus optional exchanges.
+     """
+     rows, num_items = weight.shape
+     assert num_items % num_packs == 0
+     items_per_pack = num_items // num_packs
+ 
+     if items_per_pack == 1:
+         packs = torch.arange(
+             num_items, dtype=torch.int64, device=weight.device
+         ).expand(rows, -1)
+         return packs, torch.zeros_like(packs)
+ 
+     weight = weight.float()
+     sorted_items = weight.sort(dim=1, descending=True).indices
+     sorted_weight = weight.gather(1, sorted_items)
+ 
+     pack_load = torch.zeros(
+         (rows, num_packs), dtype=weight.dtype, device=weight.device
+     )
+     pack_count = torch.zeros(
+         (rows, num_packs), dtype=torch.int64, device=weight.device
+     )
+     pack_index = torch.empty_like(sorted_items)
+     rank_in_pack = torch.empty_like(sorted_items)
+     one = torch.ones((rows, 1), dtype=torch.int64, device=weight.device)
+ 
+     for position in range(num_items):
+         available = pack_load.masked_fill(
+             pack_count >= items_per_pack, float("inf")
+         )
+         chosen = available.argmin(dim=1)
+         item = sorted_items[:, position]
+         rank = pack_count.gather(1, chosen[:, None]).squeeze(1)
+ 
+         pack_index.scatter_(1, item[:, None], chosen[:, None])
+         rank_in_pack.scatter_(1, item[:, None], rank[:, None])
+         pack_load.scatter_add_(
+             1, chosen[:, None], sorted_weight[:, position:position + 1]
+         )
+         pack_count.scatter_add_(1, chosen[:, None], one)
+ 
+     if refine:
+         pack_index, rank_in_pack = _targeted_exchange(
+             weight,
+             pack_index,
+             rank_in_pack,
+             num_packs,
+             items_per_pack,
+         )
+ 
+     return pack_index, rank_in_pack
+ 
+ 
+ def replicate_experts(
+     weight: torch.Tensor,
+     num_physical: int,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """
+     Batched discrete water filling for minimizing peak replica load.
+     """
+     rows, num_logical = weight.shape
+     assert num_physical >= num_logical
+ 
+     device = weight.device
+     extra = num_physical - num_logical
+     row_ids = torch.arange(rows, device=device)
+ 
+     physical_to_logical = torch.empty(
+         (rows, num_physical), dtype=torch.int64, device=device
+     )
+     physical_rank = torch.zeros_like(physical_to_logical)
+     physical_to_logical[:, :num_logical] = torch.arange(
+         num_logical, dtype=torch.int64, device=device
+     ).expand(rows, -1)
+ 
+     logical_count = torch.ones(
+         (rows, num_logical), dtype=torch.int64, device=device
+     )
+ 
+     for slot in range(extra):
+         selected = (weight / logical_count).argmax(dim=1)
+         physical_to_logical[:, num_logical + slot] = selected
+         physical_rank[:, num_logical + slot] = logical_count[
+             row_ids, selected
+         ]
+         logical_count[row_ids, selected] += 1
+ 
+     return physical_to_logical, physical_rank, logical_count
+ 
+ 
+ def _hierarchical_plan(
+     weight: torch.Tensor,
+     num_physical: int,
+     num_groups: int,
+     num_nodes: int,
+     num_gpus: int,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Create a node-local replication and GPU placement plan."""
+     layers, num_logical = weight.shape
+     assert num_logical % num_groups == 0
+     assert num_groups % num_nodes == 0
+     assert num_gpus % num_nodes == 0
+     assert num_physical % num_gpus == 0
+ 
+     group_size = num_logical // num_groups
+     groups_per_node = num_groups // num_nodes
+     logical_per_node = num_logical // num_nodes
+     physical_per_node = num_physical // num_nodes
+     gpus_per_node = num_gpus // num_nodes
+     physical_per_gpu = num_physical // num_gpus
+ 
+     group_load = weight.view(layers, num_groups, group_size).sum(dim=2)
+     group_pack, group_rank = balanced_packing(group_load, num_nodes)
+ 
+     group_offset = (
+         group_pack * groups_per_node + group_rank
+     ).unsqueeze(-1) * group_size
+     logical_to_node_order = (
+         group_offset
+         + torch.arange(group_size, dtype=torch.int64, device=weight.device)
+     ).flatten(1)
+     node_order_to_logical = _inverse_permutation(logical_to_node_order)
+ 
+     node_weight = weight.gather(1, node_order_to_logical).reshape(
+         layers * num_nodes, logical_per_node
+     )
+     physical_to_node_logical, physical_rank, node_count = replicate_experts(
+         node_weight, physical_per_node
+     )
+ 
+     per_replica_weight = (node_weight / node_count).gather(
+         1, physical_to_node_logical
+     )
+     gpu_pack, gpu_rank = balanced_packing(
+         per_replica_weight,
+         gpus_per_node,
+         refine=True,
+     )
+     physical_to_gpu_order = gpu_pack * physical_per_gpu + gpu_rank
+     gpu_order_to_physical = _inverse_permutation(physical_to_gpu_order)
+ 
+     gpu_node_logical = physical_to_node_logical.gather(
+         1, gpu_order_to_physical
+     )
+     node_base = torch.arange(
+         0,
+         num_logical,
+         logical_per_node,
+         dtype=torch.int64,
+         device=weight.device,
+     ).view(1, num_nodes, 1)
+ 
+     gpu_node_logical = (
+         gpu_node_logical.view(layers, num_nodes, physical_per_node)
+         + node_base
+     ).flatten(1)
+ 
+     physical_to_logical = node_order_to_logical.gather(
+         1, gpu_node_logical
+     )
+     physical_rank = physical_rank.gather(
+         1, gpu_order_to_physical
+     ).view(layers, num_physical)
+     logical_count = node_count.view(layers, num_logical).gather(
+         1, logical_to_node_order
+     )
+ 
+     return physical_to_logical, physical_rank, logical_count
+ 
+ 
+ def _reverse_map(
+     physical_to_logical: torch.Tensor,
+     physical_rank: torch.Tensor,
+     logical_count: torch.Tensor,
+ ) -> torch.Tensor:
+     """Materialize padded logical-expert to physical-expert locations."""
+     layers, num_physical = physical_to_logical.shape
+     num_logical = logical_count.size(1)
+     max_replicas = num_physical - num_logical + 1
+ 
+     result = torch.full(
+         (layers, num_logical, max_replicas),
+         -1,
+         dtype=torch.int64,
+         device=physical_to_logical.device,
+     )
+     result.flatten(1).scatter_(
+         1,
+         physical_to_logical * max_replicas + physical_rank,
+         torch.arange(
+             num_physical,
+             dtype=torch.int64,
+             device=physical_to_logical.device,
+         ).expand(layers, -1),
+     )
+     return result
+ 
+ 
+ def rebalance_experts(
+     weight: torch.Tensor,
+     num_replicas: int,
+     num_groups: int,
+     num_nodes: int,
+     num_gpus: int,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """
+     Rebalance logical experts across physical expert slots.
+     """
+     _, num_logical = weight.shape
+     assert num_replicas >= num_logical
+ 
+     planning_weight = weight.float().cpu()
+ 
+-    if num_groups % num_nodes == 0:
+-        plan_groups = num_groups
+-        plan_nodes = num_nodes
+-    else:
+-        plan_groups = 1
+-        plan_nodes = 1
+-
++    # GPU load is the limiting resource for routing throughput.  Keeping
++    # logical groups inside independently balanced nodes can strand replicas
++    # of a hot expert in one node while GPUs elsewhere remain underloaded.
++    # Plan in one global domain so both replication and LPT packing can use
++    # every physical slot.  _hierarchical_plan with one node retains the same
++    # fixed-slot output contract while bypassing unnecessary group metadata.
++    del num_groups, num_nodes
+     physical_to_logical, physical_rank, logical_count = _hierarchical_plan(
+         planning_weight,
+         num_replicas,
+-        plan_groups,
+-        plan_nodes,
++        1,
++        1,
+         num_gpus,
+     )
+     logical_to_physical = _reverse_map(
+         physical_to_logical,
+         physical_rank,
+         logical_count,
+     )
+     return physical_to_logical, logical_to_physical, logical_count
+ 
+ 
+ # EVOLVE-BLOCK-END
+ 
+ __all__ = ["rebalance_experts"]

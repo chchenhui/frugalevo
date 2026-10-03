@@ -1,0 +1,388 @@
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a memory-feasible placement minimizing maximum KV cache pressure.
+
+    Returns:
+        Dictionary mapping GPU ids to lists of assigned models.
+    """
+    if gpu_num <= 0:
+        raise ValueError("gpu_num must be positive")
+
+    model_list = list(models)
+    count = len(model_list)
+    sizes = []
+    weights = []
+
+    for model in model_list:
+        if model.slo == 0:
+            raise ValueError("model.slo must be non-zero")
+
+        size = float(model.model_size)
+        if size > GPU_MEM_SIZE:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on a "
+                f"{GPU_MEM_SIZE} GB GPU"
+            )
+
+        sizes.append(size)
+        weights.append(float(model.req_rate / model.slo))
+
+    epsilon = 1e-12
+
+    def pressure(load, remaining):
+        if remaining > epsilon:
+            return load / remaining
+        return float("inf") if load > epsilon else 0.0
+
+    def key(loads, remaining):
+        return tuple(
+            sorted(
+                (pressure(loads[gpu], remaining[gpu]) for gpu in range(gpu_num)),
+                reverse=True,
+            )
+        )
+
+    def add_item(groups, loads, remaining, gpu, item):
+        groups[gpu].append(item)
+        loads[gpu] += weights[item]
+        remaining[gpu] -= sizes[item]
+
+    def remove_item(groups, loads, remaining, gpu, item):
+        groups[gpu].remove(item)
+        loads[gpu] -= weights[item]
+        remaining[gpu] += sizes[item]
+
+    def construct(order, pack_ties):
+        groups = [[] for _ in range(gpu_num)]
+        loads = [0.0] * gpu_num
+        remaining = [float(GPU_MEM_SIZE)] * gpu_num
+
+        for item in order:
+            current_values = [
+                pressure(loads[gpu], remaining[gpu]) for gpu in range(gpu_num)
+            ]
+            best_choice = None
+
+            for gpu in range(gpu_num):
+                if sizes[item] > remaining[gpu] + epsilon:
+                    continue
+
+                values = list(current_values)
+                after_memory = remaining[gpu] - sizes[item]
+                values[gpu] = pressure(loads[gpu] + weights[item], after_memory)
+
+                # Full-vector comparison prevents secondary pressure peaks.
+                objective = tuple(sorted(values, reverse=True))
+                memory_tie = after_memory if pack_ties else -after_memory
+                candidate = (objective, memory_tie, gpu)
+
+                if best_choice is None or candidate < best_choice:
+                    best_choice = candidate
+
+            if best_choice is None:
+                return None
+
+            add_item(groups, loads, remaining, best_choice[2], item)
+
+        return groups, loads, remaining
+
+    def best_insert(groups, loads, remaining, item, pack_ties):
+        current_values = [
+            pressure(loads[gpu], remaining[gpu]) for gpu in range(gpu_num)
+        ]
+        best_choice = None
+
+        for gpu in range(gpu_num):
+            if sizes[item] > remaining[gpu] + epsilon:
+                continue
+
+            values = list(current_values)
+            after_memory = remaining[gpu] - sizes[item]
+            values[gpu] = pressure(loads[gpu] + weights[item], after_memory)
+
+            objective = tuple(sorted(values, reverse=True))
+            memory_tie = after_memory if pack_ties else -after_memory
+            candidate = (objective, memory_tie, gpu)
+
+            if best_choice is None or candidate < best_choice:
+                best_choice = candidate
+
+        return None if best_choice is None else best_choice[2]
+
+    def improve(state):
+        groups, loads, remaining = state
+        limit = max(12, count * 4)
+
+        for _ in range(limit):
+            values = [
+                pressure(loads[gpu], remaining[gpu]) for gpu in range(gpu_num)
+            ]
+            current_key = tuple(sorted(values, reverse=True))
+            current_max = current_key[0] if current_key else 0.0
+            bottlenecks = [
+                gpu for gpu in range(gpu_num)
+                if values[gpu] >= current_max - epsilon
+            ]
+
+            best_key = current_key
+            best_action = None
+
+            def changed_key(updates):
+                candidate_values = list(values)
+                for gpu, load_delta, memory_delta in updates:
+                    candidate_values[gpu] = pressure(
+                        loads[gpu] + load_delta,
+                        remaining[gpu] + memory_delta,
+                    )
+                return tuple(sorted(candidate_values, reverse=True))
+
+            # Standard relocation neighborhood.
+            for source in bottlenecks:
+                for item in groups[source]:
+                    for target in range(gpu_num):
+                        if source == target:
+                            continue
+                        if sizes[item] > remaining[target] + epsilon:
+                            continue
+
+                        candidate = changed_key((
+                            (source, -weights[item], sizes[item]),
+                            (target, weights[item], -sizes[item]),
+                        ))
+                        if candidate < best_key:
+                            best_key = candidate
+                            best_action = ("move", source, target, item)
+
+            # Swaps efficiently change both memory distribution and load balance.
+            for left in range(gpu_num):
+                for right in range(left + 1, gpu_num):
+                    if left not in bottlenecks and right not in bottlenecks:
+                        continue
+
+                    for item_left in groups[left]:
+                        for item_right in groups[right]:
+                            left_memory = (
+                                remaining[left]
+                                + sizes[item_left]
+                                - sizes[item_right]
+                            )
+                            right_memory = (
+                                remaining[right]
+                                + sizes[item_right]
+                                - sizes[item_left]
+                            )
+
+                            if left_memory < -epsilon or right_memory < -epsilon:
+                                continue
+
+                            candidate = changed_key((
+                                (
+                                    left,
+                                    weights[item_right] - weights[item_left],
+                                    sizes[item_left] - sizes[item_right],
+                                ),
+                                (
+                                    right,
+                                    weights[item_left] - weights[item_right],
+                                    sizes[item_right] - sizes[item_left],
+                                ),
+                            ))
+
+                            if candidate < best_key:
+                                best_key = candidate
+                                best_action = (
+                                    "swap", left, right, item_left, item_right
+                                )
+
+            if best_action is not None:
+                if best_action[0] == "move":
+                    _, source, target, item = best_action
+                    remove_item(groups, loads, remaining, source, item)
+                    add_item(groups, loads, remaining, target, item)
+                else:
+                    _, left, right, item_left, item_right = best_action
+                    left_index = groups[left].index(item_left)
+                    right_index = groups[right].index(item_right)
+                    groups[left][left_index] = item_right
+                    groups[right][right_index] = item_left
+
+                    loads[left] += weights[item_right] - weights[item_left]
+                    loads[right] += weights[item_left] - weights[item_right]
+                    remaining[left] += sizes[item_left] - sizes[item_right]
+                    remaining[right] += sizes[item_right] - sizes[item_left]
+                continue
+
+            # Destroy-and-repair: remove two bottleneck items, then reinsert them
+            # globally. This crosses fragmentation barriers without requiring a
+            # hard-coded exchange shape.
+            repaired = False
+
+            for source in bottlenecks:
+                source_items = list(groups[source])
+
+                for first in range(len(source_items)):
+                    for second in range(first + 1, len(source_items)):
+                        item_a = source_items[first]
+                        item_b = source_items[second]
+
+                        remove_item(groups, loads, remaining, source, item_a)
+                        remove_item(groups, loads, remaining, source, item_b)
+
+                        best_trial = None
+
+                        for order in ((item_a, item_b), (item_b, item_a)):
+                            for pack_ties in (False, True):
+                                trial_groups = [list(group) for group in groups]
+                                trial_loads = list(loads)
+                                trial_remaining = list(remaining)
+
+                                first_gpu = best_insert(
+                                    trial_groups,
+                                    trial_loads,
+                                    trial_remaining,
+                                    order[0],
+                                    pack_ties,
+                                )
+                                if first_gpu is None:
+                                    continue
+
+                                add_item(
+                                    trial_groups,
+                                    trial_loads,
+                                    trial_remaining,
+                                    first_gpu,
+                                    order[0],
+                                )
+
+                                second_gpu = best_insert(
+                                    trial_groups,
+                                    trial_loads,
+                                    trial_remaining,
+                                    order[1],
+                                    pack_ties,
+                                )
+                                if second_gpu is None:
+                                    continue
+
+                                add_item(
+                                    trial_groups,
+                                    trial_loads,
+                                    trial_remaining,
+                                    second_gpu,
+                                    order[1],
+                                )
+
+                                trial_key = key(trial_loads, trial_remaining)
+                                if (
+                                    best_trial is None
+                                    or trial_key < best_trial[0]
+                                ):
+                                    best_trial = (
+                                        trial_key,
+                                        trial_groups,
+                                        trial_loads,
+                                        trial_remaining,
+                                    )
+
+                        if best_trial is not None and best_trial[0] < current_key:
+                            _, new_groups, new_loads, new_remaining = best_trial
+                            groups[:] = new_groups
+                            loads[:] = new_loads
+                            remaining[:] = new_remaining
+                            repaired = True
+                            break
+
+                        add_item(groups, loads, remaining, source, item_b)
+                        add_item(groups, loads, remaining, source, item_a)
+
+                    if repaired:
+                        break
+                if repaired:
+                    break
+
+            if not repaired:
+                break
+
+        return groups, loads, remaining
+
+    indices = list(range(count))
+
+    def risk(item):
+        return weights[item] / max(epsilon, GPU_MEM_SIZE - sizes[item])
+
+    # A compact seed portfolio covers load-dominant, memory-dominant, density,
+    # capacity-risk, and coarse memory-bucket scenarios.
+    orders = [
+        sorted(indices, key=lambda i: (weights[i], sizes[i]), reverse=True),
+        sorted(indices, key=lambda i: (sizes[i], weights[i]), reverse=True),
+        sorted(indices, key=lambda i: weights[i] * sizes[i], reverse=True),
+        sorted(indices, key=risk, reverse=True),
+        sorted(
+            indices,
+            key=lambda i: weights[i] / max(sizes[i], epsilon),
+            reverse=True,
+        ),
+        sorted(
+            indices,
+            key=lambda i: (int(sizes[i] / 20.0), weights[i], sizes[i]),
+            reverse=True,
+        ),
+    ]
+
+    best_state = None
+    best_key = None
+
+    for order in orders:
+        for pack_ties in (False, True):
+            state = construct(order, pack_ties)
+            if state is None:
+                continue
+
+            state = improve(state)
+            candidate_key = key(state[1], state[2])
+
+            if best_key is None or candidate_key < best_key:
+                best_key = candidate_key
+                best_state = state
+
+    if best_state is None:
+        raise ValueError(
+            f"Unable to place all models on {gpu_num} GPUs of "
+            f"{GPU_MEM_SIZE} GB each"
+        )
+
+    groups = best_state[0]
+    return {
+        gpu: [model_list[item] for item in groups[gpu]]
+        for gpu in range(gpu_num)
+    }
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

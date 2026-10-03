@@ -1,0 +1,332 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+_N = 13
+_INTERIOR_COUNT = 10
+_DIMENSION = 2 * _INTERIOR_COUNT
+_EPS = 1.0e-7
+
+# A reference triangle with area 1/2.  For this hull, the absolute cross
+# product of a triangle is exactly its area divided by hull area.
+_HULL = np.array(
+    (
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (0.0, 1.0),
+    ),
+    dtype=np.float64,
+)
+
+_TRIPLES = np.asarray(
+    [
+        (i, j, k)
+        for i in range(_N)
+        for j in range(i + 1, _N)
+        for k in range(j + 1, _N)
+    ],
+    dtype=np.intp,
+)
+
+_CACHE = None
+
+
+def _repair_simplex(flat: np.ndarray) -> np.ndarray:
+    """
+    Project direct Cartesian parameters onto the closed reference simplex.
+
+    Each point is represented by x, y with:
+        x >= eps, y >= eps, x + y <= 1 - eps.
+    """
+    values = np.asarray(flat, dtype=np.float64)
+    original_shape = values.shape
+    values = values.reshape(-1, _INTERIOR_COUNT, 2).copy()
+
+    values = np.maximum(values, _EPS)
+    sums = values[:, :, 0] + values[:, :, 1]
+    limit = 1.0 - _EPS
+
+    outside = sums > limit
+    if np.any(outside):
+        scale = np.ones_like(sums)
+        scale[outside] = limit / sums[outside]
+        values *= scale[:, :, None]
+
+    return values.reshape(original_shape)
+
+
+def _assemble_points(flat: np.ndarray) -> np.ndarray:
+    """Create complete 13-point configurations from batches of free variables."""
+    repaired = _repair_simplex(flat)
+    repaired = repaired.reshape(-1, _INTERIOR_COUNT, 2)
+    hull = np.broadcast_to(_HULL, (repaired.shape[0], 3, 2))
+    return np.concatenate((hull, repaired), axis=1)
+
+
+def _triangle_areas(flat: np.ndarray) -> np.ndarray:
+    """
+    Return normalized triangle areas for every candidate and every triple.
+
+    Since the hull has area 1/2, abs(cross product) is already the area
+    normalized by convex hull area.
+    """
+    points = _assemble_points(flat)
+    triangles = points[:, _TRIPLES, :]
+
+    u = triangles[:, :, 1, :] - triangles[:, :, 0, :]
+    v = triangles[:, :, 2, :] - triangles[:, :, 0, :]
+    return np.abs(u[:, :, 0] * v[:, :, 1] - u[:, :, 1] * v[:, :, 0])
+
+
+def _exact_scores(flat: np.ndarray) -> np.ndarray:
+    """Primary objective: smallest normalized triangle area."""
+    return np.min(_triangle_areas(flat), axis=1)
+
+
+def _search_scores(flat: np.ndarray) -> np.ndarray:
+    """
+    Early-search objective.
+
+    It strongly values the actual minimum while also rewarding improvement of
+    the next few critical triangles.  This gives the evolutionary phase useful
+    direction on nonsmooth max-min plateaus.
+    """
+    areas = _triangle_areas(flat)
+    smallest = np.partition(areas, 11, axis=1)[:, :12]
+    smallest.sort(axis=1)
+
+    weights = np.array(
+        (1.00, 0.42, 0.27, 0.18, 0.13, 0.10, 0.08, 0.065, 0.05, 0.04, 0.03, 0.02),
+        dtype=np.float64,
+    )
+    return smallest @ weights
+
+
+def _uniform_simplex(rng: np.random.Generator, count: int) -> np.ndarray:
+    """Generate count x 10 uniformly distributed point sets in the simplex."""
+    bary = rng.exponential(1.0, size=(count, _INTERIOR_COUNT, 3))
+    bary /= bary.sum(axis=2, keepdims=True)
+    return bary[:, :, 1:].reshape(count, _DIMENSION)
+
+
+def _structured_population(rng: np.random.Generator, size: int) -> np.ndarray:
+    """
+    Build diverse feasible initial candidates.
+
+    The population mixes true simplex-uniform samples with shifted irrational
+    lattice patterns.  The latter are much less likely to begin with accidental
+    near-collinear triples than ordinary independent samples.
+    """
+    population = _uniform_simplex(rng, size)
+
+    structured = size // 2
+    index = np.arange(_INTERIOR_COUNT, dtype=np.float64)
+
+    for row in range(structured):
+        phase = (row + 0.5) / structured
+        a = (phase + index * 0.6180339887498949) % 1.0
+        b = (0.173 + 0.71 * phase + index * 0.4142135623730950) % 1.0
+
+        # Square-to-simplex fold.
+        x = np.minimum(a, 1.0 - a)
+        y = np.minimum(b, 1.0 - b)
+        scale = np.maximum(1.0, 2.05 * (x + y))
+        points = np.column_stack((x / scale, y / scale))
+        points += rng.normal(0.0, 0.028, size=points.shape)
+
+        population[row] = points.reshape(-1)
+
+    return _repair_simplex(population)
+
+
+def _donor_indices(rng: np.random.Generator, size: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized distinct donor-index generation for differential evolution."""
+    target = np.arange(size)
+    a = rng.permutation(size)
+    b = rng.permutation(size)
+    c = rng.permutation(size)
+
+    for array in (a, b, c):
+        collision = array == target
+        while np.any(collision):
+            array[collision] = rng.integers(0, size, size=np.count_nonzero(collision))
+            collision = array == target
+
+    for left, right in ((a, b), (a, c), (b, c)):
+        collision = left == right
+        while np.any(collision):
+            right[collision] = rng.integers(0, size, size=np.count_nonzero(collision))
+            collision = (left == right) | (right == target)
+
+    return a, b, c
+
+
+def _evolutionary_search(rng: np.random.Generator) -> np.ndarray:
+    """
+    Deterministic two-phase population search.
+
+    Phase one uses a floor-sensitive aggregate objective to escape poor
+    max-min plateaus.  Phase two switches to exact minimum-area selection.
+    """
+    population_size = 128
+    generations = 360
+    population = _structured_population(rng, population_size)
+
+    guide_scores = _search_scores(population)
+    exact_scores = _exact_scores(population)
+
+    for generation in range(generations):
+        a, b, c = _donor_indices(rng, population_size)
+
+        fraction = generation / float(generations - 1)
+        scale = 0.78 - 0.30 * fraction
+        donor = population[a] + scale * (population[b] - population[c])
+
+        cross_rate = 0.90 - 0.12 * fraction
+        crossover = rng.random((population_size, _DIMENSION)) < cross_rate
+        crossover[np.arange(population_size), rng.integers(0, _DIMENSION, population_size)] = True
+
+        trials = np.where(crossover, donor, population)
+        trials = _repair_simplex(trials)
+
+        trial_exact = _exact_scores(trials)
+
+        if generation < 220:
+            trial_guide = _search_scores(trials)
+            accept = trial_guide > guide_scores
+            # Never reject a substantial direct improvement in the true goal.
+            accept |= trial_exact > exact_scores + 2.0e-5
+            guide_scores[accept] = trial_guide[accept]
+        else:
+            accept = trial_exact > exact_scores
+            # Resolve exact ties deterministically using the broader floor.
+            ties = np.abs(trial_exact - exact_scores) < 1.0e-13
+            if np.any(ties):
+                trial_guide = _search_scores(trials[ties])
+                accept[ties] |= trial_guide > guide_scores[ties]
+                guide_scores[ties] = np.maximum(guide_scores[ties], trial_guide)
+
+        population[accept] = trials[accept]
+        exact_scores[accept] = trial_exact[accept]
+
+    return population[int(np.argmax(exact_scores))].copy()
+
+
+def _local_polish(seed: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """
+    Batched deterministic hill climbing around the strongest evolutionary
+    result.  Multiple proposal scales expose both larger rearrangements and
+    small corrections to active minimum-area constraints.
+    """
+    best = seed.copy()
+    best_exact = float(_exact_scores(best[None, :])[0])
+    best_guide = float(_search_scores(best[None, :])[0])
+
+    schedule = (
+        (0.085, 70, 72),
+        (0.045, 85, 80),
+        (0.022, 105, 88),
+        (0.010, 115, 96),
+        (0.0045, 120, 112),
+        (0.0018, 110, 120),
+    )
+
+    for sigma, iterations, batch_size in schedule:
+        for _ in range(iterations):
+            candidates = best + rng.normal(0.0, sigma, size=(batch_size, _DIMENSION))
+            candidates = _repair_simplex(candidates)
+
+            exact = _exact_scores(candidates)
+            guides = _search_scores(candidates)
+
+            candidate_order = np.lexsort((guides, exact))
+            winner = int(candidate_order[-1])
+
+            improved = exact[winner] > best_exact + 1.0e-14
+            tied_better = (
+                abs(exact[winner] - best_exact) <= 1.0e-14
+                and guides[winner] > best_guide
+            )
+
+            if improved or tied_better:
+                best = candidates[winner].copy()
+                best_exact = float(exact[winner])
+                best_guide = float(guides[winner])
+
+    return best
+
+
+def _valid(points: np.ndarray) -> bool:
+    """Verify the returned configuration before storing it in the cache."""
+    if points.shape != (_N, 2) or not np.all(np.isfinite(points)):
+        return False
+
+    if np.any(points[:, 0] < -1.0e-10) or np.any(points[:, 1] < -1.0e-10):
+        return False
+    if np.any(points[:, 0] + points[:, 1] > 1.0 + 1.0e-10):
+        return False
+
+    distances = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
+    distances += np.eye(_N)
+    if float(np.min(distances)) < 1.0e-9:
+        return False
+
+    interior = points[3:].reshape(1, -1)
+    return bool(_exact_scores(interior)[0] > 1.0e-10)
+
+
+def _fallback() -> np.ndarray:
+    """Deterministic nondegenerate fallback used only after numerical failure."""
+    return np.array(
+        (
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (0.0, 1.0),
+            (0.120, 0.105),
+            (0.315, 0.082),
+            (0.557, 0.105),
+            (0.785, 0.070),
+            (0.087, 0.305),
+            (0.294, 0.275),
+            (0.535, 0.262),
+            (0.105, 0.555),
+            (0.295, 0.500),
+            (0.180, 0.755),
+        ),
+        dtype=np.float64,
+    )
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct a deterministic arrangement of exactly 13 points inside a convex
+    triangular region.
+
+    Returns
+    -------
+    np.ndarray
+        Array of shape (13, 2).  The first three points are hull vertices and
+        the remaining ten lie inside the same convex triangular region.
+    """
+    global _CACHE
+
+    if _CACHE is not None:
+        return _CACHE.copy()
+
+    rng = np.random.default_rng(13031957)
+
+    try:
+        candidate = _evolutionary_search(rng)
+        candidate = _local_polish(candidate, rng)
+        points = _assemble_points(candidate)[0]
+
+        if not _valid(points):
+            points = _fallback()
+    except (FloatingPointError, ValueError, RuntimeError):
+        points = _fallback()
+
+    _CACHE = np.asarray(points, dtype=np.float64)
+    return _CACHE.copy()
+
+
+# EVOLVE-BLOCK-END

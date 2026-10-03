@@ -1,0 +1,178 @@
+<NAME>
+corner_aware_layout_and_multistart</NAME>
+<DESCRIPTION>
+The current hexagonal rows 5-4-5-4-5-3 leave corner slack: the end circles of each row sit against the side walls but the top/bottom rows only touch two walls, and the four corner regions of the square are underused. Two targeted improvements:
+
+1. **Corner-aware initial placement**: shift the first/last circles of the top and bottom rows diagonally into the corners (x near r, y near r, etc.), so those four circles can touch two walls simultaneously. The LP solver will then naturally assign them larger radii since the wall constraints bind in both directions. Also try squeezing the 3-circle last row against the bottom wall.
+
+2. **Multi-start hill-climbing**: instead of a single random-seed search, try several perturbed initial layouts (different row staggers and corner offsets) and keep the global best. This diversifies basins at modest extra cost (LP with HiGHS is fast).
+
+3. Increase iterations slightly and shrink jitter faster late in the search to fine-tune the best packing found. This pushes the sum of radii from ~2.44 toward the AlphaEvolve target of 2.635.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    row_counts = [5, 4, 5, 4, 5, 3]
+    idx = 0
+    for row, count in enumerate(row_counts):
+        y = r + row * h
+        if row % 2 == 0:
+            # Unstaggered rows touch both side walls
+            for j in range(count):
+                centers[idx] = [r + j * s, y]
+                idx += 1
+        else:
+            # Staggered rows are shifted by half a spacing
+            for j in range(count):
+                centers[idx] = [r + s / 2.0 + j * s, y]
+                idx += 1
+=======
+    row_counts = [5, 4, 5, 4, 5, 3]
+    n_rows = len(row_counts)
+    idx = 0
+    for row, count in enumerate(row_counts):
+        y = r + row * h
+        if row % 2 == 0:
+            # Unstaggered rows touch both side walls
+            for j in range(count):
+                centers[idx] = [r + j * s, y]
+                idx += 1
+        else:
+            # Staggered rows are shifted by half a spacing
+            for j in range(count):
+                centers[idx] = [r + s / 2.0 + j * s, y]
+                idx += 1
+
+    # Corner-aware adjustment: pull the four extreme circles diagonally
+    # into the square's corners so each touches two walls, letting the
+    # LP give them larger radii (corners have three-sided slack).
+    corner_pull = 0.25 * r
+    # Top-left circle of first row
+    centers[0] = [r - corner_pull, r - corner_pull]
+    # Top-right circle of first row
+    centers[4] = [1.0 - r + corner_pull, r - corner_pull]
+    # Bottom row: squeeze its 3 circles toward the bottom wall and corners
+    base = idx - 3
+    centers[base] = [r - corner_pull, 1.0 - r + corner_pull]
+    centers[base + 2] = [1.0 - r + corner_pull, 1.0 - r + corner_pull]
+    centers[base + 1] = [0.5, 1.0 - r + corner_pull]
+    centers = np.clip(centers, 0.001, 0.999)
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    # ---- Stage 2: hill-climb over center positions, re-solving the LP ----
+    rng = np.random.default_rng(12345)
+    n_iters = 400
+    for it in range(n_iters):
+        frac = 1.0 - it / n_iters
+        sigma = 0.01 + 0.04 * frac
+
+        cand = best_centers.copy()
+
+        # Directed move: push circles that are wall-limited away from walls
+        for i in range(n):
+            x, y = cand[i]
+            r = best_radii[i]
+            if r >= x - 1e-7:
+                cand[i, 0] += 0.5 * sigma
+            if r >= y - 1e-7:
+                cand[i, 1] += 0.5 * sigma
+            if r >= 1.0 - x - 1e-7:
+                cand[i, 0] -= 0.5 * sigma
+            if r >= 1.0 - y - 1e-7:
+                cand[i, 1] -= 0.5 * sigma
+
+        # Random jitter, larger for small circles (they have more freedom)
+        jitter = sigma * (0.3 + 0.7 * (1.0 - best_radii / (best_radii.max() + 1e-12)))
+        cand += rng.normal(0.0, 1.0, cand.shape) * jitter[:, None]
+
+        cand = np.clip(cand, 0.001, 0.999)
+
+        result = solve_radii_lp(cand)
+        if result is None:
+            continue
+        if np.sum(result) > best_sum:
+            best_sum = np.sum(result)
+            best_centers = cand.copy()
+            best_radii = result.copy()
+=======
+    # ---- Stage 2: multi-start hill-climb over center positions ----
+    # Try several perturbed initial layouts (different staggers and corner
+    # offsets), hill-climb each, and keep the global best.
+    rng = np.random.default_rng(12345)
+    n_iters = 300
+    n_restarts = 4
+
+    global_best_centers = best_centers.copy()
+    global_best_radii = best_radii.copy()
+    global_best_sum = best_sum
+
+    for restart in range(n_restarts):
+        if restart == 0:
+            cur_centers = best_centers.copy()
+            cur_radii = best_radii.copy()
+            cur_sum = best_sum
+        else:
+            # Perturbed start: jitter the base layout with a restart-specific
+            # magnitude, plus alternate the stagger of odd rows.
+            cur_centers = best_centers.copy()
+            if restart % 2 == 1:
+                # Shift staggered-row circles by an extra half spacing
+                # (swap which rows are staggered)
+                for row, count in enumerate(row_counts):
+                    lo = sum(row_counts[:row])
+                    if row % 2 == 1:
+                        cur_centers[lo:lo + count, 0] += s / 2.0
+                    elif count == 5:
+                        cur_centers[lo:lo + count, 0] -= s / 4.0
+            cur_centers += rng.normal(0.0, 0.02 * restart, cur_centers.shape)
+            cur_centers = np.clip(cur_centers, 0.001, 0.999)
+            result = solve_radii_lp(cur_centers)
+            if result is None:
+                continue
+            cur_radii = result
+            cur_sum = np.sum(cur_radii)
+
+        for it in range(n_iters):
+            frac = 1.0 - it / n_iters
+            sigma = 0.005 + 0.035 * frac
+
+            cand = cur_centers.copy()
+
+            # Directed move: push circles that are wall-limited away from walls
+            for i in range(n):
+                x, y = cand[i]
+                ri = cur_radii[i]
+                if ri >= x - 1e-7:
+                    cand[i, 0] += 0.5 * sigma
+                if ri >= y - 1e-7:
+                    cand[i, 1] += 0.5 * sigma
+                if ri >= 1.0 - x - 1e-7:
+                    cand[i, 0] -= 0.5 * sigma
+                if ri >= 1.0 - y - 1e-7:
+                    cand[i, 1] -= 0.5 * sigma
+
+            # Random jitter, larger for small circles (they have more freedom)
+            jitter = sigma * (0.3 + 0.7 * (1.0 - cur_radii / (cur_radii.max() + 1e-12)))
+            cand += rng.normal(0.0, 1.0, cand.shape) * jitter[:, None]
+
+            cand = np.clip(cand, 0.001, 0.999)
+
+            result = solve_radii_lp(cand)
+            if result is None:
+                continue
+            if np.sum(result) > cur_sum:
+                cur_sum = np.sum(result)
+                cur_centers = cand.copy()
+                cur_radii = result.copy()
+
+        if cur_sum > global_best_sum:
+            global_best_sum = cur_sum
+            global_best_centers = cur_centers.copy()
+            global_best_radii = cur_radii.copy()
+
+    best_sum = global_best_sum
+    best_centers = global_best_centers
+    best_radii = global_best_radii
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,266 @@
+# EVOLVE-BLOCK-START
+#include <bits/stdc++.h>
+using namespace std;
+
+static constexpr int MAXN = 10;
+static constexpr int MAXV = 100;
+
+int N, T;
+int dr[4] = {-1, 1, 0, 0};
+int dc[4] = {0, 0, -1, 1};
+char mch[4] = {'U', 'D', 'L', 'R'};
+
+struct Eval {
+    int tree_size;
+    int components;
+    int matched_edges;
+    int largest_component;
+
+    long long value() const {
+        // The official target dominates. The other values make the landscape
+        // less flat before a large acyclic component is completed.
+        return 1000000LL * tree_size
+             + 1800LL * largest_component
+             + 300LL * matched_edges
+             - 14000LL * components;
+    }
+};
+
+struct Board {
+    array<unsigned char, MAXV> a{};
+    int empty = 0;
+
+    bool move(int d) {
+        int r = empty / N, c = empty % N;
+        int nr = r + dr[d], nc = c + dc[d];
+        if (nr < 0 || nr >= N || nc < 0 || nc >= N) return false;
+        int q = nr * N + nc;
+        swap(a[empty], a[q]);
+        empty = q;
+        return true;
+    }
+
+    void undo(int d) {
+        move(d ^ 1);
+    }
+
+    uint64_t hash() const {
+        // A compact deterministic state fingerprint. Tile shapes may repeat,
+        // which is fine: equal layouts necessarily have equal fingerprints.
+        uint64_t h = 1469598103934665603ULL;
+        int m = N * N;
+        for (int i = 0; i < m; ++i) {
+            h ^= uint64_t(a[i] + 17 * i + 1);
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+};
+
+Eval evaluate(const Board& b) {
+    int m = N * N;
+    int par[MAXV], sz[MAXV], ed[MAXV];
+
+    for (int i = 0; i < m; ++i) {
+        par[i] = i;
+        sz[i] = (b.a[i] != 0);
+        ed[i] = 0;
+    }
+
+    auto find_root = [&](int x) {
+        int y = x;
+        while (par[y] != y) y = par[y];
+        while (par[x] != x) {
+            int nx = par[x];
+            par[x] = y;
+            x = nx;
+        }
+        return y;
+    };
+
+    auto add_edge = [&](int x, int y) {
+        int rx = find_root(x);
+        int ry = find_root(y);
+        if (rx == ry) {
+            ++ed[rx];
+            return;
+        }
+        if (sz[rx] < sz[ry]) swap(rx, ry);
+        par[ry] = rx;
+        sz[rx] += sz[ry];
+        ed[rx] += ed[ry] + 1;
+    };
+
+    int matched = 0;
+    for (int r = 0; r < N; ++r) {
+        for (int c = 0; c < N; ++c) {
+            int p = r * N + c;
+            int x = b.a[p];
+            if (x == 0) continue;
+
+            if (c + 1 < N) {
+                int y = b.a[p + 1];
+                if (y && (x & 4) && (y & 1)) {
+                    add_edge(p, p + 1);
+                    ++matched;
+                }
+            }
+            if (r + 1 < N) {
+                int y = b.a[p + N];
+                if (y && (x & 8) && (y & 2)) {
+                    add_edge(p, p + N);
+                    ++matched;
+                }
+            }
+        }
+    }
+
+    Eval ret{0, 0, matched, 0};
+    for (int i = 0; i < m; ++i) {
+        if (par[i] == i && sz[i] > 0) {
+            ++ret.components;
+            ret.largest_component = max(ret.largest_component, sz[i]);
+            if (ed[i] == sz[i] - 1) ret.tree_size = max(ret.tree_size, sz[i]);
+        }
+    }
+    return ret;
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    cin >> N >> T;
+    Board cur;
+    for (int r = 0; r < N; ++r) {
+        string s;
+        cin >> s;
+        for (int c = 0; c < N; ++c) {
+            char z = s[c];
+            int v = (z <= '9' ? z - '0' : z - 'a' + 10);
+            cur.a[r * N + c] = (unsigned char)v;
+            if (v == 0) cur.empty = r * N + c;
+        }
+    }
+
+    mt19937 rng((unsigned)chrono::steady_clock::now().time_since_epoch().count());
+
+    Eval now = evaluate(cur);
+    Eval best_eval = now;
+    string path, best_path;
+
+    // Recent-state tabu storage avoids wasting most moves in 2/4-cycle loops.
+    static constexpr int TABU_CAP = 4096;
+    unordered_set<uint64_t> tabu;
+    deque<uint64_t> tabu_queue;
+    tabu.reserve(TABU_CAP * 2);
+    auto add_tabu = [&](uint64_t h) {
+        tabu.insert(h);
+        tabu_queue.push_back(h);
+        if ((int)tabu_queue.size() > TABU_CAP) {
+            uint64_t old = tabu_queue.front();
+            tabu_queue.pop_front();
+            tabu.erase(old);
+        }
+    };
+    add_tabu(cur.hash());
+
+    int previous = -1;
+    int last_improvement = 0;
+
+    for (int step = 0; step < T; ++step) {
+        struct Candidate {
+            int d;
+            Eval e;
+            long long val;
+            bool tabu;
+        };
+        vector<Candidate> cand;
+
+        for (int d = 0; d < 4; ++d) {
+            // Reversal remains possible, but is discouraged unless necessary.
+            if (previous != -1 && d == (previous ^ 1) &&
+                uniform_int_distribution<int>(0, 99)(rng) < 75) {
+                continue;
+            }
+            if (!cur.move(d)) continue;
+            Eval e = evaluate(cur);
+            uint64_t h = cur.hash();
+            bool is_tabu = tabu.find(h) != tabu.end();
+            cur.undo(d);
+            cand.push_back({d, e, e.value(), is_tabu});
+        }
+
+        // A boundary position can occasionally leave only a forbidden reversal.
+        if (cand.empty()) {
+            for (int d = 0; d < 4; ++d) {
+                if (!cur.move(d)) continue;
+                Eval e = evaluate(cur);
+                uint64_t h = cur.hash();
+                cur.undo(d);
+                cand.push_back({d, e, e.value(), tabu.count(h) != 0});
+            }
+        }
+        if (cand.empty()) break;
+
+        long long bestv = cand[0].val;
+        for (const auto& x : cand) bestv = max(bestv, x.val);
+
+        // Sawtooth cooling plus reheating after prolonged stagnation.
+        double progress = double(step) / max(1, T - 1);
+        double temperature = 24000.0 * (1.0 - progress) + 1200.0;
+        if (step - last_improvement > N * N * 2) temperature *= 4.0;
+        if ((step / max(1, N * N * 3)) & 1) temperature *= 1.35;
+
+        vector<double> weight(cand.size());
+        double sum = 0.0;
+        for (int i = 0; i < (int)cand.size(); ++i) {
+            long long delta = cand[i].val - bestv;
+            double w = exp(max(-30.0, double(delta) / temperature));
+            if (cand[i].tabu) w *= 0.035;
+            // Give immediate official-tree improvement extra priority.
+            if (cand[i].e.tree_size > now.tree_size) w *= 10.0;
+            weight[i] = w;
+            sum += w;
+        }
+
+        double pick = uniform_real_distribution<double>(0.0, sum)(rng);
+        int chosen = 0;
+        for (int i = 0; i < (int)cand.size(); ++i) {
+            pick -= weight[i];
+            if (pick <= 0.0) {
+                chosen = i;
+                break;
+            }
+        }
+
+        int d = cand[chosen].d;
+        cur.move(d);
+        previous = d;
+        path.push_back(mch[d]);
+        now = cand[chosen].e;
+        add_tabu(cur.hash());
+
+        bool improve = false;
+        int all_tiles = N * N - 1;
+        if (now.tree_size == all_tiles) {
+            if (best_eval.tree_size != all_tiles || path.size() < best_path.size()) improve = true;
+        } else if (best_eval.tree_size != all_tiles && now.tree_size > best_eval.tree_size) {
+            improve = true;
+        }
+
+        if (improve) {
+            best_eval = now;
+            best_path = path;
+            last_improvement = step;
+        }
+
+        // Once a complete tree is found, its score strictly prefers fewer moves.
+        // Continuing cannot improve this prefix.
+        if (best_eval.tree_size == all_tiles) break;
+    }
+
+    cout << best_path << '\n';
+    return 0;
+}
+# EVOLVE-BLOCK-END

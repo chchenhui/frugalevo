@@ -1,0 +1,149 @@
+<NAME>
+seeded_shared_tree
+</NAME>
+
+<DESCRIPTION>
+Replace independent shortest-path copies with a seeded directed multicast-tree search. Each candidate grows a broadcast tree using marginal edge costs: edges already selected for the tree are treated as zero additional transfer cost, allowing later receivers to reuse common trunks. Several initial destination seeds are evaluated because multicast-tree quality depends on early branching decisions. The selected candidate is compared against the independent-shortest-path baseline by unique edge cost, retaining the baseline when sharing is not beneficial.
+
+The implementation also filters invalid or negative prices and gracefully leaves unreachable destinations empty instead of failing the entire search.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    for dst in dsts:
+        path = nx.dijkstra_path(h, src, dst, weight="cost")
+        for i in range(0, len(path) - 1):
+            s, t = path[i], path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Find a low-cost directed multicast topology.  A selected edge is paid for
+    once by the broadcast tree, so later destinations preferentially attach
+    through already-selected trunks rather than independently copying data from
+    the source.
+    """
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    if src not in G:
+        return bc_topology
+
+    h = nx.DiGraph()
+    for u, v, data in G.edges(data=True):
+        if u == v or v == src:
+            continue
+        try:
+            cost = float(data.get("cost"))
+        except (TypeError, ValueError):
+            continue
+        if not cost >= 0 or cost == float("inf"):
+            continue
+        h.add_edge(u, v, **dict(data), cost=cost)
+
+    if src not in h:
+        return bc_topology
+
+    def path_cost(path):
+        return sum(h[u][v]["cost"] for u, v in zip(path, path[1:]))
+
+    def union_cost(routes):
+        edges = {
+            (u, v)
+            for path in routes.values()
+            for u, v in zip(path, path[1:])
+        }
+        return sum(h[u][v]["cost"] for u, v in edges)
+
+    def shortest(dst, tree_edges=None):
+        if tree_edges is None:
+            weight = "cost"
+        else:
+            def weight(u, v, data):
+                return 0.0 if (u, v) in tree_edges else data["cost"]
+        try:
+            return nx.dijkstra_path(h, src, dst, weight=weight)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return None
+
+    baseline = {dst: shortest(dst) for dst in dsts}
+    reachable = [dst for dst, path in baseline.items() if path is not None]
+    if not reachable:
+        return bc_topology
+
+    selected = {dst: baseline[dst] for dst in reachable}
+    selected_cost = union_cost(selected)
+
+    # Different first branches can produce substantially different multicast
+    # trees.  Trying a bounded set preserves scalability on larger topologies.
+    ordered = sorted(reachable, key=lambda dst: (path_cost(baseline[dst]), str(dst)))
+    seeds = [None] + ordered[:8] + list(reversed(ordered[-8:]))
+
+    for seed in seeds:
+        remaining = set(reachable)
+        routes = {}
+        tree_edges = set()
+
+        if seed in remaining:
+            first_path = baseline[seed]
+            routes[seed] = first_path
+            tree_edges.update(zip(first_path, first_path[1:]))
+            remaining.remove(seed)
+
+        while remaining:
+            best_dst = None
+            best_path = None
+            best_incremental = float("inf")
+
+            for dst in remaining:
+                path = shortest(dst, tree_edges)
+                if path is None:
+                    continue
+                incremental = sum(
+                    h[u][v]["cost"]
+                    for u, v in zip(path, path[1:])
+                    if (u, v) not in tree_edges
+                )
+                if (
+                    incremental < best_incremental
+                    or (
+                        incremental == best_incremental
+                        and (best_dst is None or str(dst) < str(best_dst))
+                    )
+                ):
+                    best_dst, best_path, best_incremental = dst, path, incremental
+
+            if best_dst is None:
+                break
+
+            routes[best_dst] = best_path
+            tree_edges.update(zip(best_path, best_path[1:]))
+            remaining.remove(best_dst)
+
+        if len(routes) == len(reachable):
+            candidate_cost = union_cost(routes)
+            if candidate_cost < selected_cost:
+                selected = routes
+                selected_cost = candidate_cost
+
+    for dst in dsts:
+        path = selected.get(dst)
+        edge_records = (
+            [[u, v, dict(G[u][v])] for u, v in zip(path, path[1:])]
+            if path is not None
+            else []
+        )
+        for partition in range(num_partitions):
+            bc_topology.set_dst_partition_paths(
+                dst, partition, list(edge_records)
+            )
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

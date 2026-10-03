@@ -1,0 +1,122 @@
+<NAME>
+proportional_replication_with_sorted_placement
+</NAME>
+<DESCRIPTION>
+Replace the greedy "replicate the currently-heaviest-per-replica expert" loop in `replicate_experts` with a proportional largest-remainder allocation of the redundant expert slots. This spreads replicas across experts according to their relative load (instead of stacking replicas on the single hottest expert repeatedly), which directly reduces the variance of per-replica loads and hence improves expert-level balancedness. Additionally, the physical replicas are emitted in descending per-replica-load order, which makes the subsequent LPT-style `balanced_packing` (Step 3 in the hierarchical rebalancer) pack the heaviest replicas first — improving GPU-level balancedness too. The loop count drops from `num_redundant` full-tensor argmax passes to a single top-k pass plus a small per-row Python loop, so it is also faster.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def replicate_experts(
+        weight: torch.Tensor,
+        num_phy: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Replicate `num_log` experts to `num_phy` replicas, such that the maximum
+    load of all replicas is minimized.
+
+    Parameters:
+        weight: [X, num_log]
+        num_phy: total number of experts after replication
+
+    Returns:
+        phy2log: [X, num_phy], logical expert id of each physical expert
+        rank: [X, num_phy], the replica rank
+        logcnt: [X, num_log], number of replicas for each logical expert
+    """
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+=======
+def replicate_experts(
+        weight: torch.Tensor,
+        num_phy: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Replicate `num_log` experts to `num_phy` replicas, such that the maximum
+    load of all replicas is minimized.
+
+    Parameters:
+        weight: [X, num_log]
+        num_phy: total number of experts after replication
+
+    Returns:
+        phy2log: [X, num_phy], logical expert id of each physical expert
+        rank: [X, num_phy], the replica rank
+        logcnt: [X, num_log], number of replicas for each logical expert
+    """
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+
+    if num_redundant > 0:
+        # Proportional largest-remainder allocation of redundant slots:
+        # every expert keeps one replica, the extra replicas are handed out
+        # proportionally to each expert's load. This avoids stacking all
+        # replicas on a single hot expert and lowers per-replica load spread.
+        total = weight.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        quota = weight / total * num_redundant
+        base = quota.floor().to(torch.int64)
+        # safety: never hand out more floor copies than available slots
+        base = torch.minimum(base,
+                             torch.full_like(base, num_redundant))
+        frac = quota - base
+        rem = num_redundant - base.sum(dim=-1)
+        k = min(num_redundant, num_log)
+        topk_idx = frac.topk(k, dim=-1).indices
+        base_flat = base.flatten()
+        topk_flat = topk_idx.flatten()
+        topk_vals = frac.take_along_dim(
+            topk_idx, dim=-1).flatten() * 0  # placeholder to build increments
+        # add fractional remainders to the experts with largest fractions
+        inc = torch.zeros_like(base_flat)
+        rows = torch.arange(n, device=device).repeat_interleave(k)
+        # stable order: assign remaining slots per row
+        rem_list = rem.tolist()
+        for r in range(n):
+            need = int(rem_list[r])
+            if need > 0:
+                inc[r * num_log:(r + 1) * num_log].scatter_add_(
+                    0, topk_idx[r, :need],
+                    torch.ones(need, dtype=inc.dtype, device=device))
+        logcnt += inc.view(n, num_log)
+
+    # Emit physical replicas ordered by descending per-replica load
+    # (weight / count), so the downstream LPT packing places the heaviest
+    # replicas first and both expert- and GPU-level balance improve.
+    per_replica_load = weight / logcnt.clamp(min=1)
+    order = per_replica_load.sort(dim=-1, descending=True).indices
+    counts_sorted = logcnt.gather(-1, order)
+    order_list = order.tolist()
+    counts_list = counts_sorted.tolist()
+    num_replicas_list = []
+    for r in range(n):
+        row = order_list[r]
+        cs = counts_list[r]
+        out = []
+        rk = []
+        for e, c in zip(row, cs):
+            for j in range(int(c)):
+                out.append(e)
+                rk.append(j)
+        num_replicas_list.append((out, rk))
+    for r in range(n):
+        out, rk = num_replicas_list[r]
+        phy2log[r] = torch.tensor(out, dtype=torch.int64, device=device)
+        rank[r] = torch.tensor(rk, dtype=torch.int64, device=device)
+    return phy2log, rank, logcnt
+>>>>>>> REPLACE
+</DIFF>

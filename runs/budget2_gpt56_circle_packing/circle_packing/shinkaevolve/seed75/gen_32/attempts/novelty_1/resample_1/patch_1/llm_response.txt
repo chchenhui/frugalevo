@@ -1,0 +1,284 @@
+<NAME>
+multistart_hex_polish
+</NAME>
+
+<DESCRIPTION>
+This version uses a broader family of layered and staggered hexagonal seeds, vectorized squared-distance constraints with analytic Jacobians, and a two-stage refinement strategy. First-stage SLSQP runs discover promising contact graphs. Their center locations are then re-evaluated with a linear program for the best radii at fixed centers, ranked using both objective value and active-contact signatures, and the most structurally distinct candidates receive a final nonlinear polish. A final global safety scaling guarantees strict containment and non-overlap despite numerical tolerances.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+"""Constructor-based circle packing for n=26 circles"""
+import numpy as np
+
+
+def construct_packing():
+    """
+    Multi-start unequal-radius packing constructor for 26 circles.
+
+    Dense row-based hexagonal scaffolds provide good initial contact graphs.
+    A first nonlinear stage discovers useful asymmetric configurations; fixed
+    center LP radii and contact signatures select diverse candidates for a
+    second nonlinear polish.
+    """
+    from scipy.optimize import minimize, linprog
+
+    n = 26
+    ii, jj = np.triu_indices(n, 1)
+    npairs = len(ii)
+    nv = 3 * n
+
+    def unpack(z):
+        return z[:2 * n].reshape(n, 2), z[2 * n:]
+
+    def objective(z):
+        return -float(np.sum(z[2 * n:]))
+
+    def objective_jac(z):
+        return np.r_[np.zeros(2 * n), -np.ones(n)]
+
+    def constraints(z):
+        c, r = unpack(z)
+        d = c[ii] - c[jj]
+        pair = np.einsum("ij,ij->i", d, d) - (r[ii] + r[jj]) ** 2
+        walls = np.concatenate((
+            c[:, 0] - r, 1.0 - c[:, 0] - r,
+            c[:, 1] - r, 1.0 - c[:, 1] - r
+        ))
+        return np.concatenate((pair, walls))
+
+    def constraint_jacobian(z):
+        c, r = unpack(z)
+        jac = np.zeros((npairs + 4 * n, nv))
+        rows = np.arange(npairs)
+        dx = c[ii, 0] - c[jj, 0]
+        dy = c[ii, 1] - c[jj, 1]
+        sr = r[ii] + r[jj]
+
+        jac[rows, 2 * ii] = 2.0 * dx
+        jac[rows, 2 * ii + 1] = 2.0 * dy
+        jac[rows, 2 * jj] = -2.0 * dx
+        jac[rows, 2 * jj + 1] = -2.0 * dy
+        jac[rows, 2 * n + ii] = -2.0 * sr
+        jac[rows, 2 * n + jj] = -2.0 * sr
+
+        k = np.arange(n)
+        b = npairs
+        jac[b + k, 2 * k] = 1.0
+        jac[b + k, 2 * n + k] = -1.0
+        jac[b + n + k, 2 * k] = -1.0
+        jac[b + n + k, 2 * n + k] = -1.0
+        jac[b + 2 * n + k, 2 * k + 1] = 1.0
+        jac[b + 2 * n + k, 2 * n + k] = -1.0
+        jac[b + 3 * n + k, 2 * k + 1] = -1.0
+        jac[b + 3 * n + k, 2 * n + k] = -1.0
+        return jac
+
+    def safe_scale(c, r):
+        """Return radii with a small strict feasibility margin."""
+        r = np.maximum(np.asarray(r, dtype=float), 1e-9)
+        factors = [
+            np.min(c[:, 0] / r), np.min((1.0 - c[:, 0]) / r),
+            np.min(c[:, 1] / r), np.min((1.0 - c[:, 1]) / r)
+        ]
+        dist = np.sqrt(np.sum((c[ii] - c[jj]) ** 2, axis=1))
+        factors.append(np.min(dist / (r[ii] + r[jj])))
+        return r * min(1.0, 0.999999999 * min(factors))
+
+    def lp_radii(c):
+        """Optimal radii for fixed centers, used as a robust certification."""
+        dist = np.sqrt(np.sum((c[ii] - c[jj]) ** 2, axis=1))
+        a = np.zeros((npairs, n))
+        rows = np.arange(npairs)
+        a[rows, ii] = 1.0
+        a[rows, jj] = 1.0
+        wall = np.minimum.reduce((
+            c[:, 0], c[:, 1], 1.0 - c[:, 0], 1.0 - c[:, 1]
+        ))
+        ans = linprog(
+            -np.ones(n), A_ub=a, b_ub=dist,
+            bounds=[(1e-7, max(1e-7, float(w))) for w in wall],
+            method="highs"
+        )
+        if ans.success:
+            return safe_scale(c, ans.x)
+        return np.full(n, 1e-5)
+
+    def layered_seed(counts, phase):
+        """Boundary-aware staggered row seed with a movable row defect."""
+        pts = []
+        rows = len(counts)
+        for row, count in enumerate(counts):
+            y = 0.082 + 0.836 * row / max(1, rows - 1)
+            inset = 0.075 if count >= 6 else (0.105 if count == 5 else 0.16)
+            xs = np.linspace(inset, 1.0 - inset, count)
+            stagger = 0.009 * ((row & 1) * 2 - 1)
+            for col, x in enumerate(xs):
+                pts.append((
+                    np.clip(x + stagger + 0.005 * np.sin(
+                        1.91 * (row + 1) * (col + 1) + phase), .025, .975),
+                    np.clip(y + 0.005 * np.cos(
+                        1.37 * (row + 2) * (col + 1) + phase), .025, .975)
+                ))
+        return np.asarray(pts, dtype=float)
+
+    # Explicit near-triangular packing, supplemented with defect placements.
+    rhex = 0.099999
+    dy = np.sqrt(3.0) * rhex
+    hex_points = []
+    for row, count in enumerate((5, 6, 5, 6, 4)):
+        y = rhex + row * dy
+        xs = (np.linspace(rhex, 1.0 - rhex, count) if count == 6
+              else np.linspace(2.0 * rhex, 1.0 - 2.0 * rhex, count))
+        hex_points.extend((x, y) for x in xs)
+    hex_points = np.asarray(hex_points)
+
+    templates = (
+        (5, 6, 5, 6, 4), (4, 6, 5, 6, 5), (5, 5, 6, 5, 5),
+        (5, 6, 5, 5, 5), (5, 5, 5, 6, 5), (6, 5, 5, 5, 5),
+        (5, 4, 6, 5, 6), (6, 5, 4, 6, 5), (5, 6, 4, 5, 6),
+    )
+    rng = np.random.default_rng(260319)
+    starts = [hex_points]
+    starts.extend(layered_seed(t, 0.47 * k) for k, t in enumerate(templates))
+    starts.append(np.clip(hex_points + rng.normal(0.0, 0.003, hex_points.shape),
+                          0.02, 0.98))
+
+    bounds = [(0.00001, 0.99999)] * (2 * n) + [(1e-7, 0.49)] * n
+    candidates = []
+
+    for c0 in starts:
+        z0 = np.r_[c0.ravel(), np.full(n, 0.002)]
+        result = minimize(
+            objective, z0, jac=objective_jac, method="SLSQP",
+            bounds=bounds,
+            constraints={"type": "ineq", "fun": constraints,
+                         "jac": constraint_jacobian},
+            options={"maxiter": 900, "ftol": 2e-11, "disp": False}
+        )
+        c, _ = unpack(result.x)
+        r = lp_radii(c)
+        slack = constraints(np.r_[c.ravel(), r])
+        active = tuple(np.flatnonzero(slack < 2.5e-4).tolist())
+        candidates.append((float(np.sum(r)), active, c, r))
+
+    # Keep high-scoring candidates, but do not spend all polish runs on the
+    # same contact graph.
+    candidates.sort(key=lambda q: q[0], reverse=True)
+    selected = []
+    seen = set()
+    for item in candidates:
+        signature = item[1]
+        if signature not in seen or len(selected) < 2:
+            selected.append(item)
+            seen.add(signature)
+        if len(selected) >= 6:
+            break
+
+    best_c, best_r = candidates[0][2], candidates[0][3]
+    best_value = float(np.sum(best_r))
+
+    for _, _, c0, r0 in selected:
+        z0 = np.r_[c0.ravel(), r0]
+        result = minimize(
+            objective, z0, jac=objective_jac, method="SLSQP",
+            bounds=bounds,
+            constraints={"type": "ineq", "fun": constraints,
+                         "jac": constraint_jacobian},
+            options={"maxiter": 1300, "ftol": 5e-12, "disp": False}
+        )
+        c, r = unpack(result.x)
+        r = safe_scale(c, r)
+        value = float(np.sum(r))
+        if value > best_value:
+            best_c, best_r, best_value = c, r, value
+
+    return best_c, best_r, best_value
+
+
+def compute_max_radii(centers):
+    """
+    Compute the maximum possible radii for each circle position
+    such that they don't overlap and stay within the unit square.
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+
+    Returns:
+        np.array of shape (n) with radius of each circle
+    """
+    n = centers.shape[0]
+    radii = np.ones(n)
+
+    # First, limit by distance to square borders
+    for i in range(n):
+        x, y = centers[i]
+        # Distance to borders
+        radii[i] = min(x, y, 1 - x, 1 - y)
+
+    # Then, limit by distance to other circles
+    # Each pair of circles with centers at distance d can have
+    # sum of radii at most d to avoid overlap
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+
+            # If current radii would cause overlap
+            if radii[i] + radii[j] > dist:
+                # Scale both radii proportionally
+                scale = dist / (radii[i] + radii[j])
+                radii[i] *= scale
+                radii[j] *= scale
+
+    return radii
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_packing():
+    """Run the circle packing constructor for n=26"""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    """
+    Visualize the circle packing
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # Draw unit square
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+
+    # Draw circles
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        circle = Circle(center, radius, alpha=0.5)
+        ax.add_patch(circle)
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    # AlphaEvolve improved this to 2.635
+
+    # Uncomment to visualize:
+    visualize(centers, radii)
+``` 
+</CODE>

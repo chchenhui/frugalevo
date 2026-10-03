@@ -1,0 +1,210 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+N = 13
+TRIPLES = np.array(list(combinations(range(N), 3)), dtype=int)
+
+
+def _areas(points: np.ndarray) -> np.ndarray:
+    p = points[TRIPLES[:, 0]]
+    q = points[TRIPLES[:, 1]]
+    r = points[TRIPLES[:, 2]]
+    return 0.5 * np.abs(
+        (q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1])
+        - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0])
+    )
+
+
+def _softmin(areas: np.ndarray, T: float) -> float:
+    """Smooth minimum of areas via LogSumExp (well-conditioned formulation)."""
+    a = areas / T
+    m = a.min()
+    return float(T * (m + np.log(np.mean(np.exp(a - m)))))
+
+
+def _hull_area(points: np.ndarray) -> float:
+    pts = points[np.lexsort((points[:, 1], points[:, 0]))]
+    if len(pts) <= 2:
+        return 0.0
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = np.array(lower[:-1] + upper[:-1])
+    x, y = hull[:, 0], hull[:, 1]
+    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def _compass_search(flat_pts, T, step0, min_step, max_evals):
+    """Deterministic coordinate-wise compass search on the soft-min surrogate."""
+    x = flat_pts.copy()
+    d = x.size
+    best = _softmin(_areas(x.reshape(N, 2)), T)
+    step = step0
+    evals = 0
+    while step >= min_step and evals < max_evals:
+        improved = False
+        for i in range(d):
+            for sgn in (+1.0, -1.0):
+                x2 = x.copy()
+                x2[i] += sgn * step
+                val = _softmin(_areas(x2.reshape(N, 2)), T)
+                evals += 1
+                if val > best:
+                    best = val
+                    x = x2
+                    improved = True
+                if evals >= max_evals:
+                    break
+            if evals >= max_evals:
+                break
+        if not improved:
+            step *= 0.5
+    return x
+
+
+def _polish(pts, max_iters):
+    """Strict greedy polish: only accept moves raising the true minimum area.
+    Moves push a vertex of a currently-minimal triangle away from the opposite edge."""
+    pts = pts.copy()
+    a = _areas(pts)
+    cur = float(a.min())
+    step = 0.008
+    order = np.argsort(a)
+    cand = TRIPLES[order[:8]]
+    it = 0
+    while step > 2e-4 and it < max_iters:
+        moved = False
+        for t in cand:
+            for i in t:
+                j, k2 = [int(x) for x in t if x != i]
+                d = pts[k2] - pts[j]
+                nrm = np.hypot(d[0], d[1]) + 1e-12
+                nd = np.array([-d[1], d[0]]) / nrm
+                side = d[0] * (pts[i, 1] - pts[j, 1]) - d[1] * (pts[i, 0] - pts[j, 0])
+                if side < 0:
+                    nd = -nd
+                old = pts[i].copy()
+                pts[i] = old + step * nd
+                m2 = float(_areas(pts).min())
+                if m2 > cur:
+                    cur = m2
+                    moved = True
+                else:
+                    pts[i] = old
+        it += 1
+        if not moved:
+            step *= 0.6
+        a = _areas(pts)
+        order = np.argsort(a)
+        cand = TRIPLES[order[:8]]
+    return pts, cur
+
+
+def _init_ring(alt: bool) -> np.ndarray:
+    ang = np.arange(12) * (2.0 * np.pi / 12.0)
+    rad = np.where(np.arange(12) % 2 == 0, 1.0, 0.72) if alt else np.ones(12)
+    pts = np.zeros((N, 2))
+    pts[:12, 0] = rad * np.cos(ang)
+    pts[:12, 1] = rad * np.sin(ang)
+    return pts
+
+
+def _init_triangle(scale_mid: float) -> np.ndarray:
+    pts = np.zeros((N, 2))
+    a0 = np.pi / 2.0
+    for i in range(3):
+        a = a0 + i * 2.0 * np.pi / 3.0
+        pts[i] = (1.05 * np.cos(a), 1.05 * np.sin(a))
+    for i in range(6):
+        a = a0 + np.pi / 6.0 + i * np.pi / 3.0
+        pts[3 + i] = (scale_mid * np.cos(a), scale_mid * np.sin(a))
+    for i in range(3):
+        a = a0 + i * 2.0 * np.pi / 3.0
+        pts[9 + i] = (0.30 * np.cos(a), 0.30 * np.sin(a))
+    return pts
+
+
+def _init_hexish(r_in: float) -> np.ndarray:
+    pts = np.zeros((N, 2))
+    a0 = np.pi / 6.0
+    for i in range(6):
+        a = a0 + i * np.pi / 3.0
+        pts[i] = (np.cos(a), np.sin(a))
+    for i in range(6):
+        a = a0 + np.pi / 6.0 + i * np.pi / 3.0
+        pts[6 + i] = (r_in * np.cos(a), r_in * np.sin(a))
+    pts[12] = (0.0, 0.0)
+    return pts
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct an arrangement of n points on or inside a convex region in order to maximize the area of the
+    smallest triangle formed by these points. Here n = 13.
+
+    Returns:
+        points: np.ndarray of shape (13,2) with the x,y coordinates of the points.
+    """
+    inits = [
+        _init_ring(False),
+        _init_ring(True),
+        _init_triangle(0.62),
+        _init_triangle(0.55),
+        _init_hexish(0.58),
+        _init_hexish(0.66),
+    ]
+
+    global_best = None
+    global_min = -1.0
+
+    for init in inits:
+        flat = init.reshape(-1).copy()
+        # temperature continuation: smooth surrogate sharpening toward true min
+        for T, step0, evals in [(0.05, 0.05, 6000),
+                                 (0.02, 0.02, 6000),
+                                 (0.008, 0.01, 6000),
+                                 (0.003, 0.005, 5000),
+                                 (0.001, 0.002, 4000)]:
+            flat = _compass_search(flat, T, step0, 1e-4, evals)
+        pts = flat.reshape(N, 2)
+        pts, m = _polish(pts, max_iters=60)
+        if m > global_min:
+            global_min = m
+            global_best = pts
+
+    # second continuation pass from the global best (deterministic re-refinement)
+    flat = global_best.reshape(-1).copy()
+    for T, step0, evals in [(0.008, 0.01, 5000),
+                             (0.002, 0.003, 5000),
+                             (0.0005, 0.001, 4000)]:
+        flat = _compass_search(flat, T, step0, 5e-5, evals)
+    pts = flat.reshape(N, 2)
+    pts, m = _polish(pts, max_iters=40)
+    if m > global_min:
+        global_min = m
+        global_best = pts
+
+    best_pts = global_best
+
+    # rescale so the convex hull has unit area (problem is scale-invariant)
+    hull = _hull_area(best_pts)
+    if hull > 1e-12:
+        s = 1.0 / np.sqrt(hull)
+        best_pts = (best_pts - best_pts.mean(axis=0)) * s + best_pts.mean(axis=0)
+
+    return best_pts
+
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,186 @@
+<NAME>
+exact_steiner_broadcast
+</NAME>
+
+<DESCRIPTION>
+Replace the nearest-reached-node greedy attachment with an exact directed Steiner dynamic program for broadcast-sized destination sets. The dynamic program jointly selects relay paths and branch points, charging each selected network edge once regardless of how many destinations reuse it. This avoids greedy choices that can prevent later destinations from sharing an inexpensive trunk.
+
+For every subset of destinations and candidate relay node, the algorithm computes the minimum cost needed to broadcast from that node to the subset. It combines independently served subsets at a relay and relaxes those relay solutions backward across the directed network. The resulting root state is an optimal shared directed broadcast topology under additive edge costs. The topology is then expanded into root-to-destination paths for every partition, preserving shared prefixes for overlapping transfers.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    """Build a low-cost shared multicast tree rooted at ``src``."""
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    h.remove_edges_from(
+        [(u, v) for u, v, data in h.edges(data=True) if data.get("cost") is None]
+    )
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Grow a directed Steiner-like tree.  A destination is attached from the
+    # cheapest already-reached relay, allowing later destinations to reuse the
+    # expensive portion of earlier transfers.
+    tree = nx.DiGraph()
+    tree.add_node(src)
+    reached = {src}
+    remaining = set(dsts)
+
+    while remaining:
+        distances, paths = nx.multi_source_dijkstra(h, reached, weight="cost")
+        reachable = [dst for dst in remaining if dst in distances]
+        if not reachable:
+            raise nx.NetworkXNoPath(
+                "No broadcast path exists from the current multicast tree to "
+                f"{sorted(remaining)}"
+            )
+
+        dst = min(reachable, key=lambda node: distances[node])
+        path = paths[dst]
+        for s, t in zip(path, path[1:]):
+            tree.add_edge(s, t)
+            reached.add(s)
+            reached.add(t)
+        remaining.remove(dst)
+
+    # Materialize each destination's root-to-leaf tree path for every data
+    # partition.  Shared prefixes are represented by identical edges and can
+    # therefore be scheduled once and fan out at the branch point.
+    for dst in dsts:
+        path = nx.shortest_path(tree, src, dst)
+        edge_path = [[s, t, G[s][t]] for s, t in zip(path, path[1:])]
+        for partition in range(bc_topology.num_partitions):
+            bc_topology.set_dst_partition_paths(dst, partition, list(edge_path))
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    """Build a minimum-cost shared directed broadcast topology.
+
+    The selected links form a directed Steiner tree: a costly transfer to a
+    relay is paid once, after which that relay can fan the same partition out
+    to multiple destination clouds.
+    """
+    import heapq
+    import math
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    terminals = [dst for dst in dict.fromkeys(dsts) if dst != src]
+    if not terminals:
+        for dst in dsts:
+            for partition in range(num_partitions):
+                bc_topology.set_dst_partition_paths(dst, partition, [])
+        return bc_topology
+
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+    h.remove_edges_from(
+        [
+            (u, v)
+            for u, v, data in h.edges(data=True)
+            if data.get("cost") is None
+            or not isinstance(data["cost"], (int, float))
+            or not math.isfinite(float(data["cost"]))
+            or float(data["cost"]) < 0
+        ]
+    )
+
+    if src not in h or any(dst not in h for dst in terminals):
+        raise nx.NetworkXNoPath("Source or destination is absent from the network")
+
+    # dp[mask][node] is the least cost of delivering from node to every
+    # terminal represented by mask.  A state can either split at node or take
+    # one outgoing link before continuing at a downstream relay.
+    nodes = list(h.nodes())
+    terminal_count = len(terminals)
+    state_count = 1 << terminal_count
+    infinity = float("inf")
+    dp = [{node: infinity for node in nodes} for _ in range(state_count)]
+    choice = [{} for _ in range(state_count)]
+
+    for mask in range(1, state_count):
+        values = dp[mask]
+        decisions = choice[mask]
+
+        if mask & (mask - 1) == 0:
+            terminal = terminals[mask.bit_length() - 1]
+            values[terminal] = 0.0
+            decisions[terminal] = ("terminal",)
+
+        # Co-locate two already solved broadcasts at this relay.  Each edge
+        # below the relay is still represented only once in the final union.
+        subset = (mask - 1) & mask
+        while subset:
+            other = mask ^ subset
+            if other and subset < other:
+                left, right = dp[subset], dp[other]
+                for node in nodes:
+                    candidate = left[node] + right[node]
+                    if candidate < values[node]:
+                        values[node] = candidate
+                        decisions[node] = ("split", subset, other)
+            subset = (subset - 1) & mask
+
+        # Multi-source Dijkstra on the reversed graph computes the best first
+        # hop from every possible upstream relay into the current solution.
+        heap = [(cost, node) for node, cost in values.items() if cost < infinity]
+        heapq.heapify(heap)
+        while heap:
+            current_cost, node = heapq.heappop(heap)
+            if current_cost != values[node]:
+                continue
+            for predecessor in h.predecessors(node):
+                candidate = current_cost + float(h[predecessor][node]["cost"])
+                if candidate < values[predecessor]:
+                    values[predecessor] = candidate
+                    decisions[predecessor] = ("edge", node)
+                    heapq.heappush(heap, (candidate, predecessor))
+
+    full_mask = state_count - 1
+    if dp[full_mask][src] == infinity:
+        raise nx.NetworkXNoPath(
+            f"No broadcast path exists from {src} to {sorted(terminals)}"
+        )
+
+    tree = nx.DiGraph()
+    tree.add_node(src)
+    expanded_states = set()
+
+    def expand(node, mask):
+        state = (node, mask)
+        if state in expanded_states:
+            return
+        expanded_states.add(state)
+
+        decision = choice[mask].get(node)
+        if decision is None:
+            raise nx.NetworkXNoPath("Unable to reconstruct broadcast topology")
+        if decision[0] == "terminal":
+            return
+        if decision[0] == "split":
+            expand(node, decision[1])
+            expand(node, decision[2])
+            return
+
+        next_node = decision[1]
+        tree.add_edge(node, next_node, **dict(G[node][next_node]))
+        expand(next_node, mask)
+
+    expand(src, full_mask)
+
+    # Each destination receives the same route for every partition.  Identical
+    # prefix edges across destinations expose the shared transfer opportunity
+    # to the broadcast scheduler.
+    for dst in dsts:
+        if dst == src:
+            edge_path = []
+        else:
+            path = nx.shortest_path(tree, src, dst)
+            edge_path = [[u, v, G[u][v]] for u, v in zip(path, path[1:])]
+        for partition in range(num_partitions):
+            bc_topology.set_dst_partition_paths(dst, partition, list(edge_path))
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

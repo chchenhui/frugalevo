@@ -1,0 +1,63 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct fourteen points as antipodal pairs from an optimized packing
+    of seven unoriented lines in R^3.
+    """
+    rng = np.random.default_rng(314159)
+    n_lines = 7
+    upper = np.triu_indices(n_lines, 1)
+
+    def normalize(v: np.ndarray) -> np.ndarray:
+        return v / np.linalg.norm(v, axis=1, keepdims=True)
+
+    def coherence(v: np.ndarray) -> float:
+        return float(np.max(np.abs((v @ v.T)[upper])))
+
+    def relax(v: np.ndarray, beta: float, iterations: int) -> np.ndarray:
+        """Projected descent for a smooth approximation to max |dot(v_i,v_j)|."""
+        for _ in range(iterations):
+            dots = v @ v.T
+            pair_dots = dots[upper]
+            magnitudes = np.abs(pair_dots)
+
+            # Stable softmax weights concentrate progressively on closest pairs.
+            weights = np.exp(beta * (magnitudes - np.max(magnitudes)))
+            weights /= np.sum(weights)
+
+            signed_weights = weights * np.sign(pair_dots)
+            coupling = np.zeros((n_lines, n_lines))
+            coupling[upper] = signed_weights
+            coupling[(upper[1], upper[0])] = signed_weights
+
+            gradient = coupling @ v
+            gradient -= np.sum(gradient * v, axis=1, keepdims=True) * v
+            v = normalize(v - 0.12 * gradient)
+        return v
+
+    best = None
+    best_value = np.inf
+
+    # Multiple deterministic starts avoid selecting a poor local spherical code.
+    for _ in range(80):
+        directions = normalize(rng.standard_normal((n_lines, 3)))
+        for beta in (4.0, 10.0, 25.0, 60.0, 140.0):
+            directions = relax(directions, beta, 300)
+
+        value = coherence(directions)
+        if value < best_value:
+            best_value = value
+            best = directions.copy()
+
+    # A final sharper minimax refinement of the best discovered code.
+    for beta in (250.0, 500.0):
+        best = relax(best, beta, 900)
+
+    # Antipodal endpoints have diameter exactly two and encode line coherence.
+    return np.vstack((best, -best))
+
+
+# EVOLVE-BLOCK-END

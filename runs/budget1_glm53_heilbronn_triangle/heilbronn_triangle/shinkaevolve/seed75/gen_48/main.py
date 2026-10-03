@@ -1,0 +1,187 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+try:
+    from scipy.optimize import minimize as _scipy_minimize
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+
+VERTS = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, np.sqrt(3) / 2.0]])
+
+
+def _in_triangle(pts, tol=1e-12):
+    (x1, y1), (x2, y2), (x3, y3) = VERTS
+    s = (x2 - x1) * (pts[:, 1] - y1) - (y2 - y1) * (pts[:, 0] - x1)
+    t = (x3 - x2) * (pts[:, 1] - y2) - (y3 - y2) * (pts[:, 0] - x2)
+    u = (x1 - x3) * (pts[:, 1] - y3) - (y1 - y3) * (pts[:, 0] - x3)
+    return ((s >= -tol) & (t >= -tol) & (u >= -tol))
+
+
+def _bary_repair(pts):
+    A = np.array([[1.0, VERTS[0, 0], VERTS[0, 1]],
+                  [1.0, VERTS[1, 0], VERTS[1, 1]],
+                  [1.0, VERTS[2, 0], VERTS[2, 1]]])
+    b = np.column_stack([np.ones(len(pts)), pts])
+    lam = np.linalg.solve(A.T, b.T).T
+    lam = np.clip(lam, 0.0, None)
+    lam /= lam.sum(axis=1, keepdims=True)
+    return lam @ VERTS
+
+
+def _make_min_area(triples_arr):
+    def min_area(pts):
+        p = pts[triples_arr]
+        cross = ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+                 - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
+        a = 0.5 * np.abs(cross)
+        idx = int(np.argmin(a))
+        return a[idx], tuple(triples_arr[idx])
+    return min_area
+
+
+def _perp(a, b, c):
+    ex, ey = b[0] - a[0], b[1] - a[1]
+    L = np.hypot(ex, ey) + 1e-12
+    ux, uy = ex / L, ey / L
+    dx, dy = c[0] - a[0], c[1] - a[1]
+    px = -uy * dx + ux * dy
+    if px >= 0:
+        return np.array([-uy, ux])
+    return np.array([uy, -ux])
+
+
+def _polish(pts, min_area, iters=150, step=0.006):
+    for _ in range(iters):
+        cur, worst = min_area(pts)
+        if worst is None:
+            break
+        i, j, k = worst
+        dirs = {
+            i: _perp(pts[j], pts[k], pts[i]),
+            j: _perp(pts[i], pts[k], pts[j]),
+            k: _perp(pts[i], pts[j], pts[k]),
+        }
+        improved = False
+        for trial in [(i, j, k), (i, j), (j, k), (i, k), (i,), (j,), (k,)]:
+            cand = pts.copy()
+            for m_ in trial:
+                cand[m_] = pts[m_] + step * dirs[m_]
+            cand = _bary_repair(cand)
+            new, _ = min_area(cand)
+            if new > cur + 1e-15:
+                pts = cand
+                improved = True
+                break
+        if not improved:
+            step *= 0.85
+            if step < 1e-7:
+                break
+    return pts
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct 11 points inside the unit equilateral triangle maximizing the
+    minimum triangle area (Heilbronn problem, n=11).
+
+    Strategy: deterministic multi-start Powell optimization over
+    softmax-barycentric logits with a top-k temperature-annealed softmin
+    objective (only the k smallest triplet areas enter the log-sum-exp,
+    focusing the search on binding constraints). A short gradient-informed
+    perpendicular polish is applied as a final touch-up (kept only if it
+    improves). Hardcoded fallback on any failure.
+
+    Returns:
+        points: np.ndarray of shape (11,2) of x,y coordinates.
+    """
+    n = 11
+    s3 = np.sqrt(3.0)
+    V = VERTS
+    area_T = s3 / 4.0
+    K = 20
+
+    from itertools import combinations
+    triples_arr = np.array(list(combinations(range(n), 3)), dtype=int)
+    min_area = _make_min_area(triples_arr)
+
+    fallback = np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.5, s3 / 2.0],
+        [0.5, 0.0], [0.25, s3 / 4.0], [0.75, s3 / 4.0],
+        [0.25, s3 / 12.0], [0.75, s3 / 12.0],
+        [0.5, s3 / 6.0], [0.125, s3 / 8.0], [0.875, s3 / 8.0],
+    ])
+
+    def unpack(theta):
+        W = theta.reshape(n, 3)
+        W = W - W.max(axis=1, keepdims=True)
+        E = np.exp(W)
+        W = E / E.sum(axis=1, keepdims=True)
+        return W @ V
+
+    def softmin_obj(theta, temp):
+        pts = unpack(theta)
+        p = pts[triples_arr]
+        cross = ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+                 - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
+        a = 0.5 * np.abs(cross)
+        part = np.partition(a, K - 1)[:K]      # k smallest (binding) areas
+        m = part.min()
+        return temp * np.log(np.sum(np.exp(-(part - m) / temp))) - m
+
+    try:
+        # Deterministic starts: hand-crafted barycentric seed + fixed-seed logits
+        bary = np.array([
+            [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],
+            [0.5, 0.5, 0.0], [0.5, 0.0, 0.5], [0.0, 0.5, 0.5],
+            [0.75, 0.25, 0.0], [0.25, 0.75, 0.0], [0.25, 0.25, 0.5],
+            [0.625, 0.125, 0.25], [0.125, 0.625, 0.25],
+        ])
+        rng = np.random.default_rng(12345)
+        starts = [np.log(np.clip(bary, 1e-6, 1.0)).ravel()]
+        for _ in range(4):
+            starts.append(rng.normal(scale=1.5, size=(n, 3)).ravel())
+
+        best_pts = fallback
+        best_val, _ = min_area(fallback)
+
+        if _HAVE_SCIPY:
+            for s in starts:
+                theta = np.array(s, dtype=float)
+                try:
+                    for temp in (1e-2 * area_T, 1e-3 * area_T, 1e-4 * area_T):
+                        res = _scipy_minimize(
+                            softmin_obj, theta, args=(temp,),
+                            method="Powell",
+                            options={"maxiter": 400, "xtol": 1e-6, "ftol": 1e-8},
+                        )
+                        if np.all(np.isfinite(res.x)):
+                            theta = res.x
+                    pts = unpack(theta)
+                    val, _ = min_area(pts)
+                    if val > best_val:
+                        best_val, best_pts = val, pts
+                except Exception:
+                    continue
+
+        # Cheap final gradient-informed touch-up (kept only if it helps)
+        try:
+            cand = _bary_repair(np.asarray(best_pts, dtype=float))
+            cand = _polish(cand, min_area, iters=150, step=0.006)
+            val_r, _ = min_area(cand)
+            if val_r > best_val:
+                best_val, best_pts = val_r, cand
+        except Exception:
+            pass
+
+        best_pts = np.asarray(best_pts, dtype=float)
+        if best_pts.shape != (n, 2) or not np.all(np.isfinite(best_pts)):
+            best_pts = fallback
+        if not np.all(_in_triangle(best_pts, tol=1e-9)):
+            best_pts = _bary_repair(best_pts)
+        return best_pts
+    except Exception:
+        return np.asarray(fallback, dtype=float)
+
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,261 @@
+<NAME>
+restart_with_jitter</NAME>
+<DESCRIPTION>
+The current algorithm is deterministic: models are sorted by density r/s descending, and greedy best-fit placement is highly order-sensitive, especially among models with near-equal densities. Since execution time is 0.00s, we can rerun the entire greedy + local-search pipeline ~30 times with small random perturbations (±2% jitter) on the sort key, keeping the placement with the lowest final max KVPR. This Las Vegas restart scheme can only improve the final result since we always keep the best candidate, and every candidate uses the same crash-proof placement path so feasibility is preserved. To keep the diff simple and avoid indentation-matching issues, I replace the whole function body with a refactored version where the pipeline is a nested function invoked per restart.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Strategy:
+      1) Greedy: place models (sorted by pressure density r/s descending) onto
+         the GPU that yields the smallest resulting KVPR while fitting memory.
+      2) Local search: repeatedly pick the GPU with maximum KVPR and try to
+         move one of its models to another GPU if that strictly lowers the
+         overall maximum KVPR. Repeat until no improvement.
+    """
+
+    def safe_ratio(W, used_mem):
+        free = GPU_MEM_SIZE - used_mem
+        if free <= 1e-9:
+            return float('inf')
+        return W / free
+
+    # Sort by pressure density descending
+    sorted_models = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
+
+    placement = {i: [] for i in range(gpu_num)}
+    used = [0.0] * gpu_num       # used memory per GPU
+    W = [0.0] * gpu_num          # sum of r/s per GPU
+
+    # --- Phase 1: greedy best-fit by resulting KVPR ---
+    for m in sorted_models:
+        best_i, best_val = None, float('inf')
+        for i in range(gpu_num):
+            if m.model_size <= GPU_MEM_SIZE - used[i]:
+                val = safe_ratio(W[i] + m.req_rate / m.slo, used[i] + m.model_size)
+                if val < best_val:
+                    best_val, best_i = val, i
+        if best_i is None:
+            raise ValueError(
+                f"Unable to place model of size {m.model_size} GB on any GPU."
+            )
+        placement[best_i].append(m)
+        used[best_i] += m.model_size
+        W[best_i] += m.req_rate / m.slo
+
+    # --- Phase 2: local search (move model off the hottest GPU) ---
+    def kvpr(i):
+        return safe_ratio(W[i], used[i])
+
+    improved = True
+    guard = 0
+    while improved and guard < 10000:
+        improved = False
+        guard += 1
+        max_i = max(range(gpu_num), key=kvpr)
+        max_val = kvpr(max_i)
+        if max_val == float('inf') and used[max_i] >= GPU_MEM_SIZE - 1e-9:
+            # GPU completely full of weights: no free memory, try swaps instead
+            for m in placement[max_i]:
+                for j in range(gpu_num):
+                    if j == max_i:
+                        continue
+                    for m2 in placement[j]:
+                        # swap sizes compatible?
+                        if (used[max_i] - m.model_size + m2.model_size) <= GPU_MEM_SIZE + 1e-9 and \
+                           (used[j] - m2.model_size + m.model_size) <= GPU_MEM_SIZE + 1e-9:
+                            nW1 = W[max_i] - m.req_rate / m.slo + m2.req_rate / m2.slo
+                            nW2 = W[j] - m2.req_rate / m2.slo + m.req_rate / m.slo
+                            n1 = safe_ratio(nW1, used[max_i] - m.model_size + m2.model_size)
+                            n2 = safe_ratio(nW2, used[j] - m2.model_size + m.model_size)
+                            nmax = max(max(n1, n2), max(kvpr(k) for k in range(gpu_num) if k not in (max_i, j)))
+                            if nmax < max_val:
+                                placement[max_i].remove(m)
+                                placement[j].remove(m2)
+                                placement[max_i].append(m2)
+                                placement[j].append(m)
+                                W[max_i], W[j] = nW1, nW2
+                                used[max_i] = used[max_i] - m.model_size + m2.model_size
+                                used[j] = used[j] - m2.model_size + m.model_size
+                                improved = True
+                                break
+                        if improved:
+                            break
+                if improved:
+                    break
+            continue
+
+        # try moves
+        for m in list(placement[max_i]):
+            for j in range(gpu_num):
+                if j == max_i:
+                    continue
+                if m.model_size <= GPU_MEM_SIZE - used[j]:
+                    n1 = safe_ratio(W[max_i] - m.req_rate / m.slo,
+                                    used[max_i] - m.model_size)
+                    n2 = safe_ratio(W[j] + m.req_rate / m.slo,
+                                    used[j] + m.model_size)
+                    others = max(kvpr(k) for k in range(gpu_num) if k not in (max_i, j)) if gpu_num > 2 else -1.0
+                    nmax = max(n1, n2, others)
+                    if nmax < max_val - 1e-12:
+                        placement[max_i].remove(m)
+                        placement[j].append(m)
+                        W[max_i] -= m.req_rate / m.slo
+                        used[max_i] -= m.model_size
+                        W[j] += m.req_rate / m.slo
+                        used[j] += m.model_size
+                        improved = True
+                        break
+            if improved:
+                break
+
+    return placement
+=======
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Strategy:
+      1) Greedy: place models (sorted by pressure density r/s descending) onto
+         the GPU that yields the smallest resulting KVPR while fitting memory.
+      2) Local search: repeatedly pick the GPU with maximum KVPR and try to
+         move one of its models to another GPU if that strictly lowers the
+         overall maximum KVPR. Repeat until no improvement.
+      3) Las Vegas restarts: rerun the pipeline with small random jitter on
+         the sort key and keep the best (lowest max-KVPR) placement found.
+    """
+    import random
+
+    def safe_ratio(W, used_mem):
+        free = GPU_MEM_SIZE - used_mem
+        if free <= 1e-9:
+            return float('inf')
+        return W / free
+
+    def build_placement(order):
+        placement = {i: [] for i in range(gpu_num)}
+        used = [0.0] * gpu_num       # used memory per GPU
+        W = [0.0] * gpu_num          # sum of r/s per GPU
+
+        # --- Phase 1: greedy best-fit by resulting KVPR ---
+        for m in order:
+            best_i, best_val = None, float('inf')
+            for i in range(gpu_num):
+                if m.model_size <= GPU_MEM_SIZE - used[i]:
+                    val = safe_ratio(W[i] + m.req_rate / m.slo, used[i] + m.model_size)
+                    if val < best_val:
+                        best_val, best_i = val, i
+            if best_i is None:
+                raise ValueError(
+                    f"Unable to place model of size {m.model_size} GB on any GPU."
+                )
+            placement[best_i].append(m)
+            used[best_i] += m.model_size
+            W[best_i] += m.req_rate / m.slo
+
+        # --- Phase 2: local search (move model off the hottest GPU) ---
+        def kvpr(i):
+            return safe_ratio(W[i], used[i])
+
+        improved = True
+        guard = 0
+        while improved and guard < 10000:
+            improved = False
+            guard += 1
+            max_i = max(range(gpu_num), key=kvpr)
+            max_val = kvpr(max_i)
+            if max_val == float('inf') and used[max_i] >= GPU_MEM_SIZE - 1e-9:
+                # GPU completely full of weights: no free memory, try swaps instead
+                for m in placement[max_i]:
+                    for j in range(gpu_num):
+                        if j == max_i:
+                            continue
+                        for m2 in placement[j]:
+                            # swap sizes compatible?
+                            if (used[max_i] - m.model_size + m2.model_size) <= GPU_MEM_SIZE + 1e-9 and \
+                               (used[j] - m2.model_size + m.model_size) <= GPU_MEM_SIZE + 1e-9:
+                                nW1 = W[max_i] - m.req_rate / m.slo + m2.req_rate / m2.slo
+                                nW2 = W[j] - m2.req_rate / m2.slo + m.req_rate / m.slo
+                                n1 = safe_ratio(nW1, used[max_i] - m.model_size + m2.model_size)
+                                n2 = safe_ratio(nW2, used[j] - m2.model_size + m.model_size)
+                                nmax = max(max(n1, n2), max(kvpr(k) for k in range(gpu_num) if k not in (max_i, j)))
+                                if nmax < max_val:
+                                    placement[max_i].remove(m)
+                                    placement[j].remove(m2)
+                                    placement[max_i].append(m2)
+                                    placement[j].append(m)
+                                    W[max_i], W[j] = nW1, nW2
+                                    used[max_i] = used[max_i] - m.model_size + m2.model_size
+                                    used[j] = used[j] - m2.model_size + m.model_size
+                                    improved = True
+                                    break
+                            if improved:
+                                break
+                    if improved:
+                        break
+                continue
+
+            # try moves
+            for m in list(placement[max_i]):
+                for j in range(gpu_num):
+                    if j == max_i:
+                        continue
+                    if m.model_size <= GPU_MEM_SIZE - used[j]:
+                        n1 = safe_ratio(W[max_i] - m.req_rate / m.slo,
+                                        used[max_i] - m.model_size)
+                        n2 = safe_ratio(W[j] + m.req_rate / m.slo,
+                                        used[j] + m.model_size)
+                        others = max(kvpr(k) for k in range(gpu_num) if k not in (max_i, j)) if gpu_num > 2 else -1.0
+                        nmax = max(n1, n2, others)
+                        if nmax < max_val - 1e-12:
+                            placement[max_i].remove(m)
+                            placement[j].append(m)
+                            W[max_i] -= m.req_rate / m.slo
+                            used[max_i] -= m.model_size
+                            W[j] += m.req_rate / m.slo
+                            used[j] += m.model_size
+                            improved = True
+                            break
+                if improved:
+                    break
+
+        return placement
+
+    def max_kvpr_of(placement):
+        vals = []
+        for i in range(gpu_num):
+            free = GPU_MEM_SIZE - sum(m.model_size for m in placement[i])
+            wsum = sum(m.req_rate / m.slo for m in placement[i])
+            vals.append(wsum / free if free > 1e-9 else float('inf'))
+        return max(vals)
+
+    # --- Phase 3: Las Vegas restarts with sort-key jitter ---
+    best_placement = None
+    best_val = float('inf')
+    for attempt in range(30):
+        if attempt == 0:
+            order = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
+        else:
+            # jitter the density sort key by up to +-2%
+            order = sorted(
+                models,
+                key=lambda m: (m.req_rate / m.slo) * (1.0 + random.uniform(-0.02, 0.02)),
+                reverse=True,
+            )
+        try:
+            cand = build_placement(list(order))
+        except ValueError:
+            if best_placement is None:
+                raise
+            continue
+        val = max_kvpr_of(cand)
+        if val < best_val:
+            best_val = val
+            best_placement = cand
+
+    return best_placement
+>>>>>>> REPLACE
+</DIFF>

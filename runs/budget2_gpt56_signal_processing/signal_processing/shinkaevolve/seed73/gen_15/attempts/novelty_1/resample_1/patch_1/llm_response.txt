@@ -1,0 +1,127 @@
+<NAME>
+robust_velocity_consensus
+</NAME>
+
+<DESCRIPTION>
+Replace the fixed exponentially weighted average with a causal robust local-regression tracker. Each window produces an endpoint-aligned trend estimate and local slope using two inexpensive Huber reweighting passes. The tracker then combines that local slope with its prior velocity through a bounded velocity-consensus update.
+
+Unlike a moving average, the local-regression endpoint estimate does not impose the approximately half-window lag that drives the current lag error. Unlike a fully reactive slope estimate, the bounded consensus limits acceleration according to robust residual noise and applies hysteresis only to weak sign reversals. This specifically targets the high false-reversal and slope-change counts while retaining prediction-based responsiveness during sustained trends. The algorithm remains causal, has output aligned to the last sample in each window, and uses only small-window vector operations.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Enhanced version with trend preservation using weighted moving average.
+
+    Args:
+        x: Input signal (1D array of real-valued samples)
+        window_size: Size of the sliding window
+
+    Returns:
+        y: Filtered output signal
+    """
+    if len(x) < window_size:
+        raise ValueError(f"Input signal length ({len(x)}) must be >= window_size ({window_size})")
+
+    output_length = len(x) - window_size + 1
+    y = np.zeros(output_length)
+
+    # Create weights that emphasize recent samples
+    weights = np.exp(np.linspace(-2, 0, window_size))
+    weights = weights / np.sum(weights)
+
+    for i in range(output_length):
+        window = x[i : i + window_size]
+
+        # Weighted moving average with exponential weights
+        y[i] = np.sum(window * weights)
+
+    return y
+=======
+def enhanced_filter_with_trend_preservation(x, window_size=20):
+    """
+    Causal robust endpoint regression with bounded velocity consensus.
+
+    Every output is aligned to the newest sample of its window.  Robust local
+    regression supplies direct trend evidence, while the stateful velocity
+    update rejects noise-driven acceleration and weak direction reversals.
+    """
+    if len(x) < window_size:
+        raise ValueError(f"Input signal length ({len(x)}) must be >= window_size ({window_size})")
+    if window_size < 1:
+        raise ValueError("window_size must be >= 1")
+
+    x = np.asarray(x, dtype=float)
+    finite = np.isfinite(x)
+    if not np.any(finite):
+        return np.zeros(len(x) - window_size + 1, dtype=float)
+    first_valid = x[np.flatnonzero(finite)[0]]
+    z = np.where(finite, x, first_valid)
+
+    output_length = len(z) - window_size + 1
+    y = np.empty(output_length, dtype=float)
+    time = np.arange(window_size, dtype=float) - (window_size - 1)
+    base_weights = np.exp(2.2 * time / max(window_size - 1, 1))
+
+    level = float(z[window_size - 1])
+    velocity = float(z[window_size - 1] - z[window_size - 2]) if window_size > 1 else 0.0
+    stable_velocity = velocity
+
+    for i in range(output_length):
+        window = z[i:i + window_size]
+        weights = base_weights.copy()
+
+        # Two Huber IRLS passes are enough for impulse-resistant endpoint fits.
+        for _ in range(2):
+            design = np.column_stack((np.ones(window_size), time))
+            root_w = np.sqrt(weights)
+            coeff, _, _, _ = np.linalg.lstsq(design * root_w[:, None],
+                                              window * root_w, rcond=None)
+            residual = window - design @ coeff
+            scale = max(1.4826 * np.median(np.abs(residual - np.median(residual))),
+                        1e-6)
+            huber = np.minimum(1.0, 2.5 * scale / np.maximum(np.abs(residual), 1e-12))
+            weights = base_weights * huber
+
+        local_level, local_slope = float(coeff[0]), float(coeff[1])
+        residual_scale = max(
+            1.4826 * np.median(np.abs(residual - np.median(residual))), 1e-6
+        )
+
+        if i == 0:
+            level = local_level
+            velocity = local_slope
+            stable_velocity = velocity
+        else:
+            predicted_level = level + velocity
+            innovation = local_level - predicted_level
+
+            # Endpoint regression is trusted on clean windows but innovations
+            # are clipped so isolated impulses cannot move the tracker abruptly.
+            innovation_limit = 3.0 * residual_scale + 0.25 * abs(velocity)
+            innovation = np.clip(innovation, -innovation_limit, innovation_limit)
+            level = predicted_level + 0.62 * innovation
+
+            # Blend direct local trend evidence with actual tracker progress,
+            # then limit acceleration by the locally observed residual noise.
+            step_slope = level - y[i - 1]
+            target_velocity = 0.55 * local_slope + 0.45 * step_slope
+            acceleration_limit = 0.40 * abs(velocity) + 1.35 * residual_scale
+            velocity_change = np.clip(target_velocity - velocity,
+                                      -acceleration_limit, acceleration_limit)
+            candidate_velocity = velocity + 0.42 * velocity_change
+
+            reversal_deadband = 0.45 * residual_scale
+            if (candidate_velocity * stable_velocity < 0.0 and
+                    abs(candidate_velocity) < reversal_deadband):
+                candidate_velocity = 0.70 * stable_velocity
+            elif abs(candidate_velocity) >= reversal_deadband:
+                stable_velocity = candidate_velocity
+            velocity = candidate_velocity
+
+        y[i] = level
+
+    return y
+>>>>>>> REPLACE
+</DIFF>

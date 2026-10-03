@@ -1,0 +1,151 @@
+--- a/original.py
++++ b/original.py
+@@ -1,142 +1,142 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ try:
+     from scipy.optimize import minimize
+     HAVE_SCIPY = True
+ except Exception:
+     HAVE_SCIPY = False
+ 
+ 
+ def _pairwise_sq(points):
+     diff = points[:, None, :] - points[None, :, :]
+     d2 = np.sum(diff * diff, axis=-1)
+     return d2, diff
+ 
+ 
+ def _true_score(points):
+     d2, _ = _pairwise_sq(points)
+     iu = np.triu_indices(len(points), 1)
+     dm2 = d2[iu].min()
+     dx2 = d2[iu].max()
+     if dx2 <= 0:
+         return 0.0
+     return dm2 / dx2
+ 
+ 
+ def _neg_obj(flat, n, beta, sphere):
+     pts = flat.reshape(n, 3).copy()
+     d2, diff = _pairwise_sq(pts)
+     iu = np.triu_indices(n, 1)
+     dij2 = d2[iu]
+     dij = diff[iu]
+ 
+     a = -beta * dij2
+     amax = a.max()
+     lse_min = amax + np.log(np.sum(np.exp(a - amax)))
+     soft_min = -lse_min / beta
+ 
+     b = beta * dij2
+     bmax = b.max()
+     lse_max = bmax + np.log(np.sum(np.exp(b - bmax)))
+     soft_max = lse_max / beta
+ 
+     F = soft_min - soft_max
+     obj = -F
+ 
+     w_min = np.exp(a - amax); w_min /= w_min.sum()
+     w_max = np.exp(b - bmax); w_max /= w_max.sum()
+ 
+     g_dij2 = (-1.0) * w_min - 1.0 * w_max
+     grad_pts = np.zeros((n, 3))
+     idx_i, idx_j = iu
+     contrib = 2.0 * g_dij2[:, None] * dij
+     np.add.at(grad_pts, idx_i, contrib)
+     np.add.at(grad_pts, idx_j, -contrib)
+ 
+     if sphere:
+         norms = np.linalg.norm(pts, axis=1, keepdims=True)
+         norms = np.maximum(norms, 1e-12)
+         u = pts / norms
+         grad_pts = grad_pts - np.sum(grad_pts * u, axis=1, keepdims=True) * u
+ 
+     return obj, grad_pts.ravel()
+ 
+ 
+ def _opt(flat, n, beta, sphere, maxiter):
+     if HAVE_SCIPY:
+         res = minimize(_neg_obj, flat, args=(n, beta, sphere),
+                        jac=True, method="L-BFGS-B",
+                        options={"maxiter": maxiter, "maxfun": 4 * maxiter})
+         return res.x.reshape(n, 3)
+     else:
+         step = 0.02
+         cur = flat.copy()
+         for _ in range(maxiter):
+             f, g = _neg_obj(cur, n, beta, sphere)
+             cur = cur - step * g
+             if sphere:
+                 p = cur.reshape(n, 3)
+                 p = p / np.maximum(np.linalg.norm(p, axis=1, keepdims=True), 1e-12)
+                 cur = p.ravel()
+         return cur.reshape(n, 3)
+ 
+ 
+ def min_max_dist_dim3_14() -> np.ndarray:
+     n = 14
+     best_pts = None
+     best = -1.0
+     target = 0.2404
+ 
+     betas = [20.0, 60.0, 150.0]
+-    seeds = list(range(30))
++    seeds = list(range(28))
+ 
++    # stage 1: multi-start sphere-constrained optimization with beta escalation
+     for seed in seeds:
+         rng = np.random.RandomState(seed)
+         v = rng.randn(n, 3)
+         pts = v / np.linalg.norm(v, axis=1, keepdims=True)
+         for beta in betas:
+             pts = _opt(pts.ravel().copy(), n, beta, True, 300)
++        pts = pts - pts.mean(axis=0)
+         s = _true_score(pts)
+         if s > best:
+             best = s
+             best_pts = pts
+         if best >= target:
+             break
+ 
+-    # free-space (off-sphere) refinement with increasing sharpness
++    # stage 2: free-space (off-sphere) refinement with increasing sharpness
+     if best_pts is not None:
+         cand = best_pts
+         for beta in [60.0, 150.0, 400.0]:
+             cand = _opt(cand.ravel().copy(), n, beta, False, 400)
+             cand = cand - cand.mean(axis=0)
+             s = _true_score(cand)
+             if s > best:
+                 best = s
+                 best_pts = cand
+-        if best >= target:
+-            pass
+ 
+-    # greedy local polish: small random perturbations re-optimized
++    # stage 3: greedy local polish: perturb best config and re-optimize
+     if best_pts is not None:
+         rng = np.random.RandomState(123)
+-        for _ in range(6):
++        for _ in range(8):
+             cand = best_pts + 0.02 * rng.randn(n, 3)
+             for beta in [150.0, 400.0]:
+                 cand = _opt(cand.ravel().copy(), n, beta, False, 250)
+                 cand = cand - cand.mean(axis=0)
+             s = _true_score(cand)
+             if s > best:
+                 best = s
+                 best_pts = cand
+ 
+     if best_pts is None:
+         np.random.seed(42)
+         best_pts = np.random.randn(n, 3)
+ 
+     best_pts = best_pts - best_pts.mean(axis=0)
+     scale = np.max(np.abs(best_pts))
+     if scale > 0:
+         best_pts = best_pts / scale
+     return np.asarray(best_pts, dtype=float)
+ # EVOLVE-BLOCK-END

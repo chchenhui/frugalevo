@@ -1,0 +1,204 @@
+--- a/original.py
++++ b/original.py
+@@ -1,111 +1,98 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
++from itertools import combinations
+ 
+-def _min_area(points):
+-    """Vectorized minimum (doubled) triangle area over all triplets, normalized by triangle area."""
+-    n = len(points)
+-    i, j = np.triu_indices(n, k=1)
+-    # vectors from point i to point j
+-    d = points[j] - points[i]      # (m,2)
+-    m = len(d)
+-    best = np.inf
+-    # for each k, area = |d x (p_k - p_i)| / 2 over pairs (i,j)
+-    # chunk over k to limit memory
+-    for k0 in range(n):
+-        v = points[k0] - points[i]         # (m,2)
+-        cross = np.abs(d[:,0]*v[:,1] - d[:,1]*v[:,0])
+-        # exclude triplets where k equals i or j
+-        mask = (i != k0) & (j != k0)
+-        if mask.any():
+-            best = min(best, cross[mask].min())
+-    return best  # doubled area; divide by 2*sqrt(3)/2 for normalized
++_SQRT3 = np.sqrt(3.0)
++_TRIPLETS = np.array(list(combinations(range(11), 3)), dtype=int)
++
++
++def _to_xy(b):
++    """Barycentric (u toward B(1,0), v toward C(0.5,sqrt3/2)) -> xy."""
++    return np.column_stack([b[:, 0] + 0.5 * b[:, 1], 0.5 * _SQRT3 * b[:, 1]])
++
++
++def _clamp_simplex(b):
++    """Project rows of b onto simplex u>=0, v>=0, u+v<=1."""
++    b = np.clip(b, 0.0, 1.0)
++    s = b.sum(axis=1)
++    over = s > 1.0
++    if np.any(over):
++        b[over] *= (1.0 / s[over])[:, None]
++    return b
++
++
++def _min_doubled_area(b):
++    xy = _to_xy(b)
++    p = xy[_TRIPLETS[:, 0]]
++    q = xy[_TRIPLETS[:, 1]]
++    r = xy[_TRIPLETS[:, 2]]
++    cross = np.abs((q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1])
++                   - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0]))
++    return cross.min()
++
++
++def _local_search(b, rng, iters=2500):
++    """Greedy local search with randomized jitter moves at decreasing scales."""
++    cur = _clamp_simplex(b.copy())
++    cur_val = _min_doubled_area(cur)
++    scales = [0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002, 0.0001]
++    for sc in scales:
++        stuck = 0
++        for _ in range(iters // len(scales) + 200):
++            cand = cur.copy()
++            # random subset of 1-2 points perturbed with random per-coordinate jitter
++            k = int(rng.integers(0, 11))
++            cand[k] += rng.normal(0.0, sc, 2)
++            if rng.random() < 0.2:
++                k2 = int(rng.integers(0, 11))
++                cand[k2] += rng.normal(0.0, sc, 2)
++            cand = _clamp_simplex(cand)
++            val = _min_doubled_area(cand)
++            if val > cur_val + 1e-15:
++                cur, cur_val = cand, val
++                stuck = 0
++            else:
++                stuck += 1
++                if stuck > 400:
++                    break
++    return cur, cur_val
++
++
++def _seed_config(seed):
++    rng = np.random.default_rng(seed)
++    b = rng.random((11, 2)) * 0.9
++    # pin the three container vertices for large-scale spread
++    b[0] = [0.0, 0.0]
++    b[1] = [1.0, 0.0]
++    b[2] = [0.0, 1.0]
++    return _clamp_simplex(b)
++
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+-    n = 11
+-    verts = np.array([[0.0,0.0],[1.0,0.0],[0.5, np.sqrt(3)/2]])
+-    TRI_AREA = np.sqrt(3)/2
++    """
++    Construct an arrangement of 11 points on or inside the equilateral triangle
++    (0,0),(1,0),(0.5,sqrt(3)/2) maximizing the smallest triangle area.
++    """
++    try:
++        best_b, best_val = None, -1.0
++        for seed in (1, 7, 42, 123, 2024):
++            rng = np.random.default_rng(seed)
++            b0 = _seed_config(seed)
++            b, val = _local_search(b0, rng)
++            if val > best_val:
++                best_b, best_val = b, val
++        if best_b is None or not np.isfinite(best_val):
++            raise RuntimeError("search failed")
++        return _to_xy(_clamp_simplex(best_b))
++    except Exception:
++        # Fallback: deterministic feasible configuration
++        b = np.array([
++            [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
++            [0.5, 0.0], [0.25, 0.25], [0.5, 0.5],
++            [0.0, 0.5], [0.25, 0.0], [0.75, 0.25],
++            [0.0, 0.25], [0.5, 0.25],
++        ])
++        return _to_xy(b)
+ 
+-    rng = np.random.default_rng(12345)
+-
+-    # Start: vertices + ring structure for remaining 8 points
+-    pts = np.vstack([verts, np.zeros((8,2))])
+-    # initial guess: points on a scaled inner triangle grid (feels good for Heilbronn)
+-    # barycentric candidates
+-    bary = np.array([
+-        [1/3,1/3,1/3],
+-        [0.5,0.25,0.25],[0.25,0.5,0.25],[0.25,0.25,0.5],
+-        [2/3,1/6,1/6],[1/6,2/3,1/6],[1/6,1/6,2/3],
+-        [0.5,0.5,0.0],
+-    ])
+-    for idx in range(8):
+-        pts[3+idx] = bary[idx,0]*verts[0] + bary[idx,1]*verts[1] + bary[idx,2]*verts[2]
+-
+-    def objective(P):
+-        return _min_area(P)  # larger is better
+-
+-    cur = pts.copy()
+-    cur_val = objective(cur)
+-    best, best_val = cur.copy(), cur_val
+-
+-    # Simulated annealing on the 8 free interior/boundary points
+-    T0, T1 = 5e-3, 1e-5
+-    iters = 4000
+-    for t in range(iters):
+-        T = T0 * (T1/T0) ** (t/iters)
+-        cand = cur.copy()
+-        k = 3 + rng.integers(0, 8)
+-        step = rng.normal(0, T, size=2)
+-        cand[k] += step
+-        # project back inside triangle via barycentric clamping
+-        v0 = verts[1]-verts[0]; v1 = verts[2]-verts[0]; v2 = cand[k]-verts[0]
+-        d00 = v0@v0; d01 = v0@v1; d11 = v1@v1; d20 = v2@v0; d21 = v2@v1
+-        den = d00*d11 - d01*d01
+-        a = (d11*d20 - d01*d21)/den; b = (d00*d21 - d01*d20)/den
+-        # clamp barycentric coords to [0,1], renormalize
+-        bc = np.array([1-a-b, a, b])
+-        bc = np.clip(bc, 0.0, 1.0); bc /= bc.sum()
+-        cand[k] = bc[0]*verts[0] + bc[1]*verts[1] + bc[2]*verts[2]
+-        val = objective(cand)
+-        if val >= cur_val or rng.random() < np.exp((val-cur_val)/(T*TRI_AREA*2+1e-12)):
+-            cur, cur_val = cand, val
+-            if val > best_val:
+-                best, best_val = cand.copy(), val
+-
+-    # Greedy polish: coordinate descent on the point participating in the worst triangle
+-    P = best.copy()
+-    for _ in range(300):
+-        improved = False
+-        # find worst triangle
+-        areas = []
+-        idx3 = np.array(list(itertools.combinations(range(n),3))) if False else None
+-        # recompute worst via manual loop (cheap, 165 triplets)
+-        worst_val, worst_tri = np.inf, None
+-        for a in range(n):
+-            for b in range(a+1,n):
+-                for c in range(b+1,n):
+-                    ar = abs(np.cross(P[b]-P[a], P[c]-P[a]))
+-                    if ar < worst_val:
+-                        worst_val, worst_tri = ar, (a,b,c)
+-        for k in worst_tri:
+-            for ax in range(2):
+-                for s in (1,-1):
+-                    for h in (3e-3, 1e-3, 3e-4):
+-                        cand = P.copy()
+-                        cand[k,ax] += s*h
+-                        # clamp into triangle
+-                        v0 = verts[1]-verts[0]; v1 = verts[2]-verts[0]; v2 = cand[k]-verts[0]
+-                        d00=v0@v0; d01=v0@v1; d11=v1@v1; d20=v2@v0; d21=v2@v1
+-                        den=d00*d11-d01*d01
+-                        a2=(d11*d20-d01*d21)/den; b2=(d00*d21-d01*d20)/den
+-                        bc=np.clip(np.array([1-a2-b2,a2,b2]),0,1); bc/=bc.sum()
+-                        cand[k]=bc[0]*verts[0]+bc[1]*verts[1]+bc[2]*verts[2]
+-                        if objective(cand) > objective(P) + 1e-15:
+-                            P = cand; improved = True; break
+-                    if improved: break
+-            if improved: break
+-        if not improved:
+-            break
+-
+-    return P
+ 
+ # EVOLVE-BLOCK-END

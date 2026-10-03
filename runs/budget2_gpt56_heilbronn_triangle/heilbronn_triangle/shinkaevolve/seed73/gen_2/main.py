@@ -1,0 +1,85 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Deterministically search for a large-minimum-area 11 point configuration.
+
+    Internally points are represented by their first two barycentric coordinates
+    (u, v), with u >= 0, v >= 0, and u + v <= 1.  In these coordinates a
+    determinant is already the triangle area normalized by the area of the
+    containing equilateral triangle.
+    """
+    n = 11
+    triples = np.array(
+        [(i, j, k) for i in range(n - 2) for j in range(i + 1, n - 1)
+         for k in range(j + 1, n)],
+        dtype=np.intp,
+    )
+    rng = np.random.default_rng(11031987)
+
+    def project_simplex(p: np.ndarray) -> np.ndarray:
+        """Project rows onto {u,v >= 0, u+v <= 1}."""
+        p = np.maximum(p, 0.0)
+        excess = p.sum(axis=1) > 1.0
+        # The Euclidean projection onto u+v=1 is especially cheap in 2-D.
+        if np.any(excess):
+            q = p[excess]
+            p[excess] = np.maximum(q - (q.sum(axis=1, keepdims=True) - 1.0) / 2.0, 0.0)
+        return p
+
+    def areas(p: np.ndarray) -> np.ndarray:
+        a = p[triples[:, 1]] - p[triples[:, 0]]
+        b = p[triples[:, 2]] - p[triples[:, 0]]
+        return np.abs(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0])
+
+    def soft_min(a: np.ndarray, temperature: float) -> float:
+        # Stable log-sum-exp form; approaches min(a) as temperature decreases.
+        m = float(a.min())
+        return m - temperature * np.log(np.exp(-(a - m) / temperature).sum())
+
+    best = None
+    best_value = -1.0
+
+    # Independent starts are important because the maximin landscape has many
+    # narrow basins.  The modest fixed budget keeps this suitable as a
+    # constructor rather than an open-ended optimizer.
+    for restart in range(14):
+        p = rng.dirichlet((1.0, 1.0, 1.0), size=n)[:, :2]
+        current_areas = areas(p)
+        current_soft = soft_min(current_areas, 0.018)
+
+        for step in range(4500):
+            fraction = step / 4499.0
+            temperature = 0.018 * (1.0 - fraction) + 0.0015
+            scale = 0.105 * (1.0 - fraction) + 0.0035
+
+            candidate = p.copy()
+            index = int(rng.integers(n))
+            candidate[index] += rng.normal(0.0, scale, size=2)
+            candidate = project_simplex(candidate)
+
+            candidate_areas = areas(candidate)
+            candidate_soft = soft_min(candidate_areas, temperature)
+            delta = candidate_soft - current_soft
+
+            # Metropolis acceptance prevents early trapping; all randomness is seeded.
+            if delta >= 0.0 or rng.random() < np.exp(delta / temperature):
+                p = candidate
+                current_areas = candidate_areas
+                current_soft = candidate_soft
+
+            value = float(current_areas.min())
+            if value > best_value:
+                best_value = value
+                best = p.copy()
+
+    # (u,v,1-u-v) maps to u*(1,0) + v*(1/2,sqrt(3)/2).
+    return np.column_stack((
+        best[:, 0] + 0.5 * best[:, 1],
+        (np.sqrt(3.0) / 2.0) * best[:, 1],
+    ))
+
+
+# EVOLVE-BLOCK-END

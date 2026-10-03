@@ -1,0 +1,288 @@
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """Place models while minimizing the maximum GPU KV-cache pressure."""
+    if gpu_num <= 0:
+        if models:
+            raise ValueError("Cannot place models without GPUs.")
+        return {}
+
+    model_list = list(models)
+    if not model_list:
+        return {gpu_id: [] for gpu_id in range(gpu_num)}
+
+    EPS = 1e-10
+    count = len(model_list)
+    sizes = [model.model_size for model in model_list]
+    demands = [model.req_rate / model.slo for model in model_list]
+
+    if any(size > GPU_MEM_SIZE + EPS for size in sizes):
+        raise ValueError("A model is larger than GPU memory.")
+
+    total_size = sum(sizes)
+    total_demand = sum(demands)
+    if total_size > gpu_num * GPU_MEM_SIZE + EPS:
+        raise ValueError("Total model memory exceeds available GPU memory.")
+
+    total_remaining = gpu_num * GPU_MEM_SIZE - total_size
+    if total_remaining <= EPS and total_demand > EPS:
+        raise ValueError("No KV-cache memory remains after model placement.")
+
+    def pressure(load, remaining):
+        if remaining <= EPS:
+            return float("inf") if load > EPS else 0.0
+        return load / remaining
+
+    def profile(loads, remaining):
+        return tuple(sorted(
+            (pressure(loads[g], remaining[g]) for g in range(gpu_num)),
+            reverse=True,
+        ))
+
+    def pack_at_threshold(limit):
+        capacity = limit * GPU_MEM_SIZE
+        transformed = [demands[i] + limit * sizes[i] for i in range(count)]
+        capacity_safe = max(capacity, EPS)
+
+        orders = [
+            sorted(
+                range(count),
+                key=lambda i: (
+                    max(
+                        sizes[i] / GPU_MEM_SIZE,
+                        transformed[i] / capacity_safe,
+                    ),
+                    transformed[i],
+                    sizes[i],
+                ),
+                reverse=True,
+            ),
+            sorted(range(count), key=lambda i: (sizes[i], demands[i]), reverse=True),
+            sorted(range(count), key=lambda i: (demands[i], sizes[i]), reverse=True),
+            sorted(
+                range(count),
+                key=lambda i: (
+                    demands[i] / max(GPU_MEM_SIZE - sizes[i], EPS),
+                    sizes[i],
+                ),
+                reverse=True,
+            ),
+        ]
+
+        best = None
+        best_profile = None
+
+        for order in orders:
+            placement = {g: [] for g in range(gpu_num)}
+            loads = [0.0] * gpu_num
+            remaining = [GPU_MEM_SIZE] * gpu_num
+            used = [0.0] * gpu_num
+            feasible = True
+
+            for i in order:
+                size = sizes[i]
+                demand = demands[i]
+                cost = transformed[i]
+                chosen = None
+                chosen_key = None
+
+                for g in range(gpu_num):
+                    new_remaining = remaining[g] - size
+                    new_used = used[g] + cost
+                    new_load = loads[g] + demand
+
+                    if new_remaining < -EPS or new_used > capacity + EPS:
+                        continue
+                    if new_load > EPS and new_remaining <= EPS:
+                        continue
+
+                    # Tight multidimensional fit reduces fragmentation.
+                    key = (
+                        max(
+                            new_used / capacity_safe,
+                            1.0 - new_remaining / GPU_MEM_SIZE,
+                        ),
+                        new_used / capacity_safe,
+                        -new_remaining,
+                        g,
+                    )
+                    if chosen_key is None or key > chosen_key:
+                        chosen_key = key
+                        chosen = g
+
+                if chosen is None:
+                    feasible = False
+                    break
+
+                placement[chosen].append(i)
+                loads[chosen] += demand
+                remaining[chosen] -= size
+                used[chosen] += cost
+
+            if feasible:
+                candidate_profile = profile(loads, remaining)
+                if best_profile is None or candidate_profile < best_profile:
+                    best_profile = candidate_profile
+                    best = (placement, loads, remaining)
+
+        return best
+
+    lower = total_demand / max(total_remaining, EPS) if total_demand > EPS else 0.0
+    for size, demand in zip(sizes, demands):
+        if demand > EPS:
+            if size >= GPU_MEM_SIZE - EPS:
+                raise ValueError(
+                    "A positive-demand model leaves no KV-cache memory."
+                )
+            lower = max(lower, demand / (GPU_MEM_SIZE - size))
+
+    upper = max(lower * 1.25, 1e-8)
+    best = pack_at_threshold(upper)
+    for _ in range(50):
+        if best is not None:
+            break
+        upper *= 2.0
+        best = pack_at_threshold(upper)
+
+    if best is None:
+        raise ValueError("Unable to construct a memory-feasible GPU placement.")
+
+    for _ in range(36):
+        middle = (lower + upper) / 2.0
+        candidate = pack_at_threshold(middle)
+        if candidate is None:
+            lower = middle
+        else:
+            upper = middle
+            best = candidate
+
+    placement, loads, remaining = best
+    placement = {g: list(placement[g]) for g in range(gpu_num)}
+
+    # Strict local improvement over moves and swaps.
+    for _ in range(min(32, max(2, count * 2))):
+        current = profile(loads, remaining)
+        best_profile = current
+        action = None
+
+        for source in range(gpu_num):
+            for source_index, item in enumerate(placement[source]):
+                size = sizes[item]
+                demand = demands[item]
+
+                for target in range(gpu_num):
+                    if target == source:
+                        continue
+
+                    target_remaining = remaining[target] - size
+                    if target_remaining < -EPS:
+                        continue
+                    if demand > EPS and target_remaining <= EPS:
+                        continue
+
+                    source_load = loads[source] - demand
+                    source_remaining = remaining[source] + size
+                    target_load = loads[target] + demand
+
+                    trial_loads = loads[:]
+                    trial_remaining = remaining[:]
+                    trial_loads[source] = source_load
+                    trial_remaining[source] = source_remaining
+                    trial_loads[target] = target_load
+                    trial_remaining[target] = target_remaining
+                    candidate_profile = profile(trial_loads, trial_remaining)
+
+                    if candidate_profile < best_profile:
+                        best_profile = candidate_profile
+                        action = ("move", source, source_index, target)
+
+        if count <= 140:
+            for left in range(gpu_num):
+                for right in range(left + 1, gpu_num):
+                    for left_index, first in enumerate(placement[left]):
+                        for right_index, second in enumerate(placement[right]):
+                            left_remaining = (
+                                remaining[left] + sizes[first] - sizes[second]
+                            )
+                            right_remaining = (
+                                remaining[right] + sizes[second] - sizes[first]
+                            )
+                            if left_remaining < -EPS or right_remaining < -EPS:
+                                continue
+
+                            left_load = loads[left] - demands[first] + demands[second]
+                            right_load = loads[right] - demands[second] + demands[first]
+                            if ((left_load > EPS and left_remaining <= EPS) or
+                                    (right_load > EPS and right_remaining <= EPS)):
+                                continue
+
+                            trial_loads = loads[:]
+                            trial_remaining = remaining[:]
+                            trial_loads[left] = left_load
+                            trial_loads[right] = right_load
+                            trial_remaining[left] = left_remaining
+                            trial_remaining[right] = right_remaining
+                            candidate_profile = profile(
+                                trial_loads, trial_remaining
+                            )
+
+                            if candidate_profile < best_profile:
+                                best_profile = candidate_profile
+                                action = (
+                                    "swap", left, left_index, right, right_index
+                                )
+
+        if action is None:
+            break
+
+        if action[0] == "move":
+            _, source, source_index, target = action
+            item = placement[source].pop(source_index)
+            placement[target].append(item)
+            loads[source] -= demands[item]
+            remaining[source] += sizes[item]
+            loads[target] += demands[item]
+            remaining[target] -= sizes[item]
+        else:
+            _, left, left_index, right, right_index = action
+            first = placement[left][left_index]
+            second = placement[right][right_index]
+            placement[left][left_index] = second
+            placement[right][right_index] = first
+            loads[left] += demands[second] - demands[first]
+            loads[right] += demands[first] - demands[second]
+            remaining[left] += sizes[first] - sizes[second]
+            remaining[right] += sizes[second] - sizes[first]
+
+    return {
+        gpu_id: [model_list[index] for index in placement[gpu_id]]
+        for gpu_id in range(gpu_num)
+    }
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

@@ -1,0 +1,304 @@
+<NAME>
+beam_vnd_scheduler
+</NAME>
+
+<DESCRIPTION>
+This implementation replaces single-path greedy construction with a conflict-cost beam search. Instead of committing to one transaction at each position, it keeps multiple promising partial schedules and expands each using `get_opt_seq_cost`, preserving alternatives that may lead to lower final makespan.
+
+Step-by-step:
+1. Build a beam of partial transaction orders.
+2. Expand each beam state with every remaining transaction (or a bounded candidate sample for large workloads).
+3. Score every append using the simulator’s authoritative makespan function.
+4. Keep a diverse set of low-cost partial schedules, with randomized tie-breaking to avoid repeatedly following equivalent greedy paths.
+5. Fully evaluate the best beam completions.
+6. Apply best-improvement variable-neighborhood descent using relocation, swap, and reversal moves.
+
+The beam search explores multiple global ordering basins before local optimization, which avoids many of the irreversible decisions made by purely greedy construction.
+</DESCRIPTION>
+
+<CODE>
+```python
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Find a low-makespan transaction ordering using simulator-scored beam search
+    followed by exact-cost variable-neighborhood descent.
+    """
+    n = workload.num_txns
+    if n == 0:
+        return 0, []
+    if n == 1:
+        return workload.get_opt_seq_cost([0]), [0]
+
+    cost_cache = {}
+
+    def sequence_cost(sequence):
+        key = tuple(sequence)
+        cached = cost_cache.get(key)
+        if cached is None:
+            cached = workload.get_opt_seq_cost(sequence)
+            cost_cache[key] = cached
+        return cached
+
+    # For tiny workloads, an exhaustive ordering search is affordable and
+    # provides a genuinely optimal result rather than a heuristic one.
+    if n <= 7:
+        best_cost = None
+        best_schedule = None
+
+        def enumerate_orders(prefix, remaining):
+            nonlocal best_cost, best_schedule
+            if not remaining:
+                value = sequence_cost(prefix)
+                if best_cost is None or value < best_cost:
+                    best_cost = value
+                    best_schedule = prefix[:]
+                return
+
+            choices = list(remaining)
+            random.shuffle(choices)
+            for txn in choices:
+                prefix.append(txn)
+                remaining.remove(txn)
+                enumerate_orders(prefix, remaining)
+                remaining.add(txn)
+                prefix.pop()
+
+        enumerate_orders([], set(range(n)))
+        return best_cost, best_schedule
+
+    # A wider beam explores competing partial orderings rather than making one
+    # irreversible greedy choice.  Larger workloads use a bounded beam to
+    # retain practical evaluation cost.
+    if n <= 24:
+        beam_width = min(24, max(10, num_seqs * 3))
+    elif n <= 45:
+        beam_width = min(16, max(8, num_seqs * 2))
+    else:
+        beam_width = min(10, max(6, num_seqs))
+
+    beam = [(0, tuple())]
+
+    for depth in range(n):
+        expanded = []
+
+        for _, prefix in beam:
+            used = set(prefix)
+            remaining = [txn for txn in range(n) if txn not in used]
+
+            # Exhaustively score extensions on normal benchmark sizes.  For
+            # very large instances, use a changing random candidate subset so
+            # the beam still explores several distinct construction paths.
+            if n <= 45 or len(remaining) <= 20:
+                candidates = remaining
+            else:
+                candidate_count = min(len(remaining), 20)
+                candidates = random.sample(remaining, candidate_count)
+
+                # Retain a deterministic candidate as well, preventing an
+                # unlucky random draw from permanently excluding a txn.
+                if remaining[0] not in candidates:
+                    candidates[0] = remaining[0]
+
+            random.shuffle(candidates)
+            for txn in candidates:
+                candidate = prefix + (txn,)
+                expanded.append((sequence_cost(candidate), candidate))
+
+        # Multiple parent paths can reach the same prefix only rarely, but
+        # deduplication is cheap and avoids wasting beam slots.
+        unique = {}
+        for value, sequence in expanded:
+            old_value = unique.get(sequence)
+            if old_value is None or value < old_value:
+                unique[sequence] = value
+
+        ranked = [(value, sequence) for sequence, value in unique.items()]
+        random.shuffle(ranked)
+        ranked.sort(key=lambda item: item[0])
+
+        # Preserve some ending-transaction diversity among similarly scored
+        # partial schedules.  This is especially useful when prefix makespans
+        # are tied, where deterministic greedy selection otherwise collapses
+        # to nearly identical schedules.
+        selected = []
+        represented_last = set()
+
+        for value, sequence in ranked:
+            last = sequence[-1]
+            if last not in represented_last:
+                selected.append((value, sequence))
+                represented_last.add(last)
+                if len(selected) >= beam_width:
+                    break
+
+        if len(selected) < beam_width:
+            selected_sequences = {sequence for _, sequence in selected}
+            for value, sequence in ranked:
+                if sequence not in selected_sequences:
+                    selected.append((value, sequence))
+                    selected_sequences.add(sequence)
+                    if len(selected) >= beam_width:
+                        break
+
+        beam = selected
+
+    beam.sort(key=lambda item: item[0])
+
+    def descend(seed, seed_cost):
+        """
+        Best-improvement local search.  Every candidate is scored by the
+        workload simulator, so acceptance is based on real makespan rather
+        than transaction lengths or approximate conflict counts.
+        """
+        current = list(seed)
+        current_cost = seed_cost
+        max_passes = 6 if n <= 30 else 3
+
+        for _ in range(max_passes):
+            best_cost = current_cost
+            best_sequence = None
+
+            # Relocation changes a transaction's position relative to every
+            # transaction crossed by the move.
+            if n <= 32:
+                relocation_moves = (
+                    (source, destination)
+                    for source in range(n)
+                    for destination in range(n)
+                    if source != destination
+                )
+            else:
+                relocation_moves = (
+                    (random.randrange(n), random.randrange(n))
+                    for _ in range(500)
+                )
+
+            for source, destination in relocation_moves:
+                if source == destination:
+                    continue
+                candidate = current[:]
+                moved = candidate.pop(source)
+                candidate.insert(destination, moved)
+                value = sequence_cost(candidate)
+                if value < best_cost:
+                    best_cost = value
+                    best_sequence = candidate
+
+            # Swaps directly repair pairwise inversions.
+            if n <= 32:
+                swap_moves = (
+                    (left, right)
+                    for left in range(n - 1)
+                    for right in range(left + 1, n)
+                )
+            else:
+                swap_moves = (
+                    tuple(sorted(random.sample(range(n), 2)))
+                    for _ in range(300)
+                )
+
+            for left, right in swap_moves:
+                candidate = current[:]
+                candidate[left], candidate[right] = candidate[right], candidate[left]
+                value = sequence_cost(candidate)
+                if value < best_cost:
+                    best_cost = value
+                    best_sequence = candidate
+
+            # Reversing a short interval can simultaneously repair several
+            # related writer/reader inversions that one relocation cannot
+            # improve by itself.
+            if n <= 28:
+                reversal_moves = (
+                    (left, right)
+                    for left in range(n - 1)
+                    for right in range(left + 2, min(n, left + 7))
+                )
+            else:
+                reversal_moves = (
+                    (
+                        random.randrange(0, n - 2),
+                        random.randrange(2, min(n, 8))
+                    )
+                    for _ in range(180)
+                )
+
+            for move in reversal_moves:
+                if n <= 28:
+                    left, right = move
+                    candidate = (
+                        current[:left] +
+                        list(reversed(current[left:right + 1])) +
+                        current[right + 1:]
+                    )
+                else:
+                    left, length = move
+                    right = min(n - 1, left + length)
+                    if right <= left:
+                        continue
+                    candidate = (
+                        current[:left] +
+                        list(reversed(current[left:right + 1])) +
+                        current[right + 1:]
+                    )
+
+                value = sequence_cost(candidate)
+                if value < best_cost:
+                    best_cost = value
+                    best_sequence = candidate
+
+            if best_sequence is None:
+                break
+
+            current = best_sequence
+            current_cost = best_cost
+
+        return current_cost, current
+
+    # Refine several globally distinct beam solutions.  This combines global
+    # construction diversity with exact local improvements.
+    refine_count = min(
+        len(beam),
+        8 if n <= 28 else 4
+    )
+
+    best_cost, best_schedule = beam[0][0], list(beam[0][1])
+    for seed_cost, seed in beam[:refine_count]:
+        improved_cost, improved_schedule = descend(seed, seed_cost)
+        if improved_cost < best_cost:
+            best_cost = improved_cost
+            best_schedule = improved_schedule
+
+    return best_cost, best_schedule
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")
+```

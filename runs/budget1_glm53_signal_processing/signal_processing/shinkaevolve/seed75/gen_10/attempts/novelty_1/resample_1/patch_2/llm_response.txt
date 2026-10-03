@@ -1,0 +1,176 @@
+<NAME>
+sliding_savgol_adaptive_trend_filter
+</NAME>
+<DESCRIPTION>
+Replace the naive sliding-window averaging with an adaptive Savitzky-Golay / Kalman hybrid. A plain moving average induces phase lag proportional to window length, causing lag error and masked genuine trend reversals (false reversals). The edit computes a 2nd-order polynomial (Savitzky-Golay) fit over the sliding window, evaluating the endpoint to achieve near-zero group delay, then blends this with a constant-velocity Kalman estimate whose measurement noise is adapted to local volatility (MAD-based). The volatility-adaptive Kalman gain keeps responsiveness during high dynamics (minimizing lag) and smooths in quiet periods (minimizing slope changes). A hysteresis-based trend-sign detector with a confidence threshold suppresses spurious reversals, directly penalizing false reversals while preserving genuine ones. All operations are O(window) per sample with fixed cost, meeting the latency constraint.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        filtered.append(np.mean(window))
+=======
+        # Adaptive Savitzky-Golay endpoint + volatility-adaptive Kalman hybrid
+        w = len(window)
+        x = float(window[-1])
+        if w < 3:
+            filtered.append(x)
+            continue
+
+        # --- Savitzky-Golay quadratic endpoint fit (zero-lag endpoint estimate) ---
+        half = (w - 1) // 2
+        t_center = (w - 1) / 2.0
+        # Fit quadratic y = a + b*t + c*t^2 via normal equations (t relative to window)
+        t = np.arange(w)
+        S1 = w
+        S2 = t.sum()
+        S3 = (t**2).sum()
+        S4 = (t**3).sum()
+        S5 = (t**4).sum()
+        y = np.asarray(window, dtype=float)
+        T1 = y.sum()
+        T2 = (t*y).sum()
+        T3 = (t*t*y).sum()
+        det = S1*(S3*S5 - S4*S4) - S2*(S2*S5 - S3*S4) + S3*(S2*S4 - S3*S3)
+        if abs(det) < 1e-12:
+            sg = T1 / S1
+        else:
+            a = (T1*(S3*S5 - S4*S4) - S2*(T2*S5 - T3*S4) + S3*(T2*S4 - T3*S3)) / det
+            b = (S1*(T2*S5 - T3*S4) - T2*(S2*S5 - S3*S4) + S3*(S2*T3 - S3*T2)) / det
+            c = (S1*(S2*T3 - S3*T2) - S2*(S2*T3 - S3*T2) + T2*(S2*S4 - S3*S3)) / det
+            sg = a + b*(w-1) + c*(w-1)**2  # evaluate at the newest sample (no delay)
+
+        # --- Volatility-adaptive Kalman (constant-velocity) state update ---
+        med = np.median(window)
+        mad = np.median(np.abs(window - med)) * 1.4826 + 1e-9
+        R = (0.5 * mad)**2  # measurement noise scaled to local volatility
+        # predicted state (position, velocity)
+        pred_pos = self._kf_pos + self._kf_vel
+        pred_vel = self._kf_vel
+        P = self._kf_P.copy()
+        P[0,0] += self._kf_q[0]
+        P[0,1] += P[1,1]
+        P[1,0] += P[1,1]
+        P[1,1] += self._kf_q[1]
+        # innovation
+        innov = sg - pred_pos
+        S = P[0,0] + R
+        K0 = P[0,0]/S
+        K1 = P[1,0]/S
+        self._kf_pos = pred_pos + K0*innov
+        self._kf_vel = pred_vel + K1*innov
+        P[0,0] = (1-K0)*P[0,0]
+        P[0,1] = (1-K0)*P[0,1]
+        P[1,0] = P[1,0] - K1*P[0,0]
+        P[1,1] = P[1,1] - K1*P[0,1]
+        self._kf_P = P
+        kal = self._kf_pos
+
+        # --- Blend SG endpoint (responsive) with Kalman (smooth) ---
+        alpha = 0.5
+        val = alpha*sg + (1-alpha)*kal
+
+        # --- Hysteresis trend detection to suppress spurious reversals ---
+        self._trend_sig *= 0.9  # decay confidence
+        if self._trend_sig > 0:
+            if val < self._prev_val - 0.5*mad:
+                self._trend_sig = max(0.0, self._trend_sig - 1.0)
+            elif val > self._prev_val + 0.5*mad:
+                self._trend_sig = min(0.0, self._trend_sig + 1.0) if False else self._trend_sig
+        if val - self._prev_val > self._trend_eps*mad:
+            self._trend_sig = min(self._trend_sig + 1.0, 3.0)
+        elif self._prev_val - val > self._trend_eps*mad:
+            self._trend_sig = max(self._trend_sig - 1.0, -3.0)
+        # only allow output to follow reversal if confirmed (|confidence| >= 2)
+        if (self._trend_sig >= -1.0) and val > self._prev_out:
+            out = min(val, self._prev_out + 2.0*self._trend_eps*mad)
+        elif (self._trend_sig <= 1.0) and val < self._prev_out:
+            out = max(val, self._prev_out - 2.0*self._trend_eps*mad)
+        else:
+            out = self._prev_out + 0.25*(val - self._prev_out)
+        self._prev_val = val
+        self._prev_out = out
+        filtered.append(out)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        self.window = deque(maxlen=window_size)
+=======
+        self.window = deque(maxlen=window_size)
+        # Kalman state: [position, velocity]
+        self._kf_pos = None
+        self._kf_vel = 0.0
+        self._kf_P = np.eye(2) * 1.0
+        self._kf_q = (1e-3, 1e-2)  # process noise (pos, vel)
+        # trend state
+        self._trend_sig = 0.0
+        self._trend_eps = 1.0
+        self._prev_val = 0.0
+        self._prev_out = 0.0
+        self._initialized = False
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        self.window.append(sample)
+        if len(self.window) < self.window_size:
+            filtered.append(sample)
+            continue
+=======
+        self.window.append(sample)
+        if self._kf_pos is None:
+            self._kf_pos = float(sample)
+            self._prev_val = float(sample)
+            self._prev_out = float(sample)
+        if len(self.window) < self.window_size:
+            filtered.append(self._prev_out)
+            continue
+        if not self._initialized:
+            self._kf_pos = float(sample)
+            self._prev_out = float(np.mean(self.window))
+            self._initialized = True
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def reset(self):
+        self.window.clear()
+=======
+    def reset(self):
+        self.window.clear()
+        self._kf_pos = None
+        self._kf_vel = 0.0
+        self._kf_P = np.eye(2) * 1.0
+        self._trend_sig = 0.0
+        self._prev_val = 0.0
+        self._prev_out = 0.0
+        self._initialized = False
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def get_trend(self):
+        if len(self.window) < 3:
+            return 0
+        win = list(self.window)
+        if win[-1] > win[0]:
+            return 1
+        elif win[-1] < win[0]:
+            return -1
+        else:
+            return 0
+=======
+    def get_trend(self):
+        if len(self.window) < 3:
+            return 0
+        # trend sign from hysteresis confidence, only report confirmed trends
+        if self._trend_sig >= 2.0:
+            return 1
+        elif self._trend_sig <= -2.0:
+            return -1
+        return 0
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,177 @@
+<NAME>
+warmstart_shift_search_speedup
+</NAME>
+<DESCRIPTION>
+Warm-start the Gauss-Seidel radius solver inside the shift search: cache the previous radii vector and use it as initialization for the next candidate evaluation. Since each shift moves only one circle slightly, radii converge in a handful of sweeps instead of needing full cold 300-sweep solves. This cuts the ~9s runtime dramatically, and the freed budget funds more refine–shift fixed-point outer rounds (3→6), which historically each squeeze out a bit more sum (~2.49 → higher).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def compute_max_radii(centers):
+    """
+    Per-circle radii via Gauss-Seidel water filling, then monotone
+    repair (only shrinks) to guarantee feasibility.
+    """
+    n = centers.shape[0]
+    D = np.zeros((n, n))
+    wall = np.zeros(n)
+    for i in range(n):
+        x, y = centers[i]
+        wall[i] = min(x, y, 1.0 - x, 1.0 - y)
+        for j in range(i + 1, n):
+            d = float(np.sqrt(np.sum((centers[i] - centers[j]) ** 2)))
+            D[i, j] = d
+            D[j, i] = d
+    r = np.zeros(n)
+    for _ in range(300):
+        changed = False
+        for i in range(n):
+            cap = wall[i]
+            for j in range(n):
+                if j != i and D[i, j] - r[j] < cap:
+                    cap = D[i, j] - r[j]
+            cap = max(cap, 0.0)
+            if abs(cap - r[i]) > 1e-12:
+                changed = True
+            r[i] = cap
+        if not changed:
+            break
+=======
+def compute_max_radii(centers, r_init=None, max_sweeps=300):
+    """
+    Per-circle radii via Gauss-Seidel water filling (optionally warm-started
+    from r_init), then monotone repair (only shrinks) to guarantee
+    feasibility. Vectorized inner loop for speed.
+    """
+    n = centers.shape[0]
+    diff = centers[:, None, :] - centers[None, :, :]
+    D = np.sqrt((diff ** 2).sum(-1))
+    np.fill_diagonal(D, np.inf)
+    x, y = centers[:, 0], centers[:, 1]
+    wall = np.minimum(np.minimum(x, y), np.minimum(1.0 - x, 1.0 - y))
+    if r_init is not None and len(r_init) == n:
+        r = np.minimum(np.maximum(r_init, 0.0), np.maximum(wall, 0.0)).copy()
+    else:
+        r = np.zeros(n)
+    for _ in range(max_sweeps):
+        changed = False
+        for i in range(n):
+            cap = np.min(D[i] - r)
+            if wall[i] < cap:
+                cap = wall[i]
+            cap = max(cap, 0.0)
+            if abs(cap - r[i]) > 1e-12:
+                changed = True
+            r[i] = cap
+        if not changed:
+            break
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def _local_shift_search(centers, deltas=(0.01, 0.005, 0.002, 0.001, 0.0005)):
+    """Greedily accept small center shifts that increase total radii.
+
+    Tries axis-aligned shifts and diagonal (both-axis) shifts, since
+    improving directions in hexagonal layouts are often diagonal.
+    """
+    centers = centers.copy()
+    best = float(np.sum(compute_max_radii(centers)))
+    for delta in deltas:
+        improved = True
+        while improved:
+            improved = False
+            for i in range(N):
+                # axis-aligned moves
+                for axis in (0, 1):
+                    for sign in (+1.0, -1.0):
+                        old = centers[i, axis]
+                        new = min(max(old + sign * delta, 1e-9), 1.0 - 1e-9)
+                        if abs(new - old) < 1e-12:
+                            continue
+                        centers[i, axis] = new
+                        tot = float(np.sum(compute_max_radii(centers)))
+                        if tot > best + 1e-9:
+                            best = tot
+                            improved = True
+                        else:
+                            centers[i, axis] = old
+                # diagonal moves
+                for sx in (+1.0, -1.0):
+                    for sy in (+1.0, -1.0):
+                        old0, old1 = centers[i, 0], centers[i, 1]
+                        new0 = min(max(old0 + sx * delta, 1e-9), 1.0 - 1e-9)
+                        new1 = min(max(old1 + sy * delta, 1e-9), 1.0 - 1e-9)
+                        if abs(new0 - old0) < 1e-12 and abs(new1 - old1) < 1e-12:
+                            continue
+                        centers[i, 0], centers[i, 1] = new0, new1
+                        tot = float(np.sum(compute_max_radii(centers)))
+                        if tot > best + 1e-9:
+                            best = tot
+                            improved = True
+                        else:
+                            centers[i, 0], centers[i, 1] = old0, old1
+    return centers
+=======
+def _local_shift_search(centers, deltas=(0.01, 0.005, 0.002, 0.001, 0.0005)):
+    """Greedily accept small center shifts that increase total radii.
+
+    Tries axis-aligned shifts and diagonal (both-axis) shifts, since
+    improving directions in hexagonal layouts are often diagonal.
+    The radius solver is warm-started from the previous (feasible)
+    radii vector, so each candidate evaluation converges in a few
+    Gauss-Seidel sweeps instead of a full cold-start solve.
+    """
+    centers = centers.copy()
+    r = compute_max_radii(centers)
+    best = float(np.sum(r))
+    for delta in deltas:
+        improved = True
+        while improved:
+            improved = False
+            for i in range(N):
+                # axis-aligned moves
+                for axis in (0, 1):
+                    for sign in (+1.0, -1.0):
+                        old = centers[i, axis]
+                        new = min(max(old + sign * delta, 1e-9), 1.0 - 1e-9)
+                        if abs(new - old) < 1e-12:
+                            continue
+                        centers[i, axis] = new
+                        cand = compute_max_radii(centers, r_init=r, max_sweeps=25)
+                        tot = float(np.sum(cand))
+                        if tot > best + 1e-9:
+                            best = tot
+                            improved = True
+                            r = cand
+                        else:
+                            centers[i, axis] = old
+                # diagonal moves
+                for sx in (+1.0, -1.0):
+                    for sy in (+1.0, -1.0):
+                        old0, old1 = centers[i, 0], centers[i, 1]
+                        new0 = min(max(old0 + sx * delta, 1e-9), 1.0 - 1e-9)
+                        new1 = min(max(old1 + sy * delta, 1e-9), 1.0 - 1e-9)
+                        if abs(new0 - old0) < 1e-12 and abs(new1 - old1) < 1e-12:
+                            continue
+                        centers[i, 0], centers[i, 1] = new0, new1
+                        cand = compute_max_radii(centers, r_init=r, max_sweeps=25)
+                        tot = float(np.sum(cand))
+                        if tot > best + 1e-9:
+                            best = tot
+                            improved = True
+                            r = cand
+                        else:
+                            centers[i, 0], centers[i, 1] = old0, old1
+    # final exact cold solve to remove any warm-start bias
+    r = compute_max_radii(centers)
+    return centers
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    for _ in range(3):
+=======
+    for _ in range(6):
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

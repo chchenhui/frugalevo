@@ -1,0 +1,253 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+import itertools
+
+
+def _clip_to_triangle(pts: np.ndarray) -> np.ndarray:
+    """Project points into the equilateral triangle with vertices
+    (0,0), (1,0), (0.5, sqrt(3)/2) using barycentric coordinates."""
+    h = np.sqrt(3.0) / 2.0
+    A = np.array([0.0, 0.0])
+    B = np.array([1.0, 0.0])
+    C = np.array([0.5, h])
+    v0 = B - A
+    v1 = C - A
+    v2 = pts - A
+    d00 = v0 @ v0
+    d01 = v0 @ v1
+    d11 = v1 @ v1
+    d20 = v2 @ v0
+    d21 = v2 @ v1
+    denom = d00 * d11 - d01 * d01
+    b = (d11 * d20 - d01 * d21) / denom
+    c = (d00 * d21 - d01 * d20) / denom
+    a = 1.0 - b - c
+    w = np.stack([a, b, c], axis=-1)
+    w = np.clip(w, 0.0, 1.0)
+    w /= w.sum(axis=-1, keepdims=True)
+    out = w[:, 0:1] * A + w[:, 1:2] * B + w[:, 2:3] * C
+    return out
+
+
+def _all_areas(pts: np.ndarray) -> np.ndarray:
+    """Vectorized doubled areas of all triplets."""
+    idx = np.array(list(itertools.combinations(range(len(pts)), 3)))
+    p = pts[idx]
+    cross = (p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) - \
+            (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0])
+    return np.abs(cross)
+
+
+def _min_area(pts: np.ndarray) -> float:
+    return _all_areas(pts).min()
+
+
+def _soft_obj(pts: np.ndarray, k: float = 300.0, frac: float = 0.20) -> float:
+    areas = _all_areas(pts)
+    m = max(3, int(len(areas) * frac))
+    smallest = np.partition(areas, m - 1)[:m]
+    return -np.log(np.mean(np.exp(-smallest * k))) / k
+
+
+def _seeds(n: int, h: float) -> list:
+    seeds = []
+    pts = []
+    rows = 4
+    for r in range(rows):
+        y = h * r / (rows - 1)
+        cnt = rows - r
+        for c in range(cnt):
+            x = (c + 0.5) / cnt if r > 0 else c / (cnt - 1)
+            pts.append([x * (1.0 - 0.5 * r / (rows - 1)) + 0.25 * r / (rows - 1), y])
+    pts = np.array(pts)
+    pts = np.vstack([pts, [0.5, h / 3.0]])[:n]
+    seeds.append(_clip_to_triangle(pts))
+    t = np.linspace(0.0, 1.0, 7)
+    edge = []
+    for u in t:
+        edge.append([u, 0.0])
+    for u in t[1:-1]:
+        edge.append([0.5 * (1 + u), h * u])
+        edge.append([0.5 * (1 - u), h * u])
+    edge = np.array(edge)
+    sel = np.linspace(0, len(edge) - 1, n).round().astype(int)
+    seeds.append(_clip_to_triangle(edge[sel]))
+    rng = np.random.default_rng(777)
+    u, v = rng.random(n), rng.random(n)
+    su = np.sqrt(u)
+    w0, w1, w2 = 1 - su, su * (1 - v), su * v
+    seeds.append(_clip_to_triangle(np.stack([w1 + 0.5 * w2, h * w2], axis=1)))
+    rng2 = np.random.default_rng(2024)
+    w = rng2.dirichlet(np.full(3, 2.0), size=n)
+    seeds.append(_clip_to_triangle(np.stack([w[:, 1] + 0.5 * w[:, 2], h * w[:, 2]], axis=1)))
+    rng3 = np.random.default_rng(555)
+    for sigma in (0.01, 0.05, 0.10):
+        base = seeds[0].copy()
+        base += rng3.normal(0.0, sigma, size=base.shape)
+        seeds.append(_clip_to_triangle(base))
+    rng4 = np.random.default_rng(31337)
+    w = rng4.dirichlet(np.full(3, 2.0), size=n)
+    seeds.append(_clip_to_triangle(np.stack([w[:, 1] + 0.5 * w[:, 2], h * w[:, 2]], axis=1)))
+    return seeds
+
+
+def _pair_exchange(pts: np.ndarray, val: float, attempts: int, rng) -> tuple:
+    """Structured escape: move the two points shared by the current minimal
+    triangle in coordinated opposite directions (rotating pairs)."""
+    n = len(pts)
+    areas = _all_areas(pts)
+    tmin = int(np.argmin(areas))
+    idx = np.array(list(itertools.combinations(range(n), 3)))[tmin]
+    cur = pts.copy()
+    for att in range(attempts):
+        i, j = idx[att % 3], idx[(att % 3 + 1) % 3]
+        ang = rng.uniform(0.0, 2.0 * np.pi)
+        d = np.array([np.cos(ang), np.sin(ang)])
+        step = rng.uniform(0.002, 0.02)
+        trial = cur.copy()
+        trial[i] += step * d
+        trial[j] -= step * d
+        trial = _clip_to_triangle(trial)
+        v = _min_area(trial)
+        if v > val + 1e-15:
+            cur, val = trial, v
+            areas = _all_areas(cur)
+            tmin = int(np.argmin(areas))
+            idx = np.array(list(itertools.combinations(range(n), 3)))[tmin]
+    return cur, val
+
+
+def _directed_polish(pts: np.ndarray, val: float, step: float, rounds: int) -> tuple:
+    """Coordinate-wise greedy polish incl. paired counter-moves."""
+    n = len(pts)
+    cur, cur_val = pts.copy(), val
+    for _ in range(rounds):
+        improved = False
+        for i in range(n):
+            for d in range(2):
+                for s in (+1, -1):
+                    trial = cur.copy()
+                    trial[i, d] += s * step
+                    trial = _clip_to_triangle(trial)
+                    v = _min_area(trial)
+                    if v > cur_val + 1e-15:
+                        cur, cur_val = trial, v
+                        improved = True
+                    j = (i + 1) % n
+                    trial = cur.copy()
+                    trial[i, d] += s * step
+                    trial[j, d] -= s * step
+                    trial = _clip_to_triangle(trial)
+                    v = _min_area(trial)
+                    if v > cur_val + 1e-15:
+                        cur, cur_val = trial, v
+                        improved = True
+        if not improved:
+            step *= 0.5
+            if step < 1e-7:
+                break
+    return cur, cur_val
+
+
+def _hard_refine(pts: np.ndarray, val: float, step0: float, iters: int, rng) -> tuple:
+    """Fine stochastic refinement with mixed single/group moves."""
+    n = len(pts)
+    cur, cur_val = pts.copy(), val
+    for it in range(iters):
+        step = step0 * (1.0 - it / iters) + 1e-6
+        m = 1 + int(rng.integers(3))
+        idx = rng.choice(n, size=m, replace=False)
+        trial = cur.copy()
+        trial[idx] += rng.normal(0.0, step, size=(m, 2))
+        trial = _clip_to_triangle(trial)
+        v = _min_area(trial)
+        if v >= cur_val - 1e-13:
+            cur, cur_val = trial, v
+    return cur, cur_val
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of 11 points on or inside an equilateral triangle
+    maximizing the smallest triangle area (Heilbronn problem, n=11).
+
+    Returns:
+        points: np.ndarray of shape (11,2) with the x,y coordinates of the points.
+    """
+    n = 11
+    h = np.sqrt(3.0) / 2.0
+
+    best, best_val = None, -1.0
+    all_seeds = _seeds(n, h)
+
+    # Cheap screening, promote top 3 seeds
+    screen_scores = []
+    for sid, s0 in enumerate(all_seeds):
+        c = _clip_to_triangle(s0.copy())
+        r = np.random.default_rng(9000 + sid)
+        cval = _soft_obj(c)
+        for _ in range(15):
+            i = r.integers(n)
+            t = c.copy()
+            t[i] += r.normal(0.0, 0.03, size=2)
+            t = _clip_to_triangle(t)
+            v = _soft_obj(t)
+            if v >= cval - 1e-12:
+                c, cval = t, v
+        screen_scores.append(cval)
+    order = np.argsort(screen_scores)[::-1]
+    promoted = [all_seeds[i] for i in order[:3]]
+
+    for seed_id, start in enumerate(promoted):
+        s_rng = np.random.default_rng(12345 + 1000 * seed_id)
+        cur = _clip_to_triangle(start.copy())
+
+        # Phase 1: soft-min coarse search
+        cur_val = _soft_obj(cur)
+        iters = 9000
+        for it in range(iters):
+            step = 0.05 * (1.0 - it / iters) + 1e-3
+            i = s_rng.integers(n)
+            trial = cur.copy()
+            trial[i] += s_rng.normal(0.0, step, size=2)
+            trial = _clip_to_triangle(trial)
+            val = _soft_obj(trial)
+            if val >= cur_val - 1e-12:
+                cur, cur_val = trial, val
+
+        # Phase 2: hard-min group search
+        cur_val = _min_area(cur)
+        cur, cur_val = _hard_refine(cur, cur_val, 0.01, 5000, s_rng)
+
+        if cur_val > best_val:
+            best, best_val = cur.copy(), cur_val
+
+    # Phase 3: compounding rounds of
+    # pair-exchange -> directed polish -> hard refine, always keep the best.
+    cur, cur_val = best.copy(), best_val
+    esc_rng = np.random.default_rng(77777)
+    stall = 0
+    for rnd in range(4):
+        prev_val = cur_val
+        cur, cur_val = _pair_exchange(cur, cur_val, 40, esc_rng)
+        cur, cur_val = _directed_polish(cur, cur_val, 0.001, 15)
+        cur, cur_val = _hard_refine(cur, cur_val, 0.0005, 2000, esc_rng)
+        if cur_val > best_val:
+            best, best_val = cur.copy(), cur_val
+        if cur_val - prev_val < 1e-12:
+            stall += 1
+            if stall >= 2:
+                break
+        else:
+            stall = 0
+
+    # Final fine polish on the global best
+    best, best_val = _directed_polish(best, best_val, 0.0005, 10)
+
+    if best is None or not np.all(np.isfinite(best)):
+        best = _clip_to_triangle(np.zeros((n, 2)) + np.array([0.4, 0.3]))
+
+    return best
+
+
+# EVOLVE-BLOCK-END

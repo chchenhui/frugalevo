@@ -1,0 +1,116 @@
+<NAME>
+adaptive_bottleneck_polish</NAME>
+
+<DESCRIPTION>
+The current Adam-softmin ascent treats all near-minimal triangles with smoothly annealed weights, but it terminates at whatever local optimum the single random seed reaches. The key insight from the Heilbronn problem is that the optimum is dictated by a handful of *binding* (near-degenerate) triangles: progress stalls because the softmin gradient mixes many weak constraints. I add a post-Adam polishing phase that (1) computes exact minimum areas, (2) identifies a *set* of "tight" triangles whose area is within an adaptive threshold (3.0× min early → 1.2× min late) of the bottleneck, and (3) moves the vertices of those triangles along the exact analytic gradient of their signed areas with a temperature-scaled step and line-search acceptance. Early iterations move near-binding points broadly (exploration), late iterations focus only on the exact binding constraints (fine polish). This mirrors the proven temperature-scaled move magnitudes and costs almost nothing. I also add a small deterministic multi-start (3 seeds) and keep the best result, raising the chance of landing in the best basin while keeping runtime well under a second.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        for it in range(1, 1201):
+=======
+        def exact_min_area(P):
+            x, y = P[:, 0], P[:, 1]
+            c = (x[J] - x[I]) * (y[K] - y[I]) - (y[J] - y[I]) * (x[K] - x[I])
+            return 0.5 * np.abs(c)
+
+        def polish(P, iters=600):
+            """Adaptive-threshold bottleneck polish: move vertices of all
+            'tight' triangles (area <= thresh * min) along the gradient of
+            their signed area; thresh narrows from 3.0 to 1.2 over time."""
+            P = P.copy()
+            cur = float(exact_min_area(P).min())
+            for it in range(iters):
+                thresh = 3.0 - 1.8 * (it / iters)  # 3.0 -> 1.2
+                x, y = P[:, 0], P[:, 1]
+                xi, yi = x[I], y[I]
+                xj, yj = x[J], y[J]
+                xk, yk = x[K], y[K]
+                c = (xj - xi) * (yk - yi) - (yj - yi) * (xk - xi)
+                a = 0.5 * np.abs(c)
+                amin = a.min()
+                tight = a <= thresh * amin
+                if not np.any(tight):
+                    tight = a <= 1.2 * amin
+                s = np.sign(c)
+                coef = np.where(tight, 0.5 * s, 0.0)  # ascent on signed area
+                g = np.zeros_like(P)
+                np.add.at(g, I, np.stack([coef * (yj - yk), coef * (xk - xj)], axis=1))
+                np.add.at(g, J, np.stack([coef * (yk - yi), coef * (xi - xk)], axis=1))
+                np.add.at(g, K, np.stack([coef * (yi - yj), coef * (xj - xi)], axis=1))
+                # temperature-scaled step: broad early, tiny late
+                step = 0.02 * (1.0 - it / iters) + 0.0005
+                gn = np.linalg.norm(g, axis=1, keepdims=True)
+                gn[gn < 1e-15] = 1.0
+                moved = False
+                s_try = step
+                for _ in range(6):
+                    cand = P + s_try * g / gn
+                    lam3 = cand[:, 1] / H
+                    lam2 = cand[:, 0] - 0.5 * lam3
+                    lam1 = 1.0 - lam2 - lam3
+                    L = np.stack([lam1, lam2, lam3], axis=1)
+                    L = np.clip(L, 1e-9, 1.0)
+                    L = L / L.sum(axis=1, keepdims=True)
+                    cand = L @ V
+                    v = float(exact_min_area(cand).min())
+                    if v > cur + 1e-14:
+                        P, cur, moved = cand, v, True
+                        break
+                    s_try *= 0.5
+                if not moved and step < 1e-6:
+                    break
+            return P, cur
+
+        # Deterministic multi-start: run Adam + polish from several seeds,
+        # keep the configuration with the largest exact minimum area.
+        best_pts = None
+        best_val = -1.0
+        for seed in (20240611, 7, 1234):
+            rng = np.random.default_rng(seed)
+            u = rng.random((8, 3)) + 0.35
+            u = u / u.sum(axis=1, keepdims=True)
+            lam = np.zeros((n, 3))
+            lam[0] = [1.0, 0.0, 0.0]
+            lam[1] = [0.0, 1.0, 0.0]
+            lam[2] = [0.0, 0.0, 1.0]
+            lam[3:] = u
+            pts = lam @ V
+            m = np.zeros_like(pts)
+            v = np.zeros_like(pts)
+            lr, b1, b2, eps = 0.02, 0.9, 0.999, 1e-8
+            for it in range(1, 801):
+                tau = max(0.0004, 0.02 * np.exp(-it / 200.0))
+                x, y = pts[:, 0], pts[:, 1]
+                xi, yi = x[I], y[I]
+                xj, yj = x[J], y[J]
+                xk, yk = x[K], y[K]
+                c = (xj - xi) * (yk - yi) - (yj - yi) * (xk - xi)
+                a = 0.5 * np.abs(c)
+                s = np.sign(c)
+                z = np.exp(-(a - a.min()) / tau)
+                w = z / z.sum()
+                coef = -0.5 * w * s
+                g = np.zeros_like(pts)
+                np.add.at(g, I, np.stack([coef * (yj - yk), coef * (xk - xj)], axis=1))
+                np.add.at(g, J, np.stack([coef * (yk - yi), coef * (xi - xk)], axis=1))
+                np.add.at(g, K, np.stack([coef * (yi - yj), coef * (xj - xi)], axis=1))
+                m = b1 * m + (1 - b1) * g
+                v = b2 * v + (1 - b2) * (g * g)
+                mh = m / (1 - b1 ** it)
+                vh = v / (1 - b2 ** it)
+                pts = pts - lr * mh / (np.sqrt(vh) + eps)
+                lam3 = pts[:, 1] / H
+                lam2 = pts[:, 0] - 0.5 * lam3
+                lam1 = 1.0 - lam2 - lam3
+                L = np.stack([lam1, lam2, lam3], axis=1)
+                L = np.clip(L, 1e-9, 1.0)
+                L = L / L.sum(axis=1, keepdims=True)
+                pts = L @ V
+            pts, val = polish(pts)
+            if val > best_val:
+                best_val, best_pts = val, pts.copy()
+
+        return best_pts
+
+        for it in range(1, 1201):
+>>>>>>> REPLACE
+</DIFF>

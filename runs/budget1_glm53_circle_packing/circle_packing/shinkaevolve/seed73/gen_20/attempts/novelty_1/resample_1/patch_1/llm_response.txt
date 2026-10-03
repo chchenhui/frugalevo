@@ -1,0 +1,130 @@
+<NAME>
+relax_centers_and_contact_pass</NAME>
+<DESCRIPTION>
+The current best programs show that center relaxation after the hex-lattice initialization boosts sum_radii from 2.36 to ~2.37. I propose: (1) keep the fast greedy radius growth, (2) add a damped repulsion relaxation of the centers (away from tight neighbors/walls) with best-so-far tracking, and (3) follow the recommendation of a final per-circle "contact relaxation" pass, where each center is moved to maximize its own locally-grown radius (Voronoi-like local maximization). This directly targets sum_radii at convergence and stays within the runtime budget since the growth is cheap and vectorized.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Greedy expansion: sweep repeatedly, growing each circle to the
+    # largest radius allowed by the walls and current neighbor radii.
+    # This exploits leftover space near the square's corners that a
+    # pure hex lattice leaves empty. Each step keeps the packing valid.
+    radii = np.full(n, 0.5 * r0)
+    d = np.sqrt(((centers[:, None, :] - centers[None, :, :]) ** 2).sum(-1))
+    for _ in range(60):
+        for i in range(n):
+            # Wall limit
+            x, y = centers[i]
+            r_max = min(x, y, 1.0 - x, 1.0 - y)
+            # Neighbor limits
+            for j in range(n):
+                if j != i:
+                    r_max = min(r_max, d[i, j] - radii[j])
+            radii[i] = max(0.5 * r0, r_max)
+
+    # Calculate the sum of radii
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+=======
+    def grow(pts):
+        """Vectorized greedy sweep: each circle grows to the max radius
+        allowed by walls and current neighbor radii."""
+        m = len(pts)
+        dm = np.sqrt(((pts[:, None, :] - pts[None, :, :]) ** 2).sum(-1))
+        np.fill_diagonal(dm, np.inf)
+        wall = np.minimum(pts.min(axis=1), (1.0 - pts).min(axis=1))
+        rad = np.zeros(m)
+        for _ in range(80):
+            lim = np.minimum(wall, (dm - rad[None, :]).min(axis=1))
+            if np.all(lim <= rad + 1e-12):
+                rad = lim
+                break
+            rad = lim
+        return np.maximum(rad, 1e-9)
+
+    best_c = centers.copy()
+    best_r = grow(best_c)
+    best_sum = best_r.sum()
+
+    cur = centers.copy()
+    rng = np.random.default_rng(0)
+    step = 0.008
+    for it in range(120):
+        dm = np.sqrt(((cur[:, None, :] - cur[None, :, :]) ** 2).sum(-1))
+        rad = grow(cur)
+        np.fill_diagonal(dm, np.inf)
+        # binding constraint: wall vs nearest neighbor slack
+        slack_nb = (dm - rad[None, :]).min(axis=1)
+        j_min = (dm - rad[None, :]).argmin(axis=1)
+        wall = np.minimum(cur.min(axis=1), (1.0 - cur).min(axis=1))
+        for i in range(n):
+            if wall[i] <= slack_nb[i]:
+                # wall-limited: move toward the interior (away from nearest wall)
+                x, y = cur[i]
+                dx = step if x < 0.5 else -step
+                dy = step if y < 0.5 else -step
+                if min(x, 1 - x) < min(y, 1 - y):
+                    dy = 0.0
+                else:
+                    dx = 0.0
+                cur[i] += [dx, dy]
+            else:
+                # neighbor-limited: slide directly away from that neighbor
+                vec = cur[i] - cur[j_min[i]]
+                nrm = np.linalg.norm(vec)
+                if nrm > 1e-12:
+                    cur[i] += (vec / nrm) * step
+        cur += rng.normal(0.0, 0.15 * step, cur.shape)
+        cur = np.clip(cur, 1e-4, 1.0 - 1e-4)
+        rad2 = grow(cur)
+        s2 = rad2.sum()
+        if s2 > best_sum:
+            best_sum = s2
+            best_c, best_r = cur.copy(), rad2.copy()
+        else:
+            cur = best_c.copy()
+        step *= 0.985
+
+    # Final "contact relaxation" pass: move each center to equalize its
+    # gap to its two nearest constraints (neighbor or wall), maximizing
+    # its own grown radius — a Voronoi-like local maximization of the sum.
+    cur = best_c.copy()
+    for _ in range(40):
+        dm = np.sqrt(((cur[:, None, :] - cur[None, :, :]) ** 2).sum(-1))
+        np.fill_diagonal(dm, np.inf)
+        rad = grow(cur)
+        for i in range(n):
+            # collect constraint "slacks": walls and neighbors
+            x, y = cur[i]
+            cands = [x, y, 1.0 - x, 1.0 - y]
+            # top-2 nearest neighbors by slack
+            sl = dm[i] - rad
+            order = np.argsort(sl)
+            j1, j2 = order[0], order[1]
+            # gradient step to enlarge the min slack: push away from the
+            # tightest neighbor, and from the tightest wall
+            vec = cur[i] - cur[j1]
+            nrm = np.linalg.norm(vec) + 1e-12
+            g = 0.004 * vec / nrm
+            # wall direction (toward interior for the binding wall)
+            walls = [(x, [1, 0]), (y, [0, 1]), (1.0 - x, [-1, 0]), (1.0 - y, [0, -1])]
+            wmin = min(walls, key=lambda t: t[0])
+            if wmin[0] < sl[order[0]]:
+                g += 0.004 * np.array(wmin[1])
+            cur[i] += g
+        cur = np.clip(cur, 1e-4, 1.0 - 1e-4)
+        rad2 = grow(cur)
+        if rad2.sum() > best_sum:
+            best_sum = rad2.sum()
+            best_c, best_r = cur.copy(), rad2.copy()
+
+    centers = best_c
+    radii = best_r
+
+    # Calculate the sum of radii
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+>>>>>>> REPLACE
+</DIFF>

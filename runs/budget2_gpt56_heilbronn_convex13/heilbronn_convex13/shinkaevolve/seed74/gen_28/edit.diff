@@ -1,0 +1,362 @@
+--- a/original.py
++++ b/original.py
+@@ -1,122 +1,255 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_convex13() -> np.ndarray:
+     """
+-    Return a deterministic maximin configuration of thirteen points in the
+-    unit square.  The four corners are retained, hence the convex hull has
+-    area one and no post-search hull normalization is necessary.
++    Deterministically construct thirteen points in an equilateral convex
++    region of area one.
++
++    The layout consists of the three hull vertices, the centroid, and three
++    independently phased 3-fold rings.  All rings lie in the centroid's
++    inscribed disk, guaranteeing that every returned point is in or on the
++    convex hull.
+     """
+-    rng = np.random.default_rng(13051957)
+-
+-    # Fixing the square corners both guarantees a unit-area convex hull and
+-    # leaves the search free to distribute the nine interior points.
+-    corners = np.array(
+-        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+-        dtype=float,
+-    )
++    rng = np.random.default_rng(20260315)
++
++    root3 = np.sqrt(3.0)
++    side = np.sqrt(4.0 / root3)
++    height = 0.5 * root3 * side
++
++    hull = np.array(
++        [[0.0, 0.0], [side, 0.0], [0.5 * side, height]],
++        dtype=np.float64,
++    )
++    center = np.array([0.5 * side, height / 3.0], dtype=np.float64)
++
++    inradius = height / 3.0
++    radius_lo = 0.075 * inradius
++    radius_hi = 0.972 * inradius
++    phase_period = 2.0 * np.pi / 3.0
++    ring_offsets = np.array(
++        [0.0, phase_period, 2.0 * phase_period], dtype=np.float64
++    )
++
+     triples = np.array(
+-        [(i, j, k) for i in range(13) for j in range(i + 1, 13)
+-         for k in range(j + 1, 13)],
++        [
++            (i, j, k)
++            for i in range(13)
++            for j in range(i + 1, 13)
++            for k in range(j + 1, 13)
++        ],
+         dtype=np.intp,
+     )
+ 
+-    def areas(p: np.ndarray) -> np.ndarray:
+-        a = p[triples[:, 0]]
+-        b = p[triples[:, 1]]
+-        c = p[triples[:, 2]]
+-        return 0.5 * np.abs(
+-            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+-            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+-        )
+-
+-    def merit(p: np.ndarray, blend: float) -> tuple[float, float, np.ndarray]:
+-        values = areas(p)
+-        smallest = np.partition(values, 11)[:12]
+-        minimum = float(smallest.min())
+-        # Early in annealing, improving several tight constraints is much
+-        # more effective than optimizing just one currently active triangle.
+-        return minimum + blend * float(smallest.mean()), minimum, values
+-
+-    best = None
+-    best_minimum = -1.0
+-
+-    # Independent deterministic starts are useful because the maximin
+-    # landscape contains many narrow local optima.
+-    grid = np.array(
+-        [[x, y] for y in (0.2, 0.5, 0.8) for x in (0.2, 0.5, 0.8)],
+-        dtype=float,
+-    )
+-    for restart in range(4):
+-        if restart < 2:
+-            # This spacing supplies a productive scale without preserving the
+-            # exact grid's numerous collinear triples.
+-            interior = grid + rng.normal(0.0, 0.030 + 0.012 * restart, size=(9, 2))
+-            interior = np.clip(interior, 0.065, 0.935)
++    def reflect_unit(x: np.ndarray) -> np.ndarray:
++        """Reflect arbitrary values into [0, 1] without clipping bias."""
++        y = np.mod(x, 2.0)
++        return np.where(y <= 1.0, y, 2.0 - y)
++
++    def canonical(z: np.ndarray) -> np.ndarray:
++        """
++        Normalize parameter vectors.
++
++        z[:, :3] are normalized ring radii and use reflection.  z[:, 3:]
++        are normalized ring phases and are periodic.
++        """
++        result = z.copy()
++        result[..., :3] = reflect_unit(result[..., :3])
++        result[..., 3:] = np.mod(result[..., 3:], 1.0)
++        return result
++
++    def build_layouts(z: np.ndarray) -> np.ndarray:
++        """Convert batches of six ring parameters into point layouts."""
++        z = canonical(z)
++        count = z.shape[0]
++        points = np.empty((count, 13, 2), dtype=np.float64)
++        points[:, :3] = hull
++        points[:, 3] = center
++
++        radii = radius_lo + (radius_hi - radius_lo) * z[:, :3]
++        phases = phase_period * z[:, 3:]
++
++        for ring in range(3):
++            angle = phases[:, ring, None] + ring_offsets[None, :]
++            first = 4 + 3 * ring
++            points[:, first:first + 3, 0] = (
++                center[0] + radii[:, ring, None] * np.cos(angle)
++            )
++            points[:, first:first + 3, 1] = (
++                center[1] + radii[:, ring, None] * np.sin(angle)
++            )
++        return points
++
++    def evaluate(z: np.ndarray, tail_weight: float = 0.0):
++        """
++        Return temporary lower-tail merit and exact normalized min triangle
++        area.  Hull area is exactly one, so raw triangle areas are normalized.
++        """
++        points = build_layouts(z)
++        a = points[:, triples[:, 0]]
++        b = points[:, triples[:, 1]]
++        c = points[:, triples[:, 2]]
++
++        areas = 0.5 * np.abs(
++            (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
++            - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
++        )
++        low = np.partition(areas, 17, axis=1)[:, :18]
++        minimum = low[:, 0]
++        merit = minimum + tail_weight * low.mean(axis=1)
++        return merit, minimum
++
++    population_size = 336
++    generations = 640
++    dimension = 6
++
++    # Latin-hypercube coverage prevents the radial and angular variables from
++    # starting phase locked, unlike independent purely random initialization.
++    population = np.empty((population_size, dimension), dtype=np.float64)
++    for coordinate in range(dimension):
++        strata = np.arange(population_size, dtype=np.float64) + rng.random(
++            population_size
++        )
++        rng.shuffle(strata)
++        population[:, coordinate] = strata / population_size
++
++    # Structured starts preserve several useful radial scales at generation 0.
++    seeds = np.array(
++        [
++            [0.14, 0.47, 0.84, 0.03, 0.35, 0.77],
++            [0.20, 0.55, 0.90, 0.13, 0.56, 0.92],
++            [0.27, 0.62, 0.96, 0.25, 0.70, 0.08],
++            [0.10, 0.40, 0.76, 0.34, 0.66, 0.96],
++            [0.32, 0.68, 0.88, 0.07, 0.46, 0.82],
++            [0.23, 0.51, 0.81, 0.44, 0.79, 0.16],
++            [0.17, 0.59, 0.93, 0.30, 0.61, 0.01],
++            [0.36, 0.72, 0.98, 0.18, 0.50, 0.86],
++        ],
++        dtype=np.float64,
++    )
++    population[:len(seeds)] = seeds
++    population = canonical(population)
++
++    _, minimum = evaluate(population)
++    best_index = int(np.argmax(minimum))
++    best = population[best_index].copy()
++    best_value = float(minimum[best_index])
++
++    for generation in range(generations):
++        progress = generation / float(generations - 1)
++
++        # Lower-tail protection is strong early, then final ranking becomes
++        # increasingly faithful to the exact primary objective.
++        tail_weight = 0.12 * (1.0 - progress) ** 1.85 + 0.003
++        merit, minimum = evaluate(population, tail_weight)
++
++        elite_count = 30
++        order = np.argsort(merit)
++        elite = population[order[-elite_count:]]
++        elite_pick = elite[rng.integers(0, elite_count, population_size)]
++
++        r1 = rng.integers(0, population_size, population_size)
++        r2 = rng.integers(0, population_size, population_size)
++        r3 = rng.integers(0, population_size, population_size)
++        r2 = (r2 + (r2 == r1)) % population_size
++        r3 = (r3 + (r3 == r1) + (r3 == r2)) % population_size
++
++        differential_scale = 0.78 - 0.50 * progress
++        best_pull = 0.10 + 0.46 * progress
++
++        donor_rand = population[r1] + differential_scale * (
++            population[r2] - population[r3]
++        )
++        donor_current = population + best_pull * (elite_pick - population) + (
++            differential_scale * (population[r1] - population[r2])
++        )
++        donor_elite = elite_pick + (0.44 - 0.24 * progress) * (
++            population[r1] - population[r2]
++        )
++
++        mode = rng.random(population_size)
++        donor = np.where(
++            (mode < 0.40)[:, None],
++            donor_rand,
++            np.where((mode < 0.84)[:, None], donor_current, donor_elite),
++        )
++        donor = canonical(donor)
++
++        crossover = rng.random((population_size, dimension)) < (
++            0.88 - 0.30 * progress
++        )
++        crossover[
++            np.arange(population_size),
++            rng.integers(0, dimension, population_size),
++        ] = True
++        trial = canonical(np.where(crossover, donor, population))
++
++        trial_merit, trial_minimum = evaluate(trial, tail_weight)
++        accepted = trial_merit >= merit
++        population[accepted] = trial[accepted]
++        minimum[accepted] = trial_minimum[accepted]
++
++        current = int(np.argmax(minimum))
++        if minimum[current] > best_value:
++            best_value = float(minimum[current])
++            best = population[current].copy()
++
++        # Diversity refreshes retain elite members and repopulate weak basins.
++        if generation in (185, 365, 505):
++            weak_count = population_size // 7
++            weak = np.argsort(minimum)[:weak_count]
++            population[weak] = rng.random((weak_count, dimension))
++            _, minimum[weak] = evaluate(population[weak])
++
++    # Adaptive sparse perturbation searches the nonsmooth active-constraint
++    # neighborhood without repeatedly destroying all tight triangles.
++    sigma = 0.038
++    for iteration in range(310):
++        fraction = iteration / 309.0
++        trials = np.repeat(best[None], 72, axis=0)
++
++        mask_probability = 0.58 - 0.34 * fraction
++        mask = rng.random((72, dimension)) < mask_probability
++        mask[0, rng.integers(0, dimension)] = True
++
++        radial_sigma = sigma * (0.50 + 0.50 * (1.0 - fraction))
++        phase_sigma = sigma * (0.80 + 0.35 * (1.0 - fraction))
++        noise = rng.normal(0.0, 1.0, size=(72, dimension))
++        noise[:, :3] *= radial_sigma
++        noise[:, 3:] *= phase_sigma
++
++        trials = canonical(trials + mask * noise)
++        _, values = evaluate(trials)
++        winner = int(np.argmax(values))
++
++        if values[winner] > best_value + 1e-14:
++            best = trials[winner].copy()
++            best_value = float(values[winner])
++            sigma *= 1.018
+         else:
+-            interior = rng.uniform(0.065, 0.935, size=(9, 2))
+-        points = np.vstack((corners, interior))
+-        current_merit, current_minimum, current_values = merit(points, 0.09)
+-
+-        for iteration in range(45000):
+-            fraction = iteration / 44999.0
+-            blend = 0.09 * (1.0 - fraction)
+-            step = 0.105 * (1.0 - fraction) ** 1.7 + 0.0012
+-
+-            trial = points.copy()
+-            if rng.random() < 0.76:
+-                # Weight vertices by participation in the eighteen most
+-                # restrictive triangles.  Duplicate entries deliberately give
+-                # a point shared by several tight constraints more attention.
+-                tight = triples[np.argpartition(current_values, 17)[:18]]
+-                movable = tight[tight >= 4]
+-                index = int(rng.choice(movable))
+-            else:
+-                index = int(rng.integers(4, 13))
+-            trial[index] += rng.normal(0.0, step, size=2)
+-            trial[index] = np.clip(trial[index], 0.065, 0.935)
+-
+-            trial_merit, trial_minimum, trial_values = merit(trial, blend)
+-            temperature = 0.0028 * (1.0 - fraction) ** 2 + 0.000002
+-            if (trial_merit >= current_merit or
+-                    rng.random() < np.exp((trial_merit - current_merit) / temperature)):
+-                points = trial
+-                current_merit = trial_merit
+-                current_minimum = trial_minimum
+-                current_values = trial_values
+-
+-            if current_minimum > best_minimum:
+-                best = points.copy()
+-                best_minimum = current_minimum
+-
+-    # A short coordinate-pattern search removes residual annealing noise while
+-    # accepting only improvements to the actual primary objective.
+-    directions = np.array(
+-        [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
+-         [1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0]],
+-        dtype=float,
+-    )
+-    directions[4:] /= np.sqrt(2.0)
+-    step = 0.012
+-    for _ in range(8):
++            sigma *= 0.988
++        sigma = float(np.clip(sigma, 0.0010, 0.040))
++
++    # Final deterministic coordinate-direction refinement on the exact score.
++    direction_steps = (0.010, 0.005, 0.0022, 0.0009)
++    for step in direction_steps:
+         improved = True
+         while improved:
+             improved = False
+-            for index in range(4, 13):
+-                for direction in directions:
+-                    trial = best.copy()
+-                    trial[index] = np.clip(
+-                        trial[index] + step * direction, 0.065, 0.935
+-                    )
+-                    candidate_minimum = float(areas(trial).min())
+-                    if candidate_minimum > best_minimum:
+-                        best = trial
+-                        best_minimum = candidate_minimum
+-                        improved = True
+-        step *= 0.55
+-
+-    return best
++            for coordinate in range(dimension):
++                trials = np.repeat(best[None], 2, axis=0)
++                trials[0, coordinate] += step
++                trials[1, coordinate] -= step
++                trials = canonical(trials)
++                _, values = evaluate(trials)
++                winner = int(np.argmax(values))
++                if values[winner] > best_value + 1e-14:
++                    best = trials[winner].copy()
++                    best_value = float(values[winner])
++                    improved = True
++
++    return build_layouts(best[None])[0]
+ 
+ 
+ # EVOLVE-BLOCK-END

@@ -1,0 +1,115 @@
+<NAME>
+add_topk_softmin_stage</NAME>
+<DESCRIPTION>
+The failure came from a stale/inconsistent SEARCH block (the _polish signature appears to already have been partially updated). To stay safe, I now propose a single, self-contained edit using text guaranteed to exist in the original current program: insert a scipy-based top-k softmin refinement stage (exactly the recommendation — log-sum-exp over only the k=20 smallest triplet areas with temperature annealing, softmax barycentric parametrization for guaranteed feasibility) right before `heilbronn_triangle11`, and wire it in as a final refinement applied to the best candidate found by the multi-start search. This is the part that most directly targets the primary objective, and it's independent of the state of the other helpers (all `_min_area(pts)` calls without idx remain valid since idx is optional).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct 11 points inside the unit equilateral triangle maximizing the
+    minimum triangle area (Heilbronn problem, n=11).
+=======
+try:
+    from scipy.optimize import minimize as _scipy_minimize
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+
+
+def _softmin_refine(pts, n_temps=(2e-2, 5e-3, 1e-3), k_worst=20):
+    """Top-k softmin smooth refinement (softmax barycentric parametrization).
+    Applies log-sum-exp over only the k smallest triplet areas so the smooth
+    objective concentrates its signal on the binding constraints instead of
+    diluting it across all 165 triples."""
+    if not _HAVE_SCIPY:
+        return pts
+    n = len(pts)
+    V = VERTS
+    A = np.array([[1.0, V[0, 0], V[0, 1]],
+                  [1.0, V[1, 0], V[1, 1]],
+                  [1.0, V[2, 0], V[2, 1]]])
+    b = np.column_stack([np.ones(n), pts])
+    lam0 = np.linalg.solve(A.T, b.T).T
+    lam0 = np.clip(lam0, 1e-3, None)
+    lam0 /= lam0.sum(axis=1, keepdims=True)
+    theta = np.log(lam0).ravel()
+
+    ii = []
+    jj = []
+    kk = []
+    for a in range(n - 2):
+        for c in range(a + 1, n - 1):
+            for d in range(c + 1, n):
+                ii.append(a)
+                jj.append(c)
+                kk.append(d)
+    ii = np.array(ii)
+    jj = np.array(jj)
+    kk = np.array(kk)
+
+    def unpack(th):
+        W = th.reshape(n, 3)
+        W = W - W.max(axis=1, keepdims=True)
+        E = np.exp(W)
+        W = E / E.sum(axis=1, keepdims=True)
+        return W @ V
+
+    def obj(th, temp):
+        p = unpack(th)
+        pi, pj, pk = p[ii], p[jj], p[kk]
+        cross = ((pj[:, 0] - pi[:, 0]) * (pk[:, 1] - pi[:, 1])
+                 - (pj[:, 1] - pi[:, 1]) * (pk[:, 0] - pi[:, 0]))
+        a = 0.5 * np.abs(cross)
+        if len(a) > k_worst:
+            part = np.partition(a, k_worst - 1)[:k_worst]
+        else:
+            part = a
+        m = part.min()
+        return -(m - temp * np.log(np.sum(np.exp(-(part - m) / temp))))
+
+    cur_val, _ = _min_area(pts)
+    for temp in n_temps:
+        try:
+            res = _scipy_minimize(obj, theta, args=(temp,), method="Powell",
+                                  options={"maxiter": 300, "xtol": 1e-6, "ftol": 1e-9})
+            if np.all(np.isfinite(res.x)):
+                theta = res.x
+        except Exception:
+            break
+    cand = unpack(theta)
+    if not np.all(np.isfinite(cand)):
+        return pts
+    val, _ = _min_area(cand)
+    if val > cur_val:
+        return cand
+    return pts
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct 11 points inside the unit equilateral triangle maximizing the
+    minimum triangle area (Heilbronn problem, n=11).
+>>>>>>> REPLACE
+
+<DIFF>
+<<<<<<< SEARCH
+            cand = _polish(cand, iters=300, step=0.008)
+            val, _ = _min_area(cand)
+            if val > best_val:
+                best_val, best_pts = val, cand
+        if best_pts is None or best_pts.shape != (11, 2) or not np.all(np.isfinite(best_pts)):
+=======
+            cand = _polish(cand, iters=300, step=0.008)
+            val, _ = _min_area(cand)
+            if val > best_val:
+                best_val, best_pts = val, cand
+        # Final smooth top-k softmin refinement on the best candidate
+        cand = _softmin_refine(best_pts)
+        val, _ = _min_area(cand)
+        if val > best_val:
+            best_val, best_pts = val, cand
+        if best_pts is None or best_pts.shape != (11, 2) or not np.all(np.isfinite(best_pts)):
+>>>>>>> REPLACE
+```

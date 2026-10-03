@@ -1,0 +1,138 @@
+<NAME>
+deterministic_multistart_constructor</NAME>
+
+<DESCRIPTION>
+The previous SEARCH block did not match because the actual file's editable region is only a tiny 19-line block whose core body is the three visible lines: seeding RNG with 42, drawing uniform random points, and returning them. This naive uniform-random constructor explains the plateau: uniform random points in a square include hull-interior clusters that produce tiny near-collinear triangles, and the configuration is never refined. I replace exactly those three lines with a self-contained, deterministic multi-seed + local-refinement Heilbronn constructor: it builds seven structurally distinct seeds (regular 13-gon, ellipse variant, two-cluster arcs, rounded-square superellipse, spiral+triangle anchors, perturbed polygon, seeded random), all constructed directly in the valid domain (hull scaled to unit area at construction time, no post-hoc fixup), evaluates the min normalized triangle area for each via an O(n³) vectorized cross-product computation, and applies a coordinate-descent local refinement (pairwise perturbations with shrinking step size, keeping a point only if it strictly improves the objective and stays within the unit-area hull) to the best seed. Everything uses the fixed seed and closed-form geometry, so results are deterministic and reproducible.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        rng = np.random.default_rng(seed=42)
+        points = rng.random((n, 2))
+        return points
+=======
+        # ---------- helpers (all deterministic, valid-by-construction) ----------
+        rng = np.random.default_rng(seed=42)
+
+        def tri_areas(P):
+            A = P[:, None, :] - P[None, :, :]          # A[i,j] = P[i]-P[j]
+            cross = A[:, :, 0] * A.T[:, :, 1] - A[:, :, 1] * A.T[:, :, 0]
+            idx = np.triu_indices(n, 1)
+            pairs_i, pairs_j = idx[0], idx[1]
+            D = np.abs(cross[pairs_i, :] - cross[pairs_j, :]) * 0.5
+            k = np.arange(n)
+            mask = (k != pairs_i[:, None]) & (k != pairs_j[:, None])
+            vals = np.abs(D[:, k])
+            vals = np.where(mask, vals, np.inf)
+            return vals.min()
+
+        def hull_scale(P):
+            # shoelace area of convex hull vertices via Andrew monotone chain
+            P2 = np.unique(np.round(P, 12), axis=0)
+            P2 = P2[np.lexsort((P2[:, 1], P2[:, 0]))]
+            if len(P2) < 3:
+                return P
+            def half(pts):
+                h = []
+                for p in pts:
+                    while len(h) >= 2 and np.cross(h[-1] - h[-2], p - h[-2]) <= 1e-12:
+                        h.pop()
+                    h.append(p)
+                return h
+            hull = half(P2)[:-1] + half(P2[::-1])[:-1]
+            H = np.array(hull)
+            area = 0.5 * abs(np.sum(H[:, 0] * np.roll(H[:, 1], -1) -
+                                     H[:, 1] * np.roll(H[:, 0], -1)))
+            if area <= 1e-15:
+                return P
+            return P / np.sqrt(area), H / np.sqrt(area)
+
+        def inside(P, H, tol=1e-9):
+            # all points inside/on the (already unit-area) hull H
+            m = len(H)
+            for i in range(m):
+                a, b = H[i], H[(i + 1) % m]
+                edge = b - a
+                if np.all(np.cross(edge, P - a) < -tol):
+                    return False
+            return True
+
+        # ---------- seed construction (7 diverse, deterministic basins) ----------
+        seeds = []
+        R = (1.0 / (0.5 * n * np.sin(2 * np.pi / n))) ** 0.5
+        th = 2 * np.pi * np.arange(n) / n
+        seeds.append(("regular_gon", np.stack([R * np.cos(th), R * np.sin(th)], 1)))
+
+        a, b = 1.3, 1.0 / 1.3
+        pts2 = np.stack([R * a * np.cos(th), R * b * np.sin(th)], 1)
+        seeds.append(("ellipse_gon", pts2 / np.sqrt(0.5 * n * R * R * a * b * np.sin(2 * np.pi / n))))
+
+        nA = n // 2
+        arc = []
+        for i in range(nA):
+            t = -np.pi / 3 + (2 * np.pi / 3) * (i / max(nA - 1, 1))
+            arc.append([np.cos(t), np.sin(t)])
+        for i in range(n - nA):
+            t = np.pi - np.pi / 4 + (np.pi / 2) * (i / max(n - nA - 1, 1))
+            arc.append([np.cos(t), np.sin(t)])
+        seeds.append(("two_cluster_arcs", np.asarray(arc)))
+
+        th4 = 2 * np.pi * (np.arange(n) + 0.5) / n
+        se = np.stack([np.sign(np.cos(th4)) * np.abs(np.cos(th4)) ** 0.5,
+                       np.sign(np.sin(th4)) * np.abs(np.sin(th4)) ** 0.5], 1)
+        seeds.append(("rounded_square", se))
+
+        anchors = np.stack([np.cos(2 * np.pi * np.arange(3) / 3),
+                            np.sin(2 * np.pi * np.arange(3) / 3)], 1)
+        ksp = n - 3
+        spir = []
+        for i in range(ksp):
+            t = (i + 1) / float(ksp + 1)
+            spir.append([0.85 * t * np.cos(2 * np.pi * 2.2 * t),
+                         0.85 * t * np.sin(2 * np.pi * 2.2 * t)])
+        seeds.append(("spiral_anchors", np.vstack([anchors, np.asarray(spir)])))
+
+        pert = seeds[0][1] * (1.0 + 0.08 * (rng.random((n, 2)) - 0.5))
+        seeds.append(("perturbed_gon", pert))
+
+        seeds.append(("seeded_random", rng.random((n, 2)) * 2.0 - 1.0))
+
+        # scale every seed so its convex hull has area exactly 1 (construction-time)
+        prepared = []
+        for name, P in seeds:
+            try:
+                P2, H = hull_scale(P)
+                if inside(P2, H):
+                    prepared.append((name, P2, H))
+            except Exception:
+                continue
+        if not prepared:
+            return np.asarray(seeds[0][1])
+
+        # ---------- evaluate seeds ----------
+        def score(P):
+            return tri_areas(P)  # hull area == 1, so this is normalized already
+
+        prepared.sort(key=lambda s: -score(s[1]))
+        name, P, H = prepared[0]
+        best = P.copy()
+        best_s = score(best)
+
+        # ---------- coordinate-descent local refinement ----------
+        step = 0.05
+        while step > 1e-5:
+            improved = False
+            for i in range(n):
+                for dxy in ((step, 0), (-step, 0), (0, step), (0, -step),
+                            (step, step), (-step, -step), (step, -step), (-step, step)):
+                    Q = best.copy()
+                    Q[i] += dxy
+                    if inside(Q, H):
+                        s = score(Q)
+                        if s > best_s + 1e-12:
+                            best, best_s, improved = Q, s, True
+            if not improved:
+                step *= 0.5
+
+        return best
+>>>>>>> REPLACE
+</DIFF>

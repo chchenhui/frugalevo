@@ -1,0 +1,133 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from itertools import combinations
+
+_TRIS = np.array(list(combinations(range(13), 3)), dtype=np.int32)
+
+
+def _min_triple_area(points: np.ndarray) -> float:
+    """Area of the smallest triangle among all C(13,3) triples, vectorized."""
+    p = points[_TRIS]                      # (286, 3, 2)
+    a = p[:, 1] - p[:, 0]
+    b = p[:, 2] - p[:, 0]
+    areas = 0.5 * np.abs(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0])
+    return float(areas.min())
+
+
+def _hull_area(points: np.ndarray) -> float:
+    """Area of convex hull via the shoelace formula on hull vertices."""
+    pts = points[np.lexsort((points[:, 1], points[:, 0]))]
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lower, upper = [], []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    for p in pts[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = np.array(lower[:-1] + upper[:-1])
+    x, y = hull[:, 0], hull[:, 1]
+    return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def _score(points: np.ndarray) -> float:
+    ha = _hull_area(points)
+    if ha <= 1e-12:
+        return 0.0
+    return _min_triple_area(points) / ha
+
+
+_DIRS = np.array([[1, 0], [-1, 0], [0, 1], [0, -1],
+                  [1, 1], [1, -1], [-1, 1], [-1, -1]], dtype=float)
+_DIRS /= np.linalg.norm(_DIRS, axis=1, keepdims=True)
+
+
+def _descend(points: np.ndarray, step: float = 0.25,
+             min_step: float = 2e-5) -> tuple:
+    """Deterministic coordinate descent maximizing _score. Returns (pts, score)."""
+    pts = points.copy()
+    best = _score(pts)
+    while step > min_step:
+        improved = False
+        for i in range(len(pts)):
+            for d in _DIRS:
+                for s in (step, 0.5 * step):
+                    trial = pts.copy()
+                    trial[i] = trial[i] + s * d
+                    sc = _score(trial)
+                    if sc > best + 1e-12:
+                        pts = trial
+                        best = sc
+                        improved = True
+        if not improved:
+            step *= 0.5
+    return pts, best
+
+
+def _initializations():
+    """Deterministic diverse starting configurations for 13 points."""
+    inits = []
+    # 1) 12 on circle + center
+    ang = 2.0 * np.pi * np.arange(12) / 12.0
+    pts = np.zeros((13, 2))
+    pts[:12, 0] = np.cos(ang)
+    pts[:12, 1] = np.sin(ang)
+    inits.append(pts)
+    # 2) two rings: 6 outer (hexagon) + 6 inner rotated 30 deg + center
+    pts = np.zeros((13, 2))
+    ang = 2.0 * np.pi * np.arange(6) / 6.0
+    pts[:6, 0] = np.cos(ang)
+    pts[:6, 1] = np.sin(ang)
+    ang2 = ang + np.pi / 6.0
+    pts[6:12, 0] = 0.5 * np.cos(ang2)
+    pts[6:12, 1] = 0.5 * np.sin(ang2)
+    inits.append(pts)
+    # 3-5) jittered grids with fixed seeds
+    for seed in (7, 42, 123):
+        rng = np.random.default_rng(seed=seed)
+        gs = np.linspace(-0.55, 0.55, 3)
+        gx, gy = np.meshgrid(gs, gs)
+        grid = np.column_stack([gx.ravel(), gy.ravel()])
+        pts = grid + rng.normal(scale=0.08, size=grid.shape)
+        inits.append(pts)
+    return inits
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Construct an arrangement of 13 points maximizing the smallest triangle
+    area (normalized by convex hull area).
+
+    Strategy: multi-start deterministic coordinate descent to build an elite
+    pool, then an elite-ladder basin-hopping stage: the top-3 elites are each
+    re-optimized from 8 deterministic perturbation kicks at amplitudes
+    0.01-0.08, keeping the best configuration found.
+    """
+    # Stage 1: multi-start descent
+    elites = []
+    for init in _initializations():
+        pts, sc = _descend(init)
+        elites.append((sc, pts))
+    elites.sort(key=lambda t: -t[0])
+
+    # Stage 2: elite-ladder basin hopping on top-3 elites
+    amps = (0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08)
+    best_sc, best_pts = elites[0]
+    for sc0, elite in elites[:3]:
+        for kick in range(2):
+            for amp in amps:
+                rng = np.random.default_rng(seed=1000 + 97 * kick)
+                pert = elite + rng.normal(scale=amp, size=elite.shape)
+                pts, sc = _descend(pert, step=max(amp, 0.02))
+                if sc > best_sc + 1e-12:
+                    best_sc = sc
+                    best_pts = pts
+    if best_pts is None:
+        best_pts = elites[0][1]
+    return best_pts
+
+
+# EVOLVE-BLOCK-END

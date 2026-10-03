@@ -1,0 +1,357 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Expert parallelism load balancer (EPLB) for vLLM.
+
+The planner uses a hierarchical placement pipeline:
+
+1. Place logical-expert groups onto nodes.
+2. Allocate replica capacity independently within each node.
+3. Place physical expert replicas onto GPUs within each node.
+4. Materialize both physical-to-logical and logical-to-physical maps.
+"""
+
+# EVOLVE-BLOCK-START
+
+import heapq
+
+import torch
+
+
+def _inverse_permutation(permutation: torch.Tensor) -> torch.Tensor:
+    """Return the inverse of a batch of one-dimensional permutations."""
+    inverse = torch.empty_like(permutation)
+    positions = torch.arange(
+        permutation.size(1), dtype=torch.int64,
+        device=permutation.device).expand_as(permutation)
+    inverse.scatter_(1, permutation, positions)
+    return inverse
+
+
+def _refine_packing(
+    members: list[list[tuple[int, int, float]]],
+    pack_weights: list[float],
+    pack_index: torch.Tensor,
+    rank_in_pack: torch.Tensor,
+    row: int,
+    max_rounds: int = 4,
+) -> None:
+    """
+    Improve a cardinality-constrained packing through bounded exchanges.
+
+    Greedy LPT is very fast but can leave a heavy pack paired with a pack that
+    is not the globally lightest one yet has a much better exchange candidate.
+    Each round considers swaps from the current bottleneck pack to every other
+    pack and accepts only a strict reduction of peak load.
+    """
+    num_packs = len(pack_weights)
+    if num_packs < 2:
+        return
+
+    for _ in range(min(max_rounds, num_packs)):
+        source = max(range(num_packs), key=pack_weights.__getitem__)
+        current_peak = pack_weights[source]
+
+        # The best exchange is evaluated against every possible destination.
+        best_peak = current_peak
+        best_swap: tuple[int, int, int, int, float, float] | None = None
+
+        for destination in range(num_packs):
+            if destination == source:
+                continue
+
+            unaffected_peak = max(
+                (pack_weights[p] for p in range(num_packs)
+                 if p != source and p != destination),
+                default=float("-inf"),
+            )
+
+            for source_item, source_slot, source_weight in members[source]:
+                for dest_item, dest_slot, dest_weight in members[destination]:
+                    new_source = (pack_weights[source] - source_weight +
+                                  dest_weight)
+                    new_dest = (pack_weights[destination] - dest_weight +
+                                source_weight)
+                    candidate_peak = max(unaffected_peak, new_source, new_dest)
+
+                    if candidate_peak < best_peak:
+                        best_peak = candidate_peak
+                        best_swap = (
+                            source_item,
+                            source_slot,
+                            dest_item,
+                            dest_slot,
+                            new_source,
+                            new_dest,
+                        )
+
+        if best_swap is None:
+            break
+
+        (source_item, source_slot, dest_item, dest_slot, new_source,
+         new_dest) = best_swap
+
+        # Update packed-slot ownership.
+        pack_index[row, source_item] = next(
+            p for p in range(num_packs)
+            if any(item == dest_item for item, _, _ in members[p]))
+        pack_index[row, dest_item] = source
+        rank_in_pack[row, source_item] = dest_slot
+        rank_in_pack[row, dest_item] = source_slot
+
+        destination = int(pack_index[row, source_item].item())
+
+        source_member = next(
+            entry for entry in members[source] if entry[0] == source_item)
+        dest_member = next(
+            entry for entry in members[destination] if entry[0] == dest_item)
+
+        members[source].remove(source_member)
+        members[destination].remove(dest_member)
+        members[source].append((dest_item, source_slot, dest_member[2]))
+        members[destination].append((source_item, dest_slot, source_member[2]))
+
+        pack_weights[source] = new_source
+        pack_weights[destination] = new_dest
+
+
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Cardinality-constrained LPT packing with bounded peak-load refinement.
+
+    Every pack receives exactly ``num_groups / num_packs`` entries. The greedy
+    heap phase is O(n log(num_packs)); the small local refinement is bounded
+    and is most useful for the small per-node GPU pack counts used by EPLB.
+    """
+    num_rows, num_items = weight.shape
+    assert num_packs > 0
+    assert num_items % num_packs == 0
+
+    items_per_pack = num_items // num_packs
+    cpu_weight = weight.float().cpu()
+
+    if items_per_pack == 1:
+        pack_index = torch.arange(
+            num_items, dtype=torch.int64).expand(num_rows, -1).clone()
+        return pack_index, torch.zeros_like(pack_index)
+
+    sorted_items = cpu_weight.sort(dim=-1, descending=True).indices
+    pack_index = torch.empty(
+        (num_rows, num_items), dtype=torch.int64, device="cpu")
+    rank_in_pack = torch.empty_like(pack_index)
+
+    for row in range(num_rows):
+        values = cpu_weight[row].tolist()
+        pack_weights = [0.0] * num_packs
+        pack_sizes = [0] * num_packs
+        members: list[list[tuple[int, int, float]]] = [
+            [] for _ in range(num_packs)
+        ]
+
+        available = [(0.0, pack) for pack in range(num_packs)]
+        heapq.heapify(available)
+
+        for item in sorted_items[row].tolist():
+            _, pack = heapq.heappop(available)
+            slot = pack_sizes[pack]
+            item_weight = values[item]
+
+            pack_index[row, item] = pack
+            rank_in_pack[row, item] = slot
+            members[pack].append((item, slot, item_weight))
+            pack_weights[pack] += item_weight
+            pack_sizes[pack] += 1
+
+            if pack_sizes[pack] < items_per_pack:
+                heapq.heappush(available, (pack_weights[pack], pack))
+
+        _refine_packing(members, pack_weights, pack_index, rank_in_pack, row)
+
+    return pack_index, rank_in_pack
+
+
+def replicate_experts(
+    weight: torch.Tensor,
+    num_physical: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Allocate replica slots with batched discrete water filling.
+
+    At each allocation step the expert with the largest per-replica load gets
+    one additional replica. This greedily minimizes the maximum individual
+    replica load for the fixed number of available physical slots.
+    """
+    num_rows, num_logical = weight.shape
+    assert num_physical >= num_logical
+
+    device = weight.device
+    redundant_slots = num_physical - num_logical
+    rows = torch.arange(num_rows, dtype=torch.int64, device=device)
+
+    physical_to_logical = torch.empty(
+        (num_rows, num_physical), dtype=torch.int64, device=device)
+    physical_to_logical[:, :num_logical] = torch.arange(
+        num_logical, dtype=torch.int64, device=device)
+
+    replica_rank = torch.zeros(
+        (num_rows, num_physical), dtype=torch.int64, device=device)
+    logical_count = torch.ones(
+        (num_rows, num_logical), dtype=torch.int64, device=device)
+
+    for slot in range(redundant_slots):
+        logical_id = (weight / logical_count).argmax(dim=-1)
+        physical_slot = num_logical + slot
+        physical_to_logical[:, physical_slot] = logical_id
+        replica_rank[:, physical_slot] = logical_count[rows, logical_id]
+        logical_count[rows, logical_id] += 1
+
+    return physical_to_logical, replica_rank, logical_count
+
+
+def rebalance_experts_hierarchical(
+    weight: torch.Tensor,
+    num_physical_experts: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build a node-aware, GPU-balanced physical expert arrangement."""
+    num_layers, num_logical_experts = weight.shape
+
+    assert num_logical_experts % num_groups == 0
+    assert num_groups % num_nodes == 0
+    assert num_gpus % num_nodes == 0
+    assert num_physical_experts % num_gpus == 0
+
+    group_size = num_logical_experts // num_groups
+    groups_per_node = num_groups // num_nodes
+    gpus_per_node = num_gpus // num_nodes
+    physical_per_gpu = num_physical_experts // num_gpus
+    logical_per_node = num_logical_experts // num_nodes
+    physical_per_node = num_physical_experts // num_nodes
+
+    # Stage 1: node placement for contiguous logical-expert groups.
+    group_load = weight.reshape(num_layers, num_groups, group_size).sum(-1)
+    group_node, group_slot = balanced_packing(group_load, num_nodes)
+
+    group_offsets = torch.arange(group_size, dtype=torch.int64).view(1, 1, -1)
+    logical_to_node_local = (
+        (group_node * groups_per_node + group_slot).unsqueeze(-1) *
+        group_size + group_offsets).flatten(-2)
+    node_local_to_logical = _inverse_permutation(logical_to_node_local)
+
+    # Stage 2: replica allocation independently within each selected node.
+    node_weight = weight.gather(-1, node_local_to_logical).reshape(
+        num_layers * num_nodes, logical_per_node)
+    physical_to_node_local, replica_rank, node_logical_count = (
+        replicate_experts(node_weight, physical_per_node))
+
+    # Stage 3: balance replica loads across local GPUs.
+    physical_load = (node_weight / node_logical_count).gather(
+        -1, physical_to_node_local)
+    gpu_index, gpu_slot = balanced_packing(physical_load, gpus_per_node)
+    physical_to_gpu_slot = gpu_index * physical_per_gpu + gpu_slot
+    gpu_slot_to_physical = _inverse_permutation(physical_to_gpu_slot)
+
+    ordered_node_local = physical_to_node_local.gather(
+        -1, gpu_slot_to_physical)
+    ordered_rank = replica_rank.gather(-1, gpu_slot_to_physical)
+
+    node_offsets = torch.arange(
+        0, num_logical_experts, logical_per_node,
+        dtype=torch.int64).view(1, num_nodes, 1)
+    ordered_global_node_local = (
+        ordered_node_local.reshape(num_layers, num_nodes, physical_per_node) +
+        node_offsets).flatten(-2)
+
+    physical_to_logical = node_local_to_logical.gather(
+        -1, ordered_global_node_local)
+    physical_rank = ordered_rank.reshape(num_layers, num_physical_experts)
+
+    logical_count = node_logical_count.reshape(
+        num_layers, num_logical_experts).gather(
+            -1, logical_to_node_local)
+
+    return physical_to_logical, physical_rank, logical_count
+
+
+def _build_logical_to_physical(
+    physical_to_logical: torch.Tensor,
+    physical_rank: torch.Tensor,
+    logical_count: torch.Tensor,
+) -> torch.Tensor:
+    """Materialize the padded inverse map used by the EPLB runtime."""
+    num_layers, num_physical = physical_to_logical.shape
+    num_logical = logical_count.size(1)
+    max_replica_count = num_physical - num_logical + 1
+
+    logical_to_physical = torch.full(
+        (num_layers, num_logical, max_replica_count),
+        -1,
+        dtype=torch.int64,
+        device=physical_to_logical.device,
+    )
+    physical_slots = torch.arange(
+        num_physical, dtype=torch.int64,
+        device=physical_to_logical.device).expand(num_layers, -1)
+
+    logical_to_physical.reshape(num_layers, -1).scatter_(
+        1,
+        physical_to_logical * max_replica_count + physical_rank,
+        physical_slots,
+    )
+    return logical_to_physical
+
+
+def rebalance_experts(
+    weight: torch.Tensor,
+    num_replicas: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Rebalance experts while preserving the original EPLB public interface.
+
+    Returns:
+        physical_to_logical_map: [layers, num_replicas]
+        logical_to_physical_map: [layers, num_logical_experts, X]
+        expert_count: [layers, num_logical_experts]
+    """
+    _, num_logical_experts = weight.shape
+    assert num_replicas >= num_logical_experts
+
+    # Rearrangement is intentionally CPU resident: this avoids synchronizing
+    # every discrete scheduling decision with the inference device.
+    cpu_weight = weight.float().cpu()
+
+    if num_groups % num_nodes == 0:
+        physical_to_logical, physical_rank, logical_count = (
+            rebalance_experts_hierarchical(
+                cpu_weight,
+                num_replicas,
+                num_groups,
+                num_nodes,
+                num_gpus,
+            ))
+    else:
+        # If group topology cannot be split evenly across nodes, a global
+        # placement retains correctness and avoids partially assigned groups.
+        physical_to_logical, physical_rank, logical_count = (
+            rebalance_experts_hierarchical(
+                cpu_weight,
+                num_replicas,
+                1,
+                1,
+                num_gpus,
+            ))
+
+    logical_to_physical = _build_logical_to_physical(
+        physical_to_logical, physical_rank, logical_count)
+
+    return physical_to_logical, logical_to_physical, logical_count
+
+
+# EVOLVE-BLOCK-END
+
+__all__ = ["rebalance_experts"]

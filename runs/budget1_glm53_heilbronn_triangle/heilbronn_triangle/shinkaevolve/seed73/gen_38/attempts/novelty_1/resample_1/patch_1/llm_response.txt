@@ -1,0 +1,83 @@
+<NAME>
+pair_exchange_escape
+</NAME>
+<DESCRIPTION>
+Add a final coordinate-descent "pair-exchange" perturbation phase after the fine polish, following the recommendation. All top programs plateau at ~0.03 (vs. the ~0.037-0.040 optimum), suggesting trapped local minima where the binding vertex of the smallest triangle cannot improve by continuous moves. The structured move: identify the vertices of the smallest triangles ("binding" points) and swap one with a "free" point whose incident triangle areas are all comfortably large, then re-run a short hard-min polish (decaying steps 0.01→1e-4, ~3k iters) from the swapped configuration. Keep the result only if the true best improves. Per-vertex binding scores are computed cheaply with the existing vectorized `_all_areas` machinery via `np.minimum.reduceat`-style accumulation over the (165,3) triplet index array. This restarts the local search in a new basin without sacrificing the incumbent. Runtime increases modestly (~2000 swap attempts × short polish would be too slow, so we limit to ~12 accepted swap trials with 2500-iteration polishes, keeping eval_time acceptable while giving a real chance of escaping the plateau).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Guarantee validity of output even if optimization failed somehow
+    if best is None or not np.all(np.isfinite(best)):
+        best = _clip_to_triangle(np.zeros((n, 2)) + np.array([0.4, 0.3]))
+
+    return best
+=======
+    # ---- Phase 4: pair-exchange escape from plateaued basins ----
+    # Swap a binding vertex (in the smallest triangle) with a "free" point
+    # whose incident triangles are all comfortably large, then re-polish.
+    def _vertex_binding_scores(pts):
+        """Cheap per-vertex score: the smallest doubled area among the
+        triangles incident to each point (small = tightly binding)."""
+        a = _all_areas(pts)                       # (165,)
+        scores = np.full(n, np.inf)
+        flat = _TRIPLETS.reshape(-1)              # (495,) vertex indices
+        rep = np.repeat(a, 3)                     # (495,) area per slot
+        order = np.argsort(flat, kind="stable")
+        fs, rs = flat[order], rep[order]
+        # min-reduce per vertex
+        best_per_v = np.full(n, np.inf)
+        np.minimum.at(best_per_v, fs, rs)
+        return best_per_v
+
+    def _short_polish(pts, iters=2500, s0=0.01, s1=1e-4, seed=999):
+        rng2 = np.random.default_rng(seed)
+        cur = pts.copy()
+        cur_val = _min_area(cur)
+        out, out_val = cur.copy(), cur_val
+        for it in range(iters):
+            step = s0 * (s1 / s0) ** (it / iters)
+            a_all = _all_areas(cur)
+            order = np.argsort(a_all)[:6]
+            t = order[rng2.integers(len(order))]
+            i = _TRIPLETS[t][rng2.integers(3)]
+            trial = cur.copy()
+            trial[i] += rng2.normal(0.0, step, size=2)
+            trial = _clip_to_triangle(trial)
+            val = _min_area(trial)
+            if val >= cur_val - 1e-12:
+                cur, cur_val = trial, val
+                if val > out_val + 1e-15:
+                    out, out_val = trial.copy(), val
+        return out, out_val
+
+    try:
+        rng_swap = np.random.default_rng(777)
+        for trial_no in range(12):
+            if best_val >= 0.040:
+                break
+            vs = _vertex_binding_scores(best)
+            # binding point: vertex of a smallest triangle
+            a_all = _all_areas(best)
+            t = int(np.argmin(a_all))
+            binding_pts = _TRIPLETS[t]
+            bp = binding_pts[rng_swap.integers(3)]
+            # free point: whose binding score is largest (least constrained)
+            free_order = np.argsort(vs)[::-1]
+            fp = int(free_order[rng_swap.integers(min(4, n))])
+            if fp == bp:
+                continue
+            swapped = best.copy()
+            swapped[bp], swapped[fp] = swapped[fp].copy(), swapped[bp].copy()
+            cand, cand_val = _short_polish(swapped, seed=1000 + trial_no)
+            if cand_val > best_val + 1e-15:
+                best, best_val = cand, cand_val
+    except Exception:
+        pass
+
+    # Guarantee validity of output even if optimization failed somehow
+    if best is None or not np.all(np.isfinite(best)):
+        best = _clip_to_triangle(np.zeros((n, 2)) + np.array([0.4, 0.3]))
+
+    return best
+>>>>>>> REPLACE
+</DIFF>

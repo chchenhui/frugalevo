@@ -1,0 +1,342 @@
+// EVOLVE-BLOCK-START
+#include <bits/stdc++.h>
+using namespace std;
+
+static constexpr int LIM = 100000;
+static constexpr int G = 64;
+static constexpr int MAXV = 1000;
+static constexpr int MAXPER = 400000;
+
+struct P {
+    int x, y;
+};
+
+struct Fish {
+    int x, y, w;
+};
+
+struct RNG {
+    uint64_t s;
+    RNG() : s(chrono::steady_clock::now().time_since_epoch().count() ^ 0x9e3779b97f4a7c15ULL) {}
+    uint64_t next() {
+        s ^= s << 7;
+        s ^= s >> 9;
+        return s;
+    }
+    int rnd(int n) { return n ? (int)(next() % n) : 0; }
+    int rnd(int l, int r) { return l + rnd(r - l + 1); }
+} rng;
+
+struct Timer {
+    chrono::steady_clock::time_point st = chrono::steady_clock::now();
+    double elapsed() const {
+        return chrono::duration<double>(chrono::steady_clock::now() - st).count();
+    }
+};
+
+vector<Fish> fishs;
+vector<int> xs, ys;
+int val[G][G];
+bool chosen[G][G];
+
+static inline bool insideCell(int x, int y, int c, int r) {
+    return xs[c] < x && x < xs[c + 1] && ys[r] < y && y < ys[r + 1];
+}
+
+static inline long long pkey(int x, int y) {
+    return ((long long)x << 20) ^ y;
+}
+
+static inline bool valid2x2AfterAdd(int c, int r) {
+    for (int dc = -1; dc <= 0; ++dc) {
+        for (int dr = -1; dr <= 0; ++dr) {
+            int x = c + dc, y = r + dr;
+            if (x < 0 || x + 1 >= G || y < 0 || y + 1 >= G) continue;
+            bool a = chosen[x][y];
+            bool b = chosen[x + 1][y];
+            bool d = chosen[x][y + 1];
+            bool e = chosen[x + 1][y + 1];
+            int cnt = (int)a + (int)b + (int)d + (int)e;
+            if (cnt == 2 && ((a && e) || (b && d))) return false;
+        }
+    }
+    return true;
+}
+
+vector<P> buildPolygon(const vector<unsigned char>& sel) {
+    auto isSel = [&](int c, int r) -> bool {
+        return c >= 0 && c < G && r >= 0 && r < G && sel[c * G + r];
+    };
+
+    unordered_map<long long, P> nxt;
+    nxt.reserve(4096);
+
+    auto addEdge = [&](int ax, int ay, int bx, int by) {
+        nxt[pkey(ax, ay)] = {bx, by};
+    };
+
+    for (int c = 0; c < G; ++c) for (int r = 0; r < G; ++r) {
+        if (!isSel(c, r)) continue;
+        int x0 = xs[c], x1 = xs[c + 1];
+        int y0 = ys[r], y1 = ys[r + 1];
+
+        // Counterclockwise edges, selected area on the left.
+        if (!isSel(c, r - 1)) addEdge(x0, y0, x1, y0);
+        if (!isSel(c + 1, r)) addEdge(x1, y0, x1, y1);
+        if (!isSel(c, r + 1)) addEdge(x1, y1, x0, y1);
+        if (!isSel(c - 1, r)) addEdge(x0, y1, x0, y0);
+    }
+
+    if (nxt.empty()) return {};
+
+    vector<P> bestLoop;
+    unordered_set<long long> used;
+    used.reserve(nxt.size() * 2);
+
+    for (auto &kv : nxt) {
+        if (used.count(kv.first)) continue;
+        long long start = kv.first;
+        P cur{(int)(start >> 20), (int)(start & ((1 << 20) - 1))};
+        vector<P> loop;
+        bool ok = true;
+
+        for (int step = 0; step <= 10000; ++step) {
+            long long k = pkey(cur.x, cur.y);
+            if (used.count(k) && k != start) { ok = false; break; }
+            auto it = nxt.find(k);
+            if (it == nxt.end()) { ok = false; break; }
+            used.insert(k);
+            loop.push_back(cur);
+            cur = it->second;
+            if (pkey(cur.x, cur.y) == start) break;
+            if (step == 10000) ok = false;
+        }
+        if (!ok || loop.size() < 4) continue;
+
+        long long area = 0;
+        for (int i = 0; i < (int)loop.size(); ++i) {
+            P a = loop[i], b = loop[(i + 1) % loop.size()];
+            area += 1LL * a.x * b.y - 1LL * a.y * b.x;
+        }
+        if (area < 0) reverse(loop.begin(), loop.end());
+        if (loop.size() > bestLoop.size()) bestLoop = loop;
+    }
+
+    if (bestLoop.empty()) return {};
+
+    bool changed = true;
+    while (changed && bestLoop.size() >= 4) {
+        changed = false;
+        vector<P> q;
+        int n = (int)bestLoop.size();
+        for (int i = 0; i < n; ++i) {
+            P a = bestLoop[(i - 1 + n) % n];
+            P b = bestLoop[i];
+            P c = bestLoop[(i + 1) % n];
+            if ((a.x == b.x && b.x == c.x) || (a.y == b.y && b.y == c.y)) {
+                changed = true;
+            } else {
+                q.push_back(b);
+            }
+        }
+        bestLoop.swap(q);
+    }
+    return bestLoop;
+}
+
+int scorePolygon(const vector<P>& poly) {
+    if (poly.size() < 4) return -1000000000;
+    int ans = 0;
+    for (const auto &f : fishs) {
+        bool in = false;
+        int n = (int)poly.size();
+        for (int i = 0, j = n - 1; i < n; j = i++) {
+            const P &a = poly[i], &b = poly[j];
+            if ((a.y > f.y) != (b.y > f.y)) {
+                long long lhs = 1LL * (b.x - a.x) * (f.y - a.y);
+                long long rhs = 1LL * (f.x - a.x) * (b.y - a.y);
+                if ((b.y > a.y) ? (lhs > rhs) : (lhs < rhs)) in = !in;
+            }
+        }
+        if (in) ans += f.w;
+    }
+    return ans;
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    int N;
+    cin >> N;
+    fishs.reserve(2 * N);
+    vector<int> badX, badY;
+    badX.reserve(2 * N);
+    badY.reserve(2 * N);
+
+    for (int i = 0; i < 2 * N; ++i) {
+        int x, y;
+        cin >> x >> y;
+        fishs.push_back({x, y, i < N ? 1 : -1});
+        badX.push_back(x);
+        badY.push_back(y);
+    }
+    sort(badX.begin(), badX.end());
+    sort(badY.begin(), badY.end());
+
+    auto occupied = [](const vector<int>& a, int v) {
+        return binary_search(a.begin(), a.end(), v);
+    };
+
+    xs.resize(G + 1);
+    ys.resize(G + 1);
+    xs[0] = ys[0] = 0;
+    xs[G] = ys[G] = LIM;
+
+    // Cut lines are moved off fish coordinates, so no fish lies exactly on output edges.
+    for (int i = 1; i < G; ++i) {
+        int x = i * LIM / G;
+        while (occupied(badX, x)) ++x;
+        if (x <= xs[i - 1]) x = xs[i - 1] + 1;
+        xs[i] = x;
+
+        int y = i * LIM / G;
+        while (occupied(badY, y)) ++y;
+        if (y <= ys[i - 1]) y = ys[i - 1] + 1;
+        ys[i] = y;
+    }
+
+    memset(val, 0, sizeof(val));
+    for (const auto &f : fishs) {
+        int c = int(upper_bound(xs.begin(), xs.end(), f.x) - xs.begin()) - 1;
+        int r = int(upper_bound(ys.begin(), ys.end(), f.y) - ys.begin()) - 1;
+        c = max(0, min(G - 1, c));
+        r = max(0, min(G - 1, r));
+        val[c][r] += f.w;
+    }
+
+    vector<P> bestPoly = {{0,0},{1,0},{1,1},{0,1}};
+    int bestScore = 0;
+    Timer timer;
+
+    vector<pair<int,int>> positiveSeeds;
+    for (int c = 0; c < G; ++c)
+        for (int r = 0; r < G; ++r)
+            if (val[c][r] > 0) positiveSeeds.push_back({c,r});
+
+    // Deterministic positive/zero connected components.
+    for (auto seed : positiveSeeds) {
+        if (timer.elapsed() > 0.45) break;
+        memset(chosen, 0, sizeof(chosen));
+        queue<pair<int,int>> q;
+        q.push(seed);
+        chosen[seed.first][seed.second] = true;
+        int sum = val[seed.first][seed.second];
+
+        while (!q.empty()) {
+            auto [c,r] = q.front(); q.pop();
+            const int dc[4] = {1,-1,0,0};
+            const int dr[4] = {0,0,1,-1};
+            for (int z = 0; z < 4; ++z) {
+                int nc=c+dc[z], nr=r+dr[z];
+                if (nc<0||nc>=G||nr<0||nr>=G||chosen[nc][nr]||val[nc][nr]<0) continue;
+                chosen[nc][nr]=true;
+                q.push({nc,nr});
+                sum += val[nc][nr];
+            }
+        }
+
+        vector<unsigned char> sel(G*G);
+        for(int c=0;c<G;c++) for(int r=0;r<G;r++) sel[c*G+r]=chosen[c][r];
+        vector<P> poly = buildPolygon(sel);
+        if (poly.size() >= 4 && poly.size() <= MAXV) {
+            int sc = scorePolygon(poly);
+            if (sc > bestScore) bestScore=sc, bestPoly=poly;
+        }
+    }
+
+    // Randomized compact connected growth; negative bridge cells may be used.
+    int trials = 900;
+    while (trials-- > 0 && timer.elapsed() < 1.88 && !positiveSeeds.empty()) {
+        memset(chosen, 0, sizeof(chosen));
+        auto seed = positiveSeeds[rng.rnd((int)positiveSeeds.size())];
+        chosen[seed.first][seed.second] = true;
+        int curSum = val[seed.first][seed.second];
+        int per = 4;
+
+        struct Node {
+            int key,c,r;
+            bool operator<(const Node& o) const { return key < o.key; }
+        };
+        priority_queue<Node> pq;
+
+        auto pushNeighbors = [&](int c, int r) {
+            const int dc[4]={1,-1,0,0}, dr[4]={0,0,1,-1};
+            for(int z=0;z<4;z++) {
+                int nc=c+dc[z], nr=r+dr[z];
+                if(nc<0||nc>=G||nr<0||nr>=G||chosen[nc][nr]) continue;
+                int nb=0;
+                for(int t=0;t<4;t++) {
+                    int ac=nc+dc[t], ar=nr+dr[t];
+                    if(ac>=0&&ac<G&&ar>=0&&ar<G&&chosen[ac][ar]) nb++;
+                }
+                int noise=rng.rnd(-7,7);
+                pq.push({val[nc][nr]*12 + nb*5 + noise,nc,nr});
+            }
+        };
+        pushNeighbors(seed.first,seed.second);
+
+        vector<unsigned char> bestSel(G*G);
+        int localBest = curSum;
+        bestSel[seed.first*G+seed.second]=1;
+
+        for(int step=0; step<300 && !pq.empty(); ++step) {
+            Node u=pq.top(); pq.pop();
+            if(chosen[u.c][u.r]) continue;
+
+            int nb=0;
+            const int dc[4]={1,-1,0,0}, dr[4]={0,0,1,-1};
+            for(int z=0;z<4;z++) {
+                int ac=u.c+dc[z], ar=u.r+dr[z];
+                if(ac>=0&&ac<G&&ar>=0&&ar<G&&chosen[ac][ar]) nb++;
+            }
+            if(nb==0) continue;
+            int newPer=per+4-2*nb;
+            if(newPer>900) continue;
+
+            chosen[u.c][u.r]=true;
+            if(!valid2x2AfterAdd(u.c,u.r)) {
+                chosen[u.c][u.r]=false;
+                continue;
+            }
+            per=newPer;
+            curSum += val[u.c][u.r];
+            pushNeighbors(u.c,u.r);
+
+            if(curSum>localBest) {
+                localBest=curSum;
+                for(int c=0;c<G;c++) for(int r=0;r<G;r++)
+                    bestSel[c*G+r]=chosen[c][r];
+            }
+        }
+
+        if(localBest <= bestScore) continue;
+        vector<P> poly=buildPolygon(bestSel);
+        if(poly.size()<4 || poly.size()>MAXV) continue;
+        int sc=scorePolygon(poly);
+        if(sc>bestScore) {
+            bestScore=sc;
+            bestPoly=poly;
+        }
+    }
+
+    // Guaranteed legal fallback.
+    if (bestPoly.size() < 4 || bestPoly.size() > MAXV) {
+        bestPoly = {{0,0},{1,0},{1,1},{0,1}};
+    }
+
+    cout << bestPoly.size() << '\n';
+    for (const auto &p : bestPoly) cout << p.x << ' ' << p.y << '\n';
+    return 0;
+}
+// EVOLVE-BLOCK-END

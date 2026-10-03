@@ -1,0 +1,66 @@
+<NAME>
+vectorize_balanced_packing
+</NAME>
+
+<DESCRIPTION>
+Replace the per-layer Python greedy packing loop with a batched tensor implementation. The packing policy remains cardinality-constrained LPT: experts/groups are considered in descending load order and assigned to the currently least-loaded non-full pack.
+
+The original implementation performs Python loops over both layers and groups, repeatedly converts tensor scalars through Python list operations, and is particularly costly when balancing many MoE layers. The new implementation retains only the unavoidable sequential loop over sorted item positions; all layers select and update packs simultaneously using vectorized PyTorch operations. This substantially reduces rearrangement latency while preserving the same balancing heuristic and exact per-pack capacity constraint.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    # Cardinality-constrained LPT packing.  Process one sorted position at a
+    # time, but perform the greedy decision for every layer in parallel.
+    weight_float = weight.float()
+    indices = weight_float.sort(-1, descending=True).indices
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64)
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    pack_weights = torch.zeros((num_layers, num_packs),
+                               dtype=weight_float.dtype,
+                               device=weight.device)
+    pack_items = torch.zeros((num_layers, num_packs),
+                             dtype=torch.int64,
+                             device=weight.device)
+    rows = torch.arange(num_layers, device=weight.device)
+
+    for position in range(num_groups):
+        group = indices[:, position]
+        available = pack_items < groups_per_pack
+        # Full packs must never win the argmin. At least one pack remains
+        # available because exactly num_groups items are assigned.
+        candidate_weights = pack_weights.masked_fill(
+            ~available, torch.finfo(weight_float.dtype).max)
+        pack = candidate_weights.argmin(dim=-1)
+        rank_in_pack[rows, group] = pack_items[rows, pack]
+        pack_index[rows, group] = pack
+        pack_weights[rows, pack] += weight_float[rows, group]
+        pack_items[rows, pack] += 1
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

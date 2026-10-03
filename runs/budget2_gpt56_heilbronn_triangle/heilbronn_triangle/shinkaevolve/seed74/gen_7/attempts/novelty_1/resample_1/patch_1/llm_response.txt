@@ -1,0 +1,112 @@
+<NAME>
+anchored_epigraph_search
+</NAME>
+
+<DESCRIPTION>
+Replace the degenerate all-zero construction with a deterministic maximin optimization specialized for the Heilbronn problem. The construction anchors the three extreme vertices of the containing equilateral triangle, then searches over barycentric coordinates for the remaining eight points. This parameterization guarantees feasibility at every optimization step.
+
+The primary search uses seeded differential evolution to escape poor local arrangements. Its best candidate is then polished using the epigraph formulation of the max-min-area problem: an auxiliary variable t is maximized subject to every one of the 165 triangle areas being at least t. This is substantially better aligned with the actual evaluation criterion than optimizing a surrogate such as average area. A deterministic random/local-search fallback keeps the function usable when SciPy is unavailable or an optimizer fails.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of n points on or inside a convex region in order to maximize the area of the
+    smallest triangle formed by these points. Here n = 11.
+
+    Returns:
+        points: np.ndarray of shape (11,2) with the x,y coordinates of the points.
+    """
+    n = 11
+    points = np.zeros((n, 2))
+    return points
+=======
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Deterministically construct eleven points using a maximin-area search.
+
+    The first three points are the vertices of the containing equilateral
+    triangle.  Every other point is represented by two barycentric parameters,
+    so feasibility is preserved without penalty terms.
+    """
+    height = np.sqrt(3.0) / 2.0
+    anchors = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, height]])
+    triples = np.array(
+        [(i, j, k) for i in range(11) for j in range(i + 1, 11)
+         for k in range(j + 1, 11)],
+        dtype=int,
+    )
+
+    def decode(z: np.ndarray) -> np.ndarray:
+        # (a, b) maps to (1-b)*(1-a)*(0,0) + (1-b)*a*(1,0) + b*(.5,h).
+        q = np.asarray(z, dtype=float).reshape(8, 2)
+        a, b = q[:, 0], q[:, 1]
+        return np.vstack((anchors, np.column_stack((a * (1.0 - b) + 0.5 * b,
+                                                      height * b))))
+
+    def areas(points: np.ndarray) -> np.ndarray:
+        p, q, r = points[triples[:, 0]], points[triples[:, 1]], points[triples[:, 2]]
+        return 0.5 * np.abs((q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1])
+                            - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0]))
+
+    def quality(z: np.ndarray) -> float:
+        return float(np.min(areas(decode(z))))
+
+    rng = np.random.default_rng(110271)
+    best_z = rng.random(16)
+    best_value = quality(best_z)
+
+    try:
+        from scipy.optimize import differential_evolution, minimize
+
+        # Global exploration is important here because the minimum of 165
+        # absolute-area functions has many narrow, nonsmooth local optima.
+        global_result = differential_evolution(
+            lambda z: -quality(z),
+            bounds=[(0.0, 1.0)] * 16,
+            seed=110271,
+            popsize=20,
+            maxiter=450,
+            tol=2.0e-8,
+            polish=False,
+            updating="immediate",
+        )
+        if global_result.success or np.isfinite(global_result.fun):
+            best_z = np.clip(global_result.x, 0.0, 1.0)
+            best_value = quality(best_z)
+
+        # Epigraph polishing directly maximizes the smallest triangle area.
+        # The inequality vector contains one condition for every triplet.
+        start = np.concatenate((best_z, [best_value]))
+        polished = minimize(
+            lambda w: -w[-1],
+            start,
+            method="SLSQP",
+            bounds=[(0.0, 1.0)] * 16 + [(0.0, 0.5)],
+            constraints=[{"type": "ineq",
+                          "fun": lambda w: areas(decode(w[:-1])) - w[-1]}],
+            options={"maxiter": 2500, "ftol": 1.0e-12, "disp": False},
+        )
+        candidate = np.clip(polished.x[:-1], 0.0, 1.0)
+        if np.isfinite(candidate).all() and quality(candidate) > best_value:
+            best_z = candidate
+    except Exception:
+        # Dependency-free deterministic fallback: stochastic coordinate
+        # perturbations with decreasing radius and strict maximin acceptance.
+        step = 0.22
+        for iteration in range(50000):
+            candidate = best_z.copy()
+            coordinate = rng.integers(16)
+            candidate[coordinate] = np.clip(
+                candidate[coordinate] + rng.normal(scale=step), 0.0, 1.0
+            )
+            value = quality(candidate)
+            if value > best_value:
+                best_z, best_value = candidate, value
+            if iteration % 1000 == 999:
+                step *= 0.93
+
+    return decode(best_z)
+>>>>>>> REPLACE
+</DIFF>

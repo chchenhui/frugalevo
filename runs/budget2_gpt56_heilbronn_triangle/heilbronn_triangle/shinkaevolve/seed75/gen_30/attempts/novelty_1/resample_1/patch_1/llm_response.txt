@@ -1,0 +1,153 @@
+<NAME>
+lattice_initialized_multicell_polish
+</NAME>
+
+<DESCRIPTION>
+Replace the purely random differential-evolution population with deterministic perturbations of the boundary-supported triangular lattice pattern that has consistently produced stronger Heilbronn basins. This removes much of the expensive discovery phase spent finding useful boundary structure. Then, rather than performing only one frozen-orientation epigraph solve, repeatedly re-evaluate determinant signs and solve successive local orientation cells. The final acceptance is strictly based on the true absolute bottleneck area, preventing an infeasible sign-cell improvement from replacing a better layout.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        global_result = differential_evolution(
+            objective,
+            bounds=[(0.0, 1.0)] * 16,
+            seed=11031987,
+            popsize=20,
+            maxiter=900,
+            tol=1e-8,
+            atol=1e-10,
+            polish=False,
+            updating="immediate",
+            workers=1,
+        )
+=======
+        # Start DE in perturbations of a useful triangular boundary-support
+        # pattern, rather than requiring a random population to rediscover it.
+        # The parameterization still guarantees that every member is feasible.
+        lattice = np.array((
+            (0.24, 0.015), (0.51, 0.020), (0.76, 0.015),
+            (0.015, 0.255), (0.315, 0.245), (0.615, 0.235),
+            (0.020, 0.525), (0.310, 0.500),
+        ))
+        init_rng = np.random.default_rng(719381)
+        initial_uv = np.empty((320, 8, 2))
+        scales = np.linspace(0.018, 0.155, len(initial_uv))
+        for i, scale in enumerate(scales):
+            trial = np.maximum(
+                lattice + init_rng.normal(0.0, scale, size=(8, 2)),
+                0.0,
+            )
+            total = np.sum(trial, axis=1)
+            outside = total > 1.0
+            trial[outside] /= total[outside, None]
+            initial_uv[i] = trial
+
+        initial_z = np.empty((len(initial_uv), 16))
+        initial_z[:, 0::2] = initial_uv[:, :, 0]
+        initial_z[:, 1::2] = initial_uv[:, :, 1] / np.maximum(
+            1.0 - initial_uv[:, :, 0], 1.0e-14
+        )
+        initial_z[0] = fallback_z
+
+        global_result = differential_evolution(
+            objective,
+            bounds=[(0.0, 1.0)] * 16,
+            seed=11031987,
+            init=initial_z,
+            maxiter=700,
+            tol=1e-8,
+            atol=1e-10,
+            polish=False,
+            updating="immediate",
+            workers=1,
+        )
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+        start_uv = unpack(best_z)
+        signs = np.sign(determinants(start_uv))
+        signs[signs == 0.0] = 1.0
+
+        # Maximize t subject to every presently oriented determinant being at
+        # least t.  This is the exact local formulation of the abs-area goal.
+        def local_objective(w: np.ndarray) -> float:
+            return -w[-1]
+
+        def local_constraints(w: np.ndarray) -> np.ndarray:
+            uv = np.vstack((fixed, w[:-1].reshape(8, 2)))
+            return np.concatenate((
+                signs * determinants(uv) - w[-1],
+                w[:-1].reshape(8, 2).ravel(),
+                1.0 - np.sum(w[:-1].reshape(8, 2), axis=1),
+            ))
+
+        local_start = np.concatenate((start_uv[3:].ravel(),
+                                      [np.min(np.abs(determinants(start_uv)))]))
+        polished = minimize(
+            local_objective,
+            local_start,
+            method="SLSQP",
+            bounds=[(0.0, 1.0)] * 16 + [(0.0, 1.0)],
+            constraints={"type": "ineq", "fun": local_constraints},
+            options={"maxiter": 3000, "ftol": 1e-12, "disp": False},
+        )
+        if polished.success:
+            candidate_uv = np.vstack((fixed, polished.x[:-1].reshape(8, 2)))
+            if np.min(np.abs(determinants(candidate_uv))) >= -objective(best_z):
+                best_z = np.empty(16)
+                best_z[0::2] = candidate_uv[3:, 0]
+                best_z[1::2] = candidate_uv[3:, 1] / (1.0 - candidate_uv[3:, 0])
+=======
+        # A solve with frozen determinant signs is smooth, but a better point
+        # can lie just across a sign-cell boundary.  Re-freezing signs after
+        # each genuine improvement provides a short deterministic homotopy.
+        best_uv = unpack(best_z)
+        best_value = float(np.min(np.abs(determinants(best_uv))))
+
+        for phase in range(4):
+            signs = np.sign(determinants(best_uv))
+            signs[signs == 0.0] = 1.0
+
+            def local_objective(w: np.ndarray) -> float:
+                return -w[-1]
+
+            def local_constraints(w: np.ndarray) -> np.ndarray:
+                tail = w[:-1].reshape(8, 2)
+                uv = np.vstack((fixed, tail))
+                return np.concatenate((
+                    signs * determinants(uv) - w[-1],
+                    tail.ravel(),
+                    1.0 - np.sum(tail, axis=1),
+                ))
+
+            local_start = np.concatenate((best_uv[3:].ravel(), [best_value]))
+            polished = minimize(
+                local_objective,
+                local_start,
+                method="SLSQP",
+                bounds=[(0.0, 1.0)] * 16 + [(0.0, 1.0)],
+                constraints={"type": "ineq", "fun": local_constraints},
+                options={
+                    "maxiter": 1800 + 400 * phase,
+                    "ftol": 2e-13,
+                    "disp": False,
+                },
+            )
+            if not polished.success or not np.all(np.isfinite(polished.x)):
+                break
+
+            candidate_uv = np.vstack((fixed, polished.x[:-1].reshape(8, 2)))
+            candidate_value = float(np.min(np.abs(determinants(candidate_uv))))
+            if candidate_value > best_value + 1.0e-10:
+                best_uv = candidate_uv
+                best_value = candidate_value
+            else:
+                break
+
+        best_z = np.empty(16)
+        best_z[0::2] = best_uv[3:, 0]
+        best_z[1::2] = best_uv[3:, 1] / np.maximum(
+            1.0 - best_uv[3:, 0], 1.0e-14
+        )
+>>>>>>> REPLACE
+</DIFF>

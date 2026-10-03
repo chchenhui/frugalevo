@@ -1,0 +1,145 @@
+<NAME>
+softmin_then_hard_polish</NAME>
+<DESCRIPTION>
+Replace the naive simulated-annealing loop with a two-phase optimizer: (1) a coarse phase minimizing a log-sum-exp soft-min over the smallest ~15% of triplet areas (smoothed landscape, better gradient-like signal for all near-critical triangles), then (2) a hard-min greedy polish that moves vertices of the current minimum triangle away from its centroid with geometric step decay. Soft-min smoothing helps escape the rugged landscape where the hard min objective plateaus; the hard phase then maximizes the true metric. Deterministic seed, fixed time budget, graceful fallback retained.
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    try:
+        rng = np.random.default_rng(12345)
+        best = pts.copy()
+        best_val = _min_area(best)
+        cur = best.copy()
+        cur_val = best_val
+        deadline = time.time() + 1.5
+        step = 0.05
+        it = 0
+        while time.time() < deadline and it < 20000:
+            it += 1
+            cand = cur.copy()
+            i = rng.integers(n)
+            cand[i] += rng.normal(0.0, step, size=2)
+            # project back into the triangle (clamp roughly)
+            x, y = cand[i]
+            y = min(max(y, 0.0), h)
+            if y > np.sqrt(3.0) * x:
+                x = y / np.sqrt(3.0)
+            if y > -np.sqrt(3.0) * (x - 1.0):
+                x = 1.0 - y / np.sqrt(3.0)
+            x = min(max(x, 0.0), 1.0)
+            cand[i] = (x, y)
+            v = _min_area(cand)
+            if v >= cur_val or rng.random() < np.exp((v - cur_val) / (step * 0.05)):
+                cur, cur_val = cand, v
+                if v > best_val:
+                    best, best_val = cand.copy(), v
+            if it % 2000 == 0:
+                step *= 0.6
+        pts = best
+    except Exception:
+        pass  # graceful fallback: return the symmetric initial configuration
+
+    return pts
+=======
+    s3 = np.sqrt(3.0)
+
+    def _project(p):
+        x, y = p
+        y = min(max(y, 0.0), h)
+        if y > s3 * x:
+            x = y / s3
+        if y > -s3 * (x - 1.0):
+            x = 1.0 - y / s3
+        x = min(max(x, 0.0), 1.0)
+        return np.array([x, y])
+
+    def _areas(p):
+        q = p[_TRIPLETS]
+        a = (q[:, 1, 0] - q[:, 0, 0]) * (q[:, 2, 1] - q[:, 0, 1]) - \
+            (q[:, 1, 1] - q[:, 0, 1]) * (q[:, 2, 0] - q[:, 0, 0])
+        return np.abs(a) / (2.0 * _TRI_AREA)
+
+    def _softmin(p, k=300.0):
+        a = _areas(p)
+        m = a.min()
+        sel = a <= m + 0.02          # smallest ~15% of triangles
+        v = -sel.sum() / k
+        soft = np.log(np.exp(k * (a[sel] - m)).sum()) / k + m - v * 0.0
+        return soft
+
+    def _hard(p):
+        a = _areas(p)
+        m = int(a.argmin())
+        return a[m], _TRIPLETS[m]
+
+    try:
+        rng = np.random.default_rng(12345)
+        deadline = time.time() + 1.6
+
+        best = pts.copy()
+        best_val, _ = _hard(best)
+
+        # multiple deterministic-ish starts around the symmetric seed
+        starts = [pts.copy()]
+        for s in range(4):
+            q = pts + rng.normal(0.0, 0.03, pts.shape)
+            starts.append(np.array([_project(p) for p in q]))
+
+        for seed_pts in starts:
+            if time.time() > deadline:
+                break
+            cur = seed_pts.copy()
+            # ---- Phase 1: soft-min smoothing (coarse) ----
+            t_end = min(time.time() + 0.45, deadline)
+            step = 0.02
+            while time.time() < t_end:
+                cand = cur.copy()
+                i = rng.integers(n)
+                cand[i] = _project(cand[i] + rng.normal(0.0, step, 2))
+                v0 = _softmin(cur)
+                v1 = _softmin(cand)
+                if v1 >= v0 or rng.random() < np.exp((v1 - v0) * 200.0):
+                    cur = cand
+            # ---- Phase 2: hard-min greedy polish ----
+            cur_val, tri = _hard(cur)
+            while time.time() < deadline:
+                improved = False
+                i0, i1, i2 = tri
+                cen = cur[[i0, i1, i2]].mean(axis=0)
+                moves = []
+                for vi in (i0, i1, i2):
+                    d = cur[vi] - cen
+                    nrm = np.hypot(*d)
+                    d = d / nrm if nrm > 1e-12 else np.array([0.0, 1.0])
+                    perp = np.array([-d[1], d[0]])
+                    for st in (step, 0.5 * step):
+                        moves.append((vi, d * st))
+                        moves.append((vi, d * st + perp * 0.3 * st))
+                        moves.append((vi, d * st - perp * 0.3 * st))
+                for r in range(4):
+                    vi = int(rng.integers(n))
+                    moves.append((vi, rng.normal(0.0, step, 2)))
+                for vi, mv in moves:
+                    cand = cur.copy()
+                    cand[vi] = _project(cand[vi] + mv)
+                    v, t2 = _hard(cand)
+                    if v > cur_val + 1e-12:
+                        cur, cur_val, tri = cand, v, t2
+                        improved = True
+                        break
+                if not improved:
+                    step *= 0.5
+                    if step < 1e-6:
+                        break
+                if cur_val > best_val:
+                    best, best_val = cur.copy(), cur_val
+            if best_val >= 0.0365:
+                break
+
+        pts = best
+    except Exception:
+        pass  # graceful fallback: return the symmetric initial configuration
+
+    return pts
+>>>>>>> REPLACE
+</DIFF>

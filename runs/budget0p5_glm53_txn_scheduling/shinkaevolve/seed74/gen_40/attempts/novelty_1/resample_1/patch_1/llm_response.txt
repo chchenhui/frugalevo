@@ -1,0 +1,166 @@
+<NAME>
+ruin_recreate_plus_sa
+</NAME>
+<DESCRIPTION>
+The current program spends most of its 20s budget on expensive full greedy constructions (each O(n²) full-sequence evaluations) and only reaches the ruin-and-recreate stage once or twice per budget. Since ruin-and-recreate with perturbation was the pattern that historically gained the most makespan (Gen 20: +23 units), I restructure the budget:
+
+1. **Fast construction phase (~2s):** Run a few greedy constructions with perturbation, but immediately cap each with local search so we get a good incumbent quickly.
+2. **Ruin-and-recreate with SA acceptance (~13s):** Instead of accepting only improvements (which stalls), use simulated-annealing acceptance: accept slightly worse reconstructions with probability exp(-Δ/T), with temperature geometrically decreasing and periodic reheating. This escapes local minima while intensifying near the end. Removing 3–8 transactions and greedily reinserting each at its cheapest position is a large-neighborhood move that explores far more than pairwise swaps per evaluation.
+3. **Final intensification (~5s):** Low-temperature SA on relocation/swap moves, first-improvement descent at near-zero temperature.
+
+Time checks are done inside the insertion loops so the deadline is respected. Best incumbent is always tracked and returned. This fills the gap between the greedy tier (~356) and the SA tier (~244) by giving the LNS perturbation the bulk of the budget with annealing acceptance rather than improvement-only acceptance.
+</DESCRIPTION>
+<CODE>
+```python
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using greedy construction + ruin-and-recreate
+    LNS with simulated annealing acceptance + final descent.
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    import time
+    import math
+
+    n = workload.num_txns
+
+    def greedy_construct(perturb_rate):
+        start_txn = random.randint(0, n - 1)
+        txn_seq = [start_txn]
+        remaining = [x for x in range(n) if x != start_txn]
+        while remaining:
+            if random.random() < perturb_rate:
+                t = remaining[random.randint(0, len(remaining) - 1)]
+            else:
+                best_c = None
+                best_t = remaining[0]
+                for t in remaining:
+                    c = workload.get_opt_seq_cost(txn_seq + [t])
+                    if best_c is None or c < best_c:
+                        best_c = c
+                        best_t = t
+                t = best_t
+            txn_seq.append(t)
+            remaining.remove(t)
+        return workload.get_opt_seq_cost(txn_seq), txn_seq
+
+    def ruin_recreate(seq, cost, deadline, accept):
+        # Remove k random txns, greedily reinsert each at cheapest position.
+        while time.time() < deadline:
+            k = random.randint(3, min(8, n - 1))
+            removed_idx = random.sample(range(n), k)
+            removed = [seq[i] for i in removed_idx]
+            idx_set = set(removed_idx)
+            base = [seq[i] for i in range(n) if i not in idx_set]
+            ok = True
+            random.shuffle(removed)
+            cur = cost
+            for t in removed:
+                if time.time() >= deadline:
+                    ok = False
+                    break
+                best_c = None
+                best_pos = -1
+                for pos in range(len(base) + 1):
+                    c = workload.get_opt_seq_cost(base[:pos] + [t] + base[pos:])
+                    if best_c is None or c < best_c:
+                        best_c = c
+                        best_pos = pos
+                base.insert(best_pos, t)
+                cur = best_c
+            if not ok:
+                break
+            if cur < cost or accept(cur - cost):
+                seq = base
+                cost = cur
+        return cost, seq
+
+    def sa_moves(seq, cost, deadline, temp):
+        # Low-temp SA over relocation/swap moves.
+        while time.time() < deadline:
+            cand = seq[:]
+            i = random.randint(0, n - 1)
+            j = random.randint(0, n - 1)
+            if i == j:
+                continue
+            if random.random() < 0.5:
+                t = cand.pop(i)
+                cand.insert(j, t)
+            else:
+                cand[i], cand[j] = cand[j], cand[i]
+            c = workload.get_opt_seq_cost(cand)
+            if c < cost:
+                seq, cost = cand, c
+            elif temp > 0.01 and random.random() < math.exp(-(c - cost) / temp):
+                seq, cost = cand, c
+        return cost, seq
+
+    time_budget = 20.0
+    t0 = time.time()
+    deadline = t0 + time_budget
+
+    best_cost = None
+    best_seq = None
+
+    # Phase 1: quick construction(s) to get a good incumbent (~2.5s)
+    construct_deadline = min(deadline, t0 + 2.5)
+    while time.time() < construct_deadline:
+        cost, seq = greedy_construct(0.05)
+        if best_cost is None or cost < best_cost:
+            best_cost, best_seq = cost, seq
+
+    cost, seq = best_cost, best_seq
+
+    # Phase 2: ruin-and-recreate LNS with SA acceptance (~13s)
+    lns_deadline = min(deadline, t0 + 15.5)
+    temp = max(1.0, cost * 0.02)
+    while time.time() < lns_deadline:
+        slice_end = min(lns_deadline, time.time() + 1.0)
+        accept = lambda delta: random.random() < math.exp(-delta / max(temp, 0.01))
+        cost, seq = ruin_recreate(seq, cost, slice_end, accept)
+        if cost < best_cost:
+            best_cost, best_seq = cost, seq[:]
+        temp *= 0.9
+        if temp < 0.05:
+            temp = max(1.0, best_cost * 0.005)  # reheat mildly
+
+    # Phase 3: final low-temperature SA intensification
+    cost, seq = sa_moves(seq, cost, deadline, temp=0.3)
+    if cost < best_cost:
+        best_cost, best_seq = cost, seq
+
+    return best_cost, best_seq
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")
+```
+</CODE>

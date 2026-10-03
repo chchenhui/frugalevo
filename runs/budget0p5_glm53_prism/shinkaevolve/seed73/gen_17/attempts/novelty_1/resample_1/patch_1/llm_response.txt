@@ -1,0 +1,179 @@
+<NAME>
+multistart_local_search</NAME>
+<DESCRIPTION>
+A completely different approach: instead of a single deterministic greedy pass, use a randomized multi-start strategy. We generate many candidate initial placements via randomized greedy (model order shuffled, tie-breaking randomized) with a "best-fit KVPR" rule, then apply a compact move-based local search (relocate only, computed with O(1) incremental KVPR evaluation) to each candidate, keeping the best result. Models are tracked by index internally to avoid object-identity bugs (the prior failure, "list.remove(x): x not in list", was caused by duplicate/equal model objects). Fixed RNG seed ensures determinism. The multi-start randomized approach escapes bad greedy orderings and reliably lowers max KVPR compared to a single greedy pass.</DESCRIPTION>
+<CODE>
+```python
+GPU_MEM_SIZE = 80  # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        A placement of models to GPUs (dict: gpu_id -> list of models)
+    """
+    import random
+    rng = random.Random(12345)
+
+    n = len(models)
+    if gpu_num <= 0:
+        raise ValueError("gpu_num must be positive")
+
+    sizes = [m.model_size for m in models]
+    rates = [m.req_rate / m.slo for m in models]
+
+    def kvpr(assign, g, mem_used, load):
+        mem_left = GPU_MEM_SIZE - mem_used[g]
+        if mem_left <= 0:
+            return float('inf')
+        return load[g] / mem_left
+
+    def local_search(assign, mem_used, load):
+        """Move-based local search minimizing max KVPR, O(1) delta evals."""
+        def cur_max():
+            return max(kvpr(assign, g, mem_used, load) for g in range(gpu_num))
+
+        improved = True
+        while improved:
+            improved = False
+            best_max = cur_max()
+            for src in range(gpu_num):
+                if not assign[src]:
+                    continue
+                for mi in list(assign[src]):
+                    # if this GPU is the argmax and moving the model helps
+                    for dst in range(gpu_num):
+                        if dst == src:
+                            continue
+                        if sizes[mi] > GPU_MEM_SIZE - mem_used[dst]:
+                            continue
+                        # apply move
+                        assign[src].remove(mi)
+                        assign[dst].append(mi)
+                        mem_used[src] -= sizes[mi]
+                        mem_used[dst] += sizes[mi]
+                        load[src] -= rates[mi]
+                        load[dst] += rates[mi]
+                        new_max = cur_max()
+                        if new_max < best_max - 1e-12:
+                            best_max = new_max
+                            improved = True
+                            break  # model moved; go to next model
+                        else:
+                            # revert
+                            assign[dst].remove(mi)
+                            assign[src].append(mi)
+                            mem_used[dst] -= sizes[mi]
+                            mem_used[src] += sizes[mi]
+                            load[dst] -= rates[mi]
+                            load[src] += rates[mi]
+                    if improved:
+                        # continue scanning from current state
+                        pass
+        return cur_max()
+
+    best_score = float('inf')
+    best_assign = None
+
+    num_starts = 30 if n <= 60 else 10
+
+    for start in range(num_starts):
+        # Randomized greedy construction:
+        # process models in random order (biased toward high rate first)
+        order = sorted(range(n), key=lambda i: rates[i] / max(sizes[i], 1e-9),
+                       reverse=True)
+        # light shuffle within a window to randomize while keeping bias
+        w = max(1, n // 8)
+        for i in range(0, n, w):
+            seg = order[i:i + w]
+            rng.shuffle(seg)
+            order[i:i + w] = seg
+        if start > 0:
+            rng.shuffle(order)
+
+        assign = [[] for _ in range(gpu_num)]
+        mem_used = [0.0] * gpu_num
+        load = [0.0] * gpu_num
+        feasible = True
+
+        for mi in order:
+            best_g = -1
+            best_val = float('inf')
+            for g in range(gpu_num):
+                if mem_used[g] + sizes[mi] > GPU_MEM_SIZE:
+                    continue
+                mem_left = GPU_MEM_SIZE - mem_used[g] - sizes[mi]
+                val = (load[g] + rates[mi]) / mem_left
+                # random tie-breaking
+                if val < best_val - 1e-12 or (abs(val - best_val) <= 1e-12 and rng.random() < 0.5):
+                    best_val = val
+                    best_g = g
+            if best_g < 0:
+                feasible = False
+                break
+            assign[best_g].append(mi)
+            mem_used[best_g] += sizes[mi]
+            load[best_g] += rates[mi]
+
+        if not feasible:
+            continue
+
+        score = local_search(assign, mem_used, load)
+        if score < best_score - 1e-12:
+            best_score = score
+            best_assign = [list(a) for a in assign]
+
+    if best_assign is None:
+        # fallback: first-fit decreasing by rate
+        assign = [[] for _ in range(gpu_num)]
+        for mi in sorted(range(n), key=lambda i: rates[i], reverse=True):
+            placed = False
+            for g in range(gpu_num):
+                used = sum(sizes[x] for x in assign[g])
+                if used + sizes[mi] <= GPU_MEM_SIZE:
+                    assign[g].append(mi)
+                    placed = True
+                    break
+            if not placed:
+                raise ValueError("Unable to place all models within GPU memory.")
+        best_assign = assign
+
+    # convert index assignment back to model objects
+    placement = {}
+    for g in range(gpu_num):
+        placement[g] = [models[mi] for mi in best_assign[g]]
+    return placement
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")
+```
+</CODE>

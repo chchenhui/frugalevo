@@ -1,0 +1,270 @@
+<NAME>
+trie_safe_reorder
+</NAME>
+
+<DESCRIPTION>
+The original implementation failed validation because it could corrupt row identity and cell placement during recursive reconstruction. In particular, `column_recursion` wrote completed futures back using enumeration order rather than the original row index, recursive branches rebuilt frames from `.values.tolist()`, added and removed an `original_index` column, merged rows back with pandas, and finally sorted the output. These operations could reorder or mismatch source values and returned an empty `column_orderings` list despite performing column permutations.
+
+The replacement keeps every original row, value, index, column, and shape intact. It constructs a bounded set of safe column-order candidates using normalized string representations only for scoring, measures candidates with the exact sorted-string LCP objective, and returns valid per-row column orderings. The stored output uses object dtype so mixed values and missing values are preserved rather than converted for scoring.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import pandas as pd
+from solver import Algorithm
+from typing import Tuple, List, Dict
+from collections import Counter, defaultdict
+import math
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-cache-oriented column permutation algorithm.
+
+    Values are never normalized or changed in the returned DataFrame.  String
+    normalization is used only to estimate the evaluator's serialization.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    @staticmethod
+    def _serialized_value(value) -> str:
+        """Match fillna('').astype(str) for normal scalar DataFrame values."""
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, bool) and missing:
+                return ""
+        except Exception:
+            pass
+        return str(value)
+
+    @staticmethod
+    def _lcp(left: str, right: str) -> int:
+        """Bounded logarithmic LCP calculation; slicing comparisons run in C."""
+        if left == right:
+            return len(left)
+        high = min(len(left), len(right))
+        low = 0
+        while low < high:
+            mid = (low + high + 1) // 2
+            if left[:mid] == right[:mid]:
+                low = mid
+            else:
+                high = mid - 1
+        return low
+
+    def _trie_score(self, rows: List[str]) -> int:
+        if len(rows) < 2:
+            return 0
+        ordered = sorted(rows)
+        return sum(self._lcp(ordered[i - 1], ordered[i])
+                   for i in range(1, len(ordered)))
+
+    @staticmethod
+    def _stable_constraint_order(order, names, col_merge, one_way_dep):
+        """
+        Apply supplied ordering constraints without merging or modifying cells.
+        A merge group is interpreted as a requested contiguous block, which is
+        the only interpretation compatible with preserving every source cell.
+        """
+        position = {p: i for i, p in enumerate(order)}
+        name_to_positions = defaultdict(list)
+        for p, name in enumerate(names):
+            name_to_positions[str(name)].append(p)
+
+        # Make requested groups contiguous while retaining candidate order.
+        for group in col_merge or []:
+            members = []
+            for requested in group:
+                for p, name in enumerate(names):
+                    if name == requested and p not in members:
+                        members.append(p)
+            if len(members) > 1:
+                members.sort(key=lambda p: position[p])
+                first = min(position[p] for p in members)
+                remainder = [p for p in order if p not in members]
+                order = remainder[:first] + members + remainder[first:]
+                position = {p: i for i, p in enumerate(order)}
+
+        # Resolve dependency specifications using the original API's
+        # substring matching behavior.  Ambiguous specifications are ignored.
+        edges = defaultdict(set)
+        indegree = {p: 0 for p in order}
+        for source_text, target_text in one_way_dep or []:
+            sources = [p for p, name in enumerate(names) if str(source_text) in str(name)]
+            targets = [p for p, name in enumerate(names) if str(target_text) in str(name)]
+            if len(sources) == 1 and len(targets) == 1:
+                source, target = sources[0], targets[0]
+                if source != target and target not in edges[source]:
+                    edges[source].add(target)
+                    indegree[target] += 1
+
+        # Stable Kahn sort.  If constraints contain a cycle, retain the
+        # candidate ordering for remaining nodes instead of losing columns.
+        rank = {p: i for i, p in enumerate(order)}
+        ready = sorted((p for p in order if indegree[p] == 0), key=rank.get)
+        result = []
+        while ready:
+            node = ready.pop(0)
+            result.append(node)
+            for child in sorted(edges[node], key=rank.get):
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    ready.append(child)
+            ready.sort(key=rank.get)
+        if len(result) != len(order):
+            result.extend(p for p in order if p not in set(result))
+        return result
+
+    def _conditional_orders(self, codes, strings, global_order):
+        """
+        Cheap conditional prefix partitioning.  It chooses one repeated,
+        length-weighted field per active group and gives each partition its own
+        prefix.  Work is bounded on wide/deep inputs.
+        """
+        n = len(strings[0]) if strings else 0
+        m = len(strings)
+        prefixes = [[] for _ in range(n)]
+        groups = [(list(range(n)), set(range(m)))]
+        max_depth = min(m, 10)
+        candidate_limit = 24
+
+        for _ in range(max_depth):
+            next_groups = []
+            changed = False
+            for rows, remaining in groups:
+                if len(rows) < 2 or not remaining:
+                    continue
+
+                # Prefer globally promising columns, then inspect only a
+                # bounded number inside this partition.
+                candidates = [c for c in global_order if c in remaining][:candidate_limit]
+                best_col = None
+                best_gain = 0
+                for col in candidates:
+                    counts = Counter(codes[col][r] for r in rows)
+                    gain = 0
+                    for code, count in counts.items():
+                        if count > 1:
+                            exemplar = strings[col][rows[0]]
+                            # Locate representative safely when the first row
+                            # has another code.
+                            for r in rows:
+                                if codes[col][r] == code:
+                                    exemplar = strings[col][r]
+                                    break
+                            gain += len(exemplar) * count * (count - 1)
+                    if gain > best_gain or (gain == best_gain and best_col is not None and col < best_col):
+                        best_gain = gain
+                        best_col = col
+
+                if best_col is None or best_gain <= 0:
+                    continue
+                changed = True
+                buckets = defaultdict(list)
+                for r in rows:
+                    prefixes[r].append(best_col)
+                    buckets[codes[best_col][r]].append(r)
+                new_remaining = set(remaining)
+                new_remaining.remove(best_col)
+                for bucket in buckets.values():
+                    if len(bucket) > 1:
+                        next_groups.append((bucket, new_remaining.copy()))
+            if not changed:
+                break
+            groups = next_groups
+            if not groups:
+                break
+
+        orders = []
+        for prefix in prefixes:
+            used = set(prefix)
+            orders.append(prefix + [c for c in global_order if c not in used])
+        return orders
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        n, m = df.shape
+        names = list(df.columns)
+        if n == 0 or m == 0:
+            return df.copy(), [[] for _ in range(n)]
+
+        # Materialize values once.  The matrix itself contains original Python
+        # objects; strings are separate scoring-only data.
+        raw = df.to_numpy(dtype=object, copy=True)
+        strings = [[self._serialized_value(raw[r, c]) for r in range(n)]
+                   for c in range(m)]
+
+        codes = []
+        frequency_scores = []
+        alternate_scores = []
+        for c in range(m):
+            mapping = {}
+            col_codes = []
+            counts = Counter()
+            lengths = {}
+            for value in strings[c]:
+                if value not in mapping:
+                    mapping[value] = len(mapping)
+                    lengths[mapping[value]] = len(value)
+                code = mapping[value]
+                col_codes.append(code)
+                counts[code] += 1
+            codes.append(col_codes)
+            frequency_scores.append(sum(lengths[k] * count * (count - 1)
+                                        for k, count in counts.items()))
+            alternate_scores.append(sum(lengths[k] * max(0, count - 1)
+                                        for k, count in counts.items()))
+
+        global_order = sorted(range(m), key=lambda c: (-frequency_scores[c], c))
+        alternate_order = sorted(range(m), key=lambda c: (-alternate_scores[c], c))
+        natural_order = list(range(m))
+        conditional_orders = self._conditional_orders(codes, strings, global_order)
+
+        candidates = [
+            [global_order[:] for _ in range(n)],
+            [alternate_order[:] for _ in range(n)],
+            conditional_orders,
+        ]
+
+        best_orders = candidates[0]
+        best_score = -1
+        for candidate in candidates:
+            constrained = [
+                self._stable_constraint_order(order[:], names, col_merge, one_way_dep)
+                for order in candidate
+            ]
+            serial_rows = [
+                "".join(strings[c][r] for c in constrained[r])
+                for r in range(n)
+            ]
+            score = self._trie_score(serial_rows)
+            if score > best_score:
+                best_score = score
+                best_orders = constrained
+
+        # Each output row is a permutation of precisely its own original cells.
+        output_rows = [
+            [raw[r, c] for c in best_orders[r]]
+            for r in range(n)
+        ]
+        reordered = pd.DataFrame(output_rows, index=df.index, columns=df.columns, dtype=object)
+        column_orderings = [[names[c] for c in order] for order in best_orders]
+
+        assert reordered.shape == df.shape
+        assert len(column_orderings) == len(reordered)
+        return reordered, column_orderings
+
+# EVOLVE-BLOCK-END
+```

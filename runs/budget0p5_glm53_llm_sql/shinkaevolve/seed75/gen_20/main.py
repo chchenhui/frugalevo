@@ -1,0 +1,327 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+from solver import Algorithm
+from typing import Tuple, List
+from collections import Counter, defaultdict
+
+
+class Evolved(Algorithm):
+    """
+    Prefix-caching oriented reorder.
+
+    Objective: maximize character-level Trie prefix reuse of serialized rows,
+    where each row is serialized as "".join(row.fillna("").astype(str).values).
+    For a fixed multiset of serialized strings, ideal reuse equals the sum of
+    longest-common-prefix lengths of lexicographically adjacent sorted strings.
+
+    We build a small bounded set of candidate row/column orderings, measure each
+    with the exact sorted-string LCP objective, and return the best. All cell
+    values are preserved exactly; only per-row column orderings change.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ---------------- serialization helpers ----------------
+
+    @staticmethod
+    def _ser(v) -> str:
+        """Serialize one cell exactly like the evaluator's scoring representation."""
+        if v is None:
+            return ""
+        try:
+            if v != v:  # float NaN
+                return ""
+        except Exception:
+            pass
+        try:
+            if pd.isna(v):
+                return ""
+        except Exception:
+            pass
+        return str(v)
+
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        """Longest common prefix length via binary search (C-level slice compares)."""
+        if a == b:
+            return len(a)
+        hi = min(len(a), len(b))
+        lo = 0
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    @classmethod
+    def _score_strings(cls, strings) -> int:
+        """Exact ideal Trie reuse: sum of adjacent LCPs after sorting."""
+        ordered = sorted(strings)
+        total = 0
+        prev = None
+        for s in ordered:
+            if prev is not None:
+                total += cls._lcp(prev, s)
+            prev = s
+        return total
+
+    # ---------------- candidate constructions ----------------
+
+    @staticmethod
+    def _freq_order(cols, cell, weight="pairs"):
+        """
+        Global column ordering ranked by length-weighted repetition.
+        weight='pairs': sum(len(v) * c * (c-1));  weight='counts': sum(len(v) * c).
+        Deterministic tie-breaks on column name.
+        """
+        scores = {}
+        for c in cols:
+            cnt = Counter(cell[c])
+            if weight == "pairs":
+                sc = sum(len(v) * k * (k - 1) for v, k in cnt.items())
+            else:
+                sc = sum(len(v) * k for v, k in cnt.items())
+            scores[c] = sc
+        return sorted(cols, key=lambda c: (-scores[c], str(c)))
+
+    def _tree_order(self, rows, cols, cell, suffix_scores, depth, col_stop):
+        """
+        Conditional prefix partition tree.
+
+        Returns dict: row_index -> ordered list of columns.
+        At each node, pick the remaining column maximizing
+        sum(len(v) * g * (g - 1)) over value groups g >= 2,
+        partition rows on that column's serialized values, and recurse.
+        Leaves order remaining columns by the global frequency ranking.
+        """
+        if col_stop is not None:
+            if depth >= col_stop or not cols or len(rows) <= 1:
+                suf = self._freq_order(cols, cell) if cols else []
+                return {r: suf for r in rows}
+        else:
+            if not cols or len(rows) <= 1 or depth >= 8:
+                suf = self._freq_order(cols, cell) if cols else []
+                return {r: suf for r in rows}
+
+        best_col = None
+        best_gain = 0
+        for c in cols:
+            groups = defaultdict(list)
+            for r in rows:
+                groups[cell[c][r]].append(r)
+            gain = 0
+            for v, g in groups.items():
+                if len(g) >= 2:
+                    gain += len(v) * len(g) * (len(g) - 1)
+            if gain > best_gain:
+                best_gain = gain
+                best_col = c
+
+        if best_col is None:
+            suf = self._freq_order(cols, cell)
+            return {r: suf for r in rows}
+
+        remaining = [c for c in cols if c != best_col]
+        groups = defaultdict(list)
+        for r in rows:
+            groups[cell[best_col][r]].append(r)
+
+        result = {}
+        for v, g in groups.items():
+            sub = self._tree_order(g, remaining, cell, suffix_scores, depth + 1, col_stop)
+            for r, order in sub.items():
+                result[r] = [best_col] + order
+        return result
+
+    # ---------------- main API ----------------
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        df = df.copy()
+        n = len(df)
+        cols = list(df.columns)
+
+        if n == 0 or len(cols) == 0:
+            return df, [[] for _ in range(n)]
+
+        # Column merge semantics: merged groups must stay contiguous in every
+        # ordering. Treat each merge group as an atomic unit. Values untouched.
+        merge_map = {}
+        units = []  # list of list-of-columns (each unit keeps original order)
+        unit_of = {}
+        merged_set = set()
+        if col_merge:
+            for group in col_merge:
+                present = [c for c in cols if c in set(group)]
+                if len(present) > 1:
+                    units.append(present)
+                    for c in present:
+                        unit_of[c] = len(units) - 1
+                        merged_set.add(c)
+        for c in cols:
+            if c not in merged_set:
+                units.append([c])
+                unit_of[c] = len(units) - 1
+
+        # Serialize every cell once (evaluator representation).
+        cell = {}
+        for c in cols:
+            cell[c] = [self._ser(v) for v in df[c].tolist()]
+
+        # Candidates: (name, per-row orderings over units)
+        candidates = []
+
+        # Candidate 1: global frequency ranking with pair weighting.
+        unit_scores = {}
+        for i, unit in enumerate(units):
+            sc = 0
+            cnt = Counter()
+            for c in unit:
+                cnt.update(cell[c])
+            for v, k in cnt.items():
+                sc += len(v) * k * (k - 1) if k >= 2 else 0
+            unit_scores[i] = sc
+        unit_order_pairs = sorted(
+            range(len(units)), key=lambda i: (-unit_scores[i], str(units[i][0]))
+        )
+        cand1_units = [u for i in unit_order_pairs for u in [units[i]]]
+
+        # Candidate 2: conditional partition tree (per-row orderings).
+        tree_units = self._tree_order_units(
+            list(range(n)), [i for i in range(len(units))],
+            units, cell, 0, col_stop,
+        )
+        # tree_units: row -> ordered list of unit indices
+
+        # Candidate 3: original column order (safe fallback).
+        cand3_units = list(units)
+
+        def expand(unit_list):
+            out = []
+            for u in unit_list:
+                out.extend(u)
+            return out
+
+        def row_string(row, order_cols):
+            return "".join(cell[c][row] for c in order_cols)
+
+        # Score each candidate with the exact sorted-string LCP objective.
+        best_order = None
+        best_score = -1
+
+        # --- Candidate 1 rows ---
+        order1 = expand(cand1_units)
+        strs1 = [row_string(r, order1) for r in range(n)]
+        s1 = self._score_strings(strs1)
+        if s1 > best_score:
+            best_score = s1
+            best_order = [order1] * n
+
+        # --- Candidate 3 rows ---
+        order3 = expand(cand3_units)
+        if order3 != order1:
+            strs3 = [row_string(r, order3) for r in range(n)]
+            s3 = self._score_strings(strs3)
+            if s3 > best_score:
+                best_score = s3
+                best_order = [order3] * n
+
+        # --- Candidate 2 rows (per-row orders from the tree) ---
+        any_diff = False
+        for r in range(n):
+            if expand(tree_units[r]) != order1:
+                any_diff = True
+                break
+        if any_diff:
+            strs2 = []
+            orders2 = []
+            for r in range(n):
+                o = expand(tree_units[r])
+                orders2.append(o)
+                strs2.append(row_string(r, o))
+            s2 = self._score_strings(strs2)
+            if s2 > best_score:
+                best_score = s2
+                best_order = orders2
+
+        if best_order is None:
+            best_order = [order1] * n
+
+        # Verify each ordering is a valid permutation of all columns.
+        assert all(sorted(o) == sorted(cols) for o in best_order)
+
+        # Returned DataFrame preserves original values, columns, and row order.
+        return df, best_order
+
+    # ---------------- tree over units ----------------
+
+    def _tree_order_units(self, rows, unit_ids, units, cell, depth, col_stop):
+        """
+        Conditional partition tree over column units.
+        Returns dict row_index -> ordered list of unit ids.
+        """
+        max_depth = col_stop if col_stop is not None else 8
+
+        if not unit_ids or len(rows) <= 1 or depth >= max_depth:
+            suf = self._rank_units(unit_ids, units, cell)
+            return {r: list(suf) for r in rows}
+
+        best_unit = None
+        best_gain = 0
+        for uid in unit_ids:
+            gain = 0
+            groups = defaultdict(list)
+            for r in rows:
+                key = tuple(cell[c][r] for c in units[uid])
+                groups[key].append(r)
+            for v, g in groups.items():
+                if len(g) >= 2:
+                    gain += sum(len(x) for x in v) * len(g) * (len(g) - 1)
+            if gain > best_gain:
+                best_gain = gain
+                best_unit = uid
+
+        if best_unit is None:
+            suf = self._rank_units(unit_ids, units, cell)
+            return {r: list(suf) for r in rows}
+
+        remaining = [u for u in unit_ids if u != best_unit]
+        groups = defaultdict(list)
+        for r in rows:
+            key = tuple(cell[c][r] for c in units[best_unit])
+            groups[key].append(r)
+
+        result = {}
+        for v, g in groups.items():
+            sub = self._tree_order_units(g, remaining, units, cell, depth + 1, col_stop)
+            for r, order in sub.items():
+                result[r] = [best_unit] + order
+        return result
+
+    def _rank_units(self, unit_ids, units, cell):
+        """Order units by global length-weighted pair repetition (deterministic)."""
+        scores = {}
+        for uid in unit_ids:
+            cnt = Counter()
+            for c in units[uid]:
+                cnt.update(cell[c])
+            sc = 0
+            for v, k in cnt.items():
+                if k >= 2:
+                    sc += len(v) * k * (k - 1)
+            scores[uid] = sc
+        return sorted(unit_ids, key=lambda u: (-scores[u], str(units[u][0])))
+
+# EVOLVE-BLOCK-END

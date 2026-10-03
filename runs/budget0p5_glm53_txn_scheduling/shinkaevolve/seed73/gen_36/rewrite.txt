@@ -1,0 +1,157 @@
+import random
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+# EVOLVE-BLOCK-START
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Budgeted construction phase (randomized greedy) followed by
+    iterated local search using insertion (relocate) moves with
+    perturbation restarts on stagnation.
+    """
+    import time
+
+    n = workload.num_txns
+    if n == 0:
+        return 0, []
+
+    start_time = time.time()
+    time_budget = 20.0
+    cost_evals = [0]
+
+    def cost(seq):
+        cost_evals[0] += 1
+        return workload.get_opt_seq_cost(seq)
+
+    best_cost = float('inf')
+    best_seq = None
+    candidates = []
+
+    # ---------- Phase 1: randomized greedy constructions ----------
+    def greedy_construct(sample_rate):
+        start = random.randrange(n)
+        seq = [start]
+        rem = [x for x in range(n) if x != start]
+        while rem:
+            if random.random() < sample_rate:
+                k = min(len(rem), 12)
+                best_t, best_c = None, float('inf')
+                for t in random.sample(rem, k):
+                    c = cost(seq + [t])
+                    if c < best_c:
+                        best_c, best_t = c, t
+                t = best_t
+            else:
+                t = random.choice(rem)
+            seq.append(t)
+            rem.remove(t)
+        return cost(seq), seq
+
+    construct_end = start_time + time_budget * 0.3
+    while time.time() - start_time < time_budget * 0.3:
+        c, seq = greedy_construct(random.choice([0.6, 0.9, 1.0]))
+        candidates.append((c, seq))
+        if c < best_cost:
+            best_cost, best_seq = c, seq[:]
+
+    # one identity-based construction as fallback
+    if best_seq is None:
+        best_seq = list(range(n))
+        best_cost = cost(best_seq)
+        candidates.append((best_cost, best_seq[:]))
+
+    candidates.sort(key=lambda x: x[0])
+
+    # ---------- Phase 2: ILS with insertion moves ----------
+    def insertion_sweep(seq):
+        """Best-improvement insertion sweep: try relocating each txn."""
+        improved = False
+        i = 0
+        while i < len(seq):
+            base = seq[:i] + seq[i + 1:]
+            t = seq[i]
+            best_pos = i
+            best_c = None
+            for p in range(len(seq)):
+                if p == i:
+                    continue
+                cand = base[:p] + [t] + base[p:]
+                c = cost(cand)
+                if best_c is None or c < best_c:
+                    best_c, best_c_val = c, None
+                    best_c = c
+                    best_pos = p
+            if best_c < cost(seq) - 1e-9:
+                seq = base[:best_pos] + [t] + base[best_pos:]
+                improved = True
+            i += 1
+            if time.time() - start_time > time_budget:
+                break
+        return seq, improved
+
+    def perturb(seq, strength=3):
+        seq = seq[:]
+        for _ in range(strength):
+            if len(seq) < 2:
+                break
+            i = random.randrange(len(seq))
+            j = random.randrange(len(seq))
+            t = seq.pop(i)
+            seq.insert(j, t)
+        return seq
+
+    cur_seq = best_seq[:]
+    cur_cost = best_cost
+    stagnation = 0
+    cand_idx = 0
+    while time.time() - start_time < time_budget:
+        cur_seq, improved = insertion_sweep(cur_seq)
+        c = cost(cur_seq)
+        if c < best_cost - 1e-9:
+            best_cost, best_seq = c, cur_seq[:]
+            cur_cost = c
+            stagnation = 0
+        elif c < cur_cost - 1e-9:
+            cur_cost = c
+            stagnation += 1
+        else:
+            stagnation += 1
+
+        if stagnation >= 2:
+            # restart from another diverse candidate or perturb
+            if cand_idx < len(candidates) and random.random() < 0.3:
+                cur_seq = candidates[cand_idx][1][:]
+                cand_idx += 1
+            else:
+                cur_seq = perturb(best_seq, strength=random.choice([2, 3, 4]))
+            cur_cost = cost(cur_seq)
+            stagnation = 0
+
+    assert len(set(best_seq)) == n
+    return best_cost, best_seq
+
+# EVOLVE-BLOCK-END
+
+def get_random_costs():
+    workload_size = 100
+    workload = Workload(WORKLOAD_1)
+
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    print(cost1, cost2, cost3)
+    return cost1 + cost2 + cost3, [schedule1, schedule2, schedule3]
+
+
+if __name__ == "__main__":
+    makespan, schedule = get_random_costs()
+    print(f"Makespan: {makespan}")

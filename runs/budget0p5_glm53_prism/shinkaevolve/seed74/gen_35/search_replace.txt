@@ -1,0 +1,118 @@
+<NAME>
+lexicographic_local_search_refine</NAME>
+
+<DESCRIPTION>
+The current program stops after λ binary-search packing. Add a local-search refinement phase that takes the packing result and performs move/swap moves accepted when the full sorted KVPR vector improves lexicographically (i.e., compare sorted descending KVPR vectors; accept if `new_sorted < old_sorted`). This full-vector objective balances all GPUs, not just the max, which often lets subsequent moves reduce the true maximum. Guard with a 3000-iteration cap and use incremental load/mem arrays for speed. This directly implements the recommendation to try K=full in the lexicographic top-K objective.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    if best_placement is None:
+        raise ValueError("Unable to place models on any GPU.")
+
+    return best_placement
+
+    # local search removed: replaced by λ binary-search packing above
+=======
+    if best_placement is None:
+        raise ValueError("Unable to place models on any GPU.")
+
+    # --- Local search refinement: full lexicographic balancing of sorted KVPR vector ---
+    placement = best_placement
+    mem = [sum(m.model_size for m in placement[g]) for g in range(gpu_num)]
+    load = [sum(m.req_rate / m.slo for m in placement[g]) for g in range(gpu_num)]
+
+    def kvpr_vec():
+        vals = []
+        for g in range(gpu_num):
+            free = GPU_MEM_SIZE - mem[g]
+            vals.append(load[g] / free if free > 1e-12 else float('inf'))
+        return sorted(vals, reverse=True)
+
+    cur_vec = kvpr_vec()
+    iters = 0
+    improved = True
+    while improved and iters < 3000:
+        improved = False
+        iters += 1
+        # order GPUs by KVPR descending; try to relieve the most crowded first
+        order = sorted(range(gpu_num),
+                       key=lambda g: -(load[g] / (GPU_MEM_SIZE - mem[g])
+                                       if GPU_MEM_SIZE - mem[g] > 1e-12 else float('inf')))
+        for src in order:
+            if not placement[src]:
+                continue
+            done = False
+            # moves
+            for model in list(placement[src]):
+                for dst in range(gpu_num):
+                    if dst == src:
+                        continue
+                    if mem[dst] + model.model_size >= GPU_MEM_SIZE:
+                        continue
+                    placement[src].remove(model)
+                    placement[dst].append(model)
+                    mem[src] -= model.model_size
+                    mem[dst] += model.model_size
+                    load[src] -= model.req_rate / model.slo
+                    load[dst] += model.req_rate / model.slo
+                    nv = kvpr_vec()
+                    if nv < cur_vec:
+                        cur_vec = nv
+                        improved = True
+                        done = True
+                        break
+                    placement[dst].remove(model)
+                    placement[src].append(model)
+                    mem[dst] -= model.model_size
+                    mem[src] += model.model_size
+                    load[dst] -= model.req_rate / model.slo
+                    load[src] += model.req_rate / model.slo
+                if done:
+                    break
+            if done:
+                break
+            # swaps
+            for model in list(placement[src]):
+                if done:
+                    break
+                for dst in range(gpu_num):
+                    if dst == src:
+                        continue
+                    for other in list(placement[dst]):
+                        s_mem = mem[src] - model.model_size + other.model_size
+                        d_mem = mem[dst] - other.model_size + model.model_size
+                        if s_mem >= GPU_MEM_SIZE or d_mem >= GPU_MEM_SIZE:
+                            continue
+                        placement[src].remove(model)
+                        placement[dst].remove(other)
+                        placement[src].append(other)
+                        placement[dst].append(model)
+                        s_load = load[src] - model.req_rate / model.slo + other.req_rate / other.slo
+                        d_load = load[dst] - other.req_rate / other.slo + model.req_rate / model.slo
+                        os_, od = load[src], load[dst]
+                        load[src], load[dst] = s_load, d_load
+                        om_s, om_d = mem[src], mem[dst]
+                        mem[src], mem[dst] = s_mem, d_mem
+                        nv = kvpr_vec()
+                        if nv < cur_vec:
+                            cur_vec = nv
+                            improved = True
+                            done = True
+                            break
+                        # revert
+                        placement[dst].remove(model)
+                        placement[src].remove(other)
+                        placement[src].append(model)
+                        placement[dst].append(other)
+                        mem[src], mem[dst] = om_s, om_d
+                        load[src], load[dst] = os_, od
+                    if done:
+                        break
+                if done:
+                    break
+            if done:
+                break
+
+    return placement
+>>>>>>> REPLACE
+</DIFF>

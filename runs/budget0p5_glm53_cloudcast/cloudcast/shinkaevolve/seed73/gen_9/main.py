@@ -1,0 +1,163 @@
+# EVOLVE-BLOCK-START
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+
+
+def search_algorithm(src, dsts, G, num_partitions):
+    # Parameters
+    K_PATHS = 4              # number of candidate shortest paths per destination
+    CONGESTION_WEIGHT = 0.5  # penalty added per concurrent load on an edge
+    MAX_CANDIDATES = 8       # safety cap on candidate path enumeration
+
+    h = G.copy()
+    h.remove_edges_from(list(h.in_edges(src)) + list(nx.selfloop_edges(h)))
+
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Track congestion across the whole broadcast to balance load
+    edge_load = {}
+
+    def effective_cost(s, t):
+        base = h[s][t].get("cost")
+        if base is None:
+            base = 1e9
+        return base + CONGESTION_WEIGHT * edge_load.get((s, t), 0)
+
+    for dst in dsts:
+        if dst == src:
+            continue
+        # Enumerate candidate simple paths with congestion-aware costs
+        candidates = []
+        try:
+            count = 0
+            for path in nx.shortest_simple_paths(h, src, dst, weight="cost"):
+                candidates.append(path)
+                count += 1
+                if count >= max(K_PATHS, MAX_CANDIDATES):
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            candidates = []
+
+        if not candidates:
+            continue
+
+        # Evaluate candidates by (sum of edge costs + congestion penalty)
+        scored = []
+        for p in candidates:
+            c = 0
+            for i in range(len(p) - 1):
+                c += effective_cost(p[i], p[i + 1])
+            scored.append((c, p))
+        scored.sort(key=lambda x: x[0])
+
+        # Round-robin assign partitions over the best candidates,
+        # re-scoring with current congestion as we assign each partition.
+        chosen = []
+        for j in range(num_partitions):
+            best_c, best_p = None, None
+            for p in candidates:
+                c = 0
+                for i in range(len(p) - 1):
+                    c += effective_cost(p[i], p[i + 1])
+                if best_c is None or c < best_c:
+                    best_c, best_p = c, p
+            best_p = best_p or scored[0][1]
+            chosen.append(best_p)
+            # Update congestion for the chosen path
+            for i in range(len(best_p) - 1):
+                key = (best_p[i], best_p[i + 1])
+                edge_load[key] = edge_load.get(key, 0) + 1
+
+        # Record edges into the broadcast topology
+        for j, path in enumerate(chosen):
+            for i in range(0, len(path) - 1):
+                s, t = path[i], path[i + 1]
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+
+
+class SingleDstPath(Dict):
+    partition: int
+    edges: List[List]  # [[src, dst, edge data]]
+
+
+class BroadCastTopology:
+    def __init__(self, src: str, dsts: List[str], num_partitions: int = 4, paths: Dict[str, SingleDstPath] = None):
+        self.src = src  # single str
+        self.dsts = dsts  # list of strs
+        self.num_partitions = num_partitions
+
+        # dict(dst) --> dict(partition) --> list(nx.edges)
+        if paths is not None:
+            self.paths = paths
+            self.set_graph()
+        else:
+            self.paths = {dst: {str(i): None for i in range(num_partitions)} for dst in dsts}
+
+    def get_paths(self):
+        print(f"now the set path is: {self.paths}")
+        return self.paths
+
+    def set_num_partitions(self, num_partitions: int):
+        self.num_partitions = num_partitions
+
+    def set_dst_partition_paths(self, dst: str, partition: int, paths: List[List]):
+        partition = str(partition)
+        self.paths[dst][partition] = paths
+
+    def append_dst_partition_path(self, dst: str, partition: int, path: List):
+        partition = str(partition)
+        if self.paths[dst][partition] is None:
+            self.paths[dst][partition] = []
+        self.paths[dst][partition].append(path)
+
+    def set_graph(self):
+        pass
+
+
+def make_nx_graph(cost_path=None, throughput_path=None, num_vms=1):
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if cost_path is None:
+        cost = pd.read_csv(os.path.join(current_dir, "profiles/cost.csv"))
+    else:
+        cost = pd.read_csv(cost_path)
+
+    if throughput_path is None:
+        throughput = pd.read_csv(os.path.join(current_dir, "profiles/throughput.csv"))
+    else:
+        throughput = pd.read_csv(throughput_path)
+
+    G = nx.DiGraph()
+    for _, row in throughput.iterrows():
+        if row["src_region"] == row["dst_region"]:
+            continue
+        G.add_edge(row["src_region"], row["dst_region"], cost=None, throughput=num_vms * row["throughput_sent"] / 1e9)
+
+    for _, row in cost.iterrows():
+        if row["src"] in G and row["dest"] in G[row["src"]]:
+            G[row["src"]][row["dest"]]["cost"] = row["cost"]
+
+    no_cost_pairs = []
+    for edge in G.edges.data():
+        src, dst = edge[0], edge[1]
+        if edge[-1]["cost"] is None:
+            no_cost_pairs.append((src, dst))
+    print("Unable to get costs for: ", no_cost_pairs)
+
+    return G
+
+# EVOLVE-BLOCK-END
+
+# Helper functions that won't be evolved
+def create_broadcast_topology(src: str, dsts: List[str], num_partitions: int = 4):
+    """Create a broadcast topology instance"""
+    return BroadCastTopology(src, dsts, num_partitions)
+
+def run_search_algorithm(src: str, dsts: List[str], G, num_partitions: int):
+    """Run the search algorithm and return the topology"""
+    return search_algorithm(src, dsts, G, num_partitions)

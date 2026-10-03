@@ -1,0 +1,302 @@
+# EVOLVE-BLOCK-START
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <queue>
+#include <cstring>
+#include <limits>
+
+constexpr int GRID_SIZE = 30;
+constexpr int NUM_TURNS = 300;
+constexpr int INF = std::numeric_limits<int>::max();
+
+struct Point {
+    int r, c;
+    bool operator==(const Point& o) const { return r == o.r && c == o.c; }
+    bool operator<(const Point& o) const { return r != o.r ? r < o.r : c < o.c; }
+};
+
+const Point INVALID_POINT{-1, -1};
+const Point DIRS[4] = {{-1,0},{1,0},{0,-1},{0,1}};
+const char BUILD[4] = {'u','d','l','r'};
+const char MOVE[4] = {'U','D','L','R'};
+
+struct PetInfo {
+    Point pos;
+    int type, id;
+};
+
+struct HumanInfo {
+    Point pos;
+    int id;
+    int strip_r_start, strip_r_end;
+    Point inner_safe_ul, inner_safe_br, final_stand_pos;
+    std::vector<Point> assigned_wall_cells;
+    int turns_stuck_building = 0;
+};
+
+bool wall[31][31];
+bool reserved_wall[31][31];
+bool reserved_move[31][31];
+int visit_stamp[31][31];
+char first_move[31][31];
+int bfs_stamp = 0;
+
+int N_pets_global, M_humans_global;
+std::vector<PetInfo> pets_global_state;
+std::vector<HumanInfo> humans_global_state;
+
+inline bool valid(int r, int c) {
+    return 1 <= r && r <= GRID_SIZE && 1 <= c && c <= GRID_SIZE;
+}
+
+inline int mdist(Point a, Point b) {
+    return std::abs(a.r - b.r) + std::abs(a.c - b.c);
+}
+
+inline int direction_of(char ch) {
+    for (int d = 0; d < 4; ++d) {
+        if (BUILD[d] == ch || MOVE[d] == ch) return d;
+    }
+    return -1;
+}
+
+bool can_build_at(Point p, int builder) {
+    if (!valid(p.r, p.c) || wall[p.r][p.c] || reserved_wall[p.r][p.c]) return false;
+
+    for (const auto& pet : pets_global_state) {
+        if (mdist(p, pet.pos) <= 1) return false;
+    }
+    for (const auto& human : humans_global_state) {
+        if (human.id != builder && human.pos == p) return false;
+    }
+    return true;
+}
+
+char bfs_move(Point start, Point target) {
+    if (start == target || !valid(start.r, start.c) || !valid(target.r, target.c)) return '.';
+
+    ++bfs_stamp;
+    Point q[901];
+    int head = 0, tail = 0;
+    q[tail++] = start;
+    visit_stamp[start.r][start.c] = bfs_stamp;
+    first_move[start.r][start.c] = '.';
+
+    while (head < tail) {
+        Point cur = q[head++];
+        for (int d = 0; d < 4; ++d) {
+            int nr = cur.r + DIRS[d].r;
+            int nc = cur.c + DIRS[d].c;
+            if (!valid(nr, nc) || wall[nr][nc] || reserved_wall[nr][nc]) continue;
+            if (visit_stamp[nr][nc] == bfs_stamp) continue;
+
+            visit_stamp[nr][nc] = bfs_stamp;
+            first_move[nr][nc] = (cur == start ? MOVE[d] : first_move[cur.r][cur.c]);
+            if (nr == target.r && nc == target.c) return first_move[nr][nc];
+            q[tail++] = {nr, nc};
+        }
+    }
+    return '.';
+}
+
+void initialize_game() {
+    std::cin >> N_pets_global;
+    pets_global_state.resize(N_pets_global);
+    for (int i = 0; i < N_pets_global; ++i) {
+        pets_global_state[i].id = i;
+        std::cin >> pets_global_state[i].pos.r >> pets_global_state[i].pos.c
+                 >> pets_global_state[i].type;
+    }
+
+    std::cin >> M_humans_global;
+    humans_global_state.resize(M_humans_global);
+    std::memset(wall, 0, sizeof(wall));
+
+    const int base_h = GRID_SIZE / M_humans_global;
+    const int rem = GRID_SIZE % M_humans_global;
+    int row_start = 1;
+
+    for (int i = 0; i < M_humans_global; ++i) {
+        HumanInfo& h = humans_global_state[i];
+        h.id = i;
+        std::cin >> h.pos.r >> h.pos.c;
+
+        int height = base_h + (i < rem);
+        h.strip_r_start = row_start;
+        h.strip_r_end = row_start + height - 1;
+        row_start = h.strip_r_end + 1;
+
+        h.inner_safe_ul = {h.strip_r_start + 1, 2};
+        h.inner_safe_br = {h.strip_r_end - 1, 29};
+        if (h.inner_safe_ul.r > h.inner_safe_br.r) h.inner_safe_br.r = h.inner_safe_ul.r;
+
+        h.final_stand_pos = {
+            (h.inner_safe_ul.r + h.inner_safe_br.r) / 2,
+            (h.inner_safe_ul.c + h.inner_safe_br.c) / 2
+        };
+
+        int rs = h.strip_r_start, re = h.strip_r_end;
+        if (i == 0) {
+            for (int c = 1; c <= 30; ++c) h.assigned_wall_cells.push_back({rs, c});
+        } else {
+            for (int c = 16; c <= 30; ++c) h.assigned_wall_cells.push_back({rs, c});
+        }
+        if (i == M_humans_global - 1) {
+            for (int c = 1; c <= 30; ++c) h.assigned_wall_cells.push_back({re, c});
+        } else {
+            for (int c = 1; c <= 15; ++c) h.assigned_wall_cells.push_back({re, c});
+        }
+        for (int r = rs + 1; r < re; ++r) {
+            h.assigned_wall_cells.push_back({r, 1});
+            h.assigned_wall_cells.push_back({r, 30});
+        }
+
+        std::sort(h.assigned_wall_cells.begin(), h.assigned_wall_cells.end());
+        h.assigned_wall_cells.erase(
+            std::unique(h.assigned_wall_cells.begin(), h.assigned_wall_cells.end()),
+            h.assigned_wall_cells.end()
+        );
+    }
+}
+
+std::string decide_human_actions() {
+    std::memset(reserved_wall, 0, sizeof(reserved_wall));
+    std::memset(reserved_move, 0, sizeof(reserved_move));
+    std::string actions(M_humans_global, '.');
+
+    for (int i = 0; i < M_humans_global; ++i) {
+        HumanInfo& h = humans_global_state[i];
+
+        int unbuilt = 0;
+        for (const Point& p : h.assigned_wall_cells) {
+            if (!wall[p.r][p.c]) ++unbuilt;
+        }
+
+        char action = '.';
+        if (unbuilt == 0) {
+            action = bfs_move(h.pos, h.final_stand_pos);
+        } else if (h.turns_stuck_building >= 10) {
+            h.turns_stuck_building = 0;
+            action = bfs_move(h.pos, h.final_stand_pos);
+        } else {
+            Point best_wall = INVALID_POINT;
+            Point best_stand = INVALID_POINT;
+            int best_score = INF;
+
+            for (const Point& wp : h.assigned_wall_cells) {
+                if (!can_build_at(wp, h.id)) continue;
+
+                for (int d = 0; d < 4; ++d) {
+                    Point sp{wp.r + DIRS[d].r, wp.c + DIRS[d].c};
+                    if (!valid(sp.r, sp.c) || wall[sp.r][sp.c]) continue;
+                    if (reserved_wall[sp.r][sp.c] || reserved_move[sp.r][sp.c]) continue;
+
+                    int score = mdist(h.pos, sp);
+                    bool inside =
+                        h.inner_safe_ul.r <= sp.r && sp.r <= h.inner_safe_br.r &&
+                        h.inner_safe_ul.c <= sp.c && sp.c <= h.inner_safe_br.c;
+                    if (!inside) score += 1000;
+
+                    if (score < best_score ||
+                        (score == best_score &&
+                         (best_wall.r == -1 || wp < best_wall ||
+                          (wp == best_wall && sp < best_stand)))) {
+                        best_score = score;
+                        best_wall = wp;
+                        best_stand = sp;
+                    }
+                }
+            }
+
+            if (best_wall.r == -1) {
+                ++h.turns_stuck_building;
+                action = bfs_move(h.pos, h.final_stand_pos);
+            } else {
+                h.turns_stuck_building = 0;
+                if (h.pos == best_stand) {
+                    for (int d = 0; d < 4; ++d) {
+                        if (h.pos.r + DIRS[d].r == best_wall.r &&
+                            h.pos.c + DIRS[d].c == best_wall.c) {
+                            action = BUILD[d];
+                            break;
+                        }
+                    }
+                } else {
+                    action = bfs_move(h.pos, best_stand);
+                }
+            }
+        }
+
+        if (action >= 'a' && action <= 'z') {
+            int d = direction_of(action);
+            Point p{h.pos.r + DIRS[d].r, h.pos.c + DIRS[d].c};
+            if (!valid(p.r, p.c) || reserved_wall[p.r][p.c]) action = '.';
+            else reserved_wall[p.r][p.c] = true;
+        } else if (action >= 'A' && action <= 'Z') {
+            int d = direction_of(action);
+            Point p{h.pos.r + DIRS[d].r, h.pos.c + DIRS[d].c};
+            if (!valid(p.r, p.c) || wall[p.r][p.c] || reserved_wall[p.r][p.c] ||
+                reserved_move[p.r][p.c]) {
+                action = '.';
+            } else {
+                reserved_move[p.r][p.c] = true;
+            }
+        }
+        actions[i] = action;
+    }
+    return actions;
+}
+
+void apply_actions_and_update_state(const std::string& actions) {
+    for (int i = 0; i < M_humans_global; ++i) {
+        char a = actions[i];
+        if (a >= 'a' && a <= 'z') {
+            int d = direction_of(a);
+            if (d >= 0) {
+                Point p{humans_global_state[i].pos.r + DIRS[d].r,
+                        humans_global_state[i].pos.c + DIRS[d].c};
+                if (valid(p.r, p.c)) wall[p.r][p.c] = true;
+            }
+        }
+    }
+
+    for (int i = 0; i < M_humans_global; ++i) {
+        char a = actions[i];
+        if (a >= 'A' && a <= 'Z') {
+            int d = direction_of(a);
+            if (d >= 0) {
+                Point p{humans_global_state[i].pos.r + DIRS[d].r,
+                        humans_global_state[i].pos.c + DIRS[d].c};
+                if (valid(p.r, p.c) && !wall[p.r][p.c]) humans_global_state[i].pos = p;
+            }
+        }
+    }
+
+    for (int i = 0; i < N_pets_global; ++i) {
+        std::string s;
+        std::cin >> s;
+        for (char ch : s) {
+            int d = direction_of(ch);
+            if (d >= 0) {
+                pets_global_state[i].pos.r += DIRS[d].r;
+                pets_global_state[i].pos.c += DIRS[d].c;
+            }
+        }
+    }
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    initialize_game();
+    for (int turn = 0; turn < NUM_TURNS; ++turn) {
+        std::string actions = decide_human_actions();
+        std::cout << actions << std::endl;
+        apply_actions_and_update_state(actions);
+    }
+    return 0;
+}
+# EVOLVE-BLOCK-END

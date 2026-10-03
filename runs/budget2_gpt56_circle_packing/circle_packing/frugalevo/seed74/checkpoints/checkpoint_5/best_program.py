@@ -1,0 +1,197 @@
+"""Joint constrained constructor-based circle packing for n=26 circles."""
+import numpy as np
+from scipy.optimize import minimize
+
+
+def compute_max_radii(centers):
+    """Conservative feasible radii for a specified collection of centers."""
+    n = centers.shape[0]
+    radii = np.min(
+        np.column_stack((
+            centers[:, 0], centers[:, 1],
+            1.0 - centers[:, 0], 1.0 - centers[:, 1],
+        )),
+        axis=1,
+    )
+    for i in range(n):
+        d = centers - centers[i]
+        ds = np.sqrt(np.sum(d * d, axis=1))
+        ds[i] = np.inf
+        radii[i] = min(radii[i], 0.5 * np.min(ds))
+    return radii
+
+
+def _incumbent_centers():
+    """Build fixed guard rows and a staggered 5-6-5 hexagonal middle band."""
+    rows = []
+
+    # Fixed outer guard rows.  Their regular placement leaves the middle
+    # sixteen circles free to relax without an initial global translation.
+    rows.extend([(x, 0.1) for x in (0.1, 0.3, 0.5, 0.7, 0.9)])
+
+    # Opposite offsets make the two 5-to-6 interfaces diagonally staggered.
+    # The small 0.02 displacement is large enough to alter the contact graph
+    # but leaves comfortable boundary clearance for the outermost circles.
+    rows.extend([(x, 0.3) for x in (0.08, 0.28, 0.48, 0.68, 0.88)])
+    rows.extend([(x, 0.5) for x in ((i + 0.5) / 6.0 for i in range(6))])
+    rows.extend([(x, 0.7) for x in (0.12, 0.32, 0.52, 0.72, 0.92)])
+
+    rows.extend([(x, 0.9) for x in (0.1, 0.3, 0.5, 0.7, 0.9)])
+    return np.asarray(rows, dtype=float)
+
+
+def _constraint_values(z, pairs):
+    c = z[:52].reshape(26, 2)
+    r = z[52:]
+    boundary = np.concatenate((
+        c[:, 0] - r, c[:, 1] - r,
+        1.0 - c[:, 0] - r, 1.0 - c[:, 1] - r
+    ))
+    i, j = pairs[:, 0], pairs[:, 1]
+    d = c[i] - c[j]
+    pair = np.sum(d * d, axis=1) - (r[i] + r[j]) ** 2
+    return np.concatenate((boundary, pair))
+
+
+def _constraint_jacobian(z, pairs):
+    c = z[:52].reshape(26, 2)
+    r = z[52:]
+    m = len(pairs)
+    jac = np.zeros((104 + m, 78), dtype=float)
+
+    q = np.arange(26)
+    jac[q, 2 * q] = 1.0
+    jac[q, 52 + q] = -1.0
+    jac[26 + q, 2 * q + 1] = 1.0
+    jac[26 + q, 52 + q] = -1.0
+    jac[52 + q, 2 * q] = -1.0
+    jac[52 + q, 52 + q] = -1.0
+    jac[78 + q, 2 * q + 1] = -1.0
+    jac[78 + q, 52 + q] = -1.0
+
+    for k, (i, j) in enumerate(pairs):
+        row = 104 + k
+        dx = c[i] - c[j]
+        s = r[i] + r[j]
+        jac[row, 2 * i:2 * i + 2] = 2.0 * dx
+        jac[row, 2 * j:2 * j + 2] = -2.0 * dx
+        jac[row, 52 + i] = -2.0 * s
+        jac[row, 52 + j] = -2.0 * s
+    return jac
+
+
+def _strictly_valid(centers, radii):
+    if centers.shape != (26, 2) or radii.shape != (26,):
+        return False
+    if not np.all(np.isfinite(centers)) or not np.all(np.isfinite(radii)):
+        return False
+    if np.min(radii) < 0.0:
+        return False
+    if np.min(centers - radii[:, None]) < -1e-8:
+        return False
+    if np.min(1.0 - centers - radii[:, None]) < -1e-8:
+        return False
+    for i in range(26):
+        for j in range(i):
+            if np.linalg.norm(centers[i] - centers[j]) < radii[i] + radii[j] - 1e-8:
+                return False
+    return True
+
+
+def construct_packing():
+    """Optimize a staggered 5-6-5 middle band while retaining outer guard rows."""
+    base = _incumbent_centers()
+    pairs = np.asarray(
+        [(i, j) for i in range(26) for j in range(i)], dtype=int
+    )
+
+    # Keep a valid incumbent available if an optimizer terminates unsuccessfully.
+    best_c = base.copy()
+    best_r = compute_max_radii(best_c)
+    best_sum = float(np.sum(best_r))
+
+    objective_jac = np.concatenate((np.zeros(52), -np.ones(26)))
+    general_bounds = [(1e-6, 1.0 - 1e-6)] * 52 + [(1e-8, 0.5)] * 26
+
+    # The first and last five circles are fixed boundary guards.  The middle
+    # 5-6-5 band is released, allowing independent horizontal staggering and
+    # vertical layer spacing before a short all-circle polish.
+    fixed = base.copy()
+    rng = np.random.default_rng(24681357)
+    seeds = [base]
+    for scale in (0.012, 0.024):
+        seed = base.copy()
+        seed[5:21] += rng.normal(0.0, scale, size=(16, 2))
+        seed[5:21] = np.clip(seed[5:21], 0.035, 0.965)
+        seeds.append(seed)
+
+    for seed in seeds:
+        initial_r = 0.975 * compute_max_radii(seed)
+        z0 = np.concatenate((seed.ravel(), initial_r))
+
+        band_bounds = list(general_bounds)
+        for i in list(range(5)) + list(range(21, 26)):
+            band_bounds[2 * i] = (fixed[i, 0], fixed[i, 0])
+            band_bounds[2 * i + 1] = (fixed[i, 1], fixed[i, 1])
+
+        constraint = {
+            "type": "ineq",
+            "fun": lambda z, p=pairs: _constraint_values(z, p),
+            "jac": lambda z, p=pairs: _constraint_jacobian(z, p),
+        }
+        band_result = minimize(
+            lambda z: -np.sum(z[52:]),
+            z0,
+            jac=lambda z: objective_jac,
+            bounds=band_bounds,
+            constraints=constraint,
+            method="SLSQP",
+            options={"maxiter": 350, "ftol": 1e-11, "disp": False},
+        )
+
+        # Release the guard rows for a final inexpensive global adjustment.
+        polish = minimize(
+            lambda z: -np.sum(z[52:]),
+            band_result.x,
+            jac=lambda z: objective_jac,
+            bounds=general_bounds,
+            constraints=constraint,
+            method="SLSQP",
+            options={"maxiter": 120, "ftol": 1e-11, "disp": False},
+        )
+        c = polish.x[:52].reshape(26, 2)
+        r = np.maximum(0.0, polish.x[52:] - 2e-7)
+        if _strictly_valid(c, r):
+            value = float(np.sum(r))
+            if value > best_sum:
+                best_c, best_r, best_sum = c.copy(), r.copy(), value
+
+    return best_c, best_r, float(np.sum(best_r))
+
+
+def run_packing():
+    """Run the circle packing constructor for n=26."""
+    centers, radii, sum_radii = construct_packing()
+    return centers, radii, sum_radii
+
+
+def visualize(centers, radii):
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.grid(True)
+    for i, (center, radius) in enumerate(zip(centers, radii)):
+        ax.add_patch(Circle(center, radius, alpha=0.5))
+        ax.text(center[0], center[1], str(i), ha="center", va="center")
+    plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+    plt.show()
+
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")
+    visualize(centers, radii)

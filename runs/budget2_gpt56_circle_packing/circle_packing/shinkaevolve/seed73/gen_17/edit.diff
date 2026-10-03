@@ -1,0 +1,415 @@
+--- a/original.py
++++ b/original.py
+@@ -1,199 +1,307 @@
+ # EVOLVE-BLOCK-START
+-"""Constructor-based circle packing for n=26 circles"""
++"""Staged unequal-radius circle packing constructor for n=26."""
+ import numpy as np
+ 
+ 
+ def construct_packing():
+     """
+-    Construct a specific arrangement of 26 circles in a unit square
+-    that attempts to maximize the sum of their radii.
+-
+-    Returns:
+-        Tuple of (centers, radii, sum_of_radii)
+-        centers: np.array of shape (26, 2) with (x, y) coordinates
+-        radii: np.array of shape (26) with radius of each circle
+-        sum_of_radii: Sum of all radii
++    Construct 26 non-overlapping circles in the unit square.
++
++    The packing is found in two stages:
++      1. maximize a common radius to establish a dense, well-separated
++         center contact graph;
++      2. release each radius independently and maximize their total.
++
++    Returns
++    -------
++    centers : ndarray, shape (26, 2)
++    radii : ndarray, shape (26,)
++    sum_of_radii : float
+     """
+-    # Boundary contacts break the symmetry of an infinite hexagonal lattice.
+-    # Try several placements of the row containing six circles, as well as
+-    # lightly perturbed versions which can settle into asymmetric optima.
+-    row_layouts = (
++    n = 26
++    ii, jj = np.triu_indices(n, 1)
++    pair_count = len(ii)
++
++    # These row patterns are square-adapted versions of close-packed layers.
++    # The uneven rows allow boundary circles to become smaller while interior
++    # circles gain radius, which is beneficial for the sum objective.
++    layouts = (
+         (5, 6, 5, 5, 5),
+         (5, 6, 5, 6, 4),
+         (6, 5, 5, 5, 5),
+         (5, 5, 6, 5, 5),
++        (4, 5, 6, 5, 6),
+     )
+ 
+-    def make_seed(row_sizes):
+-        points = []
+-        for row, count in enumerate(row_sizes):
+-            y = (row + 0.5) / len(row_sizes)
++    def layered_seed(counts, stagger=0.0):
++        pts = []
++        rows = len(counts)
++        for row, count in enumerate(counts):
++            y = (row + 0.5) / rows
++            # Alternate offsets to seed diagonal / hexagonal contacts.
++            shift = stagger * (0.5 if row % 2 else -0.5)
+             for col in range(count):
+-                points.append(((col + 0.5) / count, y))
+-        return np.asarray(points, dtype=float)
+-
+-    seed_centers = make_seed(row_layouts[0])
+-    n = len(seed_centers)
+-
+-    # Optimize centers and radii simultaneously.  In contrast to successively
+-    # shrinking radii, these are the actual geometric packing constraints.
+-    ii, jj = np.triu_indices(n, 1)
+-
+-    def inequalities(z):
+-        points = z[:2 * n].reshape(n, 2)
+-        rs = z[2 * n:]
+-        dx = points[ii, 0] - points[jj, 0]
+-        dy = points[ii, 1] - points[jj, 1]
+-        separations = np.sqrt(dx * dx + dy * dy) - rs[ii] - rs[jj]
++                x = (col + 0.5) / count + shift / count
++                pts.append((x, y))
++        return np.clip(np.asarray(pts, dtype=float), 0.015, 0.985)
++
++    def full_constraints(z):
++        c = z[:2 * n].reshape(n, 2)
++        r = z[2 * n:]
++        dx = c[ii, 0] - c[jj, 0]
++        dy = c[ii, 1] - c[jj, 1]
++        d = np.sqrt(dx * dx + dy * dy)
+         return np.concatenate((
+-            points[:, 0] - rs,
+-            points[:, 1] - rs,
+-            1.0 - points[:, 0] - rs,
+-            1.0 - points[:, 1] - rs,
+-            separations,
++            c[:, 0] - r,
++            c[:, 1] - r,
++            1.0 - c[:, 0] - r,
++            1.0 - c[:, 1] - r,
++            d - r[ii] - r[jj],
+         ))
+ 
+-    # These small initial circles make every lattice and perturbation feasible.
+-    initial_radii = np.full(n, 0.025)
+-    initial = np.concatenate((seed_centers.ravel(), initial_radii))
++    def full_jacobian(z):
++        c = z[:2 * n].reshape(n, 2)
++        r = z[2 * n:]
++        jac = np.zeros((4 * n + pair_count, 3 * n), dtype=float)
++
++        inds = np.arange(n)
++        jac[inds, 2 * inds] = 1.0
++        jac[inds, 2 * n + inds] = -1.0
++
++        jac[n + inds, 2 * inds + 1] = 1.0
++        jac[n + inds, 2 * n + inds] = -1.0
++
++        jac[2 * n + inds, 2 * inds] = -1.0
++        jac[2 * n + inds, 2 * n + inds] = -1.0
++
++        jac[3 * n + inds, 2 * inds + 1] = -1.0
++        jac[3 * n + inds, 2 * n + inds] = -1.0
++
++        dx = c[ii, 0] - c[jj, 0]
++        dy = c[ii, 1] - c[jj, 1]
++        distance = np.sqrt(dx * dx + dy * dy)
++        safe_distance = np.maximum(distance, 1.0e-12)
++        ux = dx / safe_distance
++        uy = dy / safe_distance
++        rows = 4 * n + np.arange(pair_count)
++
++        jac[rows, 2 * ii] = ux
++        jac[rows, 2 * ii + 1] = uy
++        jac[rows, 2 * jj] = -ux
++        jac[rows, 2 * jj + 1] = -uy
++        jac[rows, 2 * n + ii] = -1.0
++        jac[rows, 2 * n + jj] = -1.0
++        return jac
++
++    # First-stage constraints use one shared radius q.  This makes the
++    # optimizer find a center-spreading configuration before unequal boundary
++    # defects are introduced.
++    def common_constraints(z):
++        c = z[:2 * n].reshape(n, 2)
++        q = z[-1]
++        dx = c[ii, 0] - c[jj, 0]
++        dy = c[ii, 1] - c[jj, 1]
++        return np.concatenate((
++            c[:, 0] - q,
++            c[:, 1] - q,
++            1.0 - c[:, 0] - q,
++            1.0 - c[:, 1] - q,
++            np.sqrt(dx * dx + dy * dy) - 2.0 * q,
++        ))
++
++    def common_jacobian(z):
++        c = z[:2 * n].reshape(n, 2)
++        jac = np.zeros((4 * n + pair_count, 2 * n + 1), dtype=float)
++        inds = np.arange(n)
++
++        jac[inds, 2 * inds] = 1.0
++        jac[inds, -1] = -1.0
++        jac[n + inds, 2 * inds + 1] = 1.0
++        jac[n + inds, -1] = -1.0
++        jac[2 * n + inds, 2 * inds] = -1.0
++        jac[2 * n + inds, -1] = -1.0
++        jac[3 * n + inds, 2 * inds + 1] = -1.0
++        jac[3 * n + inds, -1] = -1.0
++
++        dx = c[ii, 0] - c[jj, 0]
++        dy = c[ii, 1] - c[jj, 1]
++        d = np.sqrt(dx * dx + dy * dy)
++        d = np.maximum(d, 1.0e-12)
++        rows = 4 * n + np.arange(pair_count)
++        jac[rows, 2 * ii] = dx / d
++        jac[rows, 2 * ii + 1] = dy / d
++        jac[rows, 2 * jj] = -dx / d
++        jac[rows, 2 * jj + 1] = -dy / d
++        jac[rows, -1] = -2.0
++        return jac
++
++    fallback_centers = layered_seed(layouts[0], 0.15)
++    fallback_radii = np.full(n, 0.02)
++    best = np.concatenate((fallback_centers.ravel(), fallback_radii))
++    best_value = float(np.sum(fallback_radii))
+ 
+     try:
+         from scipy.optimize import minimize
+ 
++        full_objective_jac = np.zeros(3 * n)
++        full_objective_jac[2 * n:] = -1.0
++        common_objective_jac = np.zeros(2 * n + 1)
++        common_objective_jac[-1] = -1.0
++
++        full_bounds = [(0.0, 1.0)] * (2 * n) + [(1.0e-7, 0.5)] * n
++        common_bounds = [(0.0, 1.0)] * (2 * n) + [(1.0e-6, 0.25)]
++
+         rng = np.random.default_rng(26031991)
+-        starts = []
+-        for layout in row_layouts:
+-            base = make_seed(layout)
+-            starts.append(base)
+-            for _ in range(2):
+-                starts.append(base + rng.uniform(-0.012, 0.012, base.shape))
+-
+-        candidate = initial
+-        best_value = float(np.sum(initial_radii))
+-        for points in starts:
+-            trial = np.concatenate((points.ravel(), initial_radii))
++        final_starts = []
++
++        # Equal-radius continuation supplies stable dense contact graphs.
++        for k, layout in enumerate(layouts):
++            seed = layered_seed(layout, 0.18)
++            if k:
++                seed = np.clip(
++                    seed + rng.uniform(-0.008, 0.008, seed.shape),
++                    0.012, 0.988
++                )
++
++            common0 = np.concatenate((seed.ravel(), [0.018]))
++            common = minimize(
++                lambda z: -z[-1],
++                common0,
++                jac=lambda z: common_objective_jac,
++                method="SLSQP",
++                bounds=common_bounds,
++                constraints={
++                    "type": "ineq",
++                    "fun": common_constraints,
++                    "jac": common_jacobian,
++                },
++                options={"maxiter": 550, "ftol": 2.0e-11, "disp": False},
++            )
++
++            if (np.all(np.isfinite(common.x)) and
++                    np.min(common_constraints(common.x)) >= -2.0e-7):
++                c = common.x[:2 * n].reshape(n, 2)
++                q = common.x[-1]
++                final_starts.append(np.concatenate((c.ravel(),
++                                                    np.full(n, q * 0.985))))
++
++            # Retain a low-radius direct start as an escape from a rigid
++            # equal-radius contact graph.
++            final_starts.append(np.concatenate((
++                seed.ravel(),
++                np.full(n, 0.024)
++            )))
++
++        for start in final_starts:
+             result = minimize(
+                 lambda z: -np.sum(z[2 * n:]),
+-                trial,
++                start,
++                jac=lambda z: full_objective_jac,
+                 method="SLSQP",
+-                bounds=[(0.0, 1.0)] * (2 * n) + [(1e-6, 0.5)] * n,
+-                constraints={"type": "ineq", "fun": inequalities},
+-                options={"maxiter": 2200, "ftol": 1e-11, "disp": False},
++                bounds=full_bounds,
++                constraints={
++                    "type": "ineq",
++                    "fun": full_constraints,
++                    "jac": full_jacobian,
++                },
++                options={"maxiter": 1450, "ftol": 8.0e-12, "disp": False},
+             )
++
+             proposal = result.x
+-            # Reject unfinished SLSQP iterates rather than allowing a
+-            # subsequent global scale-down to hide constraint violations.
+-            if (np.all(np.isfinite(proposal))
+-                    and np.min(inequalities(proposal)) >= -1e-7):
++            if (np.all(np.isfinite(proposal)) and
++                    np.min(full_constraints(proposal)) >= -2.0e-7):
+                 value = float(np.sum(proposal[2 * n:]))
+                 if value > best_value:
+-                    candidate = proposal
++                    best = proposal
+                     best_value = value
+     except Exception:
+-        # The unperturbed first lattice seed is feasible without SciPy.
+-        candidate = initial
+-
+-    centers = np.clip(candidate[:2 * n].reshape(n, 2), 0.0, 1.0)
+-    radii = np.maximum(candidate[2 * n:], 0.0)
+-
+-    # SLSQP normally satisfies constraints to much better precision than this,
+-    # but scale once more to guarantee strict validity after floating point
+-    # rounding and any bound clipping above.
+-    border_limits = np.minimum.reduce((
++        pass
++
++    centers = np.clip(best[:2 * n].reshape(n, 2), 0.0, 1.0)
++    radii = np.maximum(best[2 * n:], 0.0)
++
++    # Conservative final scaling removes numerical contact violations without
++    # changing centers or the optimized radius proportions.
++    border = np.minimum.reduce((
+         centers[:, 0], centers[:, 1],
+         1.0 - centers[:, 0], 1.0 - centers[:, 1],
+     ))
+-    scale = np.min(border_limits / np.maximum(radii, 1e-15))
++    scale = np.min(border / np.maximum(radii, 1.0e-15))
++
+     dx = centers[ii, 0] - centers[jj, 0]
+     dy = centers[ii, 1] - centers[jj, 1]
+     distances = np.sqrt(dx * dx + dy * dy)
+-    pair_scale = distances / np.maximum(radii[ii] + radii[jj], 1e-15)
+-    scale = min(1.0, scale, np.min(pair_scale)) * (1.0 - 1e-10)
+-    radii *= max(0.0, scale)
++    scale = min(
++        1.0,
++        scale,
++        np.min(distances / np.maximum(radii[ii] + radii[jj], 1.0e-15)),
++    )
++    radii *= max(0.0, scale) * (1.0 - 1.0e-10)
+ 
+     return centers, radii, float(np.sum(radii))
+ 
+ 
+ def compute_max_radii(centers):
+-    """
+-    Compute the maximum possible radii for each circle position
+-    such that they don't overlap and stay within the unit square.
+-
+-    Args:
+-        centers: np.array of shape (n, 2) with (x, y) coordinates
+-
+-    Returns:
+-        np.array of shape (n) with radius of each circle
+-    """
++    """Compute conservative radii for fixed centers."""
+     n = centers.shape[0]
+-    radii = np.ones(n)
+-
+-    # First, limit by distance to square borders
+-    for i in range(n):
+-        x, y = centers[i]
+-        # Distance to borders
+-        radii[i] = min(x, y, 1 - x, 1 - y)
+-
+-    # Then, limit by distance to other circles
+-    # Each pair of circles with centers at distance d can have
+-    # sum of radii at most d to avoid overlap
++    radii = np.minimum.reduce((
++        centers[:, 0], centers[:, 1],
++        1.0 - centers[:, 0], 1.0 - centers[:, 1],
++    )).copy()
++
+     for i in range(n):
+         for j in range(i + 1, n):
+-            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+-
+-            # If current radii would cause overlap
+-            if radii[i] + radii[j] > dist:
+-                # Scale both radii proportionally
+-                scale = dist / (radii[i] + radii[j])
+-                radii[i] *= scale
+-                radii[j] *= scale
+-
++            distance = np.linalg.norm(centers[i] - centers[j])
++            if radii[i] + radii[j] > distance:
++                factor = distance / (radii[i] + radii[j])
++                radii[i] *= factor
++                radii[j] *= factor
+     return radii
+ 
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ # This part remains fixed (not evolved)
+ def run_packing():
+     """Run the circle packing constructor for n=26"""
+     centers, radii, sum_radii = construct_packing()
+     return centers, radii, sum_radii
+ 
+ 
+ def visualize(centers, radii):
+     """
+     Visualize the circle packing
+ 
+     Args:
+         centers: np.array of shape (n, 2) with (x, y) coordinates
+         radii: np.array of shape (n) with radius of each circle
+     """
+     import matplotlib.pyplot as plt
+     from matplotlib.patches import Circle
+ 
+     fig, ax = plt.subplots(figsize=(8, 8))
+ 
+     # Draw unit square
+     ax.set_xlim(0, 1)
+     ax.set_ylim(0, 1)
+     ax.set_aspect("equal")
+     ax.grid(True)
+ 
+     # Draw circles
+     for i, (center, radius) in enumerate(zip(centers, radii)):
+         circle = Circle(center, radius, alpha=0.5)
+         ax.add_patch(circle)
+         ax.text(center[0], center[1], str(i), ha="center", va="center")
+ 
+     plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+     plt.show()
+ 
+ 
+ if __name__ == "__main__":
+     centers, radii, sum_radii = run_packing()
+     print(f"Sum of radii: {sum_radii}")
+     # AlphaEvolve improved this to 2.635
+ 
+     # Uncomment to visualize:
+     visualize(centers, radii)

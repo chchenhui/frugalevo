@@ -1,0 +1,206 @@
+--- a/original.py
++++ b/original.py
+@@ -1,159 +1,200 @@
+ # EVOLVE-BLOCK-START
+ """Hexagonal-lattice constructor for packing 26 circles in a unit square."""
+ import numpy as np
+ 
+ N = 26
+ HEX_ASPECT = np.sqrt(3.0) / 2.0  # vertical spacing factor for hex lattice
+ 
+ 
+ def build_hex_rows():
+     """
+     Build 26 circle centers arranged in 6 staggered rows.
+ 
+     Row layout (bottom to top): 4, 5, 4, 5, 4, 4 circles.
+     Every adjacent row pair is offset by half the horizontal
+     spacing (s/2 = 0.1), so all nearest-neighbor distances equal
+     sqrt(dy^2 + 0.1^2). The vertical gap dy and the common radius r
+     satisfy the fixed point r = sqrt(dy^2 + 0.1^2) / 2 with the
+     bottom/top rows sitting exactly r away from the walls:
+         2r + 5*dy = 1.
+ 
+     Returns:
+         np.array of shape (26, 2)
+     """
+     s = 0.2          # horizontal spacing within a row
+     dx = s / 2.0     # stagger between adjacent rows
+ 
+     # Solve fixed point: r = sqrt(((1-2r)/5)^2 + dx^2) / 2
+     r = 0.095
+     for _ in range(100):
+         dy = (1.0 - 2.0 * r) / 5.0
+         r = min(0.1, np.sqrt(dy * dy + dx * dx) / 2.0)
+ 
+     # x-positions per row; every adjacent pair staggered by dx
+     row_xs = [
+         [0.2, 0.4, 0.6, 0.8],              # 4 circles
+         [0.1, 0.3, 0.5, 0.7, 0.9],         # 5 circles
+         [0.2, 0.4, 0.6, 0.8],              # 4 circles
+         [0.1, 0.3, 0.5, 0.7, 0.9],         # 5 circles
+         [0.2, 0.4, 0.6, 0.8],              # 4 circles
+         [0.1, 0.3, 0.5, 0.7],              # 4 circles, staggered
+     ]
+ 
+     centers = []
+     for k, xs in enumerate(row_xs):
+         y = r + k * dy
+         for x in xs:
+             centers.append([x, y])
+ 
+     return np.array(centers)
+ 
+ 
+-def solve_radii(centers, iterations=200):
++def solve_radii(centers, iterations=200, init=None):
+     """
+     Compute radii by proportional shrinking under two constraint types:
+       1. Circle must stay inside unit square: r_i <= min(x, y, 1-x, 1-y)
+       2. Circles must not overlap: r_i + r_j <= dist(i, j)
+ 
+     Uses a bounded fixed-point loop: whenever a pair violates the
+     distance constraint, both radii are scaled proportionally.
+ 
+     Args:
+         centers: (n, 2) array of centers
+         iterations: max refinement passes
+ 
+     Returns:
+         np.array of shape (n,) of radii
+     """
+     n = centers.shape[0]
+ 
+     # Wall constraints give an upper bound for each radius
+     walls = np.minimum.reduce([
+         centers[:, 0], centers[:, 1],
+         1.0 - centers[:, 0], 1.0 - centers[:, 1]
+     ])
+-    radii = walls.copy()
++    radii = walls.copy() if init is None else np.minimum(init, walls).copy()
+ 
+     # Precompute pairwise distances
+     dist = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=-1)
+ 
+     # Gauss-Seidel: each radius takes the maximum value allowed by
+     # the current neighbor radii and the walls. Feasible by
+     # construction and much less lossy than proportional shrinking.
+-    big = np.full((n, n), 1e9)
++    # Warm-starting from `init` makes post-shift re-solves converge
++    # in only a few passes.
+     np.fill_diagonal(dist, np.inf)
+     for _ in range(iterations):
+         prev = radii.copy()
+         for i in range(n):
+             d = dist[i]
+             ri = np.min(d - radii)
+             radii[i] = max(0.0, min(walls[i], ri))
+         if np.max(np.abs(prev - radii)) < 1e-14:
+             break
+ 
+     # Never exceed wall bounds
+     radii = np.minimum(radii, walls)
+     return radii
+ 
+ 
++def _local_shift_search(centers, radii, deltas=(0.01, 0.003, 0.001, 0.0005),
++                        sweeps_per_delta=2):
++    """
++    Greedy coordinate-shift hill climb on the sum of radii.
++
++    For each circle, try shifting it by +/-delta along each axis,
++    warm-start the radius solver from the current solution (cheap:
++    radii move very little for tiny shifts), and keep any shift
++    that strictly improves the total. Only accepts improving moves,
++    so the input packing is a guaranteed lower bound.
++    """
++    centers = centers.copy()
++    n = centers.shape[0]
++    best_r = radii.copy()
++    best_s = float(np.sum(best_r))
++
++    for delta in deltas:
++        for _ in range(sweeps_per_delta):
++            improved = False
++            for i in range(n):
++                for axis in (0, 1):
++                    for sign in (+1.0, -1.0):
++                        cand = centers.copy()
++                        cand[i, axis] = np.clip(
++                            cand[i, axis] + sign * delta, 1e-6, 1.0 - 1e-6)
++                        new_r = solve_radii(cand, iterations=60, init=best_r)
++                        new_s = float(np.sum(new_r))
++                        if new_s > best_s + 1e-9:
++                            centers = cand
++                            best_r = new_r
++                            best_s = new_s
++                            improved = True
++            if not improved:
++                break
++    return centers, best_r
++
++
+ def construct_packing():
+     """
+     Construct a specific arrangement of 26 circles in a unit square
+     that attempts to maximize the sum of their radii.
+ 
+     Returns:
+         Tuple of (centers, radii, sum_of_radii)
+         centers: np.array of shape (26, 2) with (x, y) coordinates
+         radii: np.array of shape (26) with radius of each circle
+         sum_of_radii: Sum of all radii
+     """
+     centers = build_hex_rows()
+     radii = solve_radii(centers)
++    centers, radii = _local_shift_search(centers, radii)
++    # Final exact solve from scratch to guarantee maximality/validity
++    radii = solve_radii(centers)
+     sum_radii = float(np.sum(radii))
+     return centers, radii, sum_radii
+ # EVOLVE-BLOCK-END
+ 
+ 
+ # This part remains fixed (not evolved)
+ def run_packing():
+     """Run the circle packing constructor for n=26"""
+     centers, radii, sum_radii = construct_packing()
+     return centers, radii, sum_radii
+ 
+ 
+ def visualize(centers, radii):
+     """
+     Visualize the circle packing
+ 
+     Args:
+         centers: np.array of shape (n, 2) with (x, y) coordinates
+         radii: np.array of shape (n) with radius of each circle
+     """
+     import matplotlib.pyplot as plt
+     from matplotlib.patches import Circle
+ 
+     fig, ax = plt.subplots(figsize=(8, 8))
+ 
+     # Draw unit square
+     ax.set_xlim(0, 1)
+     ax.set_ylim(0, 1)
+     ax.set_aspect("equal")
+     ax.grid(True)
+ 
+     # Draw circles
+     for i, (center, radius) in enumerate(zip(centers, radii)):
+         circle = Circle(center, radius, alpha=0.5)
+         ax.add_patch(circle)
+         ax.text(center[0], center[1], str(i), ha="center", va="center")
+ 
+     plt.title(f"Circle Packing (n={len(centers)}, sum={sum(radii):.6f})")
+     plt.show()
+ 
+ 
+ if __name__ == "__main__":
+     centers, radii, sum_radii = run_packing()
+     print(f"Sum of radii: {sum_radii}")
+     # AlphaEvolve improved this to 2.635
+ 
+     # Uncomment to visualize:
+     visualize(centers, radii)

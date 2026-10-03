@@ -1,0 +1,389 @@
+--- a/original.py
++++ b/original.py
+@@ -1,198 +1,220 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ 
+ def heilbronn_convex13() -> np.ndarray:
+     """
+-    Construct a deterministic thirteen-point maximin configuration in the
+-    unit square.  The four square corners fix a convex hull of area one, so
+-    the raw minimum triangle area is also the normalized objective.
++    Deterministic population-based maximin search for thirteen points in the
++    unit square.  The four fixed corners give every returned layout convex
++    hull area one, hence raw triangle area equals normalized triangle area.
+     """
+-    rng = np.random.default_rng(13051957)
++    rng = np.random.default_rng(918273645)
+     n = 13
++    mobile = 9
+ 
+     corners = np.array(
+         [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+         dtype=float,
+     )
+-
+     triples = np.array(
+-        [(i, j, k)
+-         for i in range(n)
+-         for j in range(i + 1, n)
++        [(i, j, k) for i in range(n) for j in range(i + 1, n)
+          for k in range(j + 1, n)],
+         dtype=np.intp,
+     )
+ 
+-    affected = [
+-        np.flatnonzero((triples == index).any(axis=1)).astype(np.intp)
+-        for index in range(n)
+-    ]
+-
+-    def triangle_areas(points: np.ndarray, ids: np.ndarray = None) -> np.ndarray:
+-        if ids is None:
+-            ids = np.arange(triples.shape[0], dtype=np.intp)
+-        t = triples[ids]
+-        a = points[t[:, 0]]
+-        b = points[t[:, 1]]
+-        c = points[t[:, 2]]
++    def clip_layout(x: np.ndarray) -> np.ndarray:
++        return np.clip(x, 0.026, 0.974)
++
++    def areas_batch(layouts: np.ndarray) -> np.ndarray:
++        """Return all 286 triangle areas for a batch of mobile-point layouts."""
++        batch = layouts.shape[0]
++        pts = np.empty((batch, n, 2), dtype=float)
++        pts[:, :4, :] = corners
++        pts[:, 4:, :] = layouts
++
++        a = pts[:, triples[:, 0], :]
++        b = pts[:, triples[:, 1], :]
++        c = pts[:, triples[:, 2], :]
+         return 0.5 * np.abs(
+-            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+-            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+-        )
+-
+-    def objective(values: np.ndarray, blend: float) -> tuple[float, float]:
+-        # Averaging several active constraints makes early annealing much less
+-        # likely to overfit one triangle at the cost of nearby tight ones.
+-        low = np.partition(values, 15)[:16]
+-        minimum = float(low.min())
+-        return minimum + blend * float(low.mean()), minimum
+-
+-    best_points = None
+-    best_minimum = -1.0
+-
+-    # Six deterministic starts: alternating stratified and uniform layouts.
+-    # Stratification gives a substantially better initial covering, while the
+-    # uniform starts retain the ability to discover asymmetric arrangements.
+-    for restart in range(6):
+-        if restart % 2 == 0:
+-            gx, gy = np.meshgrid(
+-                np.array([0.20, 0.50, 0.80]),
+-                np.array([0.20, 0.50, 0.80]),
++            (b[..., 0] - a[..., 0]) * (c[..., 1] - a[..., 1])
++            - (b[..., 1] - a[..., 1]) * (c[..., 0] - a[..., 0])
++        )
++
++    def quality(values: np.ndarray, blend: float) -> tuple[np.ndarray, np.ndarray]:
++        """
++        The mean of the lowest constraints is used only during global search.
++        The primary minimum is retained separately and governs final polish.
++        """
++        low = np.partition(values, 19, axis=1)[:, :20]
++        minimum = low.min(axis=1)
++        return minimum + blend * low.mean(axis=1), minimum
++
++    # A mixture of jittered grids and uniform designs provides both a useful
++    # covering baseline and genuinely asymmetric initial basins.
++    population_size = 104
++    population = rng.uniform(0.055, 0.945, size=(population_size, mobile, 2))
++    grid = np.array(
++        [[x, y] for y in (0.18, 0.50, 0.82) for x in (0.18, 0.50, 0.82)],
++        dtype=float,
++    )
++    for row in range(32):
++        population[row] = clip_layout(
++            grid[rng.permutation(mobile)] + rng.normal(0.0, 0.075, (mobile, 2))
++        )
++
++    values = areas_batch(population)
++    fit, minima = quality(values, 0.070)
++    best_id = int(np.argmax(minima))
++    best = population[best_id].copy()
++    best_minimum = float(minima[best_id])
++    best_values = values[best_id].copy()
++
++    generations = 980
++    for generation in range(generations):
++        p = generation / (generations - 1.0)
++        # Broad exploration is retained longer than in the previous annealer;
++        # the final generations are effectively a population pattern search.
++        step = 0.082 * (0.0042 / 0.082) ** p + 0.00035
++        blend = 0.070 * max(0.0, 1.0 - 1.20 * p) ** 1.35
++
++        # 1) correlated full-layout mutation
++        local = clip_layout(
++            population + rng.normal(0.0, step, size=population.shape)
++        )
++
++        # 2) differential transport between successful geometric patterns
++        ia = rng.integers(population_size, size=population_size)
++        ib = rng.integers(population_size, size=population_size)
++        de_scale = 0.72 - 0.22 * p
++        differential = clip_layout(
++            population
++            + de_scale * (population[ia] - population[ib])
++            + rng.normal(0.0, step * 0.16, size=population.shape)
++        )
++
++        # 3) move points participating in each layout's presently tight
++        # triangles.  A minority are coupled moves to resolve active networks.
++        active = np.argpartition(values, 17, axis=1)[:, :18]
++        targeted = population.copy()
++        for row in range(population_size):
++            participation = np.bincount(
++                triples[active[row]].ravel(), minlength=n
++            )[4:].astype(float)
++            probabilities = participation + 0.22
++            probabilities /= probabilities.sum()
++            first = int(rng.choice(mobile, p=probabilities))
++            targeted[row, first] += rng.normal(0.0, step * 1.34, size=2)
++
++            if rng.random() < 0.31:
++                second = int(rng.choice(mobile, p=probabilities))
++                if second != first:
++                    targeted[row, second] += rng.normal(
++                        0.0, step * 0.64, size=2
++                    )
++        targeted = clip_layout(targeted)
++
++        candidates = np.concatenate(
++            (population, local, differential, targeted), axis=0
++        )
++        candidate_values = areas_batch(candidates)
++        candidate_fit, candidate_minima = quality(candidate_values, blend)
++
++        candidate_fit = candidate_fit.reshape(4, population_size).T
++        candidate_minima = candidate_minima.reshape(4, population_size).T
++        choice = np.argmax(candidate_fit, axis=1)
++        offset = choice * population_size + np.arange(population_size)
++
++        population = candidates[offset]
++        values = candidate_values[offset]
++        fit = candidate_fit[np.arange(population_size), choice]
++        minima = candidate_minima[np.arange(population_size), choice]
++
++        current = int(np.argmax(minima))
++        if minima[current] > best_minimum + 1.0e-15:
++            best = population[current].copy()
++            best_values = values[current].copy()
++            best_minimum = float(minima[current])
++
++        # Controlled restarts stop differential evolution from collapsing to
++        # one mediocre basin.  Descendants of the record retain local insight.
++        if generation in (210, 430, 650):
++            worst = np.argsort(minima)[:20]
++            fresh = rng.uniform(0.045, 0.955, size=(20, mobile, 2))
++            fresh[10:] = clip_layout(
++                best[None, :, :]
++                + rng.normal(0.0, 0.105, size=(10, mobile, 2))
+             )
+-            interior = np.column_stack((gx.ravel(), gy.ravel()))
+-            interior += rng.normal(0.0, 0.095, size=(9, 2))
+-            interior = np.clip(interior, 0.055, 0.945)
+-            interior = interior[rng.permutation(9)]
+-        else:
+-            interior = rng.uniform(0.075, 0.925, size=(9, 2))
+-
+-        points = np.vstack((corners, interior))
+-        values = triangle_areas(points)
+-        current_score, current_minimum = objective(values, 0.085)
+-
+-        if current_minimum > best_minimum:
+-            best_points = points.copy()
+-            best_minimum = current_minimum
+-
+-        iterations = 36000
+-        for iteration in range(iterations):
+-            progress = iteration / (iterations - 1.0)
+-            blend = 0.085 * (1.0 - progress) ** 1.25
+-            step = 0.112 * (1.0 - progress) ** 1.65 + 0.00075
+-
+-            index = int(rng.integers(4, 13))
+-            old_position = points[index].copy()
+-
+-            # A small fraction of proposals use axis-biased moves.  They are
+-            # useful for resolving constraints induced by square boundaries.
+-            if rng.random() < 0.28:
+-                displacement = np.zeros(2)
+-                displacement[int(rng.integers(0, 2))] = rng.normal(0.0, step)
+-            else:
+-                displacement = rng.normal(0.0, step, size=2)
+-
+-            points[index] = np.clip(old_position + displacement, 0.038, 0.962)
+-
+-            ids = affected[index]
+-            candidate_values = values.copy()
+-            candidate_values[ids] = triangle_areas(points, ids)
+-            candidate_score, candidate_minimum = objective(candidate_values, blend)
+-
+-            temperature = 0.0025 * (1.0 - progress) ** 2 + 0.0000015
+-            if (candidate_score >= current_score or
+-                    rng.random() < np.exp(
+-                        (candidate_score - current_score) / temperature
+-                    )):
+-                values = candidate_values
+-                current_score = candidate_score
+-                current_minimum = candidate_minimum
+-            else:
+-                points[index] = old_position
+-
+-            if current_minimum > best_minimum:
+-                best_points = points.copy()
+-                best_minimum = current_minimum
+-
+-    # Strict bottleneck-aware polishing.  Coordinate search alone commonly
+-    # stalls when several tight triangles require two interior points to move
+-    # together.  Recompute participation in the lowest constraints at every
+-    # scale and spend most proposals on the points that control them.
++            population[worst] = fresh
++            values[worst] = areas_batch(fresh)
++            fit[worst], minima[worst] = quality(values[worst], blend)
++
++    # Strict maximin active-set refinement.  Unlike the population score,
++    # no tail tradeoff is accepted in this stage.
+     directions = np.array(
+         [
+             [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0],
+             [1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0],
+         ],
+         dtype=float,
+     )
+     directions[4:] /= np.sqrt(2.0)
+ 
+-    best_values = triangle_areas(best_points)
+-    step = 0.018
+-    for scale in range(10):
+-        # The active set deliberately includes near-bottlenecks: after one
+-        # tight triangle is relieved, these are normally the next constraints.
+-        active_ids = np.argpartition(best_values, 27)[:28]
+-        participation = np.bincount(
+-            triples[active_ids].ravel(), minlength=n
+-        ).astype(float)
+-        weights = participation[4:] + 0.18
+-        weights /= weights.sum()
+-
+-        for trial in range(420):
+-            candidate = best_points.copy()
+-            first = 4 + int(rng.choice(9, p=weights))
+-            direction = directions[(trial + 3 * scale) % len(directions)]
+-            candidate[first] = np.clip(
+-                candidate[first] + step * direction, 0.038, 0.962
+-            )
+-
+-            # Coupled moves address active triangles sharing two mobile
+-            # vertices, a frequent obstruction in maximin configurations.
+-            if trial % 3 == 0:
+-                second = 4 + int(rng.choice(9, p=weights))
+-                if second != first:
+-                    paired_direction = directions[
+-                        (2 * trial + scale + 1) % len(directions)
+-                    ]
+-                    candidate[second] = np.clip(
+-                        candidate[second] + step * 0.72 * paired_direction,
+-                        0.038, 0.962,
+-                    )
+-
+-            candidate_values = triangle_areas(candidate)
+-            candidate_minimum = float(candidate_values.min())
+-            if candidate_minimum > best_minimum + 1.0e-14:
+-                best_points = candidate
+-                best_values = candidate_values
+-                best_minimum = candidate_minimum
+-
+-                # Refresh the proposal distribution immediately after a true
+-                # improvement, since the active bottleneck has changed.
+-                active_ids = np.argpartition(best_values, 27)[:28]
+-                participation = np.bincount(
+-                    triples[active_ids].ravel(), minlength=n
+-                ).astype(float)
+-                weights = participation[4:] + 0.18
+-                weights /= weights.sum()
+-
+-        # Finish each scale with deterministic single-coordinate checks.
+-        for index in range(4, 13):
+-            for direction in directions:
+-                candidate = best_points.copy()
+-                candidate[index] = np.clip(
+-                    candidate[index] + step * direction, 0.038, 0.962
+-                )
+-                candidate_values = triangle_areas(candidate)
+-                candidate_minimum = float(candidate_values.min())
+-                if candidate_minimum > best_minimum + 1.0e-14:
+-                    best_points = candidate
+-                    best_values = candidate_values
+-                    best_minimum = candidate_minimum
+-
+-        step *= 0.54
+-
+-    return best_points
++    for scale, step in enumerate((0.018, 0.010, 0.0052, 0.0025, 0.0011, 0.00045)):
++        stalled = 0
++        for sweep in range(90):
++            active_ids = np.argpartition(best_values, 27)[:28]
++            participation = np.bincount(
++                triples[active_ids].ravel(), minlength=n
++            )[4:].astype(float)
++            weights = participation + 0.16
++            weights /= weights.sum()
++
++            trial_count = 64
++            trials = np.repeat(best[None, :, :], trial_count, axis=0)
++            for q in range(trial_count):
++                first = int(rng.choice(mobile, p=weights))
++                direction = directions[(q + 3 * sweep + scale) % 8]
++                trials[q, first] += step * direction
++
++                if q >= 32:
++                    second = int(rng.choice(mobile, p=weights))
++                    if second != first:
++                        paired = directions[(2 * q + scale + 1) % 8]
++                        trials[q, second] += step * 0.68 * paired
++
++            trials = clip_layout(trials)
++            trial_values = areas_batch(trials)
++            trial_minima = trial_values.min(axis=1)
++            chosen = int(np.argmax(trial_minima))
++
++            if trial_minima[chosen] > best_minimum + 1.0e-14:
++                best = trials[chosen].copy()
++                best_values = trial_values[chosen].copy()
++                best_minimum = float(trial_minima[chosen])
++                stalled = 0
++            else:
++                stalled += 1
++                if stalled >= 14:
++                    break
++
++        # Exhaustive deterministic single-point checks at each resolution.
++        improved = True
++        while improved:
++            improved = False
++            for point in range(mobile):
++                trials = np.repeat(best[None, :, :], 8, axis=0)
++                trials[:, point, :] += step * directions
++                trials = clip_layout(trials)
++                trial_values = areas_batch(trials)
++                trial_minima = trial_values.min(axis=1)
++                chosen = int(np.argmax(trial_minima))
++                if trial_minima[chosen] > best_minimum + 1.0e-14:
++                    best = trials[chosen].copy()
++                    best_values = trial_values[chosen].copy()
++                    best_minimum = float(trial_minima[chosen])
++                    improved = True
++
++    return np.vstack((corners, best))
+ 
+ 
+ # EVOLVE-BLOCK-END

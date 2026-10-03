@@ -1,0 +1,171 @@
+<NAME>
+add_slsqp_diameter_refinement
+</NAME>
+<DESCRIPTION>
+The previous SLSQP program (max dmin s.t. dmax ≤ 1) reached 0.98, while the current softmin/softmax pipeline only reaches 0.88. The soft-min/max surrogate smooths the objective and stalls away from the true ratio. Key insight: under the constraint dmax ≤ 1, the ratio dmin/dmax equals exactly the minimized dmin, so the constrained problem directly optimizes the true metric. I add a SLSQP stage (maximize min distance subject to max distance ≤ 1) applied to the top-ranked candidates from the cheap ranking pass, plus a final SLSQP polish of the best free-space point (after normalizing so dmax ≈ 1). This combines the good global search of the surrogate pipeline with the exact constrained optimizer that previously scored 0.98.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def _opt(flat, n, beta, sphere, maxiter):
+=======
+def _slsqp_packing(P0, n, maxiter=400):
+    """Maximize min pairwise distance subject to max pairwise distance <= 1.
+    Under this constraint, dmin/dmax equals dmin exactly."""
+    if not HAVE_SCIPY:
+        return None
+    from itertools import combinations
+    pairs = list(combinations(range(n), 2))
+    ii = np.array([a for a, b in pairs])
+    jj = np.array([b for a, b in pairs])
+
+    def pdists(flat):
+        P = flat.reshape(n, 3)
+        return np.linalg.norm(P[ii] - P[jj], axis=1)
+
+    def obj(flat):
+        ds = pdists(flat)
+        return -ds.min()
+
+    def cons(flat):
+        return 1.0 - pdists(flat).max()
+
+    # scale so initial diameter is 1 (feasible start)
+    P = np.asarray(P0, dtype=float).copy()
+    P = P - P.mean(axis=0)
+    dm = np.linalg.norm(P[:, None, :] - P[None, :, :], axis=-1)
+    dm = dm[np.triu_indices(n, 1)].max()
+    if dm > 0:
+        P = P / dm
+    res = minimize(obj, P.ravel(), method='SLSQP',
+                   constraints={'type': 'ineq', 'fun': cons},
+                   options={'maxiter': maxiter, 'ftol': 1e-14})
+    P = res.x.reshape(n, 3)
+    d2, _ = _pairwise_sq(P)
+    iu = np.triu_indices(n, 1)
+    dx2 = d2[iu].max()
+    if dx2 <= 0:
+        return None
+    score = d2[iu].min() / dx2
+    return P, score
+
+
+def _opt(flat, n, beta, sphere, maxiter):
+>>>>>>> REPLACE
+```
+
+Second edit: use SLSQP in phase 2 and final polish.
+
+```diff
+<DIFF>
+<<<<<<< SEARCH
+    # phase 2: fully converge the top candidates
+    betas = [20.0, 60.0, 150.0, 400.0]
+    for s0, pts in ranked[:5]:
+        for beta in betas:
+            pts = _opt(pts.ravel().copy(), n, beta, True, 300)
+        s = _true_score(pts)
+        if s > best:
+            best = s
+            best_pts = pts
+        if best >= target:
+            break
+=======
+    # phase 2: fully converge the top candidates with SLSQP on the
+    # exact constrained problem (dmax <= 1, maximize dmin)
+    for s0, pts in ranked[:5]:
+        out = _slsqp_packing(pts, n, maxiter=400)
+        if out is not None:
+            P, s = out
+        else:
+            P = pts
+            for beta in [20.0, 60.0, 150.0, 400.0]:
+                P = _opt(P.ravel().copy(), n, beta, True, 300)
+            s = _true_score(P)
+        if s > best:
+            best = s
+            best_pts = P
+        if best >= target:
+            break
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    if best_pts is not None:
+        cand = best_pts
+        for beta in [60.0, 150.0, 400.0]:
+            cand = _opt(cand.ravel().copy(), n, beta, False, 400)
+            cand = cand - cand.mean(axis=0)
+            s = _true_score(cand)
+            if s > best:
+                best = s
+                best_pts = cand
+        if best >= target:
+            pass
+=======
+    if best_pts is not None:
+        cand = best_pts
+        out = _slsqp_packing(cand, n, maxiter=600)
+        if out is not None:
+            P, s = out
+            if s > best:
+                best = s
+                cand = P
+        for beta in [60.0, 150.0, 400.0]:
+            cand = _opt(cand.ravel().copy(), n, beta, False, 400)
+            cand = cand - cand.mean(axis=0)
+            out = _slsqp_packing(cand, n, maxiter=600)
+            if out is not None:
+                cand, s = out
+            else:
+                s = _true_score(cand)
+            if s > best:
+                best = s
+                best_pts = cand
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    if best_pts is not None:
+        rng = np.random.RandomState(123)
+        for _ in range(6):
+            cand = best_pts + 0.02 * rng.randn(n, 3)
+            for beta in [150.0, 400.0]:
+                cand = _opt(cand.ravel().copy(), n, beta, False, 250)
+                cand = cand - cand.mean(axis=0)
+            s = _true_score(cand)
+            if s > best:
+                best = s
+                best_pts = cand
+=======
+    if best_pts is not None:
+        rng = np.random.RandomState(123)
+        for _ in range(6):
+            cand = best_pts + 0.02 * rng.randn(n, 3)
+            for beta in [150.0, 400.0]:
+                cand = _opt(cand.ravel().copy(), n, beta, False, 250)
+                cand = cand - cand.mean(axis=0)
+            out = _slsqp_packing(cand, n, maxiter=600)
+            if out is not None:
+                cand, s = out
+            else:
+                s = _true_score(cand)
+            if s > best:
+                best = s
+                best_pts = cand
+>>>>>>> REPLACE
+```
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def min_max_dist_dim3_14() -> np.ndarray:
+    n = 14
+    best_pts = None
+    best = -1.0
+    target = 0.2400
+=======
+def min_max_dist_dim3_14() -> np.ndarray:
+    n = 14
+    best_pts = None
+    best = -1.0
+    target = 0.2400
+>>>>>>> REPLACE
+</DIFF>

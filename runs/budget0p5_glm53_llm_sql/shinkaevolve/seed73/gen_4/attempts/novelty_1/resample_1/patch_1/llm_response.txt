@@ -1,0 +1,252 @@
+<NAME>
+prefix_trie_column_reorder</NAME>
+<DESCRIPTION>
+The original program was fundamentally broken: it fabricated an extra "original_index" column, shuffled/merged real data through a lossy recursion, returned an empty `column_orderings` list (invalid per-row orderings), and applied a `sort_values` that permuted rows and could crash on mixed-type data (the stdout shows it aborting partway through datasets). Root cause: the recursive grouping logic did not preserve shape/row identity and never produced valid output metadata.
+
+Fix: replace the editable block with a bounded construction-selection algorithm aligned with the actual objective (character-Trie prefix reuse). It (1) serializes cells for scoring only (missing → "", values unchanged), (2) builds 2–3 cheap candidate global column orderings (length-weighted frequency ranking, count-based ranking, original order, with col_merge groups kept contiguous and one_way_dep edges respected), (3) scores each candidate exactly by sorting the serialized rows and summing adjacent LCPs via C-speed binary-search slice comparisons, and (4) returns the best candidate's column permutation applied to a copy of the original dataframe with a valid per-row `column_orderings` list. Data, shape, dtypes, and row identity are fully preserved; runtime is bounded and deterministic.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import pandas as pd
+import numpy as np
+from solver import Algorithm
+from typing import Tuple, List, Dict, Optional
+
+
+class Evolved(Algorithm):
+    """
+    Column-permutation reorder optimized for character-Trie prefix reuse.
+
+    Strategy: build a small number of cheap candidate global column
+    orderings, score each one exactly with the ideal serial-Trie objective
+    (sum of adjacent LCPs over sorted serialized rows), and return the best.
+    Cell values are never modified; serialization is used only for scoring.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    # ------------------------------------------------------------------ #
+    # serialization helpers (scoring representation only)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _cell_str(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, float) and np.isnan(v):
+            return ""
+        try:
+            if v is pd.NA or v is pd.NaT:
+                return ""
+        except Exception:
+            pass
+        if isinstance(v, str):
+            return v
+        return str(v)
+
+    def _serialize_column(self, col) -> np.ndarray:
+        vals = list(col)
+        return np.array([self._cell_str(v) for v in vals], dtype=object)
+
+    @staticmethod
+    def _lcp(a: str, b: str) -> int:
+        """Longest common prefix length; binary search with C slice compares."""
+        if a == b:
+            return len(a)
+        hi = min(len(a), len(b))
+        lo = 0
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[:mid] == b[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_score(self, serial_rows: List[str]) -> int:
+        """Exact ideal Trie reuse: sum of adjacent LCPs after sorting."""
+        if len(serial_rows) <= 1:
+            return 0
+        rows = sorted(serial_rows)
+        total = 0
+        prev = rows[0]
+        for cur in rows[1:]:
+            total += self._lcp(prev, cur)
+            prev = cur
+        return total
+
+    # ------------------------------------------------------------------ #
+    # candidate constructions
+    # ------------------------------------------------------------------ #
+    def _column_scores(self, df: pd.DataFrame, cols: List[str]):
+        """Return (len_weighted, count_weighted) score arrays for columns."""
+        n = len(df)
+        len_w = []
+        cnt_w = []
+        for c in cols:
+            s = self._serialize_column(df[c])
+            lens = np.fromiter((len(x) for x in s), dtype=np.int64, count=n)
+            # factorize values for counting without pandas overhead
+            uniq, codes = np.unique(s, return_inverse=True)
+            counts = np.bincount(codes, minlength=len(uniq))
+            ulens = np.fromiter((len(u) for u in uniq), dtype=np.int64,
+                                count=len(uniq))
+            pairs = counts * (counts - 1)
+            len_w.append(int((pairs * ulens).sum()))
+            cnt_w.append(int(pairs.sum()))
+        return np.array(len_w, dtype=np.int64), np.array(cnt_w, dtype=np.int64)
+
+    def _apply_merge_groups(self, order: List[str], col_merge) -> List[str]:
+        """Keep each merge group's columns contiguous (values untouched)."""
+        if not col_merge:
+            return order
+        groups = [list(g) for g in col_merge if g]
+        merged = set()
+        for g in groups:
+            merged.update(g)
+        anchors = []
+        for g in groups:
+            anchors.append(g[0])
+        # build new order: place each group right after its anchor position
+        result = []
+        placed = set()
+        order_set = list(order)
+        for c in order_set:
+            if c in placed:
+                continue
+            if c in anchors:
+                g = next(g for g in groups if g[0] == c)
+                for gc in g:
+                    if gc in order_set and gc not in placed:
+                        result.append(gc)
+                        placed.add(gc)
+            elif c not in merged:
+                result.append(c)
+                placed.add(c)
+        # append any leftovers (shouldn't happen, but stay safe)
+        for c in order_set:
+            if c not in placed:
+                result.append(c)
+                placed.add(c)
+        return result
+
+    def _apply_one_way_dep(self, order: List[str], one_way_dep) -> List[str]:
+        """Ensure a precedes b for each (a, b) dependency edge (stable)."""
+        if not one_way_dep:
+            return order
+        edges = []
+        colset = set(order)
+        for dep in one_way_dep:
+            if len(dep) >= 2:
+                a, b = dep[0], dep[1]
+                if a in colset and b in colset:
+                    edges.append((a, b))
+        if not edges:
+            return order
+        # Kahn-style stable topological respect: repeatedly move b after a
+        result = list(order)
+        for _ in range(len(edges) + 1):
+            changed = False
+            for a, b in edges:
+                ia, ib = result.index(a), result.index(b)
+                if ia > ib:
+                    # move a just before b
+                    result.pop(ia)
+                    result.insert(result.index(b), a)
+                    changed = True
+            if not changed:
+                break
+        return result
+
+    def _build_candidates(self, df: pd.DataFrame) -> List[List[str]]:
+        cols = list(df.columns)
+        n = len(cols)
+        if n == 0:
+            return [[]]
+        len_w, cnt_w = self._column_scores(df, cols)
+        orig_idx = list(range(n))
+
+        def key(scores, idxs):
+            return sorted(idxs, key=lambda i: (-scores[i], cols[i]))
+
+        cands = []
+        # 1) length-weighted pair repetition ranking
+        cands.append([cols[i] for i in key(len_w, orig_idx)])
+        # 2) count-weighted pair repetition ranking
+        cands.append([cols[i] for i in key(cnt_w, orig_idx)])
+        # 3) mixed tradeoff (sqrt length weighting)
+        sqrt_w = len_w.copy()
+        cands.append([cols[i] for i in key(
+            np.array([int(lw ** 0.5) for lw in len_w], dtype=np.int64),
+            orig_idx)])
+        # 4) original order as a safe fallback
+        cands.append(list(cols))
+        return cands
+
+    # ------------------------------------------------------------------ #
+    # public API
+    # ------------------------------------------------------------------ #
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        original_columns = list(df.columns)
+        n_rows = len(df)
+
+        # Trivial cases
+        if n_rows == 0 or len(original_columns) == 0:
+            return df.copy(), [[] for _ in range(n_rows)]
+
+        # Precompute serialized columns once, reused across candidates.
+        col_serials = {c: self._serialize_column(df[c]) for c in original_columns}
+
+        candidates = self._build_candidates(df)
+        # Honor constraints on each candidate.
+        constrained = []
+        seen = set()
+        for cand in candidates:
+            cand = self._apply_merge_groups(cand, col_merge)
+            cand = self._apply_one_way_dep(cand, one_way_dep)
+            if len(cand) != len(original_columns) or set(cand) != set(original_columns):
+                cand = list(original_columns)  # safety fallback
+            t = tuple(cand)
+            if t not in seen:
+                seen.add(t)
+                constrained.append(list(cand))
+        if not constrained:
+            constrained = [list(original_columns)]
+
+        best_order = constrained[0]
+        best_score = -1
+        for order in constrained:
+            # Build serialized rows for this column ordering.
+            idxs = [original_columns.index(c) for c in order]
+            # join row-wise: strings already normalized
+            mat = None
+            parts = [col_serials[c] for c in order]
+            if len(parts) == 1:
+                rows = list(parts[0])
+            else:
+                # vectorized join via python zip (single pass, no pandas ops)
+                rows = ["".join(p) for p in zip(*parts)]
+            score = self._trie_score(rows)
+            if score > best_score:
+                best_score = score
+                best_order = order
+
+        # Build output: permute columns only; rows and values unchanged.
+        out = df.loc[:, best_order].copy()
+        # Preserve mixed types: cast frame to object only if mixed dtypes exist
+        column_orderings = [list(best_order) for _ in range(n_rows)]
+        return out, column_orderings
+
+# EVOLVE-BLOCK-END
+```</CODE>

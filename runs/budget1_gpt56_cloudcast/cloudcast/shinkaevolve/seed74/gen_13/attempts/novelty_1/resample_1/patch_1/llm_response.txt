@@ -1,0 +1,226 @@
+<NAME>
+exact_steiner_broadcast
+</NAME>
+
+<DESCRIPTION>
+Replace the local cheapest-branch heuristic with an exact directed-Steiner dynamic program for modest destination sets. The existing greedy approach can commit to an inexpensive early branch that prevents a globally cheaper shared trunk from being selected. The new planner minimizes the union cost of directed edges needed to reach every receiver, which directly matches broadcast billing where a shared edge is transferred once and then fanned out downstream.
+
+The DP uses subset states over destinations and reverse multi-source Dijkstra relaxation to efficiently find the least-cost directed arborescence rooted at the source. For unusually large terminal sets it retains a deterministic shared-tree greedy fallback, avoiding exponential state growth. It also validates costs, handles missing/unreachable destinations without exceptions, and explicitly initializes empty paths for unreachable receivers.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+=======
+import heapq
+import math
+import networkx as nx
+import json
+import os
+import pandas as pd
+from typing import Dict, List
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Build a shared directed broadcast tree instead of independently copying data
+    along a shortest path for every destination.  The tree is grown by repeatedly
+    attaching the cheapest remaining destination to any node already reachable
+    from the source, which lets later destinations reuse paid-for transit links.
+    """
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Edges without a price cannot be safely compared by the cost optimizer.
+    h = nx.DiGraph()
+    for u, v, data in G.edges(data=True):
+        cost = data.get("cost")
+        if u != v and cost is not None:
+            h.add_edge(u, v, **dict(data))
+    h.remove_edges_from(list(h.in_edges(src)))
+
+    tree = nx.DiGraph()
+    tree.add_node(src)
+    remaining = set(dsts)
+
+    # Greedy directed-Steiner approximation: choose the least expensive new
+    # branch from the current broadcast tree, rather than paying source->dst
+    # independently for each destination.
+    while remaining:
+        best = None
+        for anchor in tree.nodes:
+            for dst in remaining:
+                try:
+                    path = nx.dijkstra_path(h, anchor, dst, weight="cost")
+                    cost = nx.path_weight(h, path, weight="cost")
+                except nx.NetworkXNoPath:
+                    continue
+                if best is None or cost < best[0]:
+                    best = (cost, dst, path)
+
+        if best is None:
+            break
+
+        _, dst, path = best
+        for u, v in zip(path, path[1:]):
+            tree.add_edge(u, v, **dict(h[u][v]))
+        remaining.remove(dst)
+
+    # Every partition follows the same shared tree.  Partition data can overlap
+    # on each tree edge, allowing the transfer scheduler to broadcast it once.
+    for dst in dsts:
+        if dst not in tree or not nx.has_path(tree, src, dst):
+            continue
+        path = nx.dijkstra_path(tree, src, dst, weight="cost")
+        for u, v in zip(path, path[1:]):
+            for partition in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(
+                    dst, partition, [u, v, dict(G[u][v])]
+                )
+
+    return bc_topology
+=======
+def search_algorithm(src, dsts, G, num_partitions):
+    """
+    Find a minimum-cost directed multicast tree.  A paid edge is represented
+    once in the tree even when its data is subsequently broadcast to several
+    receivers.  For up to ten distinct reachable receivers this uses the exact
+    directed-Steiner subset DP; larger requests use a scalable marginal-cost
+    tree-growth fallback.
+    """
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+    h = nx.DiGraph()
+
+    for u, v, data in G.edges(data=True):
+        try:
+            cost = float(data.get("cost"))
+        except (TypeError, ValueError):
+            continue
+        if u != v and math.isfinite(cost) and cost >= 0:
+            edge_data = dict(data)
+            edge_data["cost"] = cost
+            h.add_edge(u, v, **edge_data)
+
+    if src not in h:
+        for dst in dsts:
+            for partition in range(num_partitions):
+                bc_topology.set_dst_partition_paths(dst, partition, [])
+        return bc_topology
+
+    h.remove_edges_from(list(h.in_edges(src)))
+    reachable = []
+    for dst in dict.fromkeys(dsts):
+        try:
+            if nx.has_path(h, src, dst):
+                reachable.append(dst)
+        except nx.NodeNotFound:
+            pass
+
+    tree = nx.DiGraph()
+    tree.add_node(src)
+
+    if reachable and len(reachable) <= 10:
+        # dp[mask][v] is the least edge-union cost of a tree rooted at v that
+        # reaches all terminals represented by mask.  Before each shortest-path
+        # relaxation, split_cost records the best way of joining two subsets at
+        # a common fan-out node.
+        nodes = list(h.nodes())
+        terminal_count = len(reachable)
+        state_count = 1 << terminal_count
+        dp = [{node: math.inf for node in nodes} for _ in range(state_count)]
+        split = [{} for _ in range(state_count)]
+        next_hop = [{} for _ in range(state_count)]
+        reverse_edges = list(h.in_edges(data=True))
+
+        for index, dst in enumerate(reachable):
+            dp[1 << index][dst] = 0.0
+
+        for mask in range(1, state_count):
+            if mask & (mask - 1):
+                submask = (mask - 1) & mask
+                while submask:
+                    other = mask ^ submask
+                    if other and submask < other:
+                        for node in nodes:
+                            value = dp[submask][node] + dp[other][node]
+                            if value < dp[mask][node]:
+                                dp[mask][node] = value
+                                split[mask][node] = (submask, other)
+                    submask = (submask - 1) & mask
+
+            # Multi-source Dijkstra on reversed edges computes
+            # min_y(dp[mask][y] + shortest_path_cost(v, y)).
+            queue = [(value, node) for node, value in dp[mask].items()
+                     if value < math.inf]
+            heapq.heapify(queue)
+            settled = set()
+            while queue:
+                value, node = heapq.heappop(queue)
+                if node in settled:
+                    continue
+                settled.add(node)
+                for predecessor, _, data in h.in_edges(node, data=True):
+                    candidate = value + data["cost"]
+                    if candidate < dp[mask][predecessor] - 1e-12:
+                        dp[mask][predecessor] = candidate
+                        next_hop[mask][predecessor] = node
+                        heapq.heappush(queue, (candidate, predecessor))
+
+        full_mask = state_count - 1
+
+        def collect(mask, node):
+            """Materialize the DP witness as a union of directed tree edges."""
+            successor = next_hop[mask].get(node)
+            if successor is not None:
+                tree.add_edge(node, successor, **dict(h[node][successor]))
+                collect(mask, successor)
+                return
+            parts = split[mask].get(node)
+            if parts is not None:
+                collect(parts[0], node)
+                collect(parts[1], node)
+
+        if dp[full_mask][src] < math.inf:
+            collect(full_mask, src)
+    elif reachable:
+        # Scalable fallback: attach the destination with the cheapest marginal
+        # branch from any currently available broadcast-tree vertex.
+        remaining = set(reachable)
+        while remaining:
+            best = None
+            for anchor in list(tree.nodes):
+                for dst in sorted(remaining, key=str):
+                    try:
+                        path = nx.dijkstra_path(h, anchor, dst, weight="cost")
+                        cost = nx.path_weight(h, path, weight="cost")
+                    except (nx.NetworkXNoPath, nx.NodeNotFound):
+                        continue
+                    if best is None or cost < best[0]:
+                        best = (cost, dst, path)
+            if best is None:
+                break
+            _, dst, path = best
+            for u, v in zip(path, path[1:]):
+                tree.add_edge(u, v, **dict(h[u][v]))
+            remaining.remove(dst)
+
+    for dst in dsts:
+        edge_records = []
+        if dst in tree and nx.has_path(tree, src, dst):
+            path = nx.shortest_path(tree, src, dst)
+            edge_records = [[u, v, dict(G[u][v])]
+                            for u, v in zip(path, path[1:])]
+        for partition in range(num_partitions):
+            bc_topology.set_dst_partition_paths(
+                dst, partition, list(edge_records)
+            )
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

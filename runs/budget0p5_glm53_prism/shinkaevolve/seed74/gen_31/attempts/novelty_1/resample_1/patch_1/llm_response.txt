@@ -1,0 +1,186 @@
+<NAME>
+lexicographic_topk_balancer
+
+</NAME>
+<DESCRIPTION>
+Instead of the prior "move off the hottest GPU" hill climb, this approach minimizes the sorted KVPR vector lexicographically (min the max, then the 2nd max, then 3rd...). This escapes plateaus where the max can't improve but redistributing pressure to the 2nd/3rd hottest GPUs later unlocks improvements. It scans candidate moves AND swaps from the top-3 hottest GPUs (not just the hottest), uses randomized multistart orderings (inspired by the Las Vegas recommendation but generalized), and keeps the best final max KVPR. Crash-proof: each attempt builds from scratch; failures just skip that restart.
+
+</DESCRIPTION>
+<CODE>
+```python
+GPU_MEM_SIZE = 80 # GB
+
+# EVOLVE-BLOCK-START
+
+import random
+
+def compute_model_placement(gpu_num, models):
+    """
+    Lexicographic top-K balancing: minimize the sorted (descending) vector of
+    GPU KVPRs lexicographically via moves+swaps from the hottest GPUs,
+    with randomized multistart over model orderings.
+    """
+
+    def ratio(W, used):
+        free = GPU_MEM_SIZE - used
+        if free <= 1e-9:
+            return float('inf')
+        return W / free
+
+    def attempt(order):
+        placement = {i: [] for i in range(gpu_num)}
+        used = [0.0] * gpu_num
+        W = [0.0] * gpu_num
+
+        # greedy: place on GPU giving lowest resulting KVPR (random tie-break)
+        for m in order:
+            best_val = float('inf')
+            cands = []
+            for i in range(gpu_num):
+                if m.model_size <= GPU_MEM_SIZE - used[i] + 1e-9:
+                    v = ratio(W[i] + m.req_rate / m.slo, used[i] + m.model_size)
+                    if v < best_val - 1e-12:
+                        best_val = v
+                        cands = [i]
+                    elif v < best_val + 1e-12:
+                        cands.append(i)
+            if not cands:
+                return None, float('inf')
+            i = random.choice(cands)
+            placement[i].append(m)
+            used[i] += m.model_size
+            W[i] += m.req_rate / m.slo
+
+        K = min(3, gpu_num)
+
+        def state():
+            kvs = [ratio(W[i], used[i]) for i in range(gpu_num)]
+            top = sorted(kvs, reverse=True)[:K]
+            return kvs, top
+
+        guard = 0
+        improved = True
+        while improved and guard < 3000:
+            improved = False
+            guard += 1
+            kvs, top = state()
+            # candidate source GPUs: the K hottest
+            srcs = sorted(range(gpu_num), key=lambda i: -kvs[i])[:K]
+
+            for src in srcs:
+                # ---- moves from src ----
+                for m in list(placement[src]):
+                    w = m.req_rate / m.slo
+                    for j in range(gpu_num):
+                        if j == src:
+                            continue
+                        if m.model_size <= GPU_MEM_SIZE - used[j] + 1e-9:
+                            nsrc = ratio(W[src] - w, used[src] - m.model_size)
+                            ndst = ratio(W[j] + w, used[j] + m.model_size)
+                            nkvs = list(kvs)
+                            nkvs[src] = nsrc
+                            nkvs[j] = ndst
+                            ntop = sorted(nkvs, reverse=True)[:K]
+                            if ntop < top:
+                                placement[src].remove(m)
+                                placement[j].append(m)
+                                W[src] -= w; used[src] -= m.model_size
+                                W[j] += w; used[j] += m.model_size
+                                improved = True
+                                break
+                    if improved:
+                        break
+                if improved:
+                    break
+                # ---- swaps between src and others ----
+                for m in list(placement[src]):
+                    for j in range(gpu_num):
+                        if j == src:
+                            continue
+                        for m2 in list(placement[j]):
+                            nu1 = used[src] - m.model_size + m2.model_size
+                            nu2 = used[j] - m2.model_size + m.model_size
+                            if nu1 <= GPU_MEM_SIZE + 1e-9 and nu2 <= GPU_MEM_SIZE + 1e-9:
+                                nW1 = W[src] - m.req_rate / m.slo + m2.req_rate / m2.slo
+                                nW2 = W[j] - m2.req_rate / m2.slo + m.req_rate / m.slo
+                                n1 = ratio(nW1, nu1)
+                                n2 = ratio(nW2, nu2)
+                                nkvs = list(kvs)
+                                nkvs[src] = n1
+                                nkvs[j] = n2
+                                ntop = sorted(nkvs, reverse=True)[:K]
+                                if ntop < top:
+                                    placement[src].remove(m)
+                                    placement[j].remove(m2)
+                                    placement[src].append(m2)
+                                    placement[j].append(m)
+                                    W[src], W[j] = nW1, nW2
+                                    used[src], used[j] = nu1, nu2
+                                    improved = True
+                                    break
+                        if improved:
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+
+        kvs = [ratio(W[i], used[i]) for i in range(gpu_num)]
+        return placement, max(kvs)
+
+    base = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
+
+    best = None
+    best_val = float('inf')
+    total = 30
+    for it in range(total):
+        if it == 0:
+            order = list(base)
+        elif it % 2 == 1:
+            order = list(models)
+            random.shuffle(order)
+        else:
+            order = sorted(models,
+                           key=lambda m: (m.req_rate / m.slo) * random.uniform(0.8, 1.2),
+                           reverse=True)
+        cand, val = attempt(order)
+        if cand is not None and val < best_val - 1e-15:
+            best_val = val
+            best = cand
+
+    if best is None:
+        # deterministic fallback (may raise if truly infeasible)
+        cand, _ = attempt(list(base))
+        if cand is None:
+            raise ValueError("No feasible placement found.")
+        return cand
+
+    return best
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")
+```
+</CODE>

@@ -1,0 +1,112 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+_H = np.sqrt(3.0) / 2.0
+
+
+def _clip_triangle(pts):
+    """Project points back into the unit equilateral triangle with vertices
+    (0,0), (1,0), (0.5, sqrt(3)/2)."""
+    # Barycentric clip: vertices A=(0,0), B=(1,0), C=(0.5,H)
+    A = np.array([0.0, 0.0])
+    B = np.array([1.0, 0.0])
+    C = np.array([0.5, _H])
+    V = np.stack([A, B, C])  # (3,2)
+    # barycentric coords
+    v0 = C - A
+    v1 = B - A
+    v2 = pts - A
+    d00 = v0 @ v0
+    d01 = v0 @ v1
+    d11 = v1 @ v1
+    d20 = v2 @ v0
+    d21 = v2 @ v1
+    den = d00 * d11 - d01 * d01
+    a = (d11 * d20 - d01 * d21) / den  # weight on C
+    b = (d00 * d21 - d01 * d20) / den  # weight on B
+    c = 1.0 - a - b                      # weight on A
+    w = np.stack([a, b, c], axis=1)
+    w = np.clip(w, 0.0, None)
+    w /= w.sum(axis=1, keepdims=True)
+    return w @ V
+
+
+def _min_area(pts):
+    """Minimum absolute triangle area over all triplets (vectorized)."""
+    n = len(pts)
+    i, j, k = np.triu_indices(n, 3)
+    ax, ay = pts[i, 0], pts[i, 1]
+    bx, by = pts[j, 0], pts[j, 1]
+    cx, cy = pts[k, 0], pts[k, 1]
+    areas = 0.5 * np.abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
+    return areas.min()
+
+
+def _soft_min_area(pts, t=0.02):
+    """Smooth surrogate: -logsumexp(-areas/t)*t approximates the min area."""
+    n = len(pts)
+    i, j, k = np.triu_indices(n, 3)
+    ax, ay = pts[i, 0], pts[i, 1]
+    bx, by = pts[j, 0], pts[j, 1]
+    cx, cy = pts[k, 0], pts[k, 1]
+    areas = 0.5 * np.abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax))
+    return -t * (np.logaddexp(-areas / t, -1e9 / t)).sum() / 1.0 if False else \
+        -t * np.log(np.sum(np.exp(-areas / t)))
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of n points on or inside a convex region in order to maximize the area of the
+    smallest triangle formed by these points. Here n = 11.
+
+    Returns:
+        points: np.ndarray of shape (11,2) with the x,y coordinates of the points.
+    """
+    n = 11
+    # Deterministic symmetric seed arrangement: three vertices plus interior
+    # points on a small hexagonal/triangular lattice.
+    pts = [
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (0.5, _H),
+    ]
+    # interior triangular lattice (scaled toward centroid)
+    levels = [(0.25, 0.0), (0.75, 0.0), (0.5, _H * (2.0 / 3.0) * 0.5)]
+    cx, cy = 0.5, _H / 3.0
+    # points on three medians and around centroid
+    pts.append((0.5, _H / 3.0))                       # centroid
+    pts.append((0.5, _H / 3.0 + 0.30 * (_H - _H / 3.0)))  # upper median
+    pts.append((0.5, _H / 3.0 - 0.30 * (_H / 3.0)))      # lower median
+    pts.append((0.25 + 0.10, _H / 6.0))              # left-mid region
+    pts.append((0.75 - 0.10, _H / 6.0))              # right-mid region
+    pts.append((0.30, _H * 0.60))                    # left-upper
+    pts.append((0.70, _H * 0.60))                    # right-upper
+    points = np.array(pts, dtype=float)
+    points = _clip_triangle(points)
+
+    try:
+        rng = np.random.default_rng(0)
+        best = points.copy()
+        best_val = _min_area(best)
+        step = 0.02
+        cur = points.copy()
+        for it in range(400):
+            trial = cur + rng.normal(0.0, step, size=cur.shape)
+            trial = _clip_triangle(trial)
+            tv = _min_area(trial)
+            if tv >= best_val:
+                best, best_val = trial, tv
+                cur = trial
+            elif tv >= _min_area(cur) * 0.98:
+                cur = trial  # mild sideways moves
+            if (it + 1) % 100 == 0:
+                step *= 0.6
+        points = best
+    except Exception:
+        points = _clip_triangle(points)
+
+    return points
+
+
+# EVOLVE-BLOCK-END

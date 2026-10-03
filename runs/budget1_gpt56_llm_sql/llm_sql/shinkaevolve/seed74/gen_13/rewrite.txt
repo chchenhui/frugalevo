@@ -1,0 +1,317 @@
+# EVOLVE-BLOCK-START
+import pandas as pd
+from solver import Algorithm
+from typing import Tuple, List, Dict
+from collections import Counter, defaultdict
+
+
+class Evolved(Algorithm):
+    """
+    Safe prompt-prefix-cache reordering.
+
+    Values are never changed: each output row is only a permutation of the
+    cells from the corresponding input row.  ``column_orderings[r]`` describes
+    which original column supplies each physical output position in row r.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    @staticmethod
+    def _string_value(value) -> str:
+        """Match the evaluator's fillna('').astype(str) representation."""
+        try:
+            missing = pd.isna(value)
+            try:
+                if bool(missing):
+                    return ""
+            except (TypeError, ValueError):
+                # Non-scalar objects are legitimate object-dtype cell values.
+                pass
+        except Exception:
+            pass
+        try:
+            return str(value)
+        except Exception:
+            return repr(value)
+
+    @staticmethod
+    def _lcp(left: str, right: str) -> int:
+        if left == right:
+            return len(left)
+        limit = min(len(left), len(right))
+        lo, hi = 0, limit
+        # Slice comparison is implemented in C and avoids a Python
+        # character-by-character loop for long values.
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if left[:mid] == right[:mid]:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _trie_reuse(self, strings: List[str]) -> int:
+        if len(strings) < 2:
+            return 0
+        ordered = sorted(strings)
+        return sum(self._lcp(ordered[i - 1], ordered[i])
+                   for i in range(1, len(ordered)))
+
+    @staticmethod
+    def _stable_topological(items, edges, rank):
+        """Stable topological ordering; cycles retain their stable order."""
+        item_set = set(items)
+        children = {item: set() for item in items}
+        indegree = {item: 0 for item in items}
+        for source, target in edges:
+            if source in item_set and target in item_set and source != target:
+                if target not in children[source]:
+                    children[source].add(target)
+                    indegree[target] += 1
+
+        ready = sorted((x for x in items if indegree[x] == 0),
+                       key=lambda x: rank[x])
+        result = []
+        while ready:
+            current = ready.pop(0)
+            result.append(current)
+            newly_ready = []
+            for target in children[current]:
+                indegree[target] -= 1
+                if indegree[target] == 0:
+                    newly_ready.append(target)
+            if newly_ready:
+                ready.extend(newly_ready)
+                ready.sort(key=lambda x: rank[x])
+
+        # A cyclic user dependency cannot be satisfied completely.  Preserve a
+        # deterministic valid permutation rather than losing columns.
+        if len(result) != len(items):
+            used = set(result)
+            result.extend(sorted((x for x in items if x not in used),
+                                 key=lambda x: rank[x]))
+        return result
+
+    def _constrain_order(self, base, columns, col_merge, one_way_dep):
+        """
+        Preserve requested merge groups as contiguous blocks where possible and
+        respect acyclic one-way dependencies.  Positions, not DataFrame label
+        lookup, are used so duplicate labels remain safe.
+        """
+        count = len(columns)
+        rank = {p: i for i, p in enumerate(base)}
+
+        parent = list(range(count))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            a, b = find(a), find(b)
+            if a != b:
+                parent[b] = a
+
+        # Merge constraints refer to public column labels.  All occurrences of
+        # a requested label are included, preserving duplicate-label safety.
+        for group in col_merge or []:
+            positions = [i for i, name in enumerate(columns) if name in group]
+            if len(positions) > 1:
+                first = positions[0]
+                for pos in positions[1:]:
+                    union(first, pos)
+
+        dependency_edges = []
+        for source_name, target_name in one_way_dep or []:
+            source_matches = [i for i, name in enumerate(columns)
+                              if name == source_name or source_name in str(name)]
+            target_matches = [i for i, name in enumerate(columns)
+                              if name == target_name or target_name in str(name)]
+            if len(source_matches) == 1 and len(target_matches) == 1:
+                dependency_edges.append((source_matches[0], target_matches[0]))
+
+        blocks = defaultdict(list)
+        for pos in range(count):
+            blocks[find(pos)].append(pos)
+        block_ids = list(blocks)
+        block_rank = {
+            block: min(rank[p] for p in positions)
+            for block, positions in blocks.items()
+        }
+
+        block_edges = []
+        for source, target in dependency_edges:
+            s_block, t_block = find(source), find(target)
+            if s_block != t_block:
+                block_edges.append((s_block, t_block))
+
+        ordered_blocks = self._stable_topological(
+            block_ids, block_edges, block_rank
+        )
+
+        result = []
+        for block in ordered_blocks:
+            members = blocks[block]
+            member_rank = {p: rank[p] for p in members}
+            internal_edges = [
+                (source, target)
+                for source, target in dependency_edges
+                if find(source) == block and find(target) == block
+            ]
+            result.extend(self._stable_topological(
+                members, internal_edges, member_rank
+            ))
+        return result
+
+    def _global_frequency_order(self, cell_strings, columns, col_merge, one_way_dep):
+        rows = len(cell_strings)
+        cols = len(columns)
+        weights = []
+        for col in range(cols):
+            counts = Counter(cell_strings[row][col] for row in range(rows))
+            weight = sum(
+                len(value) * frequency * (frequency - 1)
+                for value, frequency in counts.items()
+            )
+            weights.append(weight)
+
+        base = sorted(range(cols), key=lambda p: (-weights[p], p))
+        return self._constrain_order(base, columns, col_merge, one_way_dep)
+
+    def _conditional_orders(self, cell_strings, global_order, columns,
+                            col_merge, one_way_dep, max_depth):
+        """
+        Build a bounded conditional prefix partition tree.  A group chooses the
+        remaining field with greatest length-weighted pair repetition; suffixes
+        may therefore differ between groups.
+        """
+        row_count = len(cell_strings)
+        col_count = len(columns)
+        orders = [None] * row_count
+        candidate_limit = min(col_count, 32)
+
+        def finish(rows, prefix, remaining):
+            tail = [p for p in global_order if p in remaining]
+            final = self._constrain_order(prefix + tail, columns,
+                                          col_merge, one_way_dep)
+            for row in rows:
+                orders[row] = final
+
+        def visit(rows, prefix, remaining, depth):
+            if (len(rows) < 2 or not remaining or depth >= max_depth):
+                finish(rows, prefix, remaining)
+                return
+
+            candidates = [p for p in global_order if p in remaining][:candidate_limit]
+            best_col = None
+            best_score = 0
+            for col in candidates:
+                counts = Counter(cell_strings[row][col] for row in rows)
+                score = sum(
+                    len(value) * frequency * (frequency - 1)
+                    for value, frequency in counts.items()
+                )
+                if score > best_score or (
+                    score == best_score and best_col is not None and col < best_col
+                ):
+                    best_score = score
+                    best_col = col
+
+            if best_col is None or best_score <= 0:
+                finish(rows, prefix, remaining)
+                return
+
+            groups = defaultdict(list)
+            for row in rows:
+                groups[cell_strings[row][best_col]].append(row)
+            next_remaining = [p for p in remaining if p != best_col]
+            for value in sorted(groups):
+                visit(groups[value], prefix + [best_col],
+                      next_remaining, depth + 1)
+
+        visit(list(range(row_count)), [], list(range(col_count)), 0)
+        return orders
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        del early_stop, distinct_value_threshold, parallel
+
+        row_count, col_count = df.shape
+        columns = list(df.columns)
+        if row_count == 0 or col_count == 0:
+            return df.copy(), [[] for _ in range(row_count)]
+
+        # iloc-based extraction preserves mixed values and duplicate labels.
+        source_values = [
+            [df.iloc[row, col] for col in range(col_count)]
+            for row in range(row_count)
+        ]
+        cell_strings = [
+            [self._string_value(value) for value in row]
+            for row in source_values
+        ]
+
+        original_order = self._constrain_order(
+            list(range(col_count)), columns, col_merge, one_way_dep
+        )
+        frequency_order = self._global_frequency_order(
+            cell_strings, columns, col_merge, one_way_dep
+        )
+
+        candidates = [
+            [original_order for _ in range(row_count)],
+            [frequency_order for _ in range(row_count)],
+        ]
+
+        # Conditional construction is useful on ordinary datasets, but is
+        # deliberately bounded on very wide/large inputs.
+        work = row_count * col_count
+        if work <= 1_500_000 and col_count > 1:
+            depth_limit = min(col_count, 12)
+            if col_stop is not None and col_stop > 0:
+                depth_limit = min(depth_limit, int(col_stop))
+            if row_stop is not None and row_stop > 0:
+                depth_limit = min(depth_limit, int(row_stop))
+            if depth_limit > 0:
+                candidates.append(self._conditional_orders(
+                    cell_strings, frequency_order, columns, col_merge,
+                    one_way_dep, depth_limit
+                ))
+
+        best_orders = candidates[0]
+        best_score = -1
+        for candidate in candidates:
+            serialized = [
+                "".join(cell_strings[row][col] for col in candidate[row])
+                for row in range(row_count)
+            ]
+            score = self._trie_reuse(serialized)
+            if score > best_score:
+                best_score = score
+                best_orders = candidate
+
+        output_values = [
+            [source_values[row][col] for col in best_orders[row]]
+            for row in range(row_count)
+        ]
+        reordered = pd.DataFrame(
+            output_values, index=df.index, columns=df.columns, dtype=object
+        )
+        column_orderings = [
+            [columns[col] for col in order] for order in best_orders
+        ]
+        return reordered, column_orderings
+
+# EVOLVE-BLOCK-END

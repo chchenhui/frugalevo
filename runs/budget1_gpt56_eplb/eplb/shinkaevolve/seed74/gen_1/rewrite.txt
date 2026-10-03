@@ -1,0 +1,196 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Expert parallelism load balancer (EPLB) for vLLM.
+
+This implementation uses vectorized water-filling replica allocation followed
+by capacity-constrained LPT scheduling of replicas onto GPU expert slots.
+"""
+
+# EVOLVE-BLOCK-START
+
+import torch
+
+
+def _allocate_replica_counts(weight: torch.Tensor,
+                             num_replicas: int) -> torch.Tensor:
+    """
+    Allocate replicas with a batched water-filling formulation.
+
+    Adding the k-th extra replica to expert e changes its copy load to
+    weight[e] / (k + 1). Selecting the largest such values globally is
+    equivalent to repeatedly replicating the currently most loaded expert,
+    while avoiding a Python loop over replica additions.
+    """
+    num_layers, num_experts = weight.shape
+    num_extra = num_replicas - num_experts
+
+    counts = torch.ones(
+        (num_layers, num_experts),
+        dtype=torch.int64,
+        device=weight.device,
+    )
+    if num_extra == 0:
+        return counts
+
+    # marginal[layer, expert, extra_index] is the load after creating this
+    # additional copy. For non-negative routing loads these values are
+    # monotonically decreasing per expert, so top-k gives a valid water-fill.
+    extra_index = torch.arange(
+        1, num_extra + 1, dtype=weight.dtype, device=weight.device)
+    marginal = weight.unsqueeze(-1) / (extra_index + 1)
+    marginal = marginal.flatten(1)
+
+    selected = torch.topk(
+        marginal, k=num_extra, dim=1, largest=True, sorted=False).indices
+    selected_experts = selected // num_extra
+
+    counts.scatter_add_(
+        1,
+        selected_experts,
+        torch.ones_like(selected_experts, dtype=torch.int64),
+    )
+    return counts
+
+
+def _make_replicas(
+    weight: torch.Tensor,
+    replica_count: torch.Tensor,
+    num_replicas: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Materialize logical ids, replica ranks, and equalized replica loads.
+
+    The returned replicas are subsequently reordered by the GPU scheduler.
+    """
+    num_layers, num_experts = weight.shape
+    max_count = num_replicas - num_experts + 1
+
+    logical_grid = torch.arange(
+        num_experts, dtype=torch.int64, device=weight.device).view(
+            1, num_experts, 1)
+    rank_grid = torch.arange(
+        max_count, dtype=torch.int64, device=weight.device).view(
+            1, 1, max_count)
+
+    valid = rank_grid < replica_count.unsqueeze(-1)
+    per_copy_load = weight / replica_count.to(weight.dtype)
+
+    # Invalid candidate copies are sorted behind all real copies. There are
+    # exactly num_replicas valid entries for every layer.
+    candidate_load = per_copy_load.unsqueeze(-1).expand(
+        -1, -1, max_count).masked_fill(~valid, float("-inf"))
+    candidate_order = candidate_load.flatten(1).argsort(
+        dim=1, descending=True)[:, :num_replicas]
+
+    logical = candidate_order // max_count
+    rank = candidate_order % max_count
+    load = weight.gather(1, logical) / replica_count.gather(
+        1, logical).to(weight.dtype)
+    return logical, rank, load
+
+
+def _lpt_pack_to_gpus(
+    logical: torch.Tensor,
+    rank: torch.Tensor,
+    replica_load: torch.Tensor,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack replicas with capacity-constrained Longest Processing Time scheduling.
+
+    Every GPU receives the same fixed number of physical-expert slots. At each
+    LPT step, each layer independently places its heaviest remaining replica
+    on the least-loaded GPU that still has a free slot.
+    """
+    num_layers, num_replicas = logical.shape
+    experts_per_gpu = num_replicas // num_gpus
+
+    order = replica_load.argsort(dim=1, descending=True)
+    logical = logical.gather(1, order)
+    rank = rank.gather(1, order)
+    replica_load = replica_load.gather(1, order)
+
+    physical_to_logical = torch.empty_like(logical)
+    physical_rank = torch.empty_like(rank)
+
+    gpu_load = torch.zeros(
+        (num_layers, num_gpus), dtype=replica_load.dtype, device=logical.device)
+    gpu_fill = torch.zeros(
+        (num_layers, num_gpus), dtype=torch.int64, device=logical.device)
+    one = torch.ones((num_layers, 1), dtype=torch.int64, device=logical.device)
+
+    # The loop is over physical slots only. Each iteration schedules all model
+    # layers in parallel and consists entirely of compact tensor operations.
+    for replica_index in range(num_replicas):
+        available = gpu_fill < experts_per_gpu
+        candidate_load = gpu_load.masked_fill(~available, float("inf"))
+        gpu = candidate_load.argmin(dim=1)
+
+        position = gpu * experts_per_gpu + gpu_fill.gather(
+            1, gpu.unsqueeze(1)).squeeze(1)
+
+        physical_to_logical.scatter_(
+            1, position.unsqueeze(1), logical[:, replica_index:replica_index + 1])
+        physical_rank.scatter_(
+            1, position.unsqueeze(1), rank[:, replica_index:replica_index + 1])
+
+        gpu_load.scatter_add_(
+            1, gpu.unsqueeze(1), replica_load[:, replica_index:replica_index + 1])
+        gpu_fill.scatter_add_(1, gpu.unsqueeze(1), one)
+
+    return physical_to_logical, physical_rank
+
+
+def rebalance_experts(
+    weight: torch.Tensor,
+    num_replicas: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Rebalance logical experts across fixed GPU physical-expert slots.
+
+    Parameters and returned tensor layouts are identical to the original EPLB
+    implementation. num_groups and num_nodes are accepted for API compatibility;
+    the placement itself is globally optimized across all GPU slots.
+    """
+    del num_groups, num_nodes
+
+    num_layers, num_logical_experts = weight.shape
+    assert num_replicas >= num_logical_experts
+    assert num_replicas % num_gpus == 0
+
+    # Keep the original API behavior: rearrangement is performed using CPU
+    # load statistics and returns CPU mapping tensors.
+    weight = weight.float().cpu()
+
+    logical_count = _allocate_replica_counts(weight, num_replicas)
+    logical, replica_rank, replica_load = _make_replicas(
+        weight, logical_count, num_replicas)
+    physical_to_logical, physical_rank = _lpt_pack_to_gpus(
+        logical, replica_rank, replica_load, num_gpus)
+
+    max_logical_count = num_replicas - num_logical_experts + 1
+    logical_to_physical = torch.full(
+        (num_layers, num_logical_experts, max_logical_count),
+        -1,
+        dtype=torch.int64,
+        device=weight.device,
+    )
+    physical_index = torch.arange(
+        num_replicas, dtype=torch.int64, device=weight.device).expand(
+            num_layers, -1)
+
+    logical_to_physical.view(num_layers, -1).scatter_(
+        1,
+        physical_to_logical * max_logical_count + physical_rank,
+        physical_index,
+    )
+
+    return physical_to_logical, logical_to_physical, logical_count
+
+
+# EVOLVE-BLOCK-END
+
+__all__ = ["rebalance_experts"]

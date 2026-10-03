@@ -1,0 +1,283 @@
+<NAME>
+parametric_binpack
+</NAME>
+
+<DESCRIPTION>
+This approach converts a target maximum KVPR into a bin-packing feasibility problem. For a KVPR target `T`, every model has transformed size `pressure + T * model_size`, and each GPU has capacity `T * GPU_MEM_SIZE`. A placement is feasible exactly when these transformed sizes fit in the GPU capacities. The algorithm binary-searches the best target using diversified best-fit packings, then applies move and swap improvements to the resulting placements. This directly optimizes the minimax KVPR objective rather than only balancing current ratios greedily.
+</DESCRIPTION>
+
+<CODE>
+```python
+GPU_MEM_SIZE = 80  # GB
+
+# EVOLVE-BLOCK-START
+
+def compute_model_placement(gpu_num, models):
+    """Place models by parametric KVPR bin packing plus local improvement."""
+    if gpu_num <= 0:
+        raise ValueError("gpu_num must be positive")
+
+    model_list = list(models)
+    n = len(model_list)
+    eps = 1e-10
+
+    if n == 0:
+        return {gpu_id: [] for gpu_id in range(gpu_num)}
+
+    sizes = [float(model.model_size) for model in model_list]
+    weights = [float(model.req_rate / model.slo) for model in model_list]
+
+    for size in sizes:
+        if size > GPU_MEM_SIZE + eps:
+            raise ValueError(
+                f"Unable to place model of size {size} GB on any GPU."
+            )
+
+    total_size = sum(sizes)
+    if total_size > gpu_num * GPU_MEM_SIZE + eps:
+        raise ValueError(
+            f"Unable to place all models: total model size {total_size} GB "
+            f"exceeds total GPU memory {gpu_num * GPU_MEM_SIZE} GB."
+        )
+
+    def pressure(used, load):
+        free = GPU_MEM_SIZE - used
+        if free <= eps:
+            return float("inf") if load > eps else 0.0
+        return load / free
+
+    def objective(used, loads):
+        return max(pressure(used[g], loads[g]) for g in range(gpu_num))
+
+    def make_state(bins):
+        used = [0.0] * gpu_num
+        loads = [0.0] * gpu_num
+        for g in range(gpu_num):
+            for idx in bins[g]:
+                used[g] += sizes[idx]
+                loads[g] += weights[idx]
+        return bins, used, loads
+
+    def pack_for_target(target, ordering_style):
+        """
+        At target T, KVPR <= T is equivalent to:
+        sum(weight + T * size) <= T * GPU_MEM_SIZE per GPU.
+        """
+        capacity = target * GPU_MEM_SIZE
+        transformed = [weights[i] + target * sizes[i] for i in range(n)]
+
+        if ordering_style == 0:
+            order = sorted(range(n), key=lambda i: (-transformed[i], -sizes[i], i))
+        elif ordering_style == 1:
+            order = sorted(range(n), key=lambda i: (-sizes[i], -transformed[i], i))
+        elif ordering_style == 2:
+            order = sorted(
+                range(n),
+                key=lambda i: (
+                    -(weights[i] / max(GPU_MEM_SIZE - sizes[i], eps)),
+                    -transformed[i],
+                    i,
+                ),
+            )
+        else:
+            order = sorted(
+                range(n),
+                key=lambda i: (
+                    -(weights[i] / max(sizes[i], eps)),
+                    -sizes[i],
+                    i,
+                ),
+            )
+
+        bins = [[] for _ in range(gpu_num)]
+        packed = [0.0] * gpu_num
+        used = [0.0] * gpu_num
+
+        for idx in order:
+            item = transformed[idx]
+            choices = [
+                g for g in range(gpu_num)
+                if used[g] + sizes[idx] <= GPU_MEM_SIZE + eps
+                and packed[g] + item <= capacity + eps
+            ]
+
+            if not choices:
+                return None
+
+            # Best-fit leaves the least transformed capacity unused.
+            g = min(
+                choices,
+                key=lambda x: (
+                    capacity - packed[x] - item,
+                    GPU_MEM_SIZE - used[x] - sizes[idx],
+                    x,
+                ),
+            )
+            bins[g].append(idx)
+            packed[g] += item
+            used[g] += sizes[idx]
+
+        return make_state(bins)
+
+    # A valid memory-only best-fit placement gives a finite initial upper bound.
+    memory_order = sorted(range(n), key=lambda i: (-sizes[i], -weights[i], i))
+    seed_bins = [[] for _ in range(gpu_num)]
+    seed_used = [0.0] * gpu_num
+    seed_loads = [0.0] * gpu_num
+
+    for idx in memory_order:
+        choices = [
+            g for g in range(gpu_num)
+            if seed_used[g] + sizes[idx] <= GPU_MEM_SIZE + eps
+        ]
+        if not choices:
+            remaining = [GPU_MEM_SIZE - value for value in seed_used]
+            raise ValueError(
+                f"Unable to place model of size {sizes[idx]} GB on any GPU. "
+                f"Remaining per-GPU memory: {remaining}"
+            )
+        g = min(
+            choices,
+            key=lambda x: (GPU_MEM_SIZE - seed_used[x] - sizes[idx], x),
+        )
+        seed_bins[g].append(idx)
+        seed_used[g] += sizes[idx]
+        seed_loads[g] += weights[idx]
+
+    best_bins, best_used, best_loads = seed_bins, seed_used, seed_loads
+    upper = objective(best_used, best_loads)
+
+    total_weight = sum(weights)
+    free_total = gpu_num * GPU_MEM_SIZE - total_size
+    lower = total_weight / free_total if free_total > eps else 0.0
+    for i in range(n):
+        if GPU_MEM_SIZE - sizes[i] > eps:
+            lower = max(lower, weights[i] / (GPU_MEM_SIZE - sizes[i]))
+
+    # Parametric bin-packing search. Several packing variants reduce
+    # false infeasibility caused by a single greedy ordering.
+    for _ in range(28):
+        middle = (lower + upper) / 2.0
+        candidate = None
+
+        for style in range(4):
+            state = pack_for_target(middle, style)
+            if state is not None:
+                candidate = state
+                break
+
+        if candidate is None:
+            lower = middle
+        else:
+            upper = middle
+            best_bins, best_used, best_loads = candidate
+
+    bins = [group[:] for group in best_bins]
+    used = best_used[:]
+    loads = best_loads[:]
+
+    # Exact local descent on the true max-KVPR objective.
+    current = objective(used, loads)
+    max_rounds = 40
+
+    for _ in range(max_rounds):
+        best_action = None
+        best_value = current
+
+        for source in range(gpu_num):
+            for idx in bins[source]:
+                for target in range(gpu_num):
+                    if source == target:
+                        continue
+                    if used[target] + sizes[idx] > GPU_MEM_SIZE + eps:
+                        continue
+
+                    trial_used = used[:]
+                    trial_loads = loads[:]
+                    trial_used[source] -= sizes[idx]
+                    trial_loads[source] -= weights[idx]
+                    trial_used[target] += sizes[idx]
+                    trial_loads[target] += weights[idx]
+                    value = objective(trial_used, trial_loads)
+
+                    if value < best_value - 1e-12:
+                        best_value = value
+                        best_action = ("move", source, target, idx)
+
+        if best_action is None and n <= 180:
+            for left in range(gpu_num):
+                for right in range(left + 1, gpu_num):
+                    for a in bins[left]:
+                        for b in bins[right]:
+                            left_mem = used[left] - sizes[a] + sizes[b]
+                            right_mem = used[right] - sizes[b] + sizes[a]
+
+                            if left_mem > GPU_MEM_SIZE + eps:
+                                continue
+                            if right_mem > GPU_MEM_SIZE + eps:
+                                continue
+
+                            trial_used = used[:]
+                            trial_loads = loads[:]
+                            trial_used[left] = left_mem
+                            trial_used[right] = right_mem
+                            trial_loads[left] += weights[b] - weights[a]
+                            trial_loads[right] += weights[a] - weights[b]
+                            value = objective(trial_used, trial_loads)
+
+                            if value < best_value - 1e-12:
+                                best_value = value
+                                best_action = ("swap", left, right, a, b)
+
+        if best_action is None:
+            break
+
+        if best_action[0] == "move":
+            _, source, target, idx = best_action
+            bins[source].remove(idx)
+            bins[target].append(idx)
+            used[source] -= sizes[idx]
+            loads[source] -= weights[idx]
+            used[target] += sizes[idx]
+            loads[target] += weights[idx]
+        else:
+            _, left, right, a, b = best_action
+            bins[left].remove(a)
+            bins[right].remove(b)
+            bins[left].append(b)
+            bins[right].append(a)
+            used[left] += sizes[b] - sizes[a]
+            used[right] += sizes[a] - sizes[b]
+            loads[left] += weights[b] - weights[a]
+            loads[right] += weights[a] - weights[b]
+
+        current = best_value
+
+    return {
+        gpu_id: [model_list[idx] for idx in bins[gpu_id]]
+        for gpu_id in range(gpu_num)
+    }
+
+# EVOLVE-BLOCK-END
+
+
+if __name__ == "__main__":
+    from evaluator import generate_test_gpu_models
+    from evaluator import calculate_kvcache_pressure
+    from evaluator import safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+
+    for gpu_num, gpu_models in test_cases:
+        results = compute_model_placement(gpu_num, gpu_models)
+        all_kvpr.append(safe_float(calculate_kvcache_pressure(results)))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")
+``` 
+</CODE>

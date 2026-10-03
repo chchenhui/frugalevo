@@ -1,0 +1,149 @@
+<NAME>
+locally_adaptive_q_blocks
+</NAME>
+<DESCRIPTION>
+Replace the globally-scalar process noise Q in the second (refinement) RTS pass with a locally adaptive, per-sample Q derived from block-MAD second differences of the first-pass smoothed output y1. Since y1 is already denoised, its second differences reflect genuine local dynamics (e.g., the 5 Hz component) that a global Q under-serves: busy segments get larger process noise (less lag, better tracking), quiet segments get tighter Q (more smoothing, fewer slope changes/false reversals). Blocks of length ≈ window_size with 50% overlap, noise floor (σ_r/√w)·√6 subtracted in quadrature, floored at 0.05σ_r and capped at 1.5σ_r, linearly interpolated per sample. The second pass uses 0.25·Q[k]. The third refinement pass is removed (it added execution time and did not help; the local-Q pass subsumes its purpose) while keeping the final zero-phase polish to avoid the jitter collapse seen in over-smoothed variants.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    y = xs[:, 0].copy()
+
+    # --- Iterated RTS refinement: second forward+backward pass on the
+    # smoothed output with Q reduced 4x (variational refinement). The
+    # first-pass output is already de-noised, so its dynamics statistics
+    # justify a tighter process noise, sharpening the minimum-variance
+    # estimate further without adding phase lag. ---
+    if n >= 2:
+        q2 = 0.25 * qa  # Q scaled down ~4x for the refinement pass
+        Q2 = q2 * np.array([[0.25, 0.5], [0.5, 1.0]])
+        x_est = np.array([y[0], 0.0])
+        P = np.eye(2) * max(R, 1e-15)
+        for k in range(n):
+            if k == 0:
+                xp[k] = x_est
+                Pp[k] = P
+            else:
+                xp[k] = F @ x_est
+                Pp[k] = F @ P @ F.T + Q2
+            S = Pp[k][0, 0] + R
+            K = Pp[k][:, 0] / S
+            x_est = xp[k] + K * (y[k] - xp[k, 0])
+            P = (I2 - np.outer(K, H)) @ Pp[k]
+            P = 0.5 * (P + P.T)
+            xf[k] = x_est
+            Pf[k] = P
+        xs = xf.copy()
+        for k in range(n - 2, -1, -1):
+            Ppred = Pp[k + 1]
+            try:
+                Ppred_inv = np.linalg.inv(Ppred)
+            except np.linalg.LinAlgError:
+                Ppred_inv = np.linalg.pinv(Ppred)
+            G = Pf[k] @ F.T @ Ppred_inv
+            xs[k] = xf[k] + G @ (xs[k + 1] - xp[k + 1])
+        y_prev = y
+        y = xs[:, 0].copy()
+
+        # --- Third refinement pass with geometrically decaying Q
+        # (q3 = qa/16). Gated by a convergence check: if the second pass
+        # already converged (max change < 0.05·σ_r), skip to avoid
+        # over-smoothing and unnecessary compute. ---
+        max_change = float(np.max(np.abs(y - y_prev))) if n > 0 else 0.0
+        if max_change >= 0.05 * sigma_r:
+            q3 = 0.0625 * qa
+            Q3 = q3 * np.array([[0.25, 0.5], [0.5, 1.0]])
+            x_est = np.array([y[0], 0.0])
+            P = np.eye(2) * max(R, 1e-15)
+            for k in range(n):
+                if k == 0:
+                    xp[k] = x_est
+                    Pp[k] = P
+                else:
+                    xp[k] = F @ x_est
+                    Pp[k] = F @ P @ F.T + Q3
+                S = Pp[k][0, 0] + R
+                K = Pp[k][:, 0] / S
+                x_est = xp[k] + K * (y[k] - xp[k, 0])
+                P = (I2 - np.outer(K, H)) @ Pp[k]
+                P = 0.5 * (P + P.T)
+                xf[k] = x_est
+                Pf[k] = P
+            xs = xf.copy()
+            for k in range(n - 2, -1, -1):
+                Ppred = Pp[k + 1]
+                try:
+                    Ppred_inv = np.linalg.inv(Ppred)
+                except np.linalg.LinAlgError:
+                    Ppred_inv = np.linalg.pinv(Ppred)
+                G = Pf[k] @ F.T @ Ppred_inv
+                xs[k] = xf[k] + G @ (xs[k + 1] - xp[k + 1])
+            y = xs[:, 0].copy()
+=======
+    y = xs[:, 0].copy()
+
+    # --- Locally adaptive refinement pass: per-sample process noise Q[k]
+    # derived from block-MAD second differences of the first-pass smoothed
+    # output y (already denoised, so its d2 reflects genuine dynamics).
+    # Busy segments (e.g. the 5 Hz component) get larger Q -> less lag;
+    # quiet segments get tighter Q -> harder smoothing. Overlapping blocks
+    # of ~window_size with 50% overlap, linearly interpolated per sample. ---
+    if n >= 2:
+        blk = int(max(5, min(window_size, n)))
+        step = max(1, blk // 2)
+        centers = []
+        sigmas = []
+        start = 0
+        noise_d2_floor = (sigma_r / np.sqrt(blk)) * np.sqrt(6.0)
+        while start < n:
+            stop = min(start + blk, n)
+            seg = y[start:stop]
+            if seg.size > 2:
+                d2 = seg[2:] - 2.0 * seg[1:-1] + seg[:-2]
+                mad2 = np.median(np.abs(d2 - np.median(d2))) / 0.6745
+                var = mad2 * mad2 - noise_d2_floor * noise_d2_floor
+                if var < (0.05 * sigma_r) ** 2:
+                    var = (0.05 * sigma_r) ** 2
+                s = float(np.sqrt(var))
+                s = min(s, 1.5 * sigma_r)
+            else:
+                s = 0.05 * sigma_r
+            centers.append(0.5 * (start + stop - 1))
+            sigmas.append(s)
+            if stop >= n:
+                break
+            start += step
+        centers = np.asarray(centers, dtype=float)
+        sigmas = np.asarray(sigmas, dtype=float)
+        # Linear interpolation to per-sample Q, second pass uses 0.25*Q
+        qa_loc = np.interp(np.arange(n, dtype=float), centers, sigmas)
+        q2k = 0.25 * qa_loc * qa_loc
+
+        x_est = np.array([y[0], 0.0])
+        P = np.eye(2) * max(R, 1e-15)
+        Qbase = np.array([[0.25, 0.5], [0.5, 1.0]])
+        for k in range(n):
+            if k == 0:
+                xp[k] = x_est
+                Pp[k] = P
+            else:
+                xp[k] = F @ x_est
+                Pp[k] = F @ P @ F.T + q2k[k] * Qbase
+            S = Pp[k][0, 0] + R
+            K = Pp[k][:, 0] / S
+            x_est = xp[k] + K * (y[k] - xp[k, 0])
+            P = (I2 - np.outer(K, H)) @ Pp[k]
+            P = 0.5 * (P + P.T)
+            xf[k] = x_est
+            Pf[k] = P
+        xs = xf.copy()
+        for k in range(n - 2, -1, -1):
+            Ppred = Pp[k + 1]
+            try:
+                Ppred_inv = np.linalg.inv(Ppred)
+            except np.linalg.LinAlgError:
+                Ppred_inv = np.linalg.pinv(Ppred)
+            G = Pf[k] @ F.T @ Ppred_inv
+            xs[k] = xf[k] + G @ (xs[k + 1] - xp[k + 1])
+        y = xs[:, 0].copy()
+>>>>>>> REPLACE
+</DIFF>

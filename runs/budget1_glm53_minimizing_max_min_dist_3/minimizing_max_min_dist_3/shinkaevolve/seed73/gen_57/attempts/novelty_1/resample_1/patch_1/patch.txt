@@ -1,0 +1,390 @@
+--- a/original.py
++++ b/original.py
+@@ -1,224 +1,227 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ 
+ try:
+     from scipy.optimize import minimize
+     HAVE_SCIPY = True
+ except Exception:
+     HAVE_SCIPY = False
+ 
+-
+-# ---------------- Geometry layer (module-level invariants) ----------------
+-
+ N, D = 14, 3
+ _IU = np.triu_indices(N, 1)
+ PI_, PJ = _IU
++TARGET = 0.2404  # reference squared-ratio ~ 1/4.165849767
++
++
++def _true_score(points):
++    d2 = np.sum((points[PI_] - points[PJ]) ** 2, axis=1)
++    dx2 = d2.max()
++    if dx2 <= 0:
++        return 0.0
++    return d2.min() / dx2
+ 
+ 
+ def _sanitize(pts, rng=None):
+-    """Return a guaranteed-finite (N, D) point set."""
+     pts = np.asarray(pts, dtype=float)
+     if pts.shape != (N, D) or not np.all(np.isfinite(pts)):
+         if rng is None:
+             rng = np.random.default_rng(0)
+         pts = rng.standard_normal((N, D))
+     return pts
+ 
+ 
+-def _true_score(points):
+-    d2 = np.sum((points[PI_] - points[PJ]) ** 2, axis=1)
+-    dx2 = d2.max()
+-    if dx2 <= 0:
+-        return 0.0
+-    return d2.min() / dx2
+-
+-
+-# ---------------- Optimizer layer ----------------
+-
+-def _neg_obj(flat, beta, sphere):
+-    pts = flat.reshape(N, D).copy()
+-    diff = pts[PI_] - pts[PJ]
+-    dij2 = np.sum(diff * diff, axis=1)
+-
+-    a = -beta * dij2
+-    amax = a.max()
+-    soft_min = -(amax + np.log(np.sum(np.exp(a - amax)))) / beta
+-    b = beta * dij2
+-    bmax = b.max()
+-    soft_max = (bmax + np.log(np.sum(np.exp(b - bmax)))) / beta
+-    obj = -(soft_min - soft_max)
+-
+-    w_min = np.exp(a - amax); w_min /= w_min.sum()
+-    w_max = np.exp(b - bmax); w_max /= w_max.sum()
+-    g_dij2 = -w_min - w_max
+-    grad = np.zeros((N, D))
+-    contrib = 2.0 * g_dij2[:, None] * diff
+-    np.add.at(grad, PI_, contrib)
+-    np.add.at(grad, PJ, -contrib)
+-    if sphere:
+-        norms = np.maximum(np.linalg.norm(pts, axis=1, keepdims=True), 1e-12)
+-        u = pts / norms
+-        grad -= np.sum(grad * u, axis=1, keepdims=True) * u
+-    return obj, grad.ravel()
+-
+-
+-def _soft_opt(P0, betas, sphere, maxiter):
+-    """L-BFGS-B chain with escalating sharpness; fully guarded."""
+-    P = _sanitize(P0).ravel().copy()
++def _unit(v):
++    return v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
++
++
++def _dists(P):
++    return np.linalg.norm(P[PI_] - P[PJ], axis=1)
++
++
++# ---- antipodal parameterization: 7 free vectors, points are v_i and -v_i ----
++
++def _build_from_pairs(v):
++    V = v.reshape(7, 3)
++    return np.vstack([V, -V])
++
++
++def _antipodal_opt(V0, betas=(30.0, 150.0, 600.0), maxiter=300):
++    """Optimize 7 free vectors so that the 14 points (+-v_i) maximize
++    min distance under diameter <= 1. Reduced 21-dim problem."""
+     if not HAVE_SCIPY:
+-        return P.reshape(N, D)
+-    for beta in betas:
+-        try:
+-            res = minimize(_neg_obj, P, args=(beta, sphere), jac=True,
+-                           method="L-BFGS-B",
+-                           options={"maxiter": maxiter, "maxfun": 4 * maxiter})
+-            if np.all(np.isfinite(res.x)) and res.x.size == N * D:
+-                P = res.x
+-        except Exception:
+-            pass
+-    return _sanitize(P.reshape(N, D))
+-
+-
+-def _slsqp_packing(P0, betas=(20.0, 60.0, 200.0, 1000.0), maxiter=400):
+-    """Maximize soft-min distance s.t. diameter <= 1. Pre/post-guarded."""
+-    if not HAVE_SCIPY:
+-        return None
+-    P = _sanitize(P0)
+-    P = P - P.mean(axis=0)
+-    dm = np.linalg.norm(P[PI_] - P[PJ], axis=1).max()
++        return None
++    V = np.asarray(V0, dtype=float).copy()
++    P = _build_from_pairs(V)
++    dm = _dists(P).max()
+     if not np.isfinite(dm) or dm <= 0:
+         return None
+-    P = P / dm
+-
+-    def pdists(flat):
+-        Pm = flat.reshape(N, D)
+-        return np.linalg.norm(Pm[PI_] - Pm[PJ], axis=1)
+-
+-    def obj_soft(flat, beta):
+-        ds = pdists(flat)
++    V = V / dm
++
++    def pdists(v):
++        return _dists(_build_from_pairs(v))
++
++    def obj_soft(v, beta):
++        ds = pdists(v)
+         a = -beta * ds
+         amax = a.max()
+         return (amax + np.log(np.sum(np.exp(a - amax)))) / beta
+ 
++    cur = V.ravel().copy()
+     for beta in betas:
+         try:
+-            res = minimize(obj_soft, P.ravel(), args=(beta,), method='SLSQP',
++            res = minimize(obj_soft, cur, args=(beta,), method='SLSQP',
+                            constraints={'type': 'ineq',
+-                                        'fun': lambda f: 1.0 - pdists(f).max()},
++                                       'fun': lambda f: 1.0 - pdists(f).max()},
+                            options={'maxiter': maxiter, 'ftol': 1e-14})
+         except Exception:
+             break
++        if res.x.size != 21 or not np.all(np.isfinite(res.x)):
++            break
++        cur = res.x
++        dm = pdists(cur).max()
++        if np.isfinite(dm) and dm > 1e-12:
++            cur = cur / dm
++    P = _build_from_pairs(cur)
++    P = _sanitize(P)
++    s = _true_score(P)
++    if s <= 0:
++        return None
++    return P, s
++
++
++# ---- full 42-dim escalating SLSQP (used sparingly) ----
++
++def _slsqp_packing(P0, betas=(60.0, 300.0), maxiter=300):
++    if not HAVE_SCIPY:
++        return None
++    P = _sanitize(P0)
++    P = P - P.mean(axis=0)
++    dm = _dists(P).max()
++    if not np.isfinite(dm) or dm <= 0:
++        return None
++    P = P / dm
++
++    def obj_soft(flat, beta):
++        ds = _dists(flat.reshape(N, D))
++        a = -beta * ds
++        amax = a.max()
++        return (amax + np.log(np.sum(np.exp(a - amax)))) / beta
++
++    cur = P.ravel().copy()
++    for beta in betas:
++        try:
++            res = minimize(obj_soft, cur, args=(beta,), method='SLSQP',
++                           constraints={'type': 'ineq',
++                                       'fun': lambda f: 1.0 - _dists(f.reshape(N, D)).max()},
++                           options={'maxiter': maxiter, 'ftol': 1e-14})
++        except Exception:
++            break
+         if res.x.size != N * D or not np.all(np.isfinite(res.x)):
+             break
+-        P = res.x.reshape(N, D)
+-        dcur = pdists(P.ravel()).max()
+-        if np.isfinite(dcur) and dcur > 1e-12:
+-            P = P / dcur
+-
+-    P = _sanitize(P)
+-    score = _true_score(P)
+-    if score <= 0:
+-        return None
+-    return P, score
+-
+-
+-# ---------------- Initial configurations ----------------
+-
+-def _structured_inits():
+-    inits = []
+-    phi = (1 + np.sqrt(5)) / 2
++        cur = res.x
++        dm = _dists(cur.reshape(N, D)).max()
++        if np.isfinite(dm) and dm > 1e-12:
++            cur = (cur.reshape(N, D) / dm).ravel()
++    P = _sanitize(cur.reshape(N, D))
++    s = _true_score(P)
++    if s <= 0:
++        return None
++    return P, s
++
++
++# ---- extract antipodal pairs from a config, if centrally symmetric ----
++
++def _extract_pairs(P):
++    P = _unit(P - P.mean(axis=0))
++    cost = np.linalg.norm(P[:, None, :] + P[None, :, :], axis=2)
++    np.fill_diagonal(cost, np.inf)
++    partner = np.argmin(cost, axis=1)
++    if not np.all(partner[partner] == np.arange(N)):
++        return None
++    reps, seen = [], set()
++    for i in range(N):
++        if i not in seen:
++            reps.append(P[i] - P[partner[i]])
++            seen.add(i)
++            seen.add(partner[i])
++    if len(reps) != 7:
++        return None
++    return np.array(reps)
++
++
++def _icosahedron():
++    phi = (1.0 + np.sqrt(5.0)) / 2.0
+     ico = np.array([
+         [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+         [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+         [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1],
+     ], dtype=float)
+-    ico /= np.linalg.norm(ico, axis=1, keepdims=True)
+-    inits.append(np.vstack([ico, [[0, 0, 1.3], [0, 0, -1.3]]]))
+-    inits.append(np.vstack([ico, [[0, 0, 1.0], [0, 0, -1.0]]]))
+-    cube = np.array([[i, j, k] for i in (-1, 1) for j in (-1, 1) for k in (-1, 1)], dtype=float)
+-    cube /= np.linalg.norm(cube, axis=1, keepdims=True)
+-    octa = np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0],
+-                     [0, 0, 1], [0, 0, -1]], dtype=float)
+-    inits.append(np.vstack([cube, 1.05 * octa]))
+-    inits.append(np.vstack([1.05 * cube, octa]))
++    return _unit(ico)
++
++
++def _seed_list():
++    """Small, ordered-by-prioritized seed list. ico+poles first."""
++    seeds = []
++    ico = _icosahedron()
++    # swept pole heights for ico+2poles family
++    for h in (1.15, 1.0, 1.3, 0.85, 0.7):
++        seeds.append(np.vstack([ico, [[0, 0, h], [0, 0, -h]]]))
++    # twisted double ring (7+7, inherently antipodal)
+     t = np.linspace(0, 2 * np.pi, 7, endpoint=False)
+     r1 = np.stack([np.cos(t), np.sin(t), 0.5 * np.ones(7)], axis=1)
+     r2 = np.stack([np.cos(t + np.pi / 7), np.sin(t + np.pi / 7), -0.5 * np.ones(7)], axis=1)
+-    inits.append(np.vstack([r1, r2]))
++    seeds.append(np.vstack([r1, r2]))
++    # Fibonacci sphere
+     k = np.arange(N) + 0.5
+     ph = np.arccos(1.0 - 2.0 * k / N)
+     th = np.pi * (1.0 + 5.0 ** 0.5) * k
+-    inits.append(np.stack([np.cos(th) * np.sin(ph),
+-                           np.sin(th) * np.sin(ph),
+-                           np.cos(ph)], axis=1))
+-    return inits
+-
+-
+-# ---------------- Driver: staged beam search ----------------
++    seeds.append(np.stack([np.cos(th) * np.sin(ph),
++                           np.sin(th) * np.sin(ph), np.cos(ph)], axis=1))
++    # cube + octahedron
++    cube = _unit(np.array([[i, j, k] for i in (-1, 1) for j in (-1, 1)
++                           for k in (-1, 1)], dtype=float))
++    octa = np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0],
++                     [0, 0, 1], [0, 0, -1]], dtype=float)
++    seeds.append(np.vstack([cube, 1.05 * octa]))
++    # few random fallbacks
++    for seed in range(4):
++        v = np.random.RandomState(seed).randn(N, D)
++        seeds.append(_unit(v))
++    return seeds
++
+ 
+ def min_max_dist_dim3_14() -> np.ndarray:
+     rng = np.random.default_rng(7)
+-    target = 0.2404
+     best_pts, best = None, -1.0
+ 
+-    # Build candidate starts
+-    starts = [p / np.linalg.norm(p, axis=1, keepdims=True)
+-              for p in _structured_inits()]
+-    for seed in range(12):
+-        v = np.random.RandomState(seed).randn(N, D)
+-        starts.append(v / np.linalg.norm(v, axis=1, keepdims=True))
+-
+-    # Stage 1: cheap ranking (sphere-constrained soft optimization)
+-    ranked = []
+-    for pts0 in starts:
+-        pts = _soft_opt(pts0, (20.0, 60.0), True, 80)
+-        ranked.append((_true_score(pts), pts))
+-    ranked.sort(key=lambda x: -x[0])
+-
+-    # Stage 2: exact constrained polish on the top beam
+-    for s0, pts in ranked[:6]:
+-        out = _slsqp_packing(pts, maxiter=400)
++    for seed in _seed_list():
++        seed = _unit(seed)
++        # fast antipodal reduced optimization (21 params)
++        V = _extract_pairs(seed)
++        if V is not None:
++            out = _antipodal_opt(V)
++            if out is not None and out[1] > best:
++                best, best_pts = out
++        # full-space polish on the seed itself
++        out = _slsqp_packing(seed)
++        if out is not None and out[1] > best:
++            best, best_pts = out
++        # try antipodal re-extraction from polished config
+         if out is not None:
+-            P, s = out
+-        else:
+-            P = _soft_opt(pts, (20.0, 60.0, 150.0, 400.0), True, 300)
+-            s = _true_score(P)
+-        if s > best:
+-            best, best_pts = s, P
+-        if best >= target:
+-            break
+-
+-    # Stage 3: free-space refinement (only if target not yet met)
+-    if best_pts is not None and best < target:
+-        cand = best_pts
+-        for beta in (60.0, 150.0, 400.0):
+-            cand = _soft_opt(cand, (beta,), False, 300)
+-            cand = cand - cand.mean(axis=0)
+-            out = _slsqp_packing(cand, maxiter=500)
+-            if out is not None:
+-                cand, s = out
+-            else:
+-                s = _true_score(cand)
+-            if s > best:
+-                best, best_pts = s, cand
+-
+-    # Stage 4: incumbent re-polish (single, cheap)
+-    if best_pts is not None:
+-        out = _slsqp_packing(best_pts, betas=(200.0, 1000.0), maxiter=500)
+-        if out is not None:
+-            P, s = out
+-            if s > best:
+-                best_pts = P
+-
+-    # Guaranteed-safe return
++            V2 = _extract_pairs(out[0])
++            if V2 is not None:
++                out2 = _antipodal_opt(V2, betas=(300.0,), maxiter=200)
++                if out2 is not None and out2[1] > best:
++                    best, best_pts = out2
++        if best >= TARGET:
++            break
++
+     if best_pts is None:
+         best_pts = rng.standard_normal((N, D))
+     best_pts = _sanitize(best_pts, rng)
+     best_pts = best_pts - best_pts.mean(axis=0)
+     scale = np.max(np.abs(best_pts))
+     if scale > 0:
+         best_pts = best_pts / scale
+     return np.asarray(best_pts, dtype=float)
+-
+-
+ # EVOLVE-BLOCK-END

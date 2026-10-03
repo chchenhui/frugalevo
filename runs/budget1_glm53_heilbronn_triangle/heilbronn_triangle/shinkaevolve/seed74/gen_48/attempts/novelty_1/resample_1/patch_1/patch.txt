@@ -1,0 +1,151 @@
+--- a/original.py
++++ b/original.py
+@@ -1,98 +1,147 @@
+ # EVOLVE-BLOCK-START
+ import numpy as np
+ from itertools import combinations
+ 
+ _SQRT3 = np.sqrt(3.0)
+ _TRIPLETS = np.array(list(combinations(range(11), 3)), dtype=int)
+ 
+ 
+ def _to_xy(b):
+     """Barycentric (u toward B(1,0), v toward C(0.5,sqrt3/2)) -> xy."""
+     return np.column_stack([b[:, 0] + 0.5 * b[:, 1], 0.5 * _SQRT3 * b[:, 1]])
+ 
+ 
+ def _clamp_simplex(b):
+     """Project rows of b onto simplex u>=0, v>=0, u+v<=1."""
+     b = np.clip(b, 0.0, 1.0)
+     s = b.sum(axis=1)
+     over = s > 1.0
+     if np.any(over):
+         b[over] *= (1.0 / s[over])[:, None]
+     return b
+ 
+ 
+ def _min_doubled_area(b):
+     xy = _to_xy(b)
+     p = xy[_TRIPLETS[:, 0]]
+     q = xy[_TRIPLETS[:, 1]]
+     r = xy[_TRIPLETS[:, 2]]
+     cross = np.abs((q[:, 0] - p[:, 0]) * (r[:, 1] - p[:, 1])
+                    - (q[:, 1] - p[:, 1]) * (r[:, 0] - p[:, 0]))
+     return cross.min()
+ 
+ 
+ def _local_search(b, rng, iters=2500):
+     """Greedy local search with randomized jitter moves at decreasing scales."""
+     cur = _clamp_simplex(b.copy())
+     cur_val = _min_doubled_area(cur)
+     scales = [0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002, 0.0001]
+     for sc in scales:
+         stuck = 0
+         for _ in range(iters // len(scales) + 200):
+             cand = cur.copy()
+             # random subset of 1-2 points perturbed with random per-coordinate jitter
+             k = int(rng.integers(0, 11))
+             cand[k] += rng.normal(0.0, sc, 2)
+             if rng.random() < 0.2:
+                 k2 = int(rng.integers(0, 11))
+                 cand[k2] += rng.normal(0.0, sc, 2)
+             cand = _clamp_simplex(cand)
+             val = _min_doubled_area(cand)
+             if val > cur_val + 1e-15:
+                 cur, cur_val = cand, val
+                 stuck = 0
+             else:
+                 stuck += 1
+                 if stuck > 400:
+                     break
+     return cur, cur_val
+ 
+ 
++def _area_gradients(b):
++    """Doubled areas for all triplets and gradient d(cross)/d(b) for each point."""
++    xy = _to_xy(b)
++    T = _TRIPLETS
++    p = xy[T[:, 0]]; q = xy[T[:, 1]]; r = xy[T[:, 2]]
++    dqx = q[:, 0] - p[:, 0]; dqy = q[:, 1] - p[:, 1]
++    drx = r[:, 0] - p[:, 0]; dry = r[:, 1] - p[:, 1]
++    cross = np.abs(dqx * dry - dqy * drx)
++    return xy, cross, (dqx, dqy, drx, dry)
++
++
++def _smooth_opt(b0, iters=300, tau0=0.02, seed=0):
++    """Adam on softmin log-sum-exp of doubled triangle areas."""
++    b = _clamp_simplex(b0.copy())
++    m = np.zeros_like(b); v = np.zeros_like(b)
++    lr = 0.004
++    for it in range(iters):
++        tau = max(0.002, tau0 * np.exp(-it / 250.0))
++        xy, cross, (dqx, dqy, drx, dry) = _area_gradients(b)
++        # softmin weights: exp(-cross/tau), normalized
++        w = np.exp(-(cross - cross.min()) / tau)
++        w /= w.sum()
++        # gradient of cross (signed) w.r.t. each of p,q,r (in xy), then chain to barycentric
++        # d(dqx*dry - dqy*drx)/dp = (dry - drx*?) -> dp = ( -dry, drx )
++        sign = np.where(dqx * dry - dqy * drx >= 0, 1.0, -1.0) * w
++        gxy = np.zeros_like(b)  # reuse shape (11,2) as xy gradient container
++        gxy_p = np.column_stack([-dry, drx]) * sign[:, None]
++        gxy_q = np.column_stack([dry, -dqy * 0.0 - dqx * 0.0 + dry * 0.0])  # placeholder
++        # correct q gradient: d/dq = (dry, -drx)
++        gxy_q = np.column_stack([dry, -drx]) * sign[:, None]
++        gxy_r = np.column_stack([-dqy, dqx]) * sign[:, None]
++        grad = np.zeros((11, 2))
++        np.add.at(grad, _TRIPLETS[:, 0], gxy_p)
++        np.add.at(grad, _TRIPLETS[:, 1], gxy_q)
++        np.add.at(grad, _TRIPLETS[:, 2], gxy_r)
++        # chain rule xy -> barycentric: x = u + 0.5v, y = (sqrt3/2) v
++        gb = np.column_stack([grad[:, 0], 0.5 * grad[:, 0] + 0.5 * _SQRT3 * grad[:, 1]])
++        # Adam update (ascent)
++        t = it + 1
++        m = 0.9 * m + 0.1 * gb
++        v = 0.999 * v + 0.001 * gb * gb
++        mh = m / (1 - 0.9 ** t); vh = v / (1 - 0.999 ** t)
++        b = b + lr * mh / (np.sqrt(vh) + 1e-8)
++        b = _clamp_simplex(b)
++    return b
++
++
+ def _seed_config(seed):
+     rng = np.random.default_rng(seed)
+     b = rng.random((11, 2)) * 0.9
+     # pin the three container vertices for large-scale spread
+     b[0] = [0.0, 0.0]
+     b[1] = [1.0, 0.0]
+     b[2] = [0.0, 1.0]
+     return _clamp_simplex(b)
+ 
+ 
+ def heilbronn_triangle11() -> np.ndarray:
+     """
+     Construct an arrangement of 11 points on or inside the equilateral triangle
+     (0,0),(1,0),(0.5,sqrt(3)/2) maximizing the smallest triangle area.
+     """
+     try:
+         best_b, best_val = None, -1.0
+         for seed in (1, 7, 42, 123, 2024):
+             rng = np.random.default_rng(seed)
+             b0 = _seed_config(seed)
+-            b, val = _local_search(b0, rng)
++            # smooth gradient stage to escape greedy local optima
++            b0 = _smooth_opt(b0, iters=250, tau0=0.03)
++            b, val = _local_search(b0, rng, iters=1500)
+             if val > best_val:
+                 best_b, best_val = b, val
+         if best_b is None or not np.isfinite(best_val):
+             raise RuntimeError("search failed")
+         return _to_xy(_clamp_simplex(best_b))
+     except Exception:
+         # Fallback: deterministic feasible configuration
+         b = np.array([
+             [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
+             [0.5, 0.0], [0.25, 0.25], [0.5, 0.5],
+             [0.0, 0.5], [0.25, 0.0], [0.75, 0.25],
+             [0.0, 0.25], [0.5, 0.25],
+         ])
+         return _to_xy(b)
+ 
+ 
+ # EVOLVE-BLOCK-END

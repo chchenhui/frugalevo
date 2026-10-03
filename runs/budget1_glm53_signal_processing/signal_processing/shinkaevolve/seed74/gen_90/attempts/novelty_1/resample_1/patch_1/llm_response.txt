@@ -1,0 +1,72 @@
+<NAME>
+guarded_reversal_stack_on_polish
+</NAME>
+<DESCRIPTION>
+The current champion (0.72) has the dynamics-aware blend and sigma_acc cap already relaxed toward Gen 72's operating point, yet false_reversals remain at 14.2 while correlation stalls at 0.89 — the frontier is blocked by residual ripple surviving the Whittaker polish. Gen 81 demonstrated that a clamp+damp+escalation stack holds reversals near 14 even at high-tracking operating points, but its collapse (corr 0.53) came from guarding each stage against the *previous stage's output*, compounding distortion. The fix: insert a guarded sub-noise reversal-damping + escalation stack *after* the Whittaker polish, where every acceptance guard compares against the pre-stack (polished) baseline AND an absolute correlation guard against the original sanitized input `x` (aligned slice), so distortion can never accumulate across stages. Threshold is calibrated from sigma_r of the ORIGINAL input (not the intermediate y), since the intermediate's first-difference MAD underestimates the true noise floor after double smoothing. This should let us push tracking (lower lam cap, more responsive blend) while the stack pins reversals, moving along the unexplored frontier between (0.67, 30.6) and (0.72, 14.2). I also slightly relax the Whittaker lambda cap (200→120) to trade a bit of ripple suppression for tracking, letting the new damp stack pick up the reversal burden.
+</DIFF>
+<<<<<<< SEARCH
+    lam = float(np.clip(25.0 * (r_std / max(sigma_r, 1e-12)) ** 2, 1.0, 200.0))
+    y = _whittaker_polish(y, lam)
+=======
+    lam = float(np.clip(25.0 * (r_std / max(sigma_r, 1e-12)) ** 2, 1.0, 120.0))
+    y = _whittaker_polish(y, lam)
+
+    # --- Guarded sub-noise reversal damping + escalation stack ---
+    # Threshold calibrated against sigma_r of the ORIGINAL sanitized input
+    # x (the intermediate y's first-difference MAD underestimates the true
+    # noise floor after double smoothing). Every acceptance is guarded by
+    # correlation against BOTH the pre-stack polished baseline AND the
+    # original input slice, so distortion cannot accumulate across stages
+    # (the failure mode that collapsed Gen 81).
+    if n >= 3:
+        def _count_flips(v):
+            dv = np.diff(v)
+            dv = dv[dv != 0]
+            return int(np.sum(dv[1:] * dv[:-1] < 0)) if dv.size > 1 else 0
+
+        def _rev_damp(v, thresh):
+            m = len(v)
+            out = v.copy()
+            prev_d = v[1] - v[0]
+            for k in range(2, m):
+                d = out[k] - out[k - 1]
+                if prev_d * d < 0 and abs(d) < thresh:
+                    out[k] = out[k - 1]
+                prev_d = d
+            prev_d = v[-2] - v[-1]
+            for k in range(m - 3, -1, -1):
+                d = out[k] - out[k + 1]
+                if prev_d * d < 0 and abs(d) < thresh:
+                    out[k] = out[k + 1]
+                prev_d = d
+            return out
+
+        y_base = y.copy()
+        x_ref = x[window_size - 1:] if x.size >= window_size else x
+        if x_ref.size > y_base.size:
+            x_ref = x_ref[: y_base.size]
+        thresh = 0.75 * sigma_r
+        best_y = y_base
+        best_flips = _count_flips(y_base)
+        cur = y_base
+        for _iter in range(4):
+            if best_flips <= 12:
+                break
+            cand = _rev_damp(cur, thresh)
+            c_base = np.corrcoef(cand, y_base)[0, 1]
+            c_in = (
+                np.corrcoef(cand, x_ref)[0, 1]
+                if x_ref.size == cand.size and np.std(x_ref) > 0
+                else 1.0
+            )
+            if not np.isfinite(c_base) or c_base < 0.985 or not np.isfinite(c_in) or c_in < 0.80:
+                break
+            f = _count_flips(cand)
+            if f < best_flips:
+                best_flips = f
+                best_y = cand
+            cur = cand
+            thresh *= 1.4
+        y = best_y
+>>>>>>> REPLACE
+</DIFF>

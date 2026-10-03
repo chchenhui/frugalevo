@@ -1,0 +1,211 @@
+<NAME>
+constrained_basin_hopping_14pts
+</NAME>
+<DESCRIPTION>
+The three context programs reveal a clear pattern: soft (temperature-annealed) smoothing of the dmin/dmax ratio reliably reaches the ~0.48 basin from icosahedron+poles style starts, and the decisive final step is an *exact* constrained solve. My design unifies these insights into a staged pipeline with a fundamentally stronger backbone:
+
+1. **Diversified structured starts** (addressing the "escape the single basin" recommendation): icosahedron with poles swept over radii 0.6–3.0 on two different axes, a 14-point Fibonacci spiral, cube+octahedron (8+6=14), cuboctahedron+poles, jittered variants, and random Gaussian/spherical starts.
+2. **Cheap soft-ratio annealing** (log-sum-exp smoothed ratio, analytic gradient, L-BFGS) on *all* starts, with candidates ranked by their true ratio.
+3. **Exact SLSQP on the epigraph form**: maximize t subject to t² ≤ ‖pi−pj‖² ≤ 1 for all 91 pairs, with exact analytic constraint Jacobians. This directly optimizes the true objective (not a surrogate) and is applied to the top annealed candidates.
+4. **Targeted basin hopping**: jitter the incumbent at geometrically decaying scales and re-solve the exact constrained program, guarded by true-ratio selection.
+5. **Nonsmooth exact polish**: L-BFGS on −(dmin/dmax)² using the correct analytic gradient of the active min/max pairs (I also identified and fixed a gradient-sign bug in the third context program's polish).
+A wall-clock budget with stage caps keeps the whole run within the evaluation timeout, and the output is centered/normalized to unit diameter.
+</DESCRIPTION>
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import time
+import numpy as np
+
+try:
+    from scipy.optimize import minimize
+    HAVE_SCIPY = True
+except Exception:
+    HAVE_SCIPY = False
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Constructs 14 points in 3D maximizing min pairwise distance / max pairwise
+    distance. Returns np.ndarray of shape (14, 3).
+    """
+    n, d = 14, 3
+    rng = np.random.default_rng(20240)
+    I, J = np.triu_indices(n, 1)
+    m = len(I)
+    NV = 3 * n
+    T0 = time.time()
+    BUDGET = 5.5
+
+    def pdist(P):
+        return np.linalg.norm(P[I] - P[J], axis=1)
+
+    def ratio(P):
+        dd = pdist(P)
+        mx = dd.max()
+        return 0.0 if mx <= 1e-12 else dd.min() / mx
+
+    def normalize(P):
+        P = np.asarray(P, dtype=float).copy()
+        P -= P.mean(axis=0)
+        mx = pdist(P).max()
+        return P / mx if mx > 1e-12 else P
+
+    # ---------- smoothed-ratio annealing (log-sum-exp softmin/softmax) ----------
+    def soft_fg(x, T):
+        P = x.reshape(n, 3)
+        diff = P[I] - P[J]
+        dd = np.sqrt(np.sum(diff * diff, axis=1) + 1e-16)
+        a = -dd / T
+        am = a.max()
+        softmin = -T * (am + np.log(np.sum(np.exp(a - am))))
+        b = dd / T
+        bm = b.max()
+        softmax = T * (bm + np.log(np.sum(np.exp(b - bm))))
+        w = np.exp(-dd / T)
+        w /= w.sum()
+        v = np.exp(dd / T)
+        v /= v.sum()
+        gdd = (w * softmax - softmin * v) / (softmax * softmax)
+        u = diff / dd[:, None]
+        G = np.zeros((n, 3))
+        np.add.at(G, I, gdd[:, None] * u)
+        np.add.at(G, J, -gdd[:, None] * u)
+        return -softmin / softmax, -G.ravel()
+
+    def anneal(P0, temps=(0.15, 0.06, 0.02)):
+        x = normalize(P0).ravel()
+        if not HAVE_SCIPY:
+            return normalize(x.reshape(n, 3))
+        for T in temps:
+            try:
+                res = minimize(lambda z: soft_fg(z, T), x, jac=True,
+                               method="L-BFGS-B",
+                               options={"maxiter": 100, "ftol": 1e-12})
+                if np.all(np.isfinite(res.x)):
+                    x = res.x
+            except Exception:
+                pass
+        return normalize(x.reshape(n, 3))
+
+    # ---------- exact constrained solve: max t s.t. t^2 <= d^2 <= 1 ----------
+    def slsqp(P0, maxiter=300):
+        P = normalize(P0)
+        if pdist(P).max() <= 1e-12:
+            return P
+        if not HAVE_SCIPY:
+            return P
+        x0 = np.concatenate([P.ravel(), [pdist(P).min()]])
+
+        def fobj(x):
+            return -x[-1]
+
+        def fjac(x):
+            g = np.zeros(NV + 1)
+            g[-1] = -1.0
+            return g
+
+        def cons(x):
+            P2 = x[:NV].reshape(n, d)
+            dv = np.sum((P2[I] - P2[J]) ** 2, axis=1)
+            return np.concatenate([1.0 - dv, dv - x[-1] ** 2])
+
+        def cjac(x):
+            P2 = x[:NV].reshape(n, d)
+            diff = P2[I] - P2[J]
+            Jc = np.zeros((2 * m, NV + 1))
+            ci = 3 * I[:, None] + np.arange(3)
+            cj = 3 * J[:, None] + np.arange(3)
+            Jc[:m, ci] = -2 * diff
+            Jc[:m, cj] = 2 * diff
+            Jc[m:, ci] = 2 * diff
+            Jc[m:, cj] = -2 * diff
+            Jc[m:, -1] = -2 * x[-1]
+            return Jc
+
+        try:
+            res = minimize(fobj, x0, jac=fjac, method="SLSQP",
+                           constraints=[{"type": "ineq", "fun": cons, "jac": cjac}],
+                           options={"maxiter": maxiter, "ftol": 1e-12})
+            P2 = res.x[:NV].reshape(n, d)
+            if np.all(np.isfinite(P2)):
+                P = P2
+        except Exception:
+            pass
+        return normalize(P)
+
+    # ---------- exact nonsmooth ratio polish (correct gradient signs) ----------
+    def exact_fg(x):
+        P = x.reshape(n, 3)
+        diff = P[I] - P[J]
+        dd = np.sqrt(np.sum(diff * diff, axis=1) + 1e-16)
+        im = int(dd.argmin())
+        iM = int(dd.argmax())
+        dmin = dd[im]
+        dmax = max(dd[iM], 1e-12)
+        r = dmin / dmax
+        G = np.zeros((n, 3))
+
+        def add(k, c):
+            a, b = I[k], J[k]
+            u = (P[a] - P[b]) / dd[k]
+            G[a] += c * u
+            G[b] -= c * u
+
+        add(im, 2.0 * r / dmax)
+        add(iM, -2.0 * r * dmin / (dmax * dmax))
+        return -r * r, -G.ravel()
+
+    def exact_polish(P0):
+        P = normalize(P0)
+        if not HAVE_SCIPY:
+            return P
+        try:
+            res = minimize(exact_fg, P.ravel(), jac=True, method="L-BFGS-B",
+                           options={"maxiter": 300, "ftol": 1e-16, "gtol": 1e-12})
+            P2 = res.x.reshape(n, 3)
+            if np.all(np.isfinite(P2)) and ratio(P2) > ratio(P):
+                P = P2
+        except Exception:
+            pass
+        return normalize(P)
+
+    # ---------- diversified structured starts ----------
+    phi = (1 + np.sqrt(5)) / 2
+    ico = np.array(
+        [[s1, s2 * phi, 0] for s1 in (-1, 1) for s2 in (-1, 1)]
+        + [[0, s1, s2 * phi] for s1 in (-1, 1) for s2 in (-1, 1)]
+        + [[s2 * phi, 0, s1] for s1 in (-1, 1) for s2 in (-1, 1)],
+        dtype=float)
+    ico /= np.linalg.norm(ico, axis=1, keepdims=True)
+
+    kk = np.arange(n) + 0.5
+    ga = np.pi * (3 - np.sqrt(5))
+    fib = np.empty((n, 3))
+    fib[:, 2] = 1 - 2 * kk / n
+    rr = np.sqrt(np.maximum(0.0, 1 - fib[:, 2] ** 2))
+    fib[:, 0] = rr * np.cos(ga * kk)
+    fib[:, 1] = rr * np.sin(ga * kk)
+
+    cube = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)],
+                    dtype=float)
+    octa = np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0],
+                     [0, 0, 1], [0, 0, -1]], dtype=float)
+    cuboct = []
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            cuboct += [[sx, sy, 0], [sx, 0, sy], [0, sx, sy]]
+    cuboct = np.array(cuboct, dtype=float)
+
+    starts = []
+    # icosahedron + poles, pole radius sweep, two different axes
+    for h in (0.6, 0.9, 1.2, 1.6, 2.2, 3.0):
+        starts.append(np.vstack([ico, [[0, 0, h], [0, 0, -h]]]))
+    for h in (1.0, 1.8):
+        starts.append(np.vstack([ico, [[h, 0, 0], [-h, 0, 0]]]))
+    # other structured families
+    starts.append(fib)
+    starts.append(np.vstack([cube, 1.2 * octa]))
+    starts.append(np.vstack([cuboct, [[0, 0, 1.4], [0, 0, -1.4]]]))
+    # jittered variants
+    starts.append(np.vstack([ico, [[0, 0, 1.2], [0, 0, -1

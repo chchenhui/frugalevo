@@ -1,0 +1,132 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Creates 14 points in 3 dimensions in order to maximize the ratio of minimum to maximum distance.
+
+    Returns
+        points: np.ndarray of shape (14,3) containing the (x,y) coordinates of the 14 points.
+
+    """
+
+    # Use seven lines through the origin, returning both unit vectors on
+    # every line.  Antipodality makes the diameter exactly 2, so maximizing
+    # the distance ratio is equivalent to minimizing the largest absolute
+    # dot product among the seven directions.
+    rng = np.random.default_rng(271828)
+    n_lines = 7
+    n_starts = 96
+
+    directions = rng.normal(size=(n_starts, n_lines, 3))
+    directions /= np.linalg.norm(directions, axis=2, keepdims=True)
+
+    def descend(v, beta, steps, rate):
+        """Riemannian descent for log-sum-exp(max |vi dot vj|^2)."""
+        momentum = np.zeros_like(v)
+        for _ in range(steps):
+            dots = np.einsum("aid,ajd->aij", v, v)
+            values = beta * dots * dots
+            values -= np.max(values, axis=(1, 2), keepdims=True)
+
+            # Diagonal terms are constant on the sphere and must not
+            # contribute to the soft maximum or its gradient.
+            weights = np.exp(values)
+            diagonal = np.arange(n_lines)
+            weights[:, diagonal, diagonal] = 0.0
+            weights /= np.sum(weights, axis=(1, 2), keepdims=True)
+
+            grad = 2.0 * np.einsum("aij,aij,ajd->aid", weights, dots, v)
+            # Tangential projection keeps each direction on its sphere.
+            grad -= np.sum(grad * v, axis=2, keepdims=True) * v
+            momentum = 0.82 * momentum + grad
+            v -= rate * momentum
+            v /= np.linalg.norm(v, axis=2, keepdims=True)
+        return v
+
+    # Broad search first: low beta establishes balanced configurations,
+    # while later stages increasingly approximate the true maximum.
+    for beta, steps, rate in ((8.0, 400, 0.075),
+                              (25.0, 400, 0.055),
+                              (75.0, 450, 0.035),
+                              (180.0, 450, 0.020)):
+        directions = descend(directions, beta, steps, rate)
+
+    dots = np.abs(np.einsum("aid,ajd->aij", directions, directions))
+    dots[:, np.arange(n_lines), np.arange(n_lines)] = 0.0
+    best_indices = np.argsort(np.max(dots, axis=(1, 2)))[:10]
+    directions = directions[best_indices]
+
+    # Spend the expensive sharp minimax refinement only on the candidates
+    # that already have the best exact contact distance.
+    for beta, steps, rate in ((350.0, 1000, 0.012),
+                              (700.0, 1200, 0.007),
+                              (1400.0, 1400, 0.0035)):
+        directions = descend(directions, beta, steps, rate)
+
+    # The hard objective for antipodal points is monotone in the coherence
+    # max_{i != j} |vi dot vj|.  Do a final batched search with acceptance
+    # based on that exact quantity, rather than selecting solely by the
+    # finite-beta surrogate used above.
+    polish_rng = np.random.default_rng(314159)
+    n_candidates = directions.shape[0]
+    batch = 20
+    diagonal = np.arange(n_lines)
+
+    def coherence(v):
+        c = np.abs(np.einsum("aid,ajd->aij", v, v))
+        c[:, diagonal, diagonal] = 0.0
+        return np.max(c, axis=(1, 2))
+
+    current = directions.copy()
+    current_value = coherence(current)
+
+    for iteration in range(1050):
+        dots = np.einsum("aid,ajd->aij", current, current)
+        absolute = np.abs(dots)
+        absolute[:, diagonal, diagonal] = 0.0
+
+        # A sharp, stable contact weighting supplies a useful descent
+        # direction while hard acceptance below remains the true criterion.
+        beta = 180.0 + 850.0 * iteration / 1049.0
+        shifted = beta * (absolute - np.max(absolute, axis=(1, 2), keepdims=True))
+        weights = np.exp(shifted)
+        weights[:, diagonal, diagonal] = 0.0
+        weights /= np.sum(weights, axis=(1, 2), keepdims=True)
+        force = np.einsum("aij,aij,ajd->aid", weights, np.sign(dots), current)
+        force -= np.sum(force * current, axis=2, keepdims=True) * current
+
+        fraction = 1.0 - iteration / 1050.0
+        step = 0.015 * fraction + 0.0015
+        noise_size = 0.018 * fraction + 0.0007
+        noise = polish_rng.normal(size=(n_candidates, batch, n_lines, 3))
+        noise -= np.sum(noise * current[:, None], axis=3, keepdims=True) * current[:, None]
+        noise *= noise_size
+        noise[:, 0] = 0.0
+
+        # Localized perturbations are especially useful when replacing one
+        # member of a nearly active contact set.
+        for b in range(batch // 2, batch):
+            moved = polish_rng.integers(n_lines, size=n_candidates)
+            keep = np.zeros((n_candidates, n_lines, 1))
+            keep[np.arange(n_candidates), moved, 0] = 1.0
+            noise[:, b] *= keep
+
+        proposal = current[:, None] - step * force[:, None] + noise
+        proposal /= np.linalg.norm(proposal, axis=3, keepdims=True)
+        proposal_dots = np.abs(np.einsum("abid,abjd->abij", proposal, proposal))
+        proposal_dots[:, :, diagonal, diagonal] = 0.0
+        proposal_value = np.max(proposal_dots, axis=(2, 3))
+        choice = np.argmin(proposal_value, axis=1)
+        chosen_value = proposal_value[np.arange(n_candidates), choice]
+        improved = chosen_value < current_value
+        current[improved] = proposal[np.arange(n_candidates)[improved], choice[improved]]
+        current_value[improved] = chosen_value[improved]
+
+    best = current[np.argmin(current_value)]
+    points = np.vstack((best, -best))
+    return points
+
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,156 @@
+<NAME>
+multistart_broadcast_tree
+</NAME>
+
+<DESCRIPTION>
+Replace the single locally-greedy broadcast-tree construction with a multi-start directed-Steiner heuristic. The current greedy expansion always commits to the cheapest first destination extension, which can prevent selection of a slightly more expensive initial trunk that later serves many clouds at low incremental cost.
+
+The revised logic evaluates the existing greedy solution plus one seeded solution for every reachable destination. Each seeded solution installs that destination’s least-cost source path first, then continues using zero-cost reuse of installed broadcast edges. The lowest total unique-edge-cost tree is selected. This retains valid source-rooted paths and shared-edge semantics while reducing sensitivity to destination ordering and improving opportunities for overlapping inter-cloud transfers.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    pending = {dst for dst in reachable if dst != src and dst in direct_distances}
+    installed_edges = set()
+    tree_nodes = {src}
+
+    while pending:
+        tree_graph = nx.DiGraph()
+        tree_graph.add_node(src)
+        for u, v in installed_edges:
+            tree_graph.add_edge(u, v, **h[u][v])
+
+        try:
+            tree_distances = nx.single_source_dijkstra_path_length(
+                tree_graph, src, weight=lambda u, v, data: _edge_cost(data)
+            )
+        except (nx.NodeNotFound, nx.NetworkXNoPath):
+            tree_distances = {src: 0.0}
+
+        def incremental_weight(u, v, data):
+            if (u, v) in installed_edges:
+                return 0.0
+            return _edge_cost(data)
+
+        try:
+            incremental_distances, incremental_paths = nx.multi_source_dijkstra(
+                h,
+                list(tree_nodes),
+                weight=incremental_weight,
+            )
+        except (nx.NodeNotFound, nx.NetworkXNoPath):
+            incremental_distances, incremental_paths = {}, {}
+
+        best = None
+        for dst in sorted(pending, key=str):
+            candidate = incremental_paths.get(dst)
+            incremental_cost = incremental_distances.get(dst, math.inf)
+            if not candidate or not math.isfinite(incremental_cost):
+                continue
+
+            # Broadcast cost is paid once per newly installed edge.  A path may
+            # be longer than its direct unicast alternative but still be the
+            # cheapest extension because its prefix is already in the tree.
+            # Direct source paths remain available through the source node, so
+            # no end-to-end detour restriction is needed for reachability.
+            score = (incremental_cost, len(candidate), str(dst))
+            if best is None or score < best[0]:
+                best = (score, dst, candidate)
+
+        if best is None:
+            # If every shared candidate violates the detour guard, attach the
+            # cheapest remaining destination directly from the source.
+            fallback = min(
+                pending,
+                key=lambda dst: (direct_distances.get(dst, math.inf), str(dst)),
+            )
+            try:
+                candidate = nx.dijkstra_path(
+                    h, src, fallback, weight=lambda u, v, data: _edge_cost(data)
+                )
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                pending.remove(fallback)
+                continue
+            dst = fallback
+        else:
+            _, dst, candidate = best
+
+        for u, v in zip(candidate, candidate[1:]):
+            installed_edges.add((u, v))
+            tree_nodes.add(u)
+            tree_nodes.add(v)
+        pending.remove(dst)
+=======
+    pending_destinations = {
+        dst for dst in reachable if dst != src and dst in direct_distances
+    }
+
+    def build_shared_tree(seed=None):
+        """Build one greedy tree, optionally forcing a useful initial trunk."""
+        pending = set(pending_destinations)
+        edges = set()
+        tree_nodes = {src}
+
+        if seed is not None and seed in pending:
+            try:
+                seed_path = nx.dijkstra_path(
+                    h, src, seed, weight=lambda u, v, data: _edge_cost(data)
+                )
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                seed_path = None
+            if seed_path:
+                for u, v in zip(seed_path, seed_path[1:]):
+                    edges.add((u, v))
+                    tree_nodes.add(u)
+                    tree_nodes.add(v)
+                pending.remove(seed)
+
+        while pending:
+            def incremental_weight(u, v, data):
+                return 0.0 if (u, v) in edges else _edge_cost(data)
+
+            try:
+                distances, paths = nx.multi_source_dijkstra(
+                    h, list(tree_nodes), weight=incremental_weight
+                )
+            except (nx.NodeNotFound, nx.NetworkXNoPath):
+                distances, paths = {}, {}
+
+            best = None
+            for dst in sorted(pending, key=str):
+                candidate = paths.get(dst)
+                incremental_cost = distances.get(dst, math.inf)
+                if candidate and math.isfinite(incremental_cost):
+                    score = (incremental_cost, len(candidate), str(dst))
+                    if best is None or score < best[0]:
+                        best = (score, dst, candidate)
+
+            if best is None:
+                break
+
+            _, dst, candidate = best
+            for u, v in zip(candidate, candidate[1:]):
+                edges.add((u, v))
+                tree_nodes.add(u)
+                tree_nodes.add(v)
+            pending.remove(dst)
+
+        return edges
+
+    # A cheap first attachment is not always the best shared trunk.  Try each
+    # destination as the initial trunk and retain the lowest unique-link-cost
+    # tree; subsequent extensions still exploit all already-delivered data.
+    best_edges = None
+    best_cost = math.inf
+    for seed in [None] + sorted(pending_destinations, key=str):
+        candidate_edges = build_shared_tree(seed)
+        candidate_cost = sum(_edge_cost(h[u][v]) for u, v in candidate_edges)
+        score = (candidate_cost, len(candidate_edges), "" if seed is None else str(seed))
+        if best_edges is None or score < best_score:
+            best_edges = candidate_edges
+            best_cost = candidate_cost
+            best_score = score
+
+    installed_edges = best_edges if best_edges is not None else set()
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,49 @@
+<NAME>
+add_true_rts_smoother_variant</NAME>
+<DESCRIPTION>
+The recommendation is to replace the current independent backward-pass "blend" smoothing with a true Rauch-Tung-Striebel (RTS) smoother. An independent backward Kalman filter double-counts measurement information and can produce inconsistent estimates; the RTS recursion is the exact minimum-variance fixed-interval smoother given the forward pass. The edit stores the forward filtered states (x_f), filtered covariances (P_f), predicted covariances (P_pred), and the transition matrix F for each step inside the window, then runs the proper backward recursion: G_k = P_f[k] F^T P_pred[k+1]^{-1}, x_s[k] = x_f[k] + G_k (x_s[k+1] - x_f_pred[k+1]). The smoothed result is sliced to the last (n - window_size + 1) valid samples to match the existing output-length contract, with an explicit length assertion to prevent the total-failure class of bugs seen in earlier generations. Cost remains O(n) per window, latency and phase behavior are unchanged, but noise-induced slope reversals should drop because the smoothed estimate is the exact minimum-variance solution rather than a heuristic blend.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Backward pass: independent filter run in reverse
+    x_b = np.zeros((window_size, dim))
+    P_b = np.tile(P0, (window_size, 1, 1))
+    x_b[0] = x0
+    for k in range(1, window_size):
+        # predict
+        x_pred = F @ x_b[k - 1]
+        P_pred_b = F @ P_b[k - 1] @ F.T + Q
+        # update
+        S = H @ P_pred_b @ H.T + R
+        K = P_pred_b @ H.T @ np.linalg.inv(S)
+        x_b[k] = x_pred + K @ (y[window_size - 1 - k] - H @ x_pred)
+        P_b[k] = (np.eye(dim) - K @ H) @ P_pred_b @ (np.eye(dim) - K @ H).T + K @ R @ K.T
+
+    # Blend forward and backward estimates
+    P_f_inv = np.linalg.inv(P_f)
+    P_b_inv = np.linalg.inv(P_b[::-1])
+    P_blend_inv = P_f_inv + P_b_inv
+    x_smooth = np.zeros((window_size, dim))
+    for k in range(window_size):
+        P_blend = np.linalg.inv(P_blend_inv[k])
+        x_smooth[k] = P_blend @ (P_f_inv[k] @ x_f[k] + P_b_inv[k] @ x_b[::-1][k])
+=======
+    # Backward pass: true Rauch-Tung-Striebel (RTS) smoother recursion.
+    # Uses stored forward filtered states/covariances and predicted
+    # covariances; this is the exact minimum-variance fixed-interval
+    # estimate, avoiding the information double-counting of an
+    # independent backward filter blend.
+    x_smooth = np.zeros((window_size, dim))
+    P_smooth = np.zeros((window_size, dim, dim))
+    x_smooth[-1] = x_f[-1]
+    P_smooth[-1] = P_f[-1]
+    for k in range(window_size - 2, -1, -1):
+        # Predicted (prior) state and covariance at k+1 from forward pass
+        x_pred_next = F @ x_f[k]
+        P_pred_next = P_pred[k + 1]
+        # Smoother gain: G = P_f F^T P_pred^{-1}
+        G = P_f[k] @ F.T @ np.linalg.inv(P_pred_next)
+        x_smooth[k] = x_f[k] + G @ (x_smooth[k + 1] - x_pred_next)
+        P_smooth[k] = P_f[k] + G @ (P_smooth[k + 1] - P_pred_next) @ G.T
+>>>>>>> REPLACE
+</DIFF>

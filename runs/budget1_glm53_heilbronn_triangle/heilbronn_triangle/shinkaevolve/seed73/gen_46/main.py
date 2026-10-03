@@ -1,0 +1,239 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+import itertools
+
+_H = np.sqrt(3.0) / 2.0
+_TRI = np.array([[0.0, 0.0], [1.0, 0.0], [0.5, _H]])
+_N = 11
+_COMB = np.array(list(itertools.combinations(range(_N), 3)))
+
+
+def _clip_to_triangle(pts):
+    """Project points into the triangle via barycentric coordinates."""
+    A, B, C = _TRI
+    v0, v1 = B - A, C - A
+    v2 = pts - A
+    d00, d01, d11 = v0 @ v0, v0 @ v1, v1 @ v1
+    d20 = v2 @ v0
+    d21 = v2 @ v1
+    denom = d00 * d11 - d01 * d01
+    b = (d11 * d20 - d01 * d21) / denom
+    c = (d00 * d21 - d01 * d20) / denom
+    a = 1.0 - b - c
+    w = np.stack([a, b, c], axis=-1)
+    w = np.clip(w, 0.0, 1.0)
+    w /= w.sum(axis=-1, keepdims=True)
+    return w[:, 0:1] * A + w[:, 1:2] * B + w[:, 2:3] * C
+
+
+def _signed_areas(pts):
+    p = pts[_COMB]
+    return ((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) -
+            (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
+
+
+def _all_areas(pts):
+    return np.abs(_signed_areas(pts))
+
+
+def _min_area(pts):
+    return _all_areas(pts).min()
+
+
+def _bary_weights(pts):
+    """Barycentric weights (for validation)."""
+    A, B, C = _TRI
+    v0, v1 = B - A, C - A
+    v2 = pts - A
+    d00, d01, d11 = v0 @ v0, v0 @ v1, v1 @ v1
+    d20 = v2 @ v0
+    d21 = v2 @ v1
+    denom = d00 * d11 - d01 * d01
+    b = (d11 * d20 - d01 * d21) / denom
+    c = (d00 * d21 - d01 * d20) / denom
+    a = 1.0 - b - c
+    return np.stack([a, b, c], axis=-1)
+
+
+def _subgrad_ascent(pts, iters=900, step0=0.01, rel_eps=0.05):
+    """Directed ascent on the hard minimum-triangle-area objective.
+
+    Identify all triangles within (1+rel_eps) of the current minimum and move
+    their vertices along the analytic gradient of their signed area.
+    """
+    cur = pts.copy()
+    cur_min = _min_area(cur)
+    step = step0
+    for it in range(iters):
+        s = _signed_areas(cur)
+        areas = np.abs(s)
+        m = areas.min()
+        sel = areas <= m * (1.0 + rel_eps)
+        if not np.any(sel):
+            break
+        idxs = _COMB[sel]
+        signs = np.where(s[sel] < 0.0, -1.0, 1.0)  # gradient of |signed|
+        grad = np.zeros_like(cur)
+        for t, (i, j, k) in enumerate(idxs):
+            sg = signs[t]
+            x0, y0 = cur[i]
+            x1, y1 = cur[j]
+            x2, y2 = cur[k]
+            # d/dP0 = (-(y2-y1), (x2-x1)) etc.
+            grad[i] += sg * np.array([-(y2 - y1), (x2 - x1)])
+            grad[j] += sg * np.array([(y2 - y0), -(x2 - x0)])
+            grad[k] += sg * np.array([(y1 - y0), -(x1 - x0)])
+        nrm = np.linalg.norm(grad, axis=1, keepdims=True)
+        nrm[nrm < 1e-12] = 1.0
+        trial = _clip_to_triangle(cur + step * grad / nrm)
+        tmin = _min_area(trial)
+        if tmin >= cur_min - 1e-14:
+            cur, cur_min = trial, tmin
+            if tmin > cur_min:
+                pass
+            step *= 0.999
+        else:
+            step *= 0.5
+            if step < 1e-7:
+                break
+        cur_min = max(cur_min, _min_area(cur)) if False else _min_area(cur)
+    return cur, _min_area(cur)
+
+
+def _anneal(pts, rng, iters=4000, step0=0.03):
+    """Short hard-min annealing with coordinated group moves."""
+    cur = pts.copy()
+    cur_val = _min_area(cur)
+    best, best_val = cur.copy(), cur_val
+    for it in range(iters):
+        T = 1.0 - it / iters
+        step = step0 * T + 1e-4
+        m = 1 + int(rng.integers(3))
+        idx = rng.choice(_N, size=m, replace=False)
+        trial = cur.copy()
+        trial[idx] += rng.normal(0.0, step, size=(m, 2))
+        trial = _clip_to_triangle(trial)
+        val = _min_area(trial)
+        if val >= cur_val or rng.random() < 0.02 * T * (cur_val / max(val, 1e-12)) ** 20:
+            cur, cur_val = trial, val
+            if val > best_val:
+                best, best_val = trial.copy(), val
+    return best, best_val
+
+
+def _polish(pts, step=0.004, rounds=30):
+    """Deterministic coordinate-wise greedy polish."""
+    cur = pts.copy()
+    cur_val = _min_area(cur)
+    for _ in range(rounds):
+        improved = False
+        for i in range(_N):
+            for d in range(2):
+                for s in (+1, -1):
+                    trial = cur.copy()
+                    trial[i, d] += s * step
+                    trial = _clip_to_triangle(trial)
+                    val = _min_area(trial)
+                    if val > cur_val + 1e-15:
+                        cur, cur_val = trial, val
+                        improved = True
+        if not improved:
+            step *= 0.5
+            if step < 1e-7:
+                break
+    return cur, cur_val
+
+
+def _lattice_seed(n=_N):
+    pts = []
+    rows = 4
+    for r in range(rows):
+        y = _H * r / (rows - 1)
+        cnt = rows - r
+        for c in range(cnt):
+            x = c / max(cnt - 1, 1)
+            pts.append([x * (1.0 - 0.5 * r / (rows - 1)) + 0.25 * r / (rows - 1), y])
+    pts.append([0.5, _H / 3.0])
+    return _clip_to_triangle(np.array(pts[:n]))
+
+
+def _seeds():
+    seeds = []
+    # boundary-heavy: 11 points around the perimeter (classic Heilbronn style)
+    per = []
+    for u in np.linspace(0, 1, 5):
+        per.append([u, 0.0])
+    for u in np.linspace(0, 1, 4, endpoint=False)[1:]:
+        per.append([0.5 * (1 + u), _H * u])
+        per.append([0.5 * (1 - u), _H * u])
+    seeds.append(_clip_to_triangle(np.array(per[:_N])))
+    # lattice
+    seeds.append(_lattice_seed())
+    # perturbations of both (deterministic)
+    rng = np.random.default_rng(31337)
+    for base in (seeds[0], seeds[1]):
+        for _ in range(3):
+            seeds.append(_clip_to_triangle(base + rng.normal(0, 0.05, size=base.shape)))
+    # random interior sets
+    for s in range(4):
+        r2 = np.random.default_rng(500 + s)
+        u, v = r2.random(_N), r2.random(_N)
+        su = np.sqrt(u)
+        w1, w2 = su * (1 - v), su * v
+        seeds.append(_clip_to_triangle(np.stack([w1 + 0.5 * w2, _H * w2], axis=1)))
+    return seeds
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct an arrangement of 11 points on or inside an equilateral triangle
+    maximizing the smallest triangle area (Heilbronn problem, n=11).
+
+    Returns:
+        points: np.ndarray of shape (11,2) with the x,y coordinates of the points.
+    """
+    best, best_val = None, -1.0
+    try:
+        for seed_id, start in enumerate(_seeds()):
+            rng = np.random.default_rng(9000 + seed_id)
+            cur = _clip_to_triangle(start.copy())
+            # exploration: short annealing with group moves
+            cur, _ = _anneal(cur, rng, iters=3500, step0=0.04)
+            # directed subgradient ascent on the hard objective
+            cur, val = _subgrad_ascent(cur, iters=800, step0=0.008, rel_eps=0.08)
+            # fine polish
+            cur, val = _polish(cur)
+            if val > best_val:
+                best, best_val = cur.copy(), val
+
+        # extra subgradient + polish rounds on the global best
+        cur = best.copy()
+        for _ in range(3):
+            cur, val = _subgrad_ascent(cur, iters=600, step0=0.004, rel_eps=0.15)
+            cur, val = _polish(cur, step=0.002)
+            if val > best_val:
+                best, best_val = cur.copy(), val
+            cur = best.copy()
+    except Exception:
+        best = None
+
+    # ---- validation harness ----
+    ok = False
+    if best is not None:
+        try:
+            best = np.asarray(best, dtype=float)
+            if best.shape == (_N, 2) and np.all(np.isfinite(best)):
+                w = _bary_weights(best)
+                if np.all(w > -1e-9):
+                    d = np.linalg.norm(best[:, None] - best[None], axis=-1)
+                    np.fill_diagonal(d, np.inf)
+                    if d.min() > 1e-9:
+                        ok = True
+        except Exception:
+            ok = False
+    if not ok:
+        best = _lattice_seed()
+    return best
+
+
+# EVOLVE-BLOCK-END

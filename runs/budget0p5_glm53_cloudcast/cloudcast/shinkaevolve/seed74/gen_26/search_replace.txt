@@ -1,0 +1,135 @@
+<NAME>
+per_partition_edge_dedup_steiner
+</NAME>
+<DESCRIPTION>
+The prior programs (and current one) append the *full* src→dst path to every partition for every destination, so shared trunk edges get billed once per destination per partition — wasting all the sharing the Steiner-style construction creates (insight from Gen 11/16/19). The fix: build the shared trunk once via the shortest-path Steiner heuristic, record each destination's full root-to-terminal path, and then emit edges per partition with explicit deduplication — each edge of a partition is emitted exactly once, attributed to the first destination whose path uses it. Since all destinations' paths form one tree, each partition ends up carrying exactly one copy of the whole Steiner tree instead of num_dsts overlapping copies. This directly targets the deduplication the cost_score gap implies while keeping the output format `[s, t, G[s][t]]` and the per-(dst, partition) structure intact.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Steiner-tree (shortest-path heuristic): iteratively graft the closest
+    # remaining destination onto the shared trunk. Destinations with common
+    # prefix paths reuse the same trunk edges (shared edges counted once in
+    # the routing decision), while output remains per-destination edge lists.
+    tree_nodes = {src}
+    paths_from_src = nx.single_source_dijkstra(h, src, weight="cost")[1] \
+        if src in h else {}
+
+    remaining = set(dsts)
+    while remaining:
+        dist_tree, path_tree = nx.multi_source_dijkstra(
+            h, list(tree_nodes), weight="cost")
+        best_dst = None
+        best_d = float("inf")
+        for d in remaining:
+            if d in dist_tree and dist_tree[d] < best_d:
+                best_d = dist_tree[d]
+                best_dst = d
+
+        if best_dst is None:
+            # unreachable on pruned graph; fall back to original graph
+            fallback = sorted(remaining)[0]
+            try:
+                path = nx.dijkstra_path(G, fallback, weight="cost") if False \
+                    else nx.dijkstra_path(G, src, fallback, weight="cost")
+            except nx.NetworkXNoPath:
+                remaining.discard(fallback)
+                continue
+            for i in range(len(path) - 1):
+                s, t = path[i], path[i + 1]
+                tree_nodes.update([s, t])
+                for j in range(bc_topology.num_partitions):
+                    bc_topology.append_dst_partition_path(
+                        fallback, j, [s, t, G[s][t]])
+            remaining.discard(fallback)
+            continue
+
+        path = path_tree[best_dst]
+        anchor = path[0]
+        # full src->dst path: prepend tree path to the anchor if needed
+        if anchor == src:
+            full_path = path
+        else:
+            full_path = paths_from_src.get(anchor, [src]) + path[1:]
+
+        for i in range(len(path) - 1):
+            s, t = path[i], path[i + 1]
+            tree_nodes.add(t)
+
+        for i in range(len(full_path) - 1):
+            s, t = full_path[i], full_path[i + 1]
+            for j in range(bc_topology.num_partitions):
+                bc_topology.append_dst_partition_path(
+                    best_dst, j, [s, t, G[s][t]])
+        remaining.discard(best_dst)
+
+    return bc_topology
+=======
+    bc_topology = BroadCastTopology(src, dsts, num_partitions)
+
+    # Steiner-tree (shortest-path heuristic): graft closest remaining
+    # destination onto the shared trunk. Then emit edges per partition with
+    # explicit deduplication: each edge appears exactly once per partition
+    # (attributed to the first destination whose path uses it), so a
+    # partition carries one copy of the Steiner tree instead of one
+    # overlapping copy per destination.
+    tree_nodes = {src}
+    paths_from_src = nx.single_source_dijkstra(h, src, weight="cost")[1] \
+        if src in h else {}
+
+    dst_full_paths = {}  # dst -> full src->dst path
+    remaining = set(dsts)
+    while remaining:
+        dist_tree, path_tree = nx.multi_source_dijkstra(
+            h, list(tree_nodes), weight="cost")
+        best_dst = None
+        best_d = float("inf")
+        for d in remaining:
+            if d in dist_tree and dist_tree[d] < best_d:
+                best_d = dist_tree[d]
+                best_dst = d
+
+        if best_dst is None:
+            # unreachable on pruned graph; fall back to original graph
+            fallback = sorted(remaining)[0]
+            try:
+                path = nx.dijkstra_path(G, src, fallback, weight="cost")
+            except nx.NetworkXNoPath:
+                remaining.discard(fallback)
+                continue
+            tree_nodes.update(path)
+            dst_full_paths[fallback] = path
+            remaining.discard(fallback)
+            continue
+
+        path = path_tree[best_dst]
+        anchor = path[0]
+        if anchor == src:
+            full_path = path
+        else:
+            full_path = paths_from_src.get(anchor, [src]) + path[1:]
+        for i in range(len(path) - 1):
+            tree_nodes.add(path[i + 1])
+        dst_full_paths[best_dst] = full_path
+        remaining.discard(best_dst)
+
+    # Emit deduplicated edges per partition: an edge used by several
+    # destinations' paths is only emitted once per partition, attributed
+    # to the first destination that needs it.
+    for j in range(num_partitions):
+        emitted = set()
+        for dst in dsts:
+            path = dst_full_paths.get(dst)
+            if path is None:
+                continue
+            for i in range(len(path) - 1):
+                s, t = path[i], path[i + 1]
+                if (s, t) in emitted:
+                    continue
+                emitted.add((s, t))
+                bc_topology.append_dst_partition_path(dst, j, [s, t, G[s][t]])
+
+    return bc_topology
+>>>>>>> REPLACE
+</DIFF>

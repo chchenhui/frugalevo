@@ -1,0 +1,134 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def _pairwise_geometry(points: np.ndarray):
+    """Return pairwise displacement vectors, squared distances, and mask."""
+    delta = points[:, None, :] - points[None, :, :]
+    squared = np.einsum("ijk,ijk->ij", delta, delta)
+    np.fill_diagonal(squared, 1.0)
+    mask = ~np.eye(points.shape[0], dtype=bool)
+    return delta, squared, mask
+
+
+def _normalize(points: np.ndarray) -> np.ndarray:
+    """Remove irrelevant translation and uniform scale."""
+    points = points - points.mean(axis=0, keepdims=True)
+    rms = np.sqrt(np.mean(np.sum(points * points, axis=1)))
+    return points / rms
+
+
+def _exact_ratio(points: np.ndarray) -> float:
+    """Compute the actual unsmoothed minimum/maximum distance ratio."""
+    _, squared, mask = _pairwise_geometry(points)
+    values = squared[mask]
+    return float(np.sqrt(values.min() / values.max()))
+
+
+def _soft_extrema_gradient(points: np.ndarray, sharpness: float) -> np.ndarray:
+    """
+    Gradient of a differentiable approximation of
+    log(min pair distance) - log(max pair distance).
+    """
+    delta, squared, mask = _pairwise_geometry(points)
+    log_distance = 0.5 * np.log(squared)
+
+    valid_logs = log_distance[mask]
+    low_shift = valid_logs.min()
+    high_shift = valid_logs.max()
+
+    near_weights = np.zeros_like(squared)
+    far_weights = np.zeros_like(squared)
+
+    near_values = np.exp(-sharpness * (valid_logs - low_shift))
+    far_values = np.exp(sharpness * (valid_logs - high_shift))
+
+    near_weights[mask] = near_values / near_values.sum()
+    far_weights[mask] = far_values / far_values.sum()
+
+    # Pair (i,j) appears twice in the symmetric matrix.  The factor is
+    # harmless under normalized ascent and improves the update magnitude.
+    coefficients = near_weights - far_weights
+    return 2.0 * np.sum(
+        coefficients[:, :, None] * delta / squared[:, :, None],
+        axis=1,
+    )
+
+
+def _refine(seed_points: np.ndarray, iterations: int = 1800) -> np.ndarray:
+    """Annealed normalized gradient ascent for one candidate layout."""
+    points = _normalize(seed_points.astype(float, copy=True))
+    velocity = np.zeros_like(points)
+
+    for step in range(iterations):
+        progress = step / max(iterations - 1, 1)
+        sharpness = 6.0 + 94.0 * progress * progress
+        gradient = _soft_extrema_gradient(points, sharpness)
+
+        # A normalized momentum update makes the procedure insensitive to
+        # the arbitrary coordinate scale of an initializer.
+        gradient -= gradient.mean(axis=0, keepdims=True)
+        gradient_norm = np.sqrt(np.mean(np.sum(gradient * gradient, axis=1)))
+        if gradient_norm > 0.0:
+            gradient /= gradient_norm
+
+        velocity = 0.82 * velocity + 0.18 * gradient
+        step_size = 0.045 * (1.0 - 0.65 * progress)
+        points = _normalize(points + step_size * velocity)
+
+    return points
+
+
+def _structured_initializers() -> list:
+    """Build complementary symmetric and seeded-random starting layouts."""
+    initializers = []
+
+    # Two staggered hexagonal layers plus two poles.
+    angles = np.arange(6, dtype=float) * (np.pi / 3.0)
+    lower = np.column_stack((np.cos(angles), np.sin(angles), -0.48 * np.ones(6)))
+    upper = np.column_stack(
+        (
+            np.cos(angles + np.pi / 6.0),
+            np.sin(angles + np.pi / 6.0),
+            0.48 * np.ones(6),
+        )
+    )
+    initializers.append(
+        np.vstack((lower, upper, [[0.0, 0.0, -1.35], [0.0, 0.0, 1.35]]))
+    )
+
+    # Cube corners and axial points provide a distinct high-symmetry basin.
+    cube = np.array(
+        [[x, y, z] for x in (-1.0, 1.0) for y in (-1.0, 1.0) for z in (-1.0, 1.0)],
+        dtype=float,
+    )
+    axial = 1.65 * np.eye(3)
+    initializers.append(np.vstack((cube, axial, -axial)))
+
+    # Fixed seeds retain reproducibility while exploring less symmetric basins.
+    for seed in (104729, 271828, 314159, 161803):
+        rng = np.random.default_rng(seed)
+        initializers.append(rng.normal(size=(14, 3)))
+
+    return initializers
+
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    """
+    Construct fourteen 3D points by optimizing their minimum-to-maximum
+    Euclidean pairwise-distance ratio.
+    """
+    best_points = None
+    best_ratio = -np.inf
+
+    for initial in _structured_initializers():
+        candidate = _refine(initial)
+        ratio = _exact_ratio(candidate)
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_points = candidate
+
+    return np.asarray(best_points, dtype=float)
+
+
+# EVOLVE-BLOCK-END

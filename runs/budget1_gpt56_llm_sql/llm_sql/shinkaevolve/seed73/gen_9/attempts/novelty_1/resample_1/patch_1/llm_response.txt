@@ -1,0 +1,330 @@
+<NAME>
+trie_safe_reorder
+</NAME>
+
+<DESCRIPTION>
+The original implementation failed validation because it mutates the working dataframe, adds and later merges an `original_index` column, recursively rebuilds frames without preserving row identity, returns an empty `column_orderings` list, and can reorder values independently of their source columns. The stdout shows execution reached the recursive pipeline, but the program provides no valid ordering metadata and contains several shape/index-sensitive paths that can lose or misalign values.
+
+This fix replaces the unsafe recursive dataframe mutation with bounded candidate construction. It preserves every input value and row, supports mixed types and missing values, returns valid per-row column orderings, honors merge/dependency ordering constraints, and selects between a stable original order, a global frequency-ranked order, and a bounded conditional grouping order using exact serialized-row Trie/LCP scoring.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import pandas as pd
+from solver import Algorithm
+from typing import Tuple, List
+from collections import defaultdict
+import heapq
+
+
+class Evolved(Algorithm):
+    """
+    Bounded row/column reordering for serialized-prefix reuse.
+
+    Values are never changed.  For row-specific orders, the returned frame uses
+    the original output column positions and column_orderings describes which
+    source column supplied each output position for that row.
+    """
+
+    def __init__(self, df: pd.DataFrame = None):
+        self.df = df
+
+    @staticmethod
+    def _text(value) -> str:
+        """Match the evaluator's missing-value normalization without mutating data."""
+        if value is None:
+            return ""
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, bool) and missing:
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(value)
+
+    @staticmethod
+    def _lcp(left: str, right: str) -> int:
+        if left == right:
+            return len(left)
+        high = min(len(left), len(right))
+        low = 0
+        # Slice comparisons are implemented in C and avoid a Python character loop.
+        while low < high:
+            mid = (low + high + 1) // 2
+            if left[:mid] == right[:mid]:
+                low = mid
+            else:
+                high = mid - 1
+        return low
+
+    def _trie_score(self, strings: List[str]) -> int:
+        if len(strings) < 2:
+            return 0
+        ordered = sorted(strings)
+        return sum(self._lcp(ordered[i - 1], ordered[i]) for i in range(1, len(ordered)))
+
+    @staticmethod
+    def _merge_blocks(ncols: int, columns, col_merge):
+        """
+        Build indivisible position blocks.  Merge requests mean their members
+        remain adjacent; they do not merge or alter stored cell values.
+        """
+        parent = list(range(ncols))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            a, b = find(a), find(b)
+            if a != b:
+                parent[b] = a
+
+        positions = defaultdict(list)
+        for pos, name in enumerate(columns):
+            positions[name].append(pos)
+
+        for group in col_merge or []:
+            members = []
+            for name in group:
+                if positions.get(name):
+                    members.append(positions[name][0])
+            for member in members[1:]:
+                union(members[0], member)
+
+        grouped = defaultdict(list)
+        for pos in range(ncols):
+            grouped[find(pos)].append(pos)
+        blocks = list(grouped.values())
+        blocks.sort(key=lambda block: min(block))
+        return [sorted(block) for block in blocks]
+
+    @staticmethod
+    def _dependency_edges(blocks, columns, one_way_dep):
+        position_to_block = {}
+        for b, block in enumerate(blocks):
+            for pos in block:
+                position_to_block[pos] = b
+
+        by_name = defaultdict(list)
+        for pos, name in enumerate(columns):
+            by_name[name].append(pos)
+
+        edges = set()
+        for before_name, after_name in one_way_dep or []:
+            # Existing API semantics accept an identifying substring.
+            before = [p for p, name in enumerate(columns) if before_name in str(name)]
+            after = [p for p, name in enumerate(columns) if after_name in str(name)]
+            if len(before) == 1 and len(after) == 1:
+                a, b = position_to_block[before[0]], position_to_block[after[0]]
+                if a != b:
+                    edges.add((a, b))
+        return edges
+
+    @staticmethod
+    def _topological_blocks(blocks, weights, edges):
+        count = len(blocks)
+        outgoing = [[] for _ in range(count)]
+        indegree = [0] * count
+        for a, b in edges:
+            outgoing[a].append(b)
+            indegree[b] += 1
+
+        ready = []
+        for b in range(count):
+            if indegree[b] == 0:
+                heapq.heappush(ready, (-weights[b], min(blocks[b]), b))
+
+        result = []
+        while ready:
+            _, _, block = heapq.heappop(ready)
+            result.append(block)
+            for target in outgoing[block]:
+                indegree[target] -= 1
+                if indegree[target] == 0:
+                    heapq.heappush(ready, (-weights[target], min(blocks[target]), target))
+
+        # Cyclic dependency input cannot be fully honored.  Keep deterministic,
+        # data-safe block order for unresolved nodes rather than dropping data.
+        if len(result) != count:
+            used = set(result)
+            result.extend(b for b in range(count) if b not in used)
+        return result
+
+    @staticmethod
+    def _block_weight(rows, block, values):
+        counts = defaultdict(int)
+        lengths = {}
+        for row in rows:
+            for col in block:
+                value = values[row][col]
+                counts[value] += 1
+                lengths[value] = len(value)
+        return sum(lengths[value] * count * (count - 1) for value, count in counts.items())
+
+    def _global_order(self, nrows, blocks, edges, values):
+        rows = range(nrows)
+        weights = [self._block_weight(rows, block, values) for block in blocks]
+        block_order = self._topological_blocks(blocks, weights, edges)
+        return [pos for block_id in block_order for pos in blocks[block_id]]
+
+    def _conditional_orders(self, nrows, blocks, edges, values, fallback):
+        """
+        A bounded conditional partition tree.  It selects the next block from
+        length-weighted pair repetition and lets child groups choose different
+        suffixes.  Work is capped to avoid wide-table regressions.
+        """
+        nblocks = len(blocks)
+        orders = [None] * nrows
+        max_depth = min(nblocks, 12)
+        max_nodes = 128
+        nodes = 0
+
+        def visit(rows, remaining, prefix, depth):
+            nonlocal nodes
+            nodes += 1
+            if not rows:
+                return
+            if (len(rows) < 2 or not remaining or depth >= max_depth or
+                    nodes > max_nodes):
+                tail_blocks = [b for b in fallback if b in remaining]
+                tail = [p for b in tail_blocks for p in blocks[b]]
+                for row in rows:
+                    orders[row] = prefix + tail
+                return
+
+            candidates = remaining
+            # Bound scoring on extremely wide frames while retaining deterministic
+            # representative columns.
+            if len(candidates) > 48:
+                candidates = candidates[:48]
+
+            weights = []
+            for block_id in candidates:
+                weights.append((self._block_weight(rows, blocks[block_id], values),
+                                -min(blocks[block_id]), block_id))
+            best_weight, _, chosen = max(weights)
+            if best_weight <= 0:
+                tail_blocks = [b for b in fallback if b in remaining]
+                tail = [p for b in tail_blocks for p in blocks[b]]
+                for row in rows:
+                    orders[row] = prefix + tail
+                return
+
+            # Do not violate known block precedence when a predecessor remains.
+            predecessors = {a for a, b in edges if b == chosen}
+            available = [b for b in remaining if not any(a in remaining for a, z in edges if z == b)]
+            if chosen not in available and available:
+                chosen = max(
+                    available,
+                    key=lambda b: (self._block_weight(rows, blocks[b], values), -min(blocks[b]))
+                )
+
+            next_remaining = [b for b in remaining if b != chosen]
+            partitions = defaultdict(list)
+            for row in rows:
+                key = tuple(values[row][col] for col in blocks[chosen])
+                partitions[key].append(row)
+
+            # A non-splitting choice does not provide conditional benefit.
+            if len(partitions) == 1:
+                tail_blocks = [chosen] + [b for b in fallback if b in next_remaining]
+                tail = [p for b in tail_blocks for p in blocks[b]]
+                for row in rows:
+                    orders[row] = prefix + tail
+                return
+
+            new_prefix = prefix + list(blocks[chosen])
+            for key in sorted(partitions, key=lambda item: tuple(str(x) for x in item)):
+                visit(partitions[key], next_remaining, new_prefix, depth + 1)
+
+        visit(list(range(nrows)), list(range(nblocks)), [], 0)
+        return [order if order is not None else list(fallback) for order in orders]
+
+    @staticmethod
+    def _strings_for_orders(values, orders):
+        return ["".join(values[row][col] for col in order) for row, order in enumerate(orders)]
+
+    def _materialize(self, df, orders, strings):
+        """
+        Put source values into output positions according to each row ordering.
+        Output labels remain the input labels; ordering metadata makes the
+        row-specific source-to-position permutation explicit.
+        """
+        nrows, ncols = df.shape
+        raw = df.to_numpy(dtype=object, copy=False)
+        data = [[raw[row, source] for source in orders[row]] for row in range(nrows)]
+
+        # Row order does not change ideal Trie reuse, but lexical order is a
+        # deterministic and cache-friendly insertion order.
+        row_order = sorted(range(nrows), key=lambda row: (strings[row], row))
+        output = pd.DataFrame(
+            [data[row] for row in row_order],
+            columns=df.columns.copy(),
+            index=df.index.take(row_order),
+            dtype=object,
+        )
+        named_orders = [[df.columns[pos] for pos in orders[row]] for row in row_order]
+        return output, named_orders
+
+    def reorder(
+        self,
+        df: pd.DataFrame,
+        early_stop: int = 0,
+        row_stop: int = None,
+        col_stop: int = None,
+        col_merge: List[List[str]] = [],
+        one_way_dep: List[Tuple[str, str]] = [],
+        distinct_value_threshold: float = 0.8,
+        parallel: bool = True,
+    ) -> Tuple[pd.DataFrame, List[List[str]]]:
+        # Never add helper columns to df: helper state is held separately.
+        nrows, ncols = df.shape
+        if nrows == 0 or ncols == 0:
+            return df.copy(), [[] for _ in range(nrows)]
+
+        raw = df.to_numpy(dtype=object, copy=False)
+        values = [[self._text(raw[row, col]) for col in range(ncols)] for row in range(nrows)]
+        columns = list(df.columns)
+
+        blocks = self._merge_blocks(ncols, columns, col_merge)
+        edges = self._dependency_edges(blocks, columns, one_way_dep)
+
+        original = list(range(ncols))
+        global_order = self._global_order(nrows, blocks, edges, values)
+        candidates = [
+            [original[:] for _ in range(nrows)],
+            [global_order[:] for _ in range(nrows)],
+        ]
+
+        # Conditional construction is useful on ordinary inputs but deliberately
+        # bounded for very large matrices.
+        if nrows * ncols <= 1_500_000 and len(blocks) > 1:
+            fallback_blocks = []
+            seen = set()
+            for pos in global_order:
+                for block_id, block in enumerate(blocks):
+                    if pos in block and block_id not in seen:
+                        fallback_blocks.append(block_id)
+                        seen.add(block_id)
+            candidates.append(self._conditional_orders(
+                nrows, blocks, edges, values, fallback_blocks
+            ))
+
+        best_orders = candidates[0]
+        best_strings = self._strings_for_orders(values, best_orders)
+        best_score = self._trie_score(best_strings)
+
+        for orders in candidates[1:]:
+            strings = self._strings_for_orders(values, orders)
+            score = self._trie_score(strings)
+            if score > best_score:
+                best_orders, best_strings, best_score = orders, strings, score
+
+        return self._materialize(df, best_orders, best_strings)
+
+# EVOLVE-BLOCK-END
+```

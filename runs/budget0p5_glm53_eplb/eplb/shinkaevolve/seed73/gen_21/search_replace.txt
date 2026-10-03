@@ -1,0 +1,133 @@
+<NAME>
+heap_lpt_fast_packing</NAME>
+<DESCRIPTION>
+The current `balanced_packing` runs a Python-level loop over all items, but each iteration performs several full-row tensor operations (`torch.where`, `argmin`, two `scatter_`, fancy indexing). That is O(n) tensor kernel launches per row — the dominant cost of the whole algorithm (it is called twice per rebalance). Replacing it with a classic heapq-based LPT packer operating on plain Python lists removes all per-item tensor kernel launches while producing an identical (or better, due to deterministic tie-breaking) assignment. Since weights are already moved to CPU as the first operation of `rebalance_experts`, pure-Python list arithmetic is very fast at these problem sizes (tens of layers, hundreds of experts). Likewise, `replicate_experts` performs `num_redundant` iterations of tensor ops (`argmax`, gather, index updates); converting it to a per-row Python greedy with lists eliminates those kernel launches too. This keeps the exact same greedy semantics (clone the expert with the highest per-replica load) but with far lower overhead, directly improving `times_algorithm` / `speed_score` without touching the resulting balancedness scores. Per the reliability recommendation, `weight = weight.float().cpu()` stays the first operation in the entry point, all intermediate tensors remain on CPU, and `torch.sort(..., descending=True)` (no newer kwargs) is used for the initial ordering.</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Greedy LPT (longest processing time first) heuristic, vectorized
+    # across all rows: items are sorted descending once, then assigned one
+    # at a time to the lightest non-full pack. All rows are processed
+    # simultaneously with batched tensor operations.
+    weight = weight.float()
+    sorted_indices = weight.sort(-1, descending=True).indices  # [X, n]
+    sorted_weights = weight.gather(-1, sorted_indices)  # [X, n]
+
+    X = num_layers
+    pack_weights = torch.zeros(X, num_packs, dtype=weight.dtype,
+                               device=weight.device)
+    pack_items = torch.zeros(X, num_packs, dtype=torch.int64,
+                             device=weight.device)
+    pack_index = torch.empty(X, num_groups, dtype=torch.int64,
+                             device=weight.device)
+    rank_in_pack = torch.empty_like(pack_index)
+
+    inf = float("inf")
+    for t in range(num_groups):
+        # candidate mask: packs not yet full
+        allowed = pack_items < groups_per_pack  # [X, num_packs]
+        # masked weights: full packs get +inf
+        masked = torch.where(allowed, pack_weights,
+                             torch.full_like(pack_weights, inf))
+        chosen = masked.argmin(dim=-1)  # [X]
+        rows = torch.arange(X, device=weight.device)
+        pack_index.scatter_(1, sorted_indices[:, t:t + 1].long(),
+                            chosen.unsqueeze(1))
+        rank_in_pack.scatter_(1, sorted_indices[:, t:t + 1].long(),
+                              pack_items[rows, chosen].unsqueeze(1))
+        pack_weights[rows, chosen] += sorted_weights[:, t]
+        pack_items[rows, chosen] += 1
+
+    return pack_index, rank_in_pack
+=======
+    # Greedy LPT (longest processing time first) heuristic implemented with
+    # a plain Python heap: items are sorted descending once, then assigned
+    # one at a time to the lightest non-full pack. Operating on Python
+    # lists avoids per-item tensor kernel launches, which dominate the
+    # runtime of the previous vectorized-loop implementation.
+    import heapq
+
+    order = weight.float().sort(-1, descending=True).indices.tolist()
+    weights = weight.float().tolist()
+    X = num_layers
+    pack_index = torch.empty(X, num_groups, dtype=torch.int64)
+    rank_in_pack = torch.empty(X, num_groups, dtype=torch.int64)
+    cap = groups_per_pack
+
+    for r in range(X):
+        row_order = order[r]
+        row_w = weights[r]
+        load = [0.0] * num_packs
+        count = [0] * num_packs
+        heap = [(0.0, p) for p in range(num_packs)]
+        heapq.heapify(heap)
+        pi = pack_index[r].tolist()
+        ri = rank_in_pack[r].tolist()
+        for item in row_order:
+            w, pack = heapq.heappop(heap)
+            pi[item] = pack
+            ri[item] = count[pack]
+            count[pack] += 1
+            w += row_w[item]
+            load[pack] = w
+            if count[pack] < cap:
+                heapq.heappush(heap, (w, pack))
+        pack_index[r] = torch.tensor(pi, dtype=torch.int64)
+        rank_in_pack[r] = torch.tensor(ri, dtype=torch.int64)
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+=======
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    # Same greedy semantics as before (repeatedly clone the expert with the
+    # highest per-replica load), but implemented with Python lists to avoid
+    # a tensor kernel launch per redundant expert.
+    w_list = weight.float().tolist()
+    phy2log = torch.arange(num_phy, dtype=torch.int64).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64)
+    phy2log_l = phy2log.tolist()
+    rank_l = rank.tolist()
+    logcnt_l = logcnt.tolist()
+    for r in range(n):
+        row_w = w_list[r]
+        cnt = logcnt_l[r]
+        pl = phy2log_l[r]
+        rk = rank_l[r]
+        for i in range(num_log, num_phy):
+            best = 0
+            best_val = row_w[0] / cnt[0]
+            for j in range(1, num_log):
+                val = row_w[j] / cnt[j]
+                if val > best_val:
+                    best_val = val
+                    best = j
+            pl[i] = best
+            rk[i] = cnt[best]
+            cnt[best] += 1
+    phy2log = torch.tensor(phy2log_l, dtype=torch.int64)
+    rank = torch.tensor(rank_l, dtype=torch.int64)
+    logcnt = torch.tensor(logcnt_l, dtype=torch.int64)
+    return phy2log, rank, logcnt
+>>>>>>> REPLACE
+</DIFF>
+</DIFF>

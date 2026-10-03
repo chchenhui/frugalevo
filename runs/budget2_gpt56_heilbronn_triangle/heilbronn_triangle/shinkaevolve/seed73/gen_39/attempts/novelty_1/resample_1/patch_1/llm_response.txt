@@ -1,0 +1,296 @@
+<NAME>
+active_barrier_flow
+</NAME>
+
+<DESCRIPTION>
+This replaces population evolution with a deterministic active-constraint barrier-flow optimizer. Each layout is improved using analytic gradients of the smallest triangle determinants, weighted by a soft minimum barrier. This directly pushes apart the currently limiting triples rather than relying on crossover or differential evolution. Multiple independently annealed basins are maintained, periodically restarted, and the strongest layout receives a final active-set stochastic polish.
+</DESCRIPTION>
+
+<CODE>
+```python
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_triangle11() -> np.ndarray:
+    """
+    Construct eleven deterministic points in the reference equilateral
+    triangle using an active-constraint maximin flow.
+
+    Search coordinates are barycentric pairs (u, v), where u >= 0, v >= 0,
+    u + v <= 1.  Determinants in this coordinate system equal normalized
+    triangle areas.
+    """
+    rng = np.random.default_rng(45827119)
+
+    n = 11
+    fixed = 3
+    movable = n - fixed
+    population_size = 80
+
+    triples = np.asarray(
+        [(i, j, k)
+         for i in range(n)
+         for j in range(i + 1, n)
+         for k in range(j + 1, n)],
+        dtype=np.intp,
+    )
+    ta, tb, tc = triples.T
+    triple_count = len(triples)
+
+    corners = np.array(
+        ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)),
+        dtype=float,
+    )
+
+    def project_simplex(points: np.ndarray) -> np.ndarray:
+        """Safely project barycentric coordinate pairs into the unit simplex."""
+        result = np.maximum(points, 0.0)
+        total = result.sum(axis=-1, keepdims=True)
+        result /= np.maximum(total, 1.0)
+        return result
+
+    def evaluate(configurations: np.ndarray):
+        """
+        Return determinants, normalized minima, and a lower-tail ranking.
+
+        The ranking rewards a healthy collection of small constraints while
+        retaining the true minimum as its dominant component.
+        """
+        a = configurations[:, ta]
+        b = configurations[:, tb]
+        c = configurations[:, tc]
+
+        dx1 = b[..., 0] - a[..., 0]
+        dy1 = b[..., 1] - a[..., 1]
+        dx2 = c[..., 0] - a[..., 0]
+        dy2 = c[..., 1] - a[..., 1]
+
+        signed = dx1 * dy2 - dy1 * dx2
+        areas = np.abs(signed)
+
+        low = np.partition(areas, 11, axis=1)[:, :12]
+        minima = low[:, 0]
+        ranking = minima + 0.020 * low.mean(axis=1)
+        return signed, areas, minima, ranking
+
+    def random_layouts(count: int) -> np.ndarray:
+        """Generate broad interior and near-boundary restart layouts."""
+        weights = rng.dirichlet((0.78, 0.78, 0.78), size=(count, n))
+        result = weights[..., 1:].copy()
+        result[:, :fixed] = corners
+
+        # A subset has different points biased toward different sides.  This
+        # supplies geometric basins that uniform Dirichlet samples miss.
+        side_count = count // 3
+        if side_count:
+            side_ids = rng.integers(0, 3, size=(side_count, movable))
+            gaps = rng.uniform(0.015, 0.17, size=(side_count, movable))
+            w = rng.dirichlet((0.9, 0.9, 0.9), size=(side_count, movable))
+            old = np.take_along_axis(w, side_ids[..., None], axis=-1)[..., 0]
+            scale = (1.0 - gaps) / np.maximum(1.0 - old, 1.0e-12)
+            w *= scale[..., None]
+            np.put_along_axis(w, side_ids[..., None], gaps[..., None], axis=-1)
+            result[:side_count, fixed:] = w[..., 1:]
+
+        return result
+
+    layouts = random_layouts(population_size)
+
+    # Structured triangular seeds produce much better initial covering than
+    # purely independent random samples, while independent perturbations break
+    # all lattice collinearities.
+    template = np.array(
+        (
+            (0.0, 0.0), (1.0, 0.0), (0.0, 1.0),
+            (0.17, 0.095), (0.47, 0.085), (0.77, 0.085),
+            (0.085, 0.385), (0.355, 0.305), (0.635, 0.235),
+            (0.105, 0.675), (0.365, 0.500),
+        ),
+        dtype=float,
+    )
+    for row in range(24):
+        candidate = template.copy()
+        candidate[fixed:] += rng.normal(
+            0.0, 0.020 + 0.0025 * row, size=(movable, 2)
+        )
+        candidate[fixed:] = project_simplex(candidate[fixed:])
+        layouts[row] = candidate
+
+    signed, areas, values, rankings = evaluate(layouts)
+    best_id = int(np.argmax(values))
+    best = layouts[best_id].copy()
+    best_value = float(values[best_id])
+
+    # Flat point indices permit efficient accumulation of determinant
+    # gradients into all layouts simultaneously.
+    row_offsets = (
+        np.arange(population_size, dtype=np.intp)[:, None] * n
+    )
+    ia = (row_offsets + ta[None, :]).ravel()
+    ib = (row_offsets + tb[None, :]).ravel()
+    ic = (row_offsets + tc[None, :]).ravel()
+
+    iterations = 2900
+    for iteration in range(iterations):
+        fraction = iteration / (iterations - 1)
+
+        # Soft-min weights focus force on the limiting determinant family.
+        # The temperature contracts during the run, transitioning smoothly
+        # from broad lower-tail balancing to active-set refinement.
+        temperature = 0.030 * (1.0 - fraction) ** 1.65 + 0.0010
+        shifted = -(areas - values[:, None]) / temperature
+        shifted = np.maximum(shifted, -45.0)
+        weights = np.exp(shifted)
+        weights /= weights.sum(axis=1, keepdims=True)
+
+        orientation = np.where(signed >= 0.0, 1.0, -1.0)
+        w = weights * orientation
+
+        # Analytic determinant gradients:
+        # d det(a,b,c)/d a = (b_y-c_y, c_x-b_x), etc.
+        a = layouts[:, ta]
+        b = layouts[:, tb]
+        c = layouts[:, tc]
+
+        ga = np.empty((population_size, triple_count, 2), dtype=float)
+        gb = np.empty_like(ga)
+        gc = np.empty_like(ga)
+
+        ga[..., 0] = b[..., 1] - c[..., 1]
+        ga[..., 1] = c[..., 0] - b[..., 0]
+        gb[..., 0] = c[..., 1] - a[..., 1]
+        gb[..., 1] = a[..., 0] - c[..., 0]
+        gc[..., 0] = a[..., 1] - b[..., 1]
+        gc[..., 1] = b[..., 0] - a[..., 0]
+
+        ga *= w[..., None]
+        gb *= w[..., None]
+        gc *= w[..., None]
+
+        gradient = np.zeros((population_size * n, 2), dtype=float)
+        np.add.at(gradient, ia, ga.reshape(-1, 2))
+        np.add.at(gradient, ib, gb.reshape(-1, 2))
+        np.add.at(gradient, ic, gc.reshape(-1, 2))
+        gradient = gradient.reshape(population_size, n, 2)
+        gradient[:, :fixed] = 0.0
+
+        # Normalize per-layout force magnitudes.  The stochastic component is
+        # deliberately retained to allow changes in the active triple set.
+        magnitude = np.sqrt((gradient[:, fixed:] ** 2).sum(axis=(1, 2)))
+        gradient /= np.maximum(magnitude[:, None, None], 1.0e-12)
+
+        flow_step = 0.044 * (1.0 - fraction) ** 1.35 + 0.00055
+        noise_step = 0.025 * (1.0 - fraction) ** 1.75 + 0.00016
+
+        proposal = layouts.copy()
+        proposal[:, fixed:] += flow_step * gradient[:, fixed:]
+        proposal[:, fixed:] += rng.normal(
+            0.0, noise_step, size=(population_size, movable, 2)
+        )
+
+        # Sparse larger moves avoid stagnation in a fixed determinant pattern.
+        sparse_rows = rng.random(population_size) < (
+            0.22 * (1.0 - fraction) + 0.025
+        )
+        if np.any(sparse_rows):
+            indices = np.flatnonzero(sparse_rows)
+            point_ids = rng.integers(0, movable, size=len(indices))
+            proposal[indices, fixed + point_ids] += rng.normal(
+                0.0,
+                0.050 * (1.0 - fraction) + 0.002,
+                size=(len(indices), 2),
+            )
+
+        proposal[:, fixed:] = project_simplex(proposal[:, fixed:])
+        psigned, pareas, pvalues, prankings = evaluate(proposal)
+
+        # Annealed acceptance operates on the lower-tail barrier score, but
+        # accepts exact maximin improvements unconditionally.
+        score_change = prankings - rankings
+        accept_temperature = 0.0045 * (1.0 - fraction) ** 2 + 0.00002
+        accept = (
+            (pvalues >= values)
+            | (score_change >= 0.0)
+            | (
+                rng.random(population_size)
+                < np.exp(np.minimum(score_change / accept_temperature, 0.0))
+            )
+        )
+
+        layouts[accept] = proposal[accept]
+        signed[accept] = psigned[accept]
+        areas[accept] = pareas[accept]
+        values[accept] = pvalues[accept]
+        rankings[accept] = prankings[accept]
+
+        current = int(np.argmax(values))
+        if values[current] > best_value:
+            best = layouts[current].copy()
+            best_value = float(values[current])
+
+        # Restart only weak basins.  This is a multistart barrier method, not
+        # genetic replacement: strong independent local optima remain intact.
+        if iteration > 0 and iteration % 360 == 0 and fraction < 0.78:
+            weak = np.argsort(values)[:10]
+            restarted = random_layouts(len(weak))
+            restarted[:, fixed:] = project_simplex(
+                0.58 * restarted[:, fixed:]
+                + 0.42 * best[None, fixed:]
+                + rng.normal(0.0, 0.035, size=(len(weak), movable, 2))
+            )
+            layouts[weak] = restarted
+            rsigned, rareas, rvalues, rrankings = evaluate(restarted)
+            signed[weak] = rsigned
+            areas[weak] = rareas
+            values[weak] = rvalues
+            rankings[weak] = rrankings
+
+    current = int(np.argmax(values))
+    if values[current] > best_value:
+        best = layouts[current].copy()
+        best_value = float(values[current])
+
+    # Final direct active-set polish around the saved global incumbent.
+    for iteration in range(700):
+        _, best_areas, _, _ = evaluate(best[None, ...])
+        active_count = 14 if iteration < 250 else 8
+        active_ids = np.argpartition(
+            best_areas[0], active_count - 1
+        )[:active_count]
+
+        active_points = np.zeros(n, dtype=bool)
+        active_points[triples[active_ids].ravel()] = True
+        active_points[:fixed] = False
+
+        batch = 56
+        trials = np.repeat(best[None, :, :], batch, axis=0)
+        scale = 0.010 * (1.0 - iteration / 700.0) ** 1.55 + 0.00006
+
+        mask = np.zeros((batch, movable, 1), dtype=bool)
+        mask[:42, active_points[fixed:], 0] = True
+        for row in range(42, batch):
+            choices = np.flatnonzero(active_points[fixed:])
+            if len(choices):
+                mask[row, rng.choice(choices), 0] = True
+
+        trials[:, fixed:] += mask * rng.normal(
+            0.0, scale, size=(batch, movable, 2)
+        )
+        trials[:, fixed:] = project_simplex(trials[:, fixed:])
+
+        _, _, trial_values, _ = evaluate(trials)
+        winner = int(np.argmax(trial_values))
+        if trial_values[winner] > best_value:
+            best = trials[winner].copy()
+            best_value = float(trial_values[winner])
+
+    height = np.sqrt(3.0) / 2.0
+    return np.column_stack((
+        best[:, 0] + 0.5 * best[:, 1],
+        height * best[:, 1],
+    ))
+
+
+# EVOLVE-BLOCK-END
+```

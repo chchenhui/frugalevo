@@ -1,0 +1,133 @@
+<NAME>
+deterministic_iterated_descent
+</NAME>
+
+<DESCRIPTION>
+Add a bounded deterministic perturb-and-reoptimize phase after the existing beam-seeded local search. The current strict insertion/swap/reversal descent can stop at a local optimum even though reaching a better transaction order requires temporarily accepting a worse ordering. This edit creates several objectively best non-improving “kicks” from the best schedule using medium interval reversals, distant exchanges, and short block relocations. Each perturbed schedule is then reoptimized with the same conflict-aware objective.
+
+Step-by-step:
+1. Preserve the best schedule obtained from the existing beam and local-search phase.
+2. Enumerate diverse deterministic perturbations that alter several conflict precedence relations at once.
+3. Rank perturbations using `get_opt_seq_cost`, retaining only a small bounded number of promising kicks.
+4. Run strict insertion, exchange, and interval-reversal descent from each kick.
+5. Keep the globally best makespan found across the original and perturbed local optima.
+
+All decisions continue to use the simulator’s actual makespan rather than transaction-length proxies. The bounded number of kicks limits runtime while allowing the search to cross local-optimum barriers.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        if current_cost < best_cost:
+            best_cost = current_cost
+            best_schedule = current
+
+    return best_cost, best_schedule
+=======
+        if current_cost < best_cost:
+            best_cost = current_cost
+            best_schedule = current
+
+    # Strict local descent cannot cross a barrier which requires one
+    # temporarily worse ordering.  Generate a few deterministic, diverse
+    # perturbations of the best local optimum, then descend again.  Ranking
+    # kicks by the real simulator objective keeps this substantially more
+    # directed than random restarts.
+    kick_costs = {}
+    positions = list(range(num_txns))
+    if num_txns > 30:
+        stride = max(1, num_txns // 12)
+        positions = list(range(0, num_txns, stride))
+        if positions[-1] != num_txns - 1:
+            positions.append(num_txns - 1)
+
+    def add_kick(candidate):
+        key = tuple(candidate)
+        if key not in kick_costs:
+            kick_costs[key] = evaluate(candidate)
+
+    # Reversals and distant swaps change many conflict directions, while a
+    # two-transaction relocation preserves useful local adjacency inside the
+    # moved block.
+    for left_index, left in enumerate(positions):
+        for right in positions[left_index + 1:]:
+            if right - left >= 2:
+                add_kick(
+                    best_schedule[:left]
+                    + best_schedule[left:right + 1][::-1]
+                    + best_schedule[right + 1:]
+                )
+                candidate = best_schedule.copy()
+                candidate[left], candidate[right] = candidate[right], candidate[left]
+                add_kick(candidate)
+
+    for source in range(0, num_txns - 1):
+        block = best_schedule[source:source + 2]
+        remainder = best_schedule[:source] + best_schedule[source + 2:]
+        for destination in positions:
+            insert_at = min(destination, len(remainder))
+            if insert_at != source:
+                add_kick(remainder[:insert_at] + block + remainder[insert_at:])
+
+    ranked_kicks = sorted(
+        ((cost, list(sequence)) for sequence, cost in kick_costs.items()),
+        key=lambda entry: (entry[0], entry[1]),
+    )
+    kick_count = min(len(ranked_kicks), max(3, min(6, num_seqs)))
+
+    for kick_cost, kick_schedule in ranked_kicks[:kick_count]:
+        current = kick_schedule
+        current_cost = kick_cost
+
+        for _round in range(max(2, num_txns)):
+            round_best_cost = current_cost
+            round_best_schedule = current
+
+            for source in positions:
+                stripped = current[:source] + current[source + 1:]
+                moved_txn = current[source]
+                for destination in positions:
+                    insert_at = min(destination, len(stripped))
+                    if insert_at == source:
+                        continue
+                    candidate = (
+                        stripped[:insert_at]
+                        + [moved_txn]
+                        + stripped[insert_at:]
+                    )
+                    candidate_cost = evaluate(candidate)
+                    if candidate_cost < round_best_cost:
+                        round_best_cost = candidate_cost
+                        round_best_schedule = candidate
+
+            for left_index, left in enumerate(positions):
+                for right in positions[left_index + 1:]:
+                    candidate = current.copy()
+                    candidate[left], candidate[right] = candidate[right], candidate[left]
+                    candidate_cost = evaluate(candidate)
+                    if candidate_cost < round_best_cost:
+                        round_best_cost = candidate_cost
+                        round_best_schedule = candidate
+
+                for right in positions[left_index + 2:]:
+                    candidate = (
+                        current[:left]
+                        + current[left:right + 1][::-1]
+                        + current[right + 1:]
+                    )
+                    candidate_cost = evaluate(candidate)
+                    if candidate_cost < round_best_cost:
+                        round_best_cost = candidate_cost
+                        round_best_schedule = candidate
+
+            if round_best_cost >= current_cost:
+                break
+            current = round_best_schedule
+            current_cost = round_best_cost
+
+        if current_cost < best_cost:
+            best_cost = current_cost
+            best_schedule = current
+
+    return best_cost, best_schedule
+>>>>>>> REPLACE
+</DIFF>

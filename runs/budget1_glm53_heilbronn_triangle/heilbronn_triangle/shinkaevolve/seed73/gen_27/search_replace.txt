@@ -1,0 +1,197 @@
+<NAME>
+multi_start_structured_seeds_targeted_moves
+</NAME>
+<DESCRIPTION>
+The current program uses a single Dirichlet seed with blind random hill-climbing (0.49 score). Key improvements: (1) multi-start with several diverse structured seeds (symmetric layers, hexagonal perturbation, boundary+rings, multiple Dirichlet samples with different fixed seeds), (2) targeted moves that push vertices of the currently-smallest triangle away from its centroid, which is far more sample-efficient than blind perturbation, (3) a time budget (~8s) split across seeds with soft (targeted) and hard (random) phases, and (4) keeping the best configuration across all restarts. The triplets are precomputed once and areas computed fully vectorized, which makes each evaluation cheap (165 triplets).
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+def heilbronn_triangle11() -> np.ndarray:
+    n = 11
+    A = np.array([0.0, 0.0])
+    B = np.array([1.0, 0.0])
+    C = np.array([0.5, np.sqrt(3) / 2])
+
+    rng = np.random.default_rng(12345)
+
+    # Deterministic spread-out starting configuration (interior, no lattice collinearity)
+    bary = rng.dirichlet(alpha=np.ones(3) * 2.0, size=n)
+    # nudge points away from the extreme center to spread them
+    bary = 0.5 + 0.5 * (bary - bary.mean(axis=0))
+    bary = np.maximum(bary, 0.02)
+    bary /= bary.sum(axis=1, keepdims=True)
+    verts = np.stack([A, B, C])
+    pts = bary @ verts
+
+    best_val = _min_area(pts)
+
+    # Annealed hill-climbing with barycentric folding for feasibility
+    step = 0.08
+    total_iters = 6000
+    for it in range(total_iters):
+        i = it % n
+        cand = pts.copy()
+        delta = rng.normal(0.0, step, size=2)
+        cand[i] += delta
+        cand = _barycentric_fold(cand, A, B, C)
+        val = _min_area(cand)
+        if val > best_val + 1e-14:
+            pts, best_val = cand, val
+        if it % (n * 40) == n * 40 - 1:
+            step *= 0.82  # geometric annealing
+            if step < 1e-4:
+                break
+
+    # Final fine polish: tiny local perturbations per point
+    step = 1e-3
+    for it in range(2000):
+        i = it % n
+        cand = pts.copy()
+        cand[i] += rng.normal(0.0, step, size=2)
+        cand = _barycentric_fold(cand, A, B, C)
+        val = _min_area(cand)
+        if val > best_val + 1e-15:
+            pts, best_val = cand, val
+
+    points = np.asarray(pts, dtype=float)
+    assert points.shape == (n, 2)
+    return points
+=======
+def heilbronn_triangle11() -> np.ndarray:
+    import time
+    from itertools import combinations
+    n = 11
+    A = np.array([0.0, 0.0])
+    B = np.array([1.0, 0.0])
+    C = np.array([0.5, np.sqrt(3) / 2])
+    verts = np.stack([A, B, C])
+    h = np.sqrt(3) / 2
+
+    TRIP = np.array(list(combinations(range(n), 3)), dtype=int)
+
+    def min_area_trip(pts):
+        p = pts[TRIP]  # (165,3,2)
+        a = np.abs((p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1])
+                   - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0]))
+        m = int(a.argmin())
+        return a[m] / 2.0, m
+
+    def tri_area_norm(pts):
+        return min_area_trip(pts)[0]
+
+    rng = np.random.default_rng(12345)
+    deadline = time.time() + 8.0
+
+    # ---- diverse structured seeds ----
+    seeds = []
+
+    # 1. symmetric layered layout
+    seeds.append(np.array([
+        [0.0, 0.0], [1.0, 0.0], [0.5, h],
+        [0.25, 0.0], [0.75, 0.0], [0.5, 0.5 * h],
+        [0.125, 0.25 * h], [0.875, 0.25 * h],
+        [0.375, 0.75 * h], [0.625, 0.75 * h],
+        [0.0, 0.5 * h],
+    ]))
+
+    # 2. rings: points on concentric scaled triangles
+    ring = []
+    for s in (1.0, 0.6, 0.3):
+        ring.append(A * (1 - s) + (A if s == 1 else (A + B + C) / 3) * s)
+    ring_pts = []
+    for s in (1.0, 0.62, 0.28):
+        c = (A + B + C) / 3
+        for v in (A, B, C):
+            ring_pts.append(c + (v - c) * s)
+    ring_pts.append(c)
+    ring_pts = np.array(ring_pts[:n])
+    seeds.append(ring_pts)
+
+    # 3. hexagonal-grid perturbation
+    hx = []
+    for r in range(3):
+        for t in range(4):
+            hx.append([0.125 + 0.25 * t + 0.0625 * r, 0.15 + 0.25 * r])
+    hx = np.array(hx[:n])
+    hx = _barycentric_fold(hx + rng.normal(0, 0.02, hx.shape), A, B, C)
+    seeds.append(hx)
+
+    # 4-7. Dirichlet samples with different fixed seeds
+    for sd in (1, 7, 42, 2024):
+        r2 = np.random.default_rng(sd)
+        bary = r2.dirichlet(alpha=np.ones(3) * 2.0, size=n)
+        bary = 0.5 + 0.5 * (bary - bary.mean(axis=0))
+        bary = np.maximum(bary, 0.02)
+        bary /= bary.sum(axis=1, keepdims=True)
+        seeds.append(bary @ verts)
+
+    best = _barycentric_fold(seeds[0], A, B, C)
+    best_val = tri_area_norm(best)
+
+    for seed in seeds:
+        if time.time() > deadline or best_val >= 0.0366:
+            break
+        cur = _barycentric_fold(np.asarray(seed, dtype=float), A, B, C)
+        cur_val, m = min_area_trip(cur)
+        tri = TRIP[m]
+        step = 0.05
+
+        # --- soft phase: targeted pushes of min-triangle vertices ---
+        soft_iters = 6000
+        for it in range(soft_iters):
+            if (it & 63) == 0 and time.time() > deadline:
+                break
+            improved = False
+            cen = cur[list(tri)].mean(axis=0)
+            moves = []
+            for vi in tri:
+                d = cur[vi] - cen
+                nrm = np.hypot(*d)
+                d = d / nrm if nrm > 1e-12 else np.array([0.0, 1.0])
+                perp = np.array([-d[1], d[0]])
+                for st in (step, 0.5 * step):
+                    moves.append((vi, d * st))
+                    moves.append((vi, d * st + perp * 0.4 * st))
+                    moves.append((vi, d * st - perp * 0.4 * st))
+            for _ in range(4):
+                moves.append((int(rng.integers(n)), rng.normal(0.0, step, 2)))
+            for vi, mv in moves:
+                cand = cur.copy()
+                cand[vi] += mv
+                cand = _barycentric_fold(cand, A, B, C)
+                v, m2 = min_area_trip(cand)
+                if v > cur_val + 1e-14:
+                    cur, cur_val, tri = cand, v, TRIP[m2]
+                    improved = True
+                    break
+            if not improved:
+                step *= 0.6
+                if step < 1e-5:
+                    break
+            if cur_val > best_val:
+                best, best_val = cur.copy(), cur_val
+
+        # --- hard phase: random restarts of single points, annealed ---
+        step = 0.03
+        for it in range(5000):
+            if (it & 63) == 0 and time.time() > deadline:
+                break
+            cand = cur.copy()
+            i = int(rng.integers(n))
+            cand[i] += rng.normal(0.0, step, 2)
+            cand = _barycentric_fold(cand, A, B, C)
+            v, m2 = min_area_trip(cand)
+            if v > cur_val + 1e-14:
+                cur, cur_val, tri = cand, v, TRIP[m2]
+                if cur_val > best_val:
+                    best, best_val = cur.copy(), cur_val
+            elif v > cur_val - 0.0015 * step and rng.random() < 0.2:
+                cur, cur_val, tri = cand, v, TRIP[m2]  # occasional acceptance
+            if it % 500 == 499:
+                step *= 0.85
+
+    points = np.asarray(best, dtype=float)
+    assert points.shape == (n, 2)
+    return points
+>>>>>>> REPLACE
+</DIFF>

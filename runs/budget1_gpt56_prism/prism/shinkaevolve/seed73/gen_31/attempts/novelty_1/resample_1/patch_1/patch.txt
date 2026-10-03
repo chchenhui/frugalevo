@@ -1,0 +1,418 @@
+--- a/original.py
++++ b/original.py
+@@ -1,331 +1,415 @@
+ GPU_MEM_SIZE = 80 # GB
+ 
+ # EVOLVE-BLOCK-START
+ 
+ def compute_model_placement(gpu_num, models):
+     """Place models while minimizing the maximum memory-aware KVPR."""
+ 
+     def model_pressure(model):
+         return model.req_rate / model.slo
+ 
+     def kvpr(load, remaining):
+         return load / remaining if remaining > 0 else float("inf")
+ 
+     # Place high-pressure and large models first to reduce later packing failures.
+     sorted_models = sorted(
+         models,
+         key=lambda m: (model_pressure(m), m.model_size),
+         reverse=True,
+     )
+ 
+     placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+     remaining = [GPU_MEM_SIZE for _ in range(gpu_num)]
+     loads = [0.0 for _ in range(gpu_num)]
+ 
+     # Select the GPU with the best maximum KVPR *after* this placement.
+     for model in sorted_models:
+         pressure = model_pressure(model)
+         best_gpu = None
+         best_score = None
+ 
+         for gpu_id in range(gpu_num):
+             if model.model_size > remaining[gpu_id]:
+                 continue
+ 
+             projected_remaining = remaining[gpu_id] - model.model_size
+             projected_load = loads[gpu_id] + pressure
+             projected_max = max(
+                 kvpr(
+                     loads[other] + (pressure if other == gpu_id else 0.0),
+                     remaining[other] - (model.model_size if other == gpu_id else 0.0),
+                 )
+                 for other in range(gpu_num)
+             )
+             score = (projected_max, kvpr(projected_load, projected_remaining),
+                      -projected_remaining)
+ 
+             if best_score is None or score < best_score:
+                 best_score = score
+                 best_gpu = gpu_id
+ 
+         if best_gpu is None:
+             raise ValueError(
+                 f"Unable to place model of size {model.model_size} GB on any GPU. "
+                 f"Remaining per-GPU memory: {remaining}"
+             )
+ 
+         placement[best_gpu].append(model)
+         loads[best_gpu] += pressure
+         remaining[best_gpu] -= model.model_size
+ 
+     # Strict local improvements correct greedy decisions without risking cycles.
+     while True:
+         pressures = [kvpr(loads[gpu], remaining[gpu]) for gpu in range(gpu_num)]
+         current_max = max(pressures)
+         # Minimize the worst pressure first, then every lower bottleneck.
+         current_key = tuple(sorted(pressures, reverse=True))
+         improved = False
+ 
+         for source in range(gpu_num):
+             for model in list(placement[source]):
+                 pressure = model_pressure(model)
+                 for target in range(gpu_num):
+                     if source == target or model.model_size > remaining[target]:
+                         continue
+ 
+                     candidate_loads = loads[:]
+                     candidate_remaining = remaining[:]
+                     candidate_loads[source] -= pressure
+                     candidate_remaining[source] += model.model_size
+                     candidate_loads[target] += pressure
+                     candidate_remaining[target] -= model.model_size
+                     candidate_pressures = [
+                         kvpr(candidate_loads[gpu], candidate_remaining[gpu])
+                         for gpu in range(gpu_num)
+                     ]
+                     candidate_max = max(candidate_pressures)
+                     candidate_key = tuple(sorted(candidate_pressures, reverse=True))
+ 
+                     if candidate_key < current_key:
+                         placement[source].remove(model)
+                         placement[target].append(model)
+                         loads = candidate_loads
+                         remaining = candidate_remaining
+                         improved = True
+                         break
+                 if improved:
+                     break
+             if improved:
+                 break
+ 
+         if improved:
+             continue
+ 
+         # Swaps resolve memory fragmentation that prevents a useful direct move.
+         for left in range(gpu_num):
+             for right in range(left + 1, gpu_num):
+                 for left_model in list(placement[left]):
+                     for right_model in list(placement[right]):
+                         left_pressure = model_pressure(left_model)
+                         right_pressure = model_pressure(right_model)
+                         new_left_remaining = (
+                             remaining[left] + left_model.model_size - right_model.model_size
+                         )
+                         new_right_remaining = (
+                             remaining[right] + right_model.model_size - left_model.model_size
+                         )
+                         if new_left_remaining < 0 or new_right_remaining < 0:
+                             continue
+ 
+                         candidate_loads = loads[:]
+                         candidate_remaining = remaining[:]
+                         candidate_loads[left] += right_pressure - left_pressure
+                         candidate_loads[right] += left_pressure - right_pressure
+                         candidate_remaining[left] = new_left_remaining
+                         candidate_remaining[right] = new_right_remaining
+                         candidate_pressures = [
+                             kvpr(candidate_loads[gpu], candidate_remaining[gpu])
+                             for gpu in range(gpu_num)
+                         ]
+                         candidate_max = max(candidate_pressures)
+                         candidate_key = tuple(sorted(candidate_pressures, reverse=True))
+ 
+                         if candidate_key < current_key:
+                             placement[left].remove(left_model)
+                             placement[right].remove(right_model)
+                             placement[left].append(right_model)
+                             placement[right].append(left_model)
+                             loads = candidate_loads
+                             remaining = candidate_remaining
+                             improved = True
+                             break
+                     if improved:
+                         break
+                 if improved:
+                     break
+             if improved:
+                 break
+ 
+         # A reverse two-for-one exchange can relieve a bottleneck GPU when
+         # neither a direct move nor a one-for-one swap can fit beneficially.
+         for source in range(gpu_num):
+             if kvpr(loads[source], remaining[source]) < current_max - 1e-12:
+                 continue
+ 
+             source_models = placement[source]
+             for first_index in range(len(source_models)):
+                 first_model = source_models[first_index]
+                 first_pressure = model_pressure(first_model)
+ 
+                 for second_index in range(first_index + 1, len(source_models)):
+                     second_model = source_models[second_index]
+                     second_pressure = model_pressure(second_model)
+                     outgoing_size = first_model.model_size + second_model.model_size
+ 
+                     for target in range(gpu_num):
+                         if target == source:
+                             continue
+ 
+                         for target_model in list(placement[target]):
+                             target_pressure = model_pressure(target_model)
+                             new_source_remaining = (
+                                 remaining[source] + outgoing_size
+                                 - target_model.model_size
+                             )
+                             new_target_remaining = (
+                                 remaining[target] + target_model.model_size
+                                 - outgoing_size
+                             )
+                             if new_source_remaining < 0 or new_target_remaining < 0:
+                                 continue
+ 
+                             candidate_loads = loads[:]
+                             candidate_remaining = remaining[:]
+                             candidate_loads[source] += (
+                                 target_pressure - first_pressure - second_pressure
+                             )
+                             candidate_loads[target] += (
+                                 first_pressure + second_pressure - target_pressure
+                             )
+                             candidate_remaining[source] = new_source_remaining
+                             candidate_remaining[target] = new_target_remaining
+                             candidate_pressures = [
+                                 kvpr(candidate_loads[gpu], candidate_remaining[gpu])
+                                 for gpu in range(gpu_num)
+                             ]
+                             candidate_max = max(candidate_pressures)
+                             candidate_key = tuple(sorted(candidate_pressures, reverse=True))
+ 
+                             if candidate_key < current_key:
+                                 placement[source].remove(first_model)
+                                 placement[source].remove(second_model)
+                                 placement[target].remove(target_model)
+                                 placement[source].append(target_model)
+                                 placement[target].append(first_model)
+                                 placement[target].append(second_model)
+                                 loads = candidate_loads
+                                 remaining = candidate_remaining
+                                 improved = True
+                                 break
+                         if improved:
+                             break
+                     if improved:
+                         break
+                 if improved:
+                     break
+             if improved:
+                 break
+ 
+         # The complementary one-for-two exchange can reduce a bottleneck's
+         # load by replacing one expensive model with two smaller-pressure ones.
+         # It is particularly useful when neither a direct move nor the reverse
+         # two-for-one exchange can satisfy both GPUs' capacity constraints.
+         if not improved:
+             for source in range(gpu_num):
+                 if kvpr(loads[source], remaining[source]) < current_max - 1e-12:
+                     continue
+ 
+                 for source_model in list(placement[source]):
+                     source_pressure = model_pressure(source_model)
+ 
+                     for target in range(gpu_num):
+                         if target == source:
+                             continue
+ 
+                         target_models = placement[target]
+                         for first_index in range(len(target_models)):
+                             first_model = target_models[first_index]
+                             first_pressure = model_pressure(first_model)
+ 
+                             for second_index in range(
+                                 first_index + 1, len(target_models)
+                             ):
+                                 second_model = target_models[second_index]
+                                 second_pressure = model_pressure(second_model)
+                                 incoming_size = (
+                                     first_model.model_size + second_model.model_size
+                                 )
+ 
+                                 new_source_remaining = (
+                                     remaining[source] + source_model.model_size
+                                     - incoming_size
+                                 )
+                                 new_target_remaining = (
+                                     remaining[target] + incoming_size
+                                     - source_model.model_size
+                                 )
+                                 if (new_source_remaining < 0
+                                         or new_target_remaining < 0):
+                                     continue
+ 
+                                 candidate_loads = loads[:]
+                                 candidate_remaining = remaining[:]
+                                 candidate_loads[source] += (
+                                     first_pressure + second_pressure
+                                     - source_pressure
+                                 )
+                                 candidate_loads[target] += (
+                                     source_pressure
+                                     - first_pressure - second_pressure
+                                 )
+                                 candidate_remaining[source] = new_source_remaining
+                                 candidate_remaining[target] = new_target_remaining
+                                 candidate_pressures = [
+                                     kvpr(candidate_loads[gpu], candidate_remaining[gpu])
+                                     for gpu in range(gpu_num)
+                                 ]
+                                 candidate_key = tuple(
+                                     sorted(candidate_pressures, reverse=True)
+                                 )
+ 
+                                 if candidate_key < current_key:
+                                     placement[source].remove(source_model)
+                                     placement[target].remove(first_model)
+                                     placement[target].remove(second_model)
+                                     placement[source].extend(
+                                         (first_model, second_model)
+                                     )
+                                     placement[target].append(source_model)
+                                     loads = candidate_loads
+                                     remaining = candidate_remaining
+                                     improved = True
+                                     break
+                             if improved:
+                                 break
+                         if improved:
+                             break
+                     if improved:
+                         break
+                 if improved:
+                     break
+ 
++        # If a desired low-pressure destination is blocked by memory, eject one
++        # small resident model to a third GPU and make both moves atomically.
++        if not improved:
++            low_pressure_gpus = sorted(
++                range(gpu_num),
++                key=lambda gpu: (pressures[gpu], -remaining[gpu]),
++            )
++
++            for source in range(gpu_num):
++                if pressures[source] < current_max - 1e-12:
++                    continue
++
++                for source_model in list(placement[source]):
++                    source_pressure = model_pressure(source_model)
++
++                    for target in low_pressure_gpus:
++                        if target == source:
++                            continue
++
++                        # Direct moves were already tried; focus on destinations
++                        # that need a small eviction to receive this model.
++                        if source_model.model_size <= remaining[target]:
++                            continue
++
++                        victims = sorted(
++                            placement[target],
++                            key=lambda model: model.model_size,
++                        )[:3]
++
++                        for victim in victims:
++                            victim_pressure = model_pressure(victim)
++                            new_target_remaining = (
++                                remaining[target] + victim.model_size
++                                - source_model.model_size
++                            )
++                            if new_target_remaining < 0:
++                                continue
++
++                            for third in low_pressure_gpus:
++                                if third == source or third == target:
++                                    continue
++                                if victim.model_size > remaining[third]:
++                                    continue
++
++                                candidate_loads = loads[:]
++                                candidate_remaining = remaining[:]
++                                candidate_loads[source] -= source_pressure
++                                candidate_remaining[source] += source_model.model_size
++                                candidate_loads[target] += (
++                                    source_pressure - victim_pressure
++                                )
++                                candidate_remaining[target] = new_target_remaining
++                                candidate_loads[third] += victim_pressure
++                                candidate_remaining[third] -= victim.model_size
++
++                                candidate_pressures = [
++                                    kvpr(
++                                        candidate_loads[gpu],
++                                        candidate_remaining[gpu],
++                                    )
++                                    for gpu in range(gpu_num)
++                                ]
++                                candidate_key = tuple(
++                                    sorted(candidate_pressures, reverse=True)
++                                )
++
++                                if candidate_key < current_key:
++                                    placement[source].remove(source_model)
++                                    placement[target].remove(victim)
++                                    placement[target].append(source_model)
++                                    placement[third].append(victim)
++                                    loads = candidate_loads
++                                    remaining = candidate_remaining
++                                    improved = True
++                                    break
++                            if improved:
++                                break
++                        if improved:
++                            break
++                    if improved:
++                        break
++                if improved:
++                    break
++
+         if not improved:
+             break
+ 
+     return placement
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ if __name__ == "__main__":
+     # Test the algorithm
+ 
+     from evaluator import generate_test_gpu_models
+     from evaluator import calculate_kvcache_pressure
+     from evaluator import safe_float
+     import numpy as np
+ 
+     test_cases = generate_test_gpu_models()
+     all_kvpr = []
+     for i, (gpu_num, gpu_models) in enumerate(test_cases):
+ 
+         results = compute_model_placement(gpu_num, gpu_models)
+         max_kvpr = calculate_kvcache_pressure(results)
+         all_kvpr.append(safe_float(max_kvpr))
+ 
+     avg_kvpr = np.mean(all_kvpr)
+     if avg_kvpr != 0:
+         avg_kvpr = 1.0 / avg_kvpr
+ 
+ 
+     print(f"Max KVPR: {avg_kvpr:.3f}")

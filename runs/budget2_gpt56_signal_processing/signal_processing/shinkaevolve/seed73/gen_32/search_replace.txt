@@ -1,0 +1,90 @@
+<NAME>
+multiscale_endpoint_consensus
+</NAME>
+
+<DESCRIPTION>
+Replace the single exponential-window reference with a precomputed bank of causal endpoint regressions. A gentle decay remains dominant in flat or noisy regions, while current and steep recency-weighted fits receive progressively more weight when the fitted slope is large relative to its residual scale. This supplies a low-lag, trend-aware consensus measurement without making the Kalman tracker itself more reactive. The existing predictive stage and reversal hysteresis remain in place, preserving their false-reversal protection while the improved local reference reduces lag during coherent motion.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Exponential window state.  The selected decay has substantially less
+    # delay than a uniform average but remains a stable local trend reference.
+    decay = np.exp(-2.0 / max(window_size - 1, 1))
+    window_level = float(x[0])
+
+    output = np.empty(n - window_size + 1, dtype=float)
+=======
+    # Precompute causal endpoint regressions at several recency scales.  The
+    # gentle fit is stable in noisy/flat regions; increasingly recent fits
+    # reduce endpoint lag when their slope is supported by low residual error.
+    padded = np.concatenate((np.full(window_size - 1, x[0]), x))
+    causal_windows = np.lib.stride_tricks.sliding_window_view(padded, window_size)
+    regression_time = np.arange(window_size, dtype=float) - (window_size - 1)
+    regression_design = np.column_stack((np.ones(window_size), regression_time))
+    endpoint_levels = []
+    endpoint_slopes = []
+    endpoint_residuals = []
+
+    for decay_strength in (1.5, 3.0, 5.0):
+        regression_weights = np.exp(
+            np.linspace(-decay_strength, 0.0, window_size)
+        )
+        regression_map = np.linalg.solve(
+            regression_design.T @ (regression_weights[:, None] * regression_design),
+            regression_design.T * regression_weights,
+        )
+        coefficients = causal_windows @ regression_map.T
+        fitted = (coefficients[:, :1] +
+                  coefficients[:, 1:] * regression_time[None, :])
+        residuals = causal_windows - fitted
+        endpoint_levels.append(coefficients[:, 0])
+        endpoint_slopes.append(coefficients[:, 1])
+        endpoint_residuals.append(
+            1.4826 * np.median(
+                np.abs(residuals - np.median(residuals, axis=1, keepdims=True)),
+                axis=1,
+            )
+        )
+
+    endpoint_levels = np.asarray(endpoint_levels)
+    endpoint_slopes = np.asarray(endpoint_slopes)
+    endpoint_residuals = np.asarray(endpoint_residuals)
+    trend_strength = np.abs(endpoint_slopes[1]) / (
+        np.abs(endpoint_slopes[1]) + endpoint_residuals[1] + 1e-10
+    )
+    endpoint_reference = (
+        (1.0 - 0.75 * trend_strength) * endpoint_levels[0]
+        + 0.50 * trend_strength * endpoint_levels[1]
+        + 0.25 * trend_strength * endpoint_levels[2]
+    )
+    endpoint_noise = np.maximum(endpoint_residuals[1], 1e-8)
+
+    output = np.empty(n - window_size + 1, dtype=float)
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+        # Causal exponentially weighted local estimate from the crossover
+        # moving-average implementation.
+        window_level = decay * window_level + (1.0 - decay) * sample
+
+        # Agreement means the motion is likely noise-dominated, so favor the
+        # stable window reference. Disagreement indicates a genuine transition,
+        # so favor the low-lag Kalman state.
+        disagreement = abs(level - window_level)
+        scale = np.sqrt(max(innovation_var, 1e-10))
+        local_weight = 0.26 / (1.0 + (disagreement / (1.75 * scale)) ** 2)
+        target = (1.0 - local_weight) * level + local_weight * window_level
+=======
+        # The multiscale endpoint reference is conservative without coherent
+        # slope evidence and becomes more recent only during supported trends.
+        # Its residual scale prevents a volatile local fit from overpowering
+        # the robust tracker.
+        window_level = endpoint_reference[index]
+        disagreement = abs(level - window_level)
+        scale = max(np.sqrt(max(innovation_var, 1e-10)), endpoint_noise[index])
+        local_weight = 0.30 / (1.0 + (disagreement / (1.75 * scale)) ** 2)
+        target = (1.0 - local_weight) * level + local_weight * window_level
+>>>>>>> REPLACE
+
+</DIFF>

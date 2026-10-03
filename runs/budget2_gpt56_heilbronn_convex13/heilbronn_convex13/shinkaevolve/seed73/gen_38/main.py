@@ -1,0 +1,164 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def heilbronn_convex13() -> np.ndarray:
+    """
+    Deterministically search for a high-quality maximin configuration of 13
+    points.  Coordinates are unconstrained because the convex hull of the
+    returned points is itself the containing convex region; the objective is
+    invariant under translation and uniform scaling.
+    """
+    n = 13
+    rng = np.random.default_rng(seed=91723)
+    triangles = np.array(
+        [(i, j, k) for i in range(n - 2) for j in range(i + 1, n - 1)
+         for k in range(j + 1, n)],
+        dtype=np.intp,
+    )
+
+    def hull_area(p: np.ndarray) -> float:
+        """Area of the convex hull, using the monotone-chain algorithm."""
+        order = np.lexsort((p[:, 1], p[:, 0]))
+        hull = []
+
+        def turn(a: int, b: int, c: int) -> float:
+            return ((p[b, 0] - p[a, 0]) * (p[c, 1] - p[a, 1])
+                    - (p[b, 1] - p[a, 1]) * (p[c, 0] - p[a, 0]))
+
+        for q in order:
+            while len(hull) >= 2 and turn(hull[-2], hull[-1], q) <= 0.0:
+                hull.pop()
+            hull.append(q)
+        lower_size = len(hull)
+        for q in order[-2::-1]:
+            while len(hull) > lower_size and turn(hull[-2], hull[-1], q) <= 0.0:
+                hull.pop()
+            hull.append(q)
+
+        vertices = p[np.asarray(hull[:-1], dtype=np.intp)]
+        return 0.5 * abs(
+            np.dot(vertices[:, 0], np.roll(vertices[:, 1], -1))
+            - np.dot(vertices[:, 1], np.roll(vertices[:, 0], -1))
+        )
+
+    def evaluate(p: np.ndarray) -> tuple[float, int]:
+        a = p[triangles[:, 0]]
+        b = p[triangles[:, 1]]
+        c = p[triangles[:, 2]]
+        double_areas = np.abs(
+            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+        )
+        worst = int(np.argmin(double_areas))
+        area = hull_area(p)
+        if area <= 1.0e-14:
+            return -np.inf, worst
+        return 0.5 * double_areas[worst] / area, worst
+
+    best_points = None
+    best_score = -np.inf
+
+    def anneal(points: np.ndarray, score: float, worst: int,
+               iterations: int, initial_step: float,
+               initial_temperature: float) -> tuple[np.ndarray, float, int]:
+        """Metropolis refinement at one exploration or polishing scale."""
+        for iteration in range(iterations):
+            fraction = iteration / max(1, iterations - 1)
+            step = initial_step * (1.0 - fraction) ** 1.7 + 0.0020
+            temperature = (initial_temperature * (1.0 - fraction) ** 2
+                           + 0.000012)
+
+            candidate = points.copy()
+            if rng.random() < 0.82:
+                moved = int(triangles[worst, rng.integers(0, 3)])
+            else:
+                moved = int(rng.integers(n))
+            candidate[moved] += rng.normal(0.0, step, 2)
+
+            candidate_score, candidate_worst = evaluate(candidate)
+            delta = candidate_score - score
+            if delta >= 0.0 or rng.random() < np.exp(delta / temperature):
+                points, score, worst = candidate, candidate_score, candidate_worst
+        return points, score, worst
+
+    # The centre-plus-four-rings prior is effective, but nearly identical
+    # restarts repeatedly discover the same oriented-matroid basin.  Cycle
+    # through controlled variants which retain its useful threefold density.
+    base_radii = np.array([0.31, 0.55, 0.79, 1.00])
+    base_phases = np.array([0.03, 0.29, 0.57, 0.84])
+
+    # Initial trials identify good determinant-orientation patterns.  Refining
+    # only survivors avoids spending the full budget in poor maximin basins.
+    survivors = []
+    for restart in range(10):
+        family = restart % 3
+        points = np.zeros((n, 2), dtype=float)
+        radii = base_radii + rng.normal(0.0, 0.035, 4)
+        phases = base_phases + rng.normal(0.0, 0.045, 4)
+        if family == 2:
+            # Independent role changes occasionally swap radial ordering and
+            # break the locked triples of the perfectly rotational seed.
+            radii += rng.normal(0.0, 0.052, 4)
+
+        points[0] = rng.normal(0.0, 0.018, 2)
+        index = 1
+        for radius, phase in zip(radii, phases):
+            angular_noise = (
+                rng.normal(0.0, 0.075, 3) if family == 2 else np.zeros(3)
+            )
+            angles = phase + 2.0 * np.pi * np.arange(3) / 3.0 + angular_noise
+            local_radii = radius * np.ones(3)
+            if family == 2:
+                local_radii += rng.normal(0.0, 0.028, 3)
+            points[index:index + 3] = local_radii[:, None] * np.column_stack(
+                (np.cos(angles), np.sin(angles))
+            )
+            index += 3
+
+        if family == 1:
+            # Although affine-neutral at initialization, this makes subsequent
+            # isotropic proposals explore a genuinely different coordinate path.
+            points[:, 0] *= 1.16
+            points[:, 1] *= 0.86
+        points += rng.normal(0.0, 0.012, points.shape)
+
+        score, worst = evaluate(points)
+        points, score, worst = anneal(
+            points, score, worst, 3000, 0.115, 0.0022
+        )
+        survivors.append((score, points.copy(), worst, family))
+        if score > best_score:
+            best_score = score
+            best_points = points.copy()
+
+    survivors.sort(key=lambda item: item[0], reverse=True)
+    # Preserve the strongest basin from every structured prior, then use the
+    # remaining refinement slot for the globally strongest unused trajectory.
+    selected = []
+    represented = set()
+    for survivor in survivors:
+        if survivor[3] not in represented:
+            selected.append(survivor)
+            represented.add(survivor[3])
+    for survivor in survivors:
+        if len(selected) >= 4:
+            break
+        if not any(survivor is chosen for chosen in selected):
+            selected.append(survivor)
+
+    for _, points, worst, _ in selected:
+        score, worst = evaluate(points)
+        points, score, worst = anneal(
+            points, score, worst, 21000, 0.062, 0.0011
+        )
+        if score > best_score:
+            best_score = score
+            best_points = points.copy()
+
+    if best_points is None or not np.all(np.isfinite(best_points)):
+        raise RuntimeError("deterministic Heilbronn search failed to produce a configuration")
+    return best_points
+
+
+# EVOLVE-BLOCK-END
