@@ -111,7 +111,7 @@ uv run skydiscover-run [INITIAL_PROGRAM] EVALUATOR [options]
 </details>
 
 ## 🔗 Acknowledgement
-FrugalEvo is adapted from the [SkyDiscover](https://github.com/skydiscover-ai/skydiscover) framework. This framework is also is inspired by [AlphaEvolve](https://deepmind.google/discover/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/) and incorporates useful code components from open-source efforts such as [OpenEvolve](https://github.com/codelion/openevolve). Its interface is compatible with the [optimize_anything](https://gepa-ai.github.io/gepa/blog/2026/02/18/introducing-optimize-anything/) API.
+FrugalEvo is adapted from the [SkyDiscover](https://github.com/skydiscover-ai/skydiscover) framework, which is also inspired by [AlphaEvolve](https://deepmind.google/discover/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/) and incorporates useful code components from open-source efforts such as [OpenEvolve](https://github.com/codelion/openevolve). Its interface is compatible with the [optimize_anything](https://gepa-ai.github.io/gepa/blog/2026/02/18/introducing-optimize-anything/) API.
 
 
 
