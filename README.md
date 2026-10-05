@@ -1,5 +1,5 @@
 # FrugalEvo: Towards Cost-Aware LLM-Guided Program Evolution
-[![Paper](https://img.shields.io/badge/Paper-Arxiv-darkred.svg)](https://arxiv.org/pdf/)
+[![Paper](https://img.shields.io/badge/Paper-Arxiv-darkred.svg)](https://arxiv.org/pdf/2610.03675)
 [![Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-2EA44F)](https://opensource.org/license/apache-2.0)
 
 
