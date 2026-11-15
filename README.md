@@ -1,5 +1,5 @@
 # FrugalEvo: Towards Cost-Aware LLM-Guided Program Evolution
-[![Paper](https://img.shields.io/badge/Paper-Arxiv-darkred.svg)](https://arxiv.org/pdf/)
+[![Paper](https://img.shields.io/badge/Paper-Arxiv-darkred.svg)](https://arxiv.org/pdf/2610.03675)
 [![Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-2EA44F)](https://opensource.org/license/apache-2.0)
 
 
@@ -111,9 +111,18 @@ uv run skydiscover-run [INITIAL_PROGRAM] EVALUATOR [options]
 </details>
 
 ## 🔗 Acknowledgement
-FrugalEvo is adapted from the [SkyDiscover](https://github.com/skydiscover-ai/skydiscover) framework. This framework is also is inspired by [AlphaEvolve](https://deepmind.google/discover/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/) and incorporates useful code components from open-source efforts such as [OpenEvolve](https://github.com/codelion/openevolve). Its interface is compatible with the [optimize_anything](https://gepa-ai.github.io/gepa/blog/2026/02/18/introducing-optimize-anything/) API.
+FrugalEvo is adapted from the [SkyDiscover](https://github.com/skydiscover-ai/skydiscover) framework, which is also inspired by [AlphaEvolve](https://deepmind.google/discover/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/) and incorporates useful code components from open-source efforts such as [OpenEvolve](https://github.com/codelion/openevolve). Its interface is compatible with the [optimize_anything](https://gepa-ai.github.io/gepa/blog/2026/02/18/introducing-optimize-anything/) API.
 
-
+## ✍️ Citation
+Please cite our paper if you find our work helpful:
+```bibtex
+@article{chen2026frugalevo,
+      title={FrugalEvo: Towards Cost-Aware LLM-Guided Program Evolution}, 
+      author={Chen, Hui and Qi, Xuan and Zhao, James Xu and Feng, Zhaopeng and Liu, Shilong and Xu, Kuang and Koh, Pang Wei and Hooi, Bryan},
+      journal={arXiv preprint arXiv:2610.03675},
+      year={2026}
+}
+```
 
 ## 📬 Contact Us
 If you have any questions or feedback, please reach out to:
